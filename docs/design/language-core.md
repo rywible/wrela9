@@ -52,7 +52,22 @@ Functions are statically higher-order and may also form runtime callables from a
 
 Interfaces primarily constrain monomorphized generics. Explicit `any Interface` opts into a finite Image-closed existential family. Such an interface declares Data-only or Resource-owning representation, enforces method effect ceilings, exposes its concrete family in compiler reports, and has no open virtual dispatch, dynamic loading, downcasting, or runtime type reflection. Domain-significant alternatives may still use explicit enums.
 
-Modules follow conventional Project files and directories, use explicit imports and exports, default declarations to private, and form an acyclic import graph. Wrela has no package or dependency model yet.
+One Project directory builds one Image and conventionally roots Creator source at `src/image.wr`. A repository may contain several independent Project directories, but Wrela has no manifest, multi-Image Project, package, dependency, or external source model. The selected Project's absolute host path is operational metadata and cannot affect source semantics or Image identity.
+
+Each regular `src/**/*.wr` file is a possible Module. Its canonical Project-relative path is its complete Module identity: `src/game/player.wr` defines `game.player`, while `src/image.wr` defines the distinguished root Module `image`. Source contains no redundant Module declaration, directory Module, index Module, or alternate file mapping. Module path segments use a portable lowercase ASCII profile; the grammar specification owns its exact spelling rules. Moving a file deliberately changes its Module identity.
+
+The root Module contains exactly one `@image` Image Constructor. Another `@image` in the reachable closure is rejected, while an unreachable source file is not part of that compilation. The filesystem adapter captures every regular `.wr` file beneath `src/` into the immutable Project snapshot, but the compiler analyzes only `image` and its transitive import closure. Unreachable candidate source has no semantic diagnostics and cannot affect the accepted Image.
+
+An import names one absolute Module identity and binds its namespace, optionally under an `as` alias. Without an alias, references retain the complete Module path; imports do not copy declarations into the importing Module's unqualified scope. Every `pub` declaration in the imported Module is accessible through that namespace, while declarations and fields remain private to their defining Module unless marked `pub`. Wrela initially has no relative, wildcard, selective-declaration, implicit-parent, friend, or re-export form. `pub` defines a source Module interface, not a compatibility or binary-ABI promise.
+
+```wrela
+import game.player
+import core.option as option
+```
+
+Project Modules may import authenticated Modules from the sealed Compiler Distribution, using the same source import form while resolution retains their distinct origins. Authenticated Modules cannot import Project Modules, and a Project cannot declare or shadow an authenticated Module identity. Trust derives from the distribution registry and content identity rather than source spelling.
+
+The reachable Module import graph is acyclic without type-only or compile-time exceptions. Resolution orders it dependency-first with canonical Module identity as the tie-breaker and preserves source order within a Module; filesystem enumeration and import discovery order are unobservable. Missing imports, path collisions, authenticated-identity collisions, and case or normalization aliases are Creator diagnostics with deterministic Project-relative provenance.
 
 Metaprogramming consists of ordinary effect-free compile-time Wrela, generics, constant evaluation, symbolic visual declarations, and the Image Constructor. Wrela does not initially provide syntax macros, AST reflection, or Project compiler plugins.
 

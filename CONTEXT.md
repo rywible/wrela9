@@ -13,8 +13,12 @@ A self-contained bootable artifact containing all system software, selected devi
 _Avoid_: Console Image, executable, program, application bundle
 
 **Project**:
-A manifest-free source tree with one reachable Image Constructor and no external dependencies; its module paths and immutable content are resolved from conventional directories.
+A manifest-free source tree rooted at `src/image.wr` with one reachable Image Constructor and no external dependencies; Module identities derive from conventional Project-relative file paths.
 _Avoid_: Package, crate, dependency graph
+
+**Module**:
+A single `.wr` source file whose identity derives from its canonical path beneath a Project's `src/` directory or from an authenticated Compiler Distribution registry; its `pub` declarations are accessed through an explicitly imported Module namespace.
+_Avoid_: Package, path declaration, implicit global namespace
 
 **Image Constructor**:
 The single `@image` function evaluated as effect-free ordinary Wrela during the build to select Image Facilities, declare bounded resources, create Actors, and return the closed Image graph.

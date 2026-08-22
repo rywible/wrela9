@@ -112,6 +112,22 @@ _Avoid_: Generated visual result, hidden editor override, decompiled constant
 One atomic human- or agent-authored semantic edit represented as an exact Wrela source patch with diagnostics, preview impact, and reversible history.
 _Avoid_: UI gesture recording, private scene mutation, invisible agent state
 
+**Semantic Identity**:
+The closure-scoped identity of one named semantic thing, preserved across edits that retain its defining Module, owner chain, declaration kind, and name; its current meaning is checked separately through a Semantic Fingerprint.
+_Avoid_: Source address, global Project identity, qualified-name string, artifact version
+
+**Semantic Fingerprint**:
+A deterministic description of a semantic thing's current meaning used to detect incompatible edits and stale artifacts without pretending the thing itself was deleted and recreated.
+_Avoid_: Semantic Identity, source revision, security signature
+
+**Identity Catalog**:
+The immutable compiler-owned catalog that interns canonical Semantic Identity keys for one compilation revision and carries their typed opaque IDs, readable names, provenance, and Semantic Fingerprints across compiler phases.
+_Avoid_: Symbol table, global registry, mutable compiler session
+
+**Specialization**:
+One executable function or method body after every type, compile-time Data, and Pool argument has been fixed for the closed Image.
+_Avoid_: Generic instance, Actor instance, runtime object
+
 **Capability**:
 An unforgeable value granting narrowly scoped authority over an Image resource or privileged operation.
 _Avoid_: Permission flag, raw handle

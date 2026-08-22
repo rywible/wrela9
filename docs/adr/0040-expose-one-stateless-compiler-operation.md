@@ -1,0 +1,3 @@
+# Expose one stateless compiler operation
+
+The host compiler will expose one synchronous `compile` operation over a complete immutable request rather than separate phase runners, convenience methods, revisioned sessions, or a compiler daemon. Its cumulative Analyze, Plan, and Build intents always run through the authoritative batch pipeline; inspection is output-only, cancellation is semantically sterile, and callers own Project capture and artifact persistence. This smaller interface gives every host tool the same compiler, prevents a second frontend, and preserves room for private measured reuse without making cache or session behavior part of Wrela semantics.

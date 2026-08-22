@@ -30,7 +30,7 @@ The compiler and editor expose a provider-neutral local semantic protocol for ex
 
 ## Preview execution
 
-The editor directly previews only effect-free constants, Image-construction fragments, Forms, Worlds, Views, Materials, and explicit bounded test snapshots through compiler-owned presentation paths. Checked World and Transport plans may lower sealed Preview Kernels through Cranelift JIT for interactive execution. Those kernels receive copied Preview Fixture Data and have no Actors, Facilities, Capabilities, host calls, or semantic authority. The Typed-HIR evaluator and scalar presentation semantics remain their differential oracle. Effectful gameplay and complete Image behavior remain AOT-only and authoritative only under pinned QEMU.
+The editor directly previews only effect-free constants, Image-construction fragments, Forms, Worlds, Views, Materials, and explicit bounded test snapshots through compiler-owned presentation paths. Checked World and Transport plans may lower sealed Preview Kernels through Cranelift JIT for interactive execution. Those kernels receive copied Preview Fixture Data and have no Actors, Facilities, Capabilities, host calls, or semantic authority. The Typed-HIR evaluator and scalar presentation semantics remain their differential oracle. Effectful gameplay and complete Image behavior remain AOT-only and authoritative only under the documented local QEMU configuration.
 
 Field evaluation, lighting, and Transport remain CPU-executed through the same planned kernels and contracts used by the Console. The host GPU may composite editor chrome and display completed pixels, but it cannot evaluate Fields, shade Materials, execute Transport, or become an alternate renderer.
 
@@ -44,7 +44,7 @@ Selections, panel arrangements, temporary cameras, expanded nodes, local undo hi
 
 ## Running Images
 
-The editor may build, launch, stop, observe, and inspect pinned QEMU Images and attach their structured Telemetry and Evidence. It does not hot-patch a running Image. Every accepted source change produces a new Image, and retaining durable state across launch is an explicit `Continue` against a compatible Event Store rather than an editor mutation of guest state.
+The editor may build, launch, stop, observe, and inspect Images under the documented local QEMU configuration and attach their structured Telemetry and Evidence. It does not hot-patch a running Image. Every accepted source change produces a new Image, and retaining durable state across launch is an explicit `Continue` against a compatible Event Store rather than an editor mutation of guest state.
 
 Each editor launch configuration visibly selects `New`, `Continue`, or `Ephemeral`. `New` refuses to overwrite an existing Store binding, `Continue` requires compatible Store Identity and schema, and `Ephemeral` uses disposable storage. A per-user workspace may remember the choice, but neither the editor nor launcher infers persistence from an Image digest.
 

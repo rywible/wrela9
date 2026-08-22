@@ -24,7 +24,7 @@ Fast host tests cover parsing, type and effect checking, build evaluation, compi
 
 Compiler test and debug builds run structural verification after individual Wrela-owned transformations; release builds verify major representation seams. Generated pure programs compare the Typed-HIR evaluator with optimized compiled execution. These differential checks cover semantic outcomes rather than requiring stable Core IR, Cranelift IR, or machine bytes.
 
-Representative conformance Images boot through pinned QEMU for every Image Facility, VM ABI seam, Driver protocol, backend, scheduler transition family, and Panic/shutdown path. Release gates run the complete applicable suite on every supported architecture. QEMU is required evidence but not the execution environment for every small semantic case.
+Representative conformance Images boot through the documented local QEMU version for every Image Facility, VM ABI seam, Driver protocol, backend, scheduler transition family, and Panic/shutdown path. Release gates run the complete applicable suite on every supported architecture. QEMU is required evidence but not the execution environment for every small semantic case.
 
 The Genshin-shaped, Pokémon-shaped, and Yu-Gi-Oh-shaped references are complete conformance Images. Each boots through QEMU, offers a deterministic scripted mode for release gates, permits limited manual interaction, and supplies typed Preview Fixtures for editor workflows. They use only public Wrela and standard-library interfaces but do not carry independent full-game progression obligations.
 
@@ -40,4 +40,4 @@ Deterministic tests validate cost-model accounting, admitted work bounds, placem
 
 Git contains the durable inputs and expectations needed to reproduce a release judgment: Wrela source, typed Preview Fixtures, canonical Replay scripts, Event Schema Locks, semantic expectations, and calibrated thresholds. Generated Images, Evidence Bundles, traces, profiles, screenshots, and other large or host-specific outputs are build artifacts rather than source-controlled files. They are keyed by Image digest and retained by the release runner when a run must be inspected or compared.
 
-No release assertion depends on an unrecorded manual action or an artifact that cannot be regenerated from the committed inputs and the authenticated local toolchain.
+No release assertion depends on an unrecorded manual action or an artifact that cannot be regenerated from the committed inputs and the documented unchanged local developer environment.

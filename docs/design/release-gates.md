@@ -4,17 +4,17 @@ Status: accepted current-version completion contract. Numeric thresholds are fil
 
 ## Authority
 
-One release gate decides whether the current Wrela version is complete. It begins from a fresh checkout on the Apple Silicon macOS development host after the documented external prerequisites have been installed and authenticated. Every required result must come from committed inputs and the locally locked toolchain; an ad hoc demonstration cannot replace a failed or absent gate.
+One release gate decides whether the current Wrela version is complete. It begins from a fresh checkout on the Apple Silicon macOS development host after the documented external prerequisites have been installed. Every required result must come from committed inputs and the documented local developer environment; an ad hoc demonstration cannot replace a failed or absent gate.
 
-The physical performance authority is the Apple M4 MacBook Air with 16 GB RAM running the AArch64 Architecture Profile through pinned QEMU and HVF. Controlled prototypes select the exact virtual CPU count, guest RAM, service budgets, thermal protocol, rendering budgets, and other numeric thresholds before those values become gate inputs.
+The physical performance authority is the Apple M4 MacBook Air with 16 GB RAM running the AArch64 Architecture Profile through the documented local QEMU version and HVF. Controlled prototypes select the exact virtual CPU count, guest RAM, service budgets, thermal protocol, rendering budgets, and other numeric thresholds before those values become gate inputs.
 
 ## Build identity
 
-Two builds made from identical Project source, compiler executable, authenticated external tools, Architecture Profile, build mode, and declared inputs must produce byte-identical `.wrela-image` artifacts. Each build also produces a canonical Evidence Bundle keyed by the Image digest. A tool identity mismatch, undeclared input, unresolved symbol, unsupported capability, or noncanonical package blocks the release.
+Two consecutive builds made from identical Project source, compiler executable, unchanged local external tools, Architecture Profile, build mode, and declared inputs must produce byte-identical `.wrela-image` artifacts. Each build also produces a canonical Evidence Bundle keyed by the Image digest. A missing tool, failed invocation, undeclared input, unresolved symbol, unsupported capability, or noncanonical package blocks the release.
 
 ## Semantic and runtime conformance
 
-The complete language, evaluator, Wrela-owned IR verifier, optimizer differential, scheduler model, ownership, capacity, cancellation, Driver, VM ABI, boot, shutdown, and Panic suites must pass. Representative conformance Images boot through pinned QEMU and exercise every implemented Image Facility and terminal path, including bounded recovery and deliberately injected failures.
+The complete language, evaluator, Wrela-owned IR verifier, optimizer differential, scheduler model, ownership, capacity, cancellation, Driver, VM ABI, boot, shutdown, and Panic suites must pass. Representative conformance Images boot through the documented local QEMU version and exercise every implemented Image Facility and terminal path, including bounded recovery and deliberately injected failures.
 
 Requests for unsupported Facilities, Architecture Profiles, content mechanisms, or host authority must fail at compilation or Image planning with structured diagnostics. The gate tests these negative cases explicitly; an inert stub or runtime fallback is a defect.
 

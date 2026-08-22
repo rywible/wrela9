@@ -14,7 +14,7 @@ The supported audience is initially the Wrela system builders themselves. The re
 
 The current release gates only the AArch64 Architecture Profile used for Apple Silicon development. The accepted later x86-64 profile remains documented so the architecture does not accidentally become AArch64-specific, but its boot path, Drivers, conformance, and performance are not implemented or tested in this version.
 
-The supported development host is Apple Silicon macOS. The compiler, linker integration, pinned QEMU launcher, tests, and editor are gated only there; behavior on another host creates no current support obligation.
+The supported development host is Apple Silicon macOS. The compiler, linker integration, QEMU launcher, tests, and editor are gated only there; behavior on another host creates no current support obligation.
 
 ## Included Facilities
 
@@ -34,15 +34,15 @@ The same repository also provides the coherent developer operations needed to ch
 
 ## Distribution
 
-The current version is delivered as a reproducible developer checkout. It produces real `.wrela-image` artifacts but has no signed installer, automatic updater, publishing service, catalog, or supported third-party binary distribution. Toolchain acquisition and pinning must be defined without silently reintroducing those product-distribution obligations.
+The current version is delivered as a developer checkout for its builders. It produces real `.wrela-image` artifacts but has no signed installer, automatic updater, publishing service, catalog, supported third-party binary distribution, or cross-machine toolchain-reproducibility promise.
 
-QEMU and LLD are explicitly installed external developer tools. A local setup operation records their resolved paths and cryptographic identities, including the relevant dynamically loaded dependency closure, and every later invocation verifies those identities rather than rediscovering commands through `PATH`. Wrela does not copy them into the repository, download them automatically, embed them in the editor, or sign and redistribute them. Selecting and shipping a true self-contained toolchain is a later product branch.
+QEMU and LLD are ordinary locally installed developer prerequisites. When their roles are needed, Wrela resolves `qemu-system-aarch64` or `ld.lld` through the current process `PATH`, records the resolved path and reported version in evidence, and produces a direct host diagnostic if the command is absent or fails. There is no setup operation, lockfile, executable hash, dynamic-dependency inventory, signature check, macOS-build binding, automatic download, or vendored copy. Selecting, authenticating, and shipping a self-contained toolchain are deferred together until Wrela has an actual distribution product.
 
 The current version manages no Developer ID certificate, notarization, App Sandbox policy, Hypervisor entitlement, signing identity, or package-acceptance suite. Incidental ad-hoc signatures produced by local build tools carry no Wrela product meaning.
 
 ## Physical Reference Console
 
-The initial physical performance authority is the builders' Apple M4 MacBook Air with 16 GB RAM running the AArch64 Image through pinned QEMU and HVF. Exact virtual CPU count, guest RAM, service budgets, thermal protocol, and rendering cost calibration will be selected from controlled measurements rather than guessed. Supporting an older Apple Silicon floor is a later measured product decision.
+The initial physical performance authority is the builders' Apple M4 MacBook Air with 16 GB RAM running the AArch64 Image through the documented local QEMU version and HVF. Exact virtual CPU count, guest RAM, service budgets, thermal protocol, and rendering cost calibration will be selected from controlled measurements rather than guessed. Supporting an older Apple Silicon floor is a later measured product decision.
 
 ## Completion
 

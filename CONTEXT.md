@@ -101,8 +101,52 @@ The checked Console obligations governing semantic preservation, visible error, 
 _Avoid_: Quality hint, frame-time heuristic
 
 **Reference Console**:
-The concrete minimum supported host and VM configuration against which Display cost models and performance gates are calibrated.
+The concrete minimum supported VM configuration against which Display cost models and Image Performance Challenges are calibrated.
 _Avoid_: Current development machine, abstract ISA budget
+
+**Reference Development Host**:
+The builders' controlled Apple Silicon Mac profile used to evaluate Compilation Performance and Check Latency; it may host the Reference Console but is a distinct role.
+_Avoid_: Reference Console, every contributor machine, frozen macOS patch manifest
+
+**Release Obligation**:
+An accepted observable property whose violation would prevent release and whose deterministic evidence therefore belongs in Check.
+_Avoid_: Aspirational quality, undocumented expectation, Challenge result
+
+**Check**:
+The one fast deterministic command whose Passed result establishes every currently encoded Release Obligation and makes a revision Releasable; it has no fast, full, CI, or release modes.
+_Avoid_: Test tier, partial validation, Challenge suite
+
+**Releasable**:
+The technical state of a revision for which Check has Passed, without claiming that no undiscovered defect or unencoded obligation exists.
+_Avoid_: Automatic product approval, proof of perfection, stronger result after more Challenges
+
+**Challenge**:
+A named, bounded exploratory activity run to answer a stated investigative question and discover gaps in Check; it supplies no release status and never runs routinely or automatically.
+_Avoid_: Full test suite, release gate, scheduled qualification
+
+**Finding**:
+A reproducible Challenge observation that violates an accepted Release Obligation and must be reduced into Check before the next merge or release.
+_Avoid_: Interesting measurement, speculative concern, retained raw trace
+
+**Regression Case**:
+The narrowest credible deterministic evidence that protects a Release Obligation inside Check, normally reduced from a Finding and replaceable by a cheaper or stronger invariant.
+_Avoid_: Historical bug archive, unreduced scenario, immortal test
+
+**Compilation Performance**:
+The elapsed time and memory used by an already-built Wrela compiler for a fixed Compilation Request.
+_Avoid_: Rust toolchain build time, Check Latency, generated-code speed
+
+**Generated-Code Performance**:
+The execution quality of generated native code for a fixed semantic workload.
+_Avoid_: Compiler latency, complete Image behavior, benchmark status
+
+**Image Performance**:
+The end-to-end behavior and resource use of a complete Image on the Reference Console.
+_Avoid_: Isolated generated kernel, Check Latency, host editor performance
+
+**Check Latency**:
+The wall time from invoking Check until its Passed, Failed, or Unable result on the Reference Development Host.
+_Avoid_: Toolchain setup cost, Compilation Performance, Challenge duration
 
 **Creator**:
 A curious solo programmer who builds Images and, when desired, works on the underlying Wrela system software.

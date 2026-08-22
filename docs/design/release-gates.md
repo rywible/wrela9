@@ -1,62 +1,37 @@
-# Release Gates
+# Check and Challenges
 
-Status: accepted current-version completion contract. Numeric thresholds are filled by controlled calibration without changing the shape of the gate.
+Status: accepted technical release authority and development-loop contract.
 
 ## Authority
 
-One release gate decides whether the current Wrela version is complete. It begins from a fresh checkout on the Apple Silicon macOS development host after the documented external prerequisites have been installed. Every required result must come from committed inputs and the documented local developer environment; an ad hoc demonstration cannot replace a failed or absent gate.
+Check is the sole technical authority for merge and release. It is one fast deterministic command: `Passed` means the revision is Releasable, `Failed` means a Release Obligation is violated, and `Unable` means no judgment was produced. There are no separate edit, merge, CI, full, or release checks.
 
-The physical performance authority is the Apple M4 MacBook Air with 16 GB RAM running the AArch64 Architecture Profile through the documented local QEMU version and HVF. Controlled prototypes select the exact virtual CPU count, guest RAM, service budgets, thermal protocol, rendering budgets, and other numeric thresholds before those values become gate inputs.
+Releasable means that Check establishes every currently encoded Release Obligation for the revision. It does not mean that no undiscovered defect or unencoded obligation exists, and it does not automatically approve a product or design choice. Running Challenges cannot strengthen, replace, or override this status.
 
-## Build identity
+Main is kept Releasable. An implementation is not declared complete until Check passes, and releases are built from an exact passing revision of `main` without a second technical qualification ceremony. Packaging and later distribution may produce artifacts from that revision but cannot introduce another definition of correctness.
 
-Two consecutive builds made from identical Project source, compiler executable, unchanged local external tools, Architecture Profile, build mode, and declared inputs must produce byte-identical `.wrela-image` artifacts. Each build also produces a canonical Evidence Bundle keyed by the Image digest. A missing tool, failed invocation, undeclared input, unresolved symbol, unsupported capability, or noncanonical package blocks the release.
+## Check envelope
 
-## Semantic and runtime conformance
+Check always selects the same evidence. Correct incremental computation may make repeated execution faster, while missing external prerequisites may make it `Unable`; neither condition changes the release claim. Initial tool installation and host-toolchain compilation are setup cost rather than a separate Check mode.
 
-The complete language, evaluator, Wrela-owned IR verifier, optimizer differential, scheduler model, ownership, capacity, cancellation, Driver, VM ABI, boot, shutdown, and Panic suites must pass. Representative conformance Images boot through the documented local QEMU version and exercise every implemented Image Facility and terminal path, including bounded recovery and deliberately injected failures.
+The Reference Development Host is the builders' Apple Silicon Mac profile, identified by model and memory class. A representative warm local change targets subsecond Check Latency and may not exceed two seconds on that host. Other hosts receive the same semantic result but do not become latency authorities.
 
-Requests for unsupported Facilities, Architecture Profiles, content mechanisms, or host authority must fail at compilation or Image planning with structured diagnostics. The gate tests these negative cases explicitly; an inert stub or runtime fallback is a defect.
+The Check envelope includes every deterministic Regression Case and one minimal production-shaped path through compilation, Image packaging, QEMU boot, typed terminal observation, and shutdown. When Check approaches its latency ceiling, evidence must be made deeper or cheaper. It is not split into another tier.
 
-## Editor journey
+## Challenge discipline
 
-The graphical editor gate performs one complete source-native authoring journey:
+A Challenge is a bounded exploratory instrument, not a gate. Before running one, a human or agent states the concrete question it is meant to answer. A Challenge may run only when the user requests it, the task creates or changes that Challenge, or an observed failure or suspected weakness supplies a concrete investigative question. Extra confidence is not a sufficient reason.
 
-1. Create or extend a reusable Form abstraction in canonical Wrela source.
-2. Declare Authoring Parameters with source provenance.
-3. Manipulate an instance through the graphical scene tools.
-4. Run a typed Preview Fixture through the isolated pure Preview Worker.
-5. Inspect bounds, approximation choices, and dominant costs.
-6. Receive and review an external agent-authored Source Transaction.
-7. Build the complete Image.
-8. Launch it under QEMU and verify the resulting behavior.
+Each named Challenge targets about thirty seconds and terminates within sixty seconds on the Reference Development Host. Ordinary work has one sixty-second aggregate Challenge budget unless the user explicitly authorizes more. There is no aggregate Challenge command, scheduled Challenge requirement, CI invocation, merge hook, release invocation, or automatic discovery of Challenge names.
 
-The journey must prove revision-aware conflicts, semantic diff, undo, and invalidation after an incompatible external source edit. Preview success cannot substitute for an AOT Image run.
+The canonical agent rule is:
 
-## Flagship journey
+> Run Check before declaring implementation complete. Do not run Challenges for routine confidence. Run a named Challenge only to answer a stated investigative question, within a total one-minute budget unless the user authorizes more.
 
-The flagship runs as a silent third-person exploration adventure at the fixed 1280×720, 60 Hz Display contract. Automated Replay and bounded manual checks cover New, Continue, Reset, movement, camera, target lock, light attack, dodge, damage, defeat, checkpoint respawn, all progression milestones, victory, durable completion, save-status UI, pause, Facility-loss UI, and the ending.
+## Product and performance Challenges
 
-After every persistent milestone, terminating and relaunching Continue must reconstruct the authoritative state from the Event Store. Victory becomes authoritative and visibly final only after its Event transaction has been durably acknowledged. Reset appends a new Campaign Epoch rather than deleting the host store.
+The complete graphical-editor authoring journey, flagship progression and persistence journey, Greenfield and Production Event Store lifecycles, Facility fault campaigns, and complete Replay runs are named Challenges. The Genshin-shaped, Pokémon-shaped, and Yu-Gi-Oh-shaped reference Images are also permanent Challenges. These programs remain important product and architecture pressure without becoming a shadow full suite.
 
-The gate runs both Event Store lifecycles. Greenfield mode may archive incompatible development history and begin cleanly. Production mode generates and validates the committed Event Schema Lock, proves every released payload readable through admitted upcasts, verifies retry deduplication, and rejects unsafe evolution.
+Physical Reference Console runs, native microbenchmarks, scheduler and Driver measurements, full-frame Display workloads, profiles, fuzzers, and bounded model exploration are Performance Challenges. They calibrate cost models and seek weaknesses in deterministic Check evidence. A benchmark records measurements; it does not pass a revision.
 
-## Reference Images
-
-The three permanent reference Images boot through QEMU, execute their canonical Replay scripts, and supply typed Preview Fixtures:
-
-- The Genshin-shaped Image stresses continuous terrain, articulation, lighting, shadows, transparency, and field effects.
-- The Pokémon-shaped Image stresses deterministic regional generation, reusable creature families, overworld-to-battle transition, and menus.
-- The Yu-Gi-Oh-shaped Image stresses dense board layout, exact procedural text, cards, nested Form illustrations, overlap, and dramatic effects.
-
-They use only public Wrela and standard-library mechanisms. They are conformance programs rather than independent games, but a shortcut or private compiler hook introduced only to make one pass is a gate failure.
-
-## Replay and performance
-
-The flagship and all three reference Images replay admitted Input Samples, explicit gameplay seeds, and logical boundaries deterministically. Event Store truth and lossy Telemetry remain outside the Replay artifact. Repeated runs must agree on authoritative structured observations even when host timing differs.
-
-Controlled Reference Console runs measure the complete Images and the supporting native microbenchmarks against calibrated admission and real-time thresholds. The flagship and references must sustain their admitted presentation contracts without relying on a host GPU for field evaluation, lighting, or compositing. A missed complete frame retains the previous frame and records the environmental performance fault, but a release fails when its calibrated scenario exceeds the permitted fault budget.
-
-## Retention
-
-Git retains Wrela source, typed Preview Fixtures, canonical Replay scripts, Event Schema Locks, semantic expectations, and calibrated thresholds. Generated Images, Evidence Bundles, traces, profiles, screenshots, and other large or host-specific outputs remain reproducible release artifacts keyed by Image digest. The runner retains enough failed-run evidence to diagnose a gate without turning incidental output into a source compatibility promise.
+When a Challenge exposes a reproducible violation of a Release Obligation, the Finding must enter Check before the next merge or release. Its narrow Regression Case, not the complete Challenge execution or raw output, becomes durable release evidence.

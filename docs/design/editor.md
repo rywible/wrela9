@@ -1,6 +1,6 @@
 # Graphical Editor
 
-Status: accepted through product boundary, procedural manipulation, human-agent transactions, preview execution and isolation, workspace state, Source Transaction conflicts and undo, QEMU lifecycle integration, launch storage modes, typed preview fixtures, pure preview JIT, the external agent boundary, Project extensibility, and the release-gating flagship workflow.
+Status: accepted through product boundary, procedural manipulation, human-agent transactions, preview execution and isolation, workspace state, Source Transaction conflicts and undo, QEMU lifecycle integration, launch storage modes, typed preview fixtures, pure preview JIT, the external agent boundary, Project extensibility, and the flagship authoring Challenge.
 
 ## Product boundary
 
@@ -48,6 +48,6 @@ The editor may build, launch, stop, observe, and inspect Images under the docume
 
 Each editor launch configuration visibly selects `New`, `Continue`, or `Ephemeral`. `New` refuses to overwrite an existing Store binding, `Continue` requires compatible Store Identity and schema, and `Ephemeral` uses disposable storage. A per-user workspace may remember the choice, but neither the editor nor launcher infers persistence from an Image digest.
 
-## Release-gating workflow
+## Flagship authoring Challenge
 
-The editor must let a Creator create a Form abstraction, expose Authoring Parameters, instantiate and directly manipulate it, construct a typed Preview Fixture, inspect bounds and cost, review and accept an agent-proposed Source Transaction, build the complete Image, run it under QEMU, and inspect structured runtime evidence. This complete journey gates the current version; isolated feature demonstrations do not.
+The editor must let a Creator create a Form abstraction, expose Authoring Parameters, instantiate and directly manipulate it, construct a typed Preview Fixture, inspect bounds and cost, review and accept an agent-proposed Source Transaction, build the complete Image, run it under QEMU, and inspect structured runtime evidence. This complete journey is a named bounded Challenge. Any reproducible violation of an accepted obligation is reduced into a Regression Case for Check rather than making the full journey a routine release ceremony.

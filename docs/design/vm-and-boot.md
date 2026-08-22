@@ -1,6 +1,6 @@
 # VM and Boot
 
-Status: accepted architecture through Image packaging, QEMU launch, architecture boot, static memory, restricted Virtio-PCI transport, DMA ownership, and terminal lifecycle. The current version implements and gates only AArch64; x86-64 is a preserved later design. Exact numeric limits and individual Image Facility protocols remain measured implementation specifications.
+Status: accepted architecture through Image packaging, QEMU launch, architecture boot, static memory, restricted Virtio-PCI transport, DMA ownership, and terminal lifecycle. The current version implements and checks only AArch64; x86-64 is a preserved later design. Exact numeric limits and individual Image Facility protocols remain measured implementation specifications.
 
 ## Image and launcher
 

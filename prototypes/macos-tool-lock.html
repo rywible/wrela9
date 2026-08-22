@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wrela macOS tool lock prototype</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18201f;
+      --muted: #66706e;
+      --paper: #f5f7f3;
+      --panel: #ffffff;
+      --line: #dce3dd;
+      --accent: #176b5b;
+      --accent-soft: #e4f2ed;
+      --danger: #a53d2d;
+      --danger-soft: #fae9e5;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(1120px, calc(100% - 32px));
+      margin: 48px auto 72px;
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { margin-bottom: 10px; font-size: clamp(28px, 4vw, 42px); line-height: 1.08; letter-spacing: -0.03em; }
+    h2 { margin-bottom: 16px; font-size: 20px; }
+    h3 { margin-bottom: 8px; font-size: 15px; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
+
+    .intro { max-width: 820px; margin-bottom: 28px; }
+    .intro p { color: var(--muted); font-size: 17px; }
+    .eyebrow { color: var(--accent); font-size: 12px; font-weight: 750; letter-spacing: 0.12em; text-transform: uppercase; }
+
+    .panel {
+      margin-bottom: 20px;
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--panel);
+      box-shadow: 0 8px 30px rgb(30 54 45 / 5%);
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: 1.15fr 1fr;
+      gap: 18px;
+    }
+
+    .status {
+      padding: 16px;
+      border-radius: 10px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 700;
+    }
+
+    .status.failed { background: var(--danger-soft); color: var(--danger); }
+
+    .facts {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin: 0;
+    }
+
+    .facts div { min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 9px; }
+    .facts dt { color: var(--muted); font-size: 12px; }
+    .facts dd { margin: 3px 0 0; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+    .tools { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .tool { padding: 16px; border: 1px solid var(--line); border-radius: 10px; }
+    .tool header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .tool header span { color: var(--muted); font-size: 12px; }
+    .pair { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 5px 10px; margin-top: 10px; font-size: 12px; }
+    .pair .label { color: var(--muted); }
+    .pair code { overflow-wrap: anywhere; }
+
+    .controls { display: flex; flex-wrap: wrap; gap: 9px; }
+    button {
+      appearance: none;
+      padding: 9px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--ink);
+      cursor: pointer;
+      font: inherit;
+      font-weight: 650;
+    }
+    button:hover { border-color: var(--accent); }
+    button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+    button.danger { color: var(--danger); }
+    button:disabled { cursor: default; opacity: 0.45; }
+
+    .diagnostics { margin: 14px 0 0; padding-left: 20px; }
+    .diagnostics li { margin: 5px 0; }
+    .diagnostics .ok { color: var(--accent); }
+    .diagnostics .error { color: var(--danger); }
+
+    .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px; }
+    .tabs button[aria-selected="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+    .walkthrough { padding: 16px; border: 1px solid var(--line); border-radius: 10px; }
+    .walkthrough p { color: var(--muted); }
+    .steps { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .step-number { display: inline-grid; width: 23px; height: 23px; place-items: center; border-radius: 50%; background: var(--paper); color: var(--muted); font-size: 12px; }
+
+    .observations { margin: 0; padding-left: 19px; }
+    .observations li { margin: 8px 0; }
+
+    @media (max-width: 800px) {
+      .summary, .tools { grid-template-columns: 1fr; }
+      .facts { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="intro">
+      <div class="eyebrow">Throwaway logic prototype</div>
+      <h1>Can a local lock catch toolchain drift without certificates or a bundled toolchain?</h1>
+      <p>This demo models setup and verification for explicitly installed QEMU and LLD on Apple Silicon macOS. It tests whether paths, symlinks, binary hashes, dynamic dependencies, and the macOS system closure can produce useful failures without making Homebrew or signing part of Wrela.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Current lock state</h2>
+      <div class="summary">
+        <div id="status" class="status"></div>
+        <dl id="host-facts" class="facts"></dl>
+      </div>
+      <ul id="diagnostics" class="diagnostics"></ul>
+    </section>
+
+    <section class="panel">
+      <h2>Locked tools and current observations</h2>
+      <div id="tools" class="tools"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Free play</h2>
+      <div class="controls">
+        <button class="primary" data-action="verify">Verify now</button>
+        <button data-action="path_changed">Change PATH only</button>
+        <button data-action="qemu_alias_retargeted">Retarget QEMU symlink</button>
+        <button data-action="lld_binary_changed">Upgrade LLD in place</button>
+        <button data-action="qemu_dependency_changed">Upgrade a QEMU dependency</button>
+        <button data-action="os_changed">Install a macOS update</button>
+        <button class="danger" data-action="qemu_missing">Remove locked QEMU</button>
+        <button data-action="relock">Explicitly re-lock current installation</button>
+        <button data-action="reset">Reset demo</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Guided walkthroughs</h2>
+      <div id="tabs" class="tabs"></div>
+      <div id="walkthrough" class="walkthrough"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Facts observed on this Mac</h2>
+      <ul class="observations">
+        <li><code>/opt/homebrew/bin/qemu-system-aarch64</code> is a symlink to Homebrew QEMU 11.0.2. Its recursive Mach-O closure contains 29 non-system files and 27 system install names.</li>
+        <li><code>/opt/homebrew/bin/ld.lld</code> is a symlink to Homebrew LLD 22.1.8. Its tiny launcher loads six LLD libraries, LLVM, and Z3: nine non-system files and six system install names in total.</li>
+        <li>Both executables are ad-hoc signed. Their complete file hashes already cover those embedded signatures; certificate trust adds no useful identity here.</li>
+        <li>Most macOS libraries live in the dyld shared cache rather than independently hashable files. The prototype therefore locks their install names together with architecture and exact macOS build.</li>
+        <li>QEMU ships a large firmware and data directory. Wrela's firmwareless invocation should select every runtime resource explicitly; installed-but-unselected QEMU data should not enter the lock.</li>
+      </ul>
+    </section>
+  </main>
+
+  <script>
+    // Pure state model. The page below this module only dispatches actions and renders state.
+    const ToolLockModel = (() => {
+      const BASELINE = {
+        locked: {
+          schema: 1,
+          host: { architecture: "arm64", macOS: "15.6", build: "24G84" },
+          tools: {
+            qemu: {
+              role: "Image launcher",
+              requestedPath: "/opt/homebrew/bin/qemu-system-aarch64",
+              canonicalPath: "/opt/homebrew/Cellar/qemu/11.0.2/bin/qemu-system-aarch64",
+              aliasTarget: "../Cellar/qemu/11.0.2/bin/qemu-system-aarch64",
+              binarySha256: "170e58bbca9103daaaf5b1135c8c43e119ba677af71a643704997cc7dc104cc8",
+              closureSha256: "581857d1b457898a7f86db6753ed5b8c9a56a019a1d6a5ae6d5770b62c68ec2d",
+              externalFiles: 29,
+              systemNames: 27,
+              present: true,
+              closureResolved: true
+            },
+            lld: {
+              role: "Image linker",
+              requestedPath: "/opt/homebrew/bin/ld.lld",
+              canonicalPath: "/opt/homebrew/Cellar/lld/22.1.8/bin/lld",
+              aliasTarget: "../Cellar/lld/22.1.8/bin/ld.lld",
+              binarySha256: "dfb99bcf2667a484359b6e60c42e5ee82f77ba6453f1f91acc9639a3d57daf8a",
+              closureSha256: "8716e37fa8f6d2535d1db73d36c0c3acfc1875a594d30fce04151e4dba8dba69",
+              externalFiles: 9,
+              systemNames: 6,
+              present: true,
+              closureResolved: true
+            }
+          }
+        },
+        observed: null,
+        pathEnvironment: "/opt/homebrew/bin:/usr/bin:/bin",
+        status: "Not verified",
+        diagnostics: [{ severity: "ok", text: "The lock was captured, but this invocation has not verified it yet." }]
+      };
+
+      function clone(value) {
+        return JSON.parse(JSON.stringify(value));
+      }
+
+      function initialState() {
+        const state = clone(BASELINE);
+        state.observed = clone(state.locked);
+        return state;
+      }
+
+      function compareTool(name, expected, observed) {
+        const label = name === "qemu" ? "QEMU" : "LLD";
+        const failures = [];
+        if (!observed.present) {
+          failures.push({ code: "tool_missing", text: `${label}: locked canonical tool is missing at ${expected.canonicalPath}.` });
+          return failures;
+        }
+        if (observed.canonicalPath !== expected.canonicalPath || observed.aliasTarget !== expected.aliasTarget) {
+          failures.push({ code: "alias_retargeted", text: `${label}: requested path resolves somewhere new; expected ${expected.canonicalPath}, observed ${observed.canonicalPath}.` });
+        }
+        if (observed.binarySha256 !== expected.binarySha256) {
+          failures.push({ code: "binary_changed", text: `${label}: executable content changed; expected ${expected.binarySha256.slice(0, 12)}…, observed ${observed.binarySha256.slice(0, 12)}….` });
+        }
+        if (!observed.closureResolved) {
+          failures.push({ code: "dependency_unresolved", text: `${label}: at least one declared Mach-O dependency cannot be resolved from the locked loader context.` });
+        } else if (observed.closureSha256 !== expected.closureSha256) {
+          failures.push({ code: "closure_changed", text: `${label}: dynamic dependency closure changed; expected ${expected.closureSha256.slice(0, 12)}…, observed ${observed.closureSha256.slice(0, 12)}….` });
+        }
+        return failures;
+      }
+
+      function verify(input) {
+        const state = clone(input);
+        const failures = [];
+        const expectedHost = state.locked.host;
+        const observedHost = state.observed.host;
+        if (expectedHost.architecture !== observedHost.architecture || expectedHost.build !== observedHost.build) {
+          failures.push({ code: "host_changed", text: `Host system closure changed; expected ${expectedHost.architecture} macOS build ${expectedHost.build}, observed ${observedHost.architecture} build ${observedHost.build}.` });
+        }
+        failures.push(...compareTool("qemu", state.locked.tools.qemu, state.observed.tools.qemu));
+        failures.push(...compareTool("lld", state.locked.tools.lld, state.observed.tools.lld));
+        state.status = failures.length ? "Verification rejected" : "Verified installation";
+        state.diagnostics = failures.length
+          ? failures.map(failure => ({ severity: "error", text: failure.text }))
+          : [{ severity: "ok", text: "Exact tool paths, executable bytes, dependency closures, architecture, and macOS build match the lock. PATH and Homebrew metadata were not consulted." }];
+        return state;
+      }
+
+      function relock(input) {
+        const state = clone(input);
+        const tools = Object.values(state.observed.tools);
+        if (tools.some(tool => !tool.present || !tool.closureResolved)) {
+          state.status = "Re-lock rejected";
+          state.diagnostics = [{ severity: "error", text: "Cannot lock an incomplete installation. Restore the missing tool or dependency first." }];
+          return state;
+        }
+        state.locked = clone(state.observed);
+        state.status = "Installation re-locked";
+        state.diagnostics = [{ severity: "ok", text: "Explicit setup accepted the currently observed installation and would atomically replace the machine-local lock." }];
+        return state;
+      }
+
+      function reduce(input, action) {
+        if (action === "reset") return initialState();
+        if (action === "verify") return verify(input);
+        if (action === "relock") return relock(input);
+
+        const state = clone(input);
+        if (action === "path_changed") {
+          state.pathEnvironment = "/tmp/untrusted:/opt/homebrew/bin:/usr/bin:/bin";
+          state.diagnostics = [{ severity: "ok", text: "PATH changed. Verification still uses locked canonical paths and will ignore it." }];
+        }
+        if (action === "qemu_alias_retargeted") {
+          state.observed.tools.qemu.aliasTarget = "../Cellar/qemu/11.1.0/bin/qemu-system-aarch64";
+          state.observed.tools.qemu.canonicalPath = "/opt/homebrew/Cellar/qemu/11.1.0/bin/qemu-system-aarch64";
+          state.observed.tools.qemu.binarySha256 = "6e7759f6fbd1f1e50b8dfc535ace22dfb2566cd16565ef1a91fb7c659fb70231";
+          state.observed.tools.qemu.closureSha256 = "1c93edab9a7d16012786231ab361557a509a23781b828652381622244b8180f2";
+          state.diagnostics = [{ severity: "ok", text: "The Homebrew-facing symlink now points to a hypothetical QEMU 11.1.0 installation." }];
+        }
+        if (action === "lld_binary_changed") {
+          state.observed.tools.lld.binarySha256 = "a29a62ee8d7e92775597265121e531466e596491bde05ee41d99c1ee3252f2b";
+          state.diagnostics = [{ severity: "ok", text: "The locked LLD path still exists, but its executable bytes changed." }];
+        }
+        if (action === "qemu_dependency_changed") {
+          state.observed.tools.qemu.closureSha256 = "0d37aabcf7abf5a1b6b40aa1233c6aed94ab08498998127cf88dfe9b2949b028";
+          state.diagnostics = [{ severity: "ok", text: "QEMU is unchanged, but one Homebrew dependency now resolves to different bytes." }];
+        }
+        if (action === "os_changed") {
+          state.observed.host.macOS = "15.7";
+          state.observed.host.build = "24H20";
+          state.diagnostics = [{ severity: "ok", text: "The macOS build changed, so shared-cache libraries are no longer the locked system closure." }];
+        }
+        if (action === "qemu_missing") {
+          state.observed.tools.qemu.present = false;
+          state.diagnostics = [{ severity: "ok", text: "The locked canonical QEMU path was removed." }];
+        }
+        state.status = "Observed state changed";
+        return state;
+      }
+
+      return { initialState, reduce };
+    })();
+
+    const WALKTHROUGHS = [
+      {
+        title: "Unchanged installation",
+        description: "The happy path: setup captured explicit tools and a later invocation verifies the exact installation without consulting PATH.",
+        steps: [
+          ["verify", "Verify the lock"],
+          ["path_changed", "Put an untrusted directory first on PATH"],
+          ["verify", "Verify again"]
+        ]
+      },
+      {
+        title: "Homebrew upgrade",
+        description: "Homebrew upgrades often retarget a stable symlink. The lock should identify the alias change and require deliberate re-locking.",
+        steps: [
+          ["qemu_alias_retargeted", "Retarget QEMU's symlink"],
+          ["verify", "Observe the rejection"],
+          ["relock", "Accept the new installation explicitly"],
+          ["verify", "Verify the replacement lock"]
+        ]
+      },
+      {
+        title: "Dependency drift",
+        description: "The executable can remain byte-identical while one dynamically loaded Homebrew library changes. Executable-only hashing misses this case.",
+        steps: [
+          ["qemu_dependency_changed", "Change one QEMU dependency"],
+          ["verify", "Observe the closure failure"]
+        ]
+      },
+      {
+        title: "Incomplete installation",
+        description: "A missing locked binary must fail verification, and setup must refuse to bless an incomplete state.",
+        steps: [
+          ["qemu_missing", "Remove locked QEMU"],
+          ["verify", "Observe the missing-tool failure"],
+          ["relock", "Try to re-lock the broken installation"]
+        ]
+      }
+    ];
+
+    let state = ToolLockModel.initialState();
+    let activeWalkthrough = 0;
+    let completedSteps = 0;
+
+    const escapeHtml = value => String(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;");
+
+    function shortHash(hash) {
+      return `${hash.slice(0, 12)}…`;
+    }
+
+    function render() {
+      const failed = state.status.includes("rejected");
+      const status = document.querySelector("#status");
+      status.className = `status${failed ? " failed" : ""}`;
+      status.textContent = state.status;
+
+      document.querySelector("#host-facts").innerHTML = [
+        ["Locked host", `${state.locked.host.architecture} / ${state.locked.host.build}`],
+        ["Observed host", `${state.observed.host.architecture} / ${state.observed.host.build}`],
+        ["Current PATH", state.pathEnvironment]
+      ].map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("");
+
+      document.querySelector("#diagnostics").innerHTML = state.diagnostics
+        .map(item => `<li class="${item.severity}">${escapeHtml(item.text)}</li>`)
+        .join("");
+
+      document.querySelector("#tools").innerHTML = Object.entries(state.locked.tools).map(([name, locked]) => {
+        const observed = state.observed.tools[name];
+        return `<article class="tool">
+          <header><h3>${name === "qemu" ? "QEMU" : "LLD"}</h3><span>${escapeHtml(locked.role)}</span></header>
+          <div class="pair">
+            <span class="label">Requested</span><code>${escapeHtml(locked.requestedPath)}</code>
+            <span class="label">Locked path</span><code>${escapeHtml(locked.canonicalPath)}</code>
+            <span class="label">Observed path</span><code>${escapeHtml(observed.canonicalPath)}</code>
+            <span class="label">Binary hash</span><code>${shortHash(locked.binarySha256)} / ${shortHash(observed.binarySha256)}</code>
+            <span class="label">Closure hash</span><code>${shortHash(locked.closureSha256)} / ${shortHash(observed.closureSha256)}</code>
+            <span class="label">Closure size</span><code>${locked.externalFiles} external + ${locked.systemNames} system names</code>
+            <span class="label">Present</span><code>${observed.present ? "yes" : "no"}</code>
+          </div>
+        </article>`;
+      }).join("");
+
+      document.querySelector("#tabs").innerHTML = WALKTHROUGHS.map((walkthrough, index) =>
+        `<button data-tab="${index}" aria-selected="${index === activeWalkthrough}">${escapeHtml(walkthrough.title)}</button>`
+      ).join("");
+
+      const walkthrough = WALKTHROUGHS[activeWalkthrough];
+      document.querySelector("#walkthrough").innerHTML = `
+        <h3>${escapeHtml(walkthrough.title)}</h3>
+        <p>${escapeHtml(walkthrough.description)}</p>
+        <div class="steps">
+          ${walkthrough.steps.map(([action, label], index) => `
+            <span class="step-number">${index + 1}</span>
+            <button data-step="${index}" data-action="${action}" ${index !== completedSteps ? "disabled" : ""}>${escapeHtml(label)}</button>
+          `).join("")}
+        </div>`;
+    }
+
+    function dispatch(action) {
+      state = ToolLockModel.reduce(state, action);
+      render();
+    }
+
+    document.addEventListener("click", event => {
+      const tab = event.target.closest("[data-tab]");
+      if (tab) {
+        activeWalkthrough = Number(tab.dataset.tab);
+        completedSteps = 0;
+        state = ToolLockModel.initialState();
+        render();
+        return;
+      }
+
+      const button = event.target.closest("[data-action]");
+      if (!button || button.disabled) return;
+      dispatch(button.dataset.action);
+      if (button.hasAttribute("data-step")) completedSteps += 1;
+      render();
+    });
+
+    render();
+  </script>
+</body>
+</html>

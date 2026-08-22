@@ -13,11 +13,11 @@ A self-contained bootable artifact containing all system software, selected devi
 _Avoid_: Console Image, executable, program, application bundle
 
 **Project**:
-A manifest-free source tree rooted at `src/image.wr` with one reachable Image Constructor and no external dependencies; Module identities derive from conventional Project-relative file paths.
+A manifest-free source tree whose only root source is `src/image.wr`, with one reachable Image Constructor and no external dependencies; every other Module is hierarchically nested and derives identity from its conventional Project-relative path.
 _Avoid_: Package, crate, dependency graph
 
 **Module**:
-A single `.wr` source file whose identity derives from its canonical path beneath a Project's `src/` directory or from an authenticated Compiler Distribution registry; its `pub` declarations are accessed through an explicitly imported Module namespace.
+A single hierarchical `.wr` source file whose identity derives from its canonical path beneath a Project's `src/` directory or from an authenticated Compiler Distribution registry; one `from parent import leaf [as alias]` form imports its complete namespace, through which its `pub` declarations are accessed.
 _Avoid_: Package, path declaration, implicit global namespace
 
 **Image Constructor**:

@@ -24,6 +24,10 @@ _Avoid_: Package, path declaration, implicit global namespace
 The single `@image` function evaluated as effect-free ordinary Wrela during the build to select Image Facilities, declare bounded resources, create Actors, and return the closed Image graph.
 _Avoid_: Configuration file, macro language, runtime entry point
 
+**Build Constructor**:
+A sealed pure operation available during Image construction that creates one typed symbolic declaration for the returned Image graph without performing a runtime or ambient host effect.
+_Avoid_: Compiler Primitive, Facility planner, mutable compiler callback
+
 **Image Facility**:
 A high-level Image declaration such as Input, Display, or Event Store that expands into its sealed Drivers, Actors, Pools, interrupts, and Device Manifest entries.
 _Avoid_: Raw transport, manually assembled kernel service, host plugin

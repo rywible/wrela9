@@ -57,7 +57,7 @@ Each attribute occupies its own line at the declaration's indentation. It has `@
 
 ## Declarations and types
 
-Module declarations are imports, `const`, `fn`, `async fn`, `struct`, `resource struct`, `enum`, `interface`, `pool`, transparent `type` aliases, attributes, and `comptime if`. There are no executable top-level statements, mutable statics, nested types or Pools, or declaration re-opening blocks. Declarations and members are private unless prefixed `pub`.
+Module declarations are imports, `const`, `fn`, `async fn`, `struct`, `resource struct`, `enum`, `interface`, `pool`, transparent `type` aliases, attributes, `comptime if`, and `comptime assert`. There are no runtime executable top-level statements, mutable statics, nested types or Pools, or declaration re-opening blocks. Declarations and members are private unless prefixed `pub`.
 
 Representative forms are:
 

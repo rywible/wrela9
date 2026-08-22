@@ -1,0 +1,3 @@
+# Build Images, not host programs
+
+Wrela Creator code will produce self-contained bootable Images against one generic VM ABI rather than macOS or Linux executables. The Console is the flagship curated kind of Image, but the Image model, Constructor, Facilities, Drivers, and Device Manifest will not assume every system is a game. The compiler, launcher, inspector, and editor remain host-native Rust tools; the host evaluator supports builds and pure semantic tests, while an optional later JIT may support tests or previews without becoming a deployable Wrela target. This protects whole-Image analysis without hard-coding the first product into the language or committing to self-hosting.

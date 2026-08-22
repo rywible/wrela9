@@ -1,0 +1,119 @@
+# Compiler
+
+Status: accepted compiler architecture through execution, specialization, optimization, linking, diagnostics, reproducibility, and pure editor-preview JIT. Detailed IR instruction sets, individual pass designs, and build-tool packaging are implementation specifications rather than unresolved product policy.
+
+## Compiler boundary
+
+The host-native Rust compiler exposes one small service over a deterministic batch pipeline of immutable phase artifacts with explicit inputs. The command-line builder, tests, inspector, and future graphical editor use that same service instead of assembling independent compiler pipelines.
+
+Its external interface accepts an immutable Project snapshot, a build intent, an Architecture Profile, and explicit build inputs, then returns structured diagnostics, the requested artifacts, and their evidence. `Analyze` stops after source semantics, `Plan` evaluates and validates the closed `ImagePlan`, and `Build` produces the native Image. Evidence selection changes what the result exposes, not which compiler pipeline is authoritative. Internal phase representations may be inspected through returned artifacts, but callers cannot invoke phases out of order, mutate phase state, or assemble a second frontend.
+
+Project source cannot extend the compiler with plugins. The authenticated toolchain supplies a closed set of Image-kind and Facility planners. A Project selects and configures those planners through ordinary checked Wrela declarations and its Image Constructor.
+
+Authenticated Wrela modules come from a compiler-distribution registry keyed by content digest, role, version, and permitted Compiler Primitives. Trust is not a source modifier or reserved pathname, and Project modules cannot shadow or forge registered module identities.
+
+The compiler represents the evaluated declaration graph as a generic target-neutral `ImagePlan`. Trusted planners validate and refine their owned declarations without hard-coding Console, Display, Event Store, or individual Virtio devices into the generic compiler graph.
+
+## Source and identity
+
+Parsing produces a lossless syntax representation suitable for exact source preservation, diagnostics, formatting, and future editor collaboration. Semantic analysis uses a separate representation rather than progressively annotating or rewriting syntax nodes.
+
+Resolution assigns closure-wide stable `ModuleId`, `DefId`, `TypeId`, and `InstanceId` identities before typing and lowering. A declaration remains owned by its defining module, and every monomorphized instance has one canonical closure-wide identity. Source spelling, AST addresses, copied imported declarations, and concatenated strings are never semantic identities.
+
+Every semantic value that originated in source retains file-aware provenance. Generated compiler structures retain provenance back to the declaration, planner, or lowering step that produced them.
+
+Generic declarations are resolved and structurally validated before use. A reachable concrete combination of a generic `DefId` and compile-time arguments is demand-specialized, fully checked after substitution, and interned as one closure-wide `InstanceId`. Wrela initially treats generics as checked templates rather than implementing a polymorphic Core IR, dictionary passing, or backend-owned specialization.
+
+The compiler computes the complete reachable `InstanceId` set from the closed Image graph before Core lowering. Only that set participates in effects, ownership, capacity, cost, and code generation. Linker section collection is a defensive validation and size optimization, not the definition of semantic reachability.
+
+## Representation stack
+
+The compiler uses representations with narrow responsibilities:
+
+1. Lossless syntax preserves what the Creator wrote.
+2. Typed HIR records resolved identities, types, ownership, effects, and source provenance.
+3. Core IR makes monomorphized control flow, values, ownership operations, Panics, and Wrela-specific optimization facts explicit.
+4. Flow IR represents suspension, Actor Turns, Replies, Groups, cleanup, cancellation checkpoints, and statically planned async frames.
+5. World and Transport IRs represent symbolic visual structure, spatial bounds, approximation contracts, acceleration structures, and field-evaluation plans.
+6. `ImagePlan` represents the closed target-neutral system graph, Facility requirements, resource bounds, service obligations, and logical placement constraints.
+7. Backend lowering turns admitted synchronous functions and Flow resume functions into Cranelift IR and then target machine code.
+
+Core IR is intentionally Wrela-owned. It is the home for optimizations that depend on Wrela semantics, including ownership and Pool reasoning, bounds and capacity proofs, effect-aware specialization, whole-Image constant propagation, and transformations coordinated with World compilation. World and Transport IRs may perform domain-specific transformations before producing or specializing Core IR. Cranelift remains responsible for generic machine optimization, instruction selection, register allocation, and emission; it is not Wrela's semantic optimizer.
+
+Flow IR is also Wrela-owned and survives until scheduler behavior has been made explicit. Cranelift receives ordinary non-suspending functions and generated resume functions; it does not define Actor, Reply, Group, cancellation, or deterministic scheduling semantics.
+
+Generated runtime glue is represented as authenticated compiler IR or authenticated precompiled runtime modules. The compiler does not generate Wrela source and feed it back through parsing and whole-closure semantic analysis.
+
+## Compile-time evaluation
+
+The authoritative pure evaluator executes Typed HIR directly. It uses explicit control, call, and value stacks rather than host recursion, so evaluation limits and failures are deterministic and cannot require an oversized host thread stack. Wrela does not introduce a separate Eval IR or use JIT-compiled code to define compile-time semantics.
+
+One evaluator implements constants, compile-time branches, compile-time generic values, pure tests, and the Image Constructor. It may observe source values, literals, and authenticated compiler declarations only. Ambient files, environment variables, clocks, entropy, network state, and host process state are unavailable. A future declared immutable-content feature may add explicit build inputs without weakening this rule.
+
+Evaluation is bounded by deterministic instruction fuel and evaluator memory. Explicit frames count against evaluator memory. Exhaustion is a build diagnostic with source provenance, not a host timeout or runtime Panic.
+
+Compile-time and compiled ordinary floating-point operations share one specified mode: round to nearest with ties to even, preserve signed zero, use no ambient host floating-point mode, and canonicalize NaN results. Transcendental functions are not inherited from the host math library; each may be added later only with explicit language semantics and matching evaluator and runtime implementations.
+
+## Behavior facts and optimization
+
+Effects, possible Panic, suspension, ownership transfer and cleanup, allocation behavior, nondeterministic authority, and cost remain separate analyses with their own rules. Compiler consumers may retrieve them through a plain `FunctionFacts` aggregation keyed by stable identity; this aggregation is not a universal effect lattice. Message ordering belongs to Flow analysis, and contextual machine or visual cost may be computed separately rather than forced into every function summary.
+
+Core transformations preserve source-observable authoritative values, effects, ownership, deterministic choices, ordering, and possible Panic outcomes. A proven-impossible check may disappear; a pass may not introduce, defer, or reorder observable failure. Flow transformations additionally preserve Actor and scheduler observations. World and Transport transformations may approximate presentation only through an admitted Visual Contract.
+
+Typed HIR, Core IR, Flow IR, World and Transport plans, `ImagePlan`, and backend inputs each have structural verifiers. Test and debug builds verify after individual transformations; release builds verify at major pipeline seams. Generated pure programs compare evaluator results with optimized compiled results, while scheduler behavior remains checked through its independent model. Wrela does not require formal proofs or an optimizer-wide model checker.
+
+## Layout domains
+
+The compiler keeps three layout domains distinct:
+
+- **Wire Layout** is a portable exact byte contract for persistent Events, Store Snapshots, messages or protocols that explicitly request it, and other schema-governed data.
+- **Logical Image Layout** is the target-neutral bounded arrangement of Pools, Mailboxes, async frames, buffers, Facility state, scheduler structures, and memory regions required by an `ImagePlan`.
+- **Target ABI Layout** is the target-specific calling convention, stack and register representation, alignment, relocation, and machine encoding used by Cranelift and the selected machine serializer.
+
+Crossing between layout domains requires an explicit checked lowering. A native struct layout never silently becomes a Wire Layout, and a Cranelift ABI choice never changes an Event schema or target-neutral capacity proof.
+
+## Pipeline, diagnostics, and artifacts
+
+Parsing, name resolution, typing, pure evaluation, monomorphization, proof analyses, World compilation, Image planning, cost analysis, and backend lowering consume and produce immutable artifacts through explicit stage interfaces. Global mutable compilation switches and duplicated frontends are forbidden.
+
+Wrela initially implements this as a batch pipeline without a general query engine, dependency invalidator, in-memory incremental-recomputation promise, or persistent cache. Stable identities and explicit inputs preserve the option to add those mechanisms when the editor creates a measured need. The batch build remains authoritative.
+
+Parsing and independent declaration checks recover locally enough to report several useful structured diagnostics. Error values do not propagate into evaluator, Core IR, World compilation, Image planning, or backend representations; a hard no-errors gate precedes executable planning. IDE-grade typed holes and cross-file recovery are deferred.
+
+Creator diagnostics and compiler defects are disjoint. A violated compiler invariant produces a structured internal compiler error containing the failed phase, stable artifact identities, and bounded reproduction evidence, and no Image is emitted. The compiler never disguises its own defect as a Creator source error.
+
+Every important phase can emit a structured inspect artifact for reports and tests. These observations describe stable semantics and plans rather than promising compatibility for incidental Cranelift IR, register allocation, instruction bytes, or final Image byte offsets.
+
+The Image carries compact stable diagnostic and Panic-site identities. A canonical Evidence Bundle keyed by Image digest holds Project-relative source spans, symbols, layouts, plans, and phase receipts for launchers, tests, and tools. It excludes absolute host paths and need not embed complete source text into the Image. The public `.wrela-image` container holds its Architecture Profile, Device Manifest, admitted RAM layout, bootable ELF, and any required architecture-owned reset member.
+
+## Native backend and linking
+
+The first compiler is AOT-only. It lowers admitted synchronous functions and Flow resume functions to Cranelift and emits standard target ELF object files through Cranelift's object module. Authenticated runtime and target-stub objects use the same link seam.
+
+Each Architecture Profile declares a fixed ISA, CPU-feature baseline, conventional freestanding calling convention, Cranelift version and flags, VM ABI revision, and trusted architecture stubs. Code generation never detects or inherits features from the compiler host. The initial compiler uses the architecture's conventional ABI across generated code and trusted stubs rather than defining a custom Wrela calling convention.
+
+Safe runtime policy, Facilities, and Drivers are implemented primarily as authenticated Wrela modules. Minimal architecture-owned Rust or assembly stubs contain reset, interrupt and fault entry, MMIO, context switching, and operations that cannot be expressed through safe Wrela and Compiler Primitives.
+
+A closed primitive manifest maps each typed Compiler Primitive to its exact Image-internal symbol, calling convention, required Capability-bearing operands, and permitted Architecture Profiles. Neither Creator nor authenticated Wrela source can declare a general FFI or acquire authority merely by naming a linker symbol.
+
+An Image links no libc, libm, host operating-system library, shared library, dynamic library, or other external library. When Cranelift requests a helper operation, the backend must lower it directly or resolve it to a finite allowlisted sealed function owned by the Image runtime. Every requested helper appears in build evidence, an unknown helper is a compiler error, and the final linked result must contain no unresolved symbols.
+
+A pinned `ld.lld` invocation links those objects under a compiler-generated, architecture-owned linker script. The linker resolves Image-internal symbols, applies relocations, places ELF sections, and reports overflows. ELF exists only as a host-side linking and QEMU-loading interchange: a small Wrela packager validates its linked segments against the Logical Image Layout and VM ABI, adds the Architecture Profile, Device Manifest, exact admitted RAM layout, and any architecture-owned reset member, and produces the final `.wrela-image` container. The guest does not contain an ELF loader. Wrela does not initially implement a general linker or private relocatable object format, and it never invokes an uncontrolled host-default linker.
+
+The Wrela toolchain owns the accepted identity of the exact LLD binary and every other build-critical native tool. In the current developer-checkout version, explicitly installed external tools are resolved once into a machine-local lock containing their paths, cryptographic identities, and relevant dynamic dependency closure. Builds never select tools implicitly from the host `PATH`, and a changed or mismatched tool is rejected. Downloading, bundling, signing, and distributing a self-contained toolchain remain a later product problem.
+
+Cranelift JIT is admitted only for compiler-produced effect-free Preview Kernels used by the graphical editor. It is not the semantic oracle, a general Wrela host target, deployed Image execution, an Actor or Facility runtime, a Driver environment, or part of scheduler semantics. Preview Kernels expose no host-call seam or ambient authority and are differentially checked against the Typed-HIR evaluator and scalar presentation semantics. They execute in a replaceable child Preview Worker so generated-code failure does not share the editor address space. All complete Images remain AOT-only.
+
+## Reproducibility
+
+Repeated builds using the same compiler executable, declared inputs, Architecture Profile, authenticated planner and runtime objects, Cranelift version and flags, pinned linker, and build mode produce bit-identical Image bytes and canonical structured reports. Artifacts exclude timestamps, absolute host paths, host scheduling order, and unordered iteration.
+
+Rebuilding an identical compiler executable from source across different hosts is a separate future toolchain-reproducibility problem. Wrela does not promise byte identity across compiler versions, Cranelift versions, build modes, or target architectures.
+
+Development and optimized build modes preserve identical language, ownership, Panic, floating-point, and scheduler semantics. Neither may bypass resource, ownership, scheduler, deadline, or VM ABI proofs. A development Image may carry instrumentation and lack flagship performance certification, provided the Evidence Bundle says so explicitly; a development-only behavior is never valid evidence for a release-only semantic rule.
+
+## Wrela8 inheritance
+
+Wrela9 preserves the useful semantics and behavioral cases from Wrela8's lexer, grammar, type/access/move/flow analyses, whole-closure proofs, deterministic compile-time values and quotas, explicit async state-machine concepts, final artifact validation, and phase inspection. Each relevant case is inventoried and explicitly adopted, revised, or retired; none is binding merely because Wrela8 implemented it.
+
+Wrela9 rewrites Wrela8's string-based identity, imported-body splicing, per-module generic ownership, recursive compile-time interpreter, closed product-specific `ImageGraph`, generated-runtime-source feedback loop, orchestration monolith, thread-local options, fragmented diagnostics, custom general-purpose optimizer, custom register allocator, AArch64 emitter, and linker relaxation. Wrela8's old intermediate and machine dumps remain migration evidence, not Wrela9 compatibility requirements.

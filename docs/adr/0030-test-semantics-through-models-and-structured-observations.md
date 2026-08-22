@@ -1,0 +1,3 @@
+# Test semantics through models and structured observations
+
+Wrela will preserve the behavioral knowledge in Wrela8's golden cases without preserving its snapshot-heavy harness. Language and runtime conformance use typed observations, a compact executable scheduler model, generated bounded state spaces, and representative QEMU Images; textual snapshots remain limited to intentionally user-facing presentation. This adds model and schema work but keeps semantic tests stable across compiler wording, offsets, transport layouts, and scheduler reimplementation while still testing the production VM boundary.

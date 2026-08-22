@@ -1,0 +1,3 @@
+# Make World authoring intrinsic to Wrela
+
+Wrela will make Space, Form, World, View, Material, and Transport language and compiler concepts rather than recovering them from a Pixels standard library. Creators compose symbolic Forms through restricted pure Wrela over a sealed spatial floor, while the compiler lowers them into internal Fields and deterministic execution plans. Game-facing concepts such as Character, Creature, Terrain, Card, and glyph families remain ordinary public standard-library abstractions so the compiler understands universal spatial structure without defining what games are allowed to be.

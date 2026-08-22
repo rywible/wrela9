@@ -1,0 +1,3 @@
+# Keep the source language safe to the floor
+
+Wrela source will expose no `unsafe` block, pointer arithmetic, inline assembly, FFI, or raw hardware operation. Effects that ordinary safe Wrela cannot express will be a closed, typed set of Compiler Primitives available only to authenticated runtime and Driver modules. Every privileged primitive requires local authority from an explicit Capability-bearing operand; call-graph analysis may infer and report effects but cannot grant authority. One verifier and lowering boundary will own this primitive set, keeping Cranelift, QEMU, and architecture-specific details out of the language.

@@ -1,0 +1,3 @@
+# Separate cancellation cleanup from Panic
+
+Cancellation is a recoverable Group outcome: admission closes, children stop, moved resources and device receipts are recovered, and registered cleanup runs in deterministic reverse order before `Cancelled` becomes observable outside the Group. Panic instead means the complete Image is invalid. Panic records a bounded diagnostic and ends the current Image through the VM ABI without running ordinary source-level cleanup. A build-selected launcher policy may start a fresh instance with reset memory and devices under a finite crash-loop bound, but failed source execution never restarts itself. This keeps recoverable ownership guarantees strong without introducing arbitrary failure paths during fail-stop handling.

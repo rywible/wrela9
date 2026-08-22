@@ -1,0 +1,3 @@
+# Compile Transport without baking solved appearance
+
+The compiler may emit structural indexes, conservative bounds, symbolic reductions, deterministic schedules, and certified Transport operators derived from Forms, Materials, and Worlds. It will not embed lightmaps, sampled radiance, pre-rendered shadows, textures, meshes, or another solved appearance as the authoritative visual source. Runtime caches may retain evaluated lighting and reconstruction data under deterministic Visual Contracts because they are disposable and a reference evaluator can recover the intended presentation from source. This boundary preserves field-defined appearance while giving CPU execution meaningful lighting acceleration.

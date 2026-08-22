@@ -1,0 +1,3 @@
+# Use the build evaluator as the pure semantic oracle
+
+The simple evaluator required for constants and effect-free Image construction will define the behavior of pure Wrela operations, and compiled backends must agree with it through a shared conformance corpus. It executes Typed HIR directly with explicit stacks, deterministic fuel, and bounded evaluator memory rather than adding an Eval IR, using host recursion, or defining semantics through JIT execution. Wrela will not build a second complete interpreter for Drivers, Actors, or other effectful Image execution; those semantics are governed by specifications and conformance tests. This provides an independent check on optimized code without doubling the entire runtime implementation.

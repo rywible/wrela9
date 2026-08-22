@@ -1,0 +1,3 @@
+# Use Cranelift for native code generation
+
+Wrela will lower its verified, architecture-independent representation through Cranelift for x86-64 and AArch64 instead of porting Wrela 8's in-house AArch64 backend. Wrela continues to own semantic Image planning, the VM ABI, sealed architecture primitives, final packaging and validation, and backend evidence; Cranelift emits standard target objects and pinned LLD performs relocation and ELF linking. This gives Creators practical development portability and removes instruction selection, register allocation, ISA scheduling, and general linking from Wrela's core responsibilities, at the cost of trusting and pinning both backend tools and validating their emitted artifacts.

@@ -1,0 +1,3 @@
+# Separate required allocation from capacity pressure
+
+Pools will expose proof-required `allocate` and `reserve` operations separately from fallible `try_allocate`. Required allocation is admitted only when whole-Image analysis proves capacity; a reservation produces a one-shot Pool Permit guaranteeing later allocation. Expected gameplay pressure uses `try_allocate` and handles `PoolFull` explicitly. Keeping these as different source operations makes memory guarantees strong without forcing decorative effects, inventories, or other legitimately capacity-limited behavior to overprovision or Panic.

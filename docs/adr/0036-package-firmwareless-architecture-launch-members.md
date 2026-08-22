@@ -1,0 +1,3 @@
+# Package firmwareless architecture launch members
+
+A Wrela Image will be one canonical uncompressed versioned container whose Architecture Profile supplies the launch members needed by pinned unmodified QEMU. AArch64 boots its ELF directly through QEMU's bare-metal `-kernel` path and starts secondary cores through sealed PSCI HVC; later x86-64 adds a tiny Wrela-owned reset ROM that establishes long mode before entering its loader-placed ELF. Each architecture normalizes entry into one exact-version Boot Contract, and the guest never parses the container, ELF, DTB, UEFI, or a BIOS. This keeps the public Image model uniform while accepting that genuinely firmwareless reset is architecture-specific.

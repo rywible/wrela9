@@ -1,0 +1,3 @@
+# Generate boot and type Image termination
+
+The compiler will derive ordered runtime boot phases from the closed Image graph rather than requiring a Creator boot Actor. Missing devices, incompatible ABI, and failed initialization produce `BootFailed` before the Image runs; normal Shutdown is structured and may terminate as `ShutdownFailed`, while Panic remains immediate fail-stop. The VM ABI reports a typed Image Result, and any post-Panic restart is a fresh launcher-supervised instance under a finite crash-loop policy. This separates environmental startup, recoverable shutdown, source defects, and power loss without permitting partial boot or partially resumed shutdown.

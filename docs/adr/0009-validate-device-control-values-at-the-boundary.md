@@ -1,0 +1,3 @@
+# Validate device control values at the boundary
+
+Device-controlled values that can influence indexing, lengths, allocation, ownership transitions, or dispatch will enter safe Driver code as `Untrusted[T]` or a narrower sealed type and must be checked into a bounded value before use. Ordinary payload bytes are not automatically marked. Interrupt and completion work remains inside compiler-planned service quotas; repeated notification without valid progress triggers bounded containment and reset rather than unlimited service. Malformed device behavior produces a typed Driver Error when the Driver can recover ownership and safely quiesce or reset the device; an uncontainable device state or violated compiler/runtime invariant causes Panic.

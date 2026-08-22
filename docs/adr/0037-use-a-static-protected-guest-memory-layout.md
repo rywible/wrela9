@@ -1,0 +1,3 @@
+# Use a static protected guest memory layout
+
+Each Image will boot one compiler-planned identity-mapped address space with RX code, RO/NX immutable Data, RW/NX mutable regions, fixed MMIO, unmapped null and guard pages, compiler-derived per-core and interrupt stacks, and explicit zero initialization. Creator code cannot observe native addresses or layouts, and the guest has no demand paging, ASLR, dynamic stack growth, or general virtual-memory manager. This spends a small amount of boot and page-table machinery to contain compiler, runtime, Driver, and machine faults without importing conventional OS memory-management complexity.

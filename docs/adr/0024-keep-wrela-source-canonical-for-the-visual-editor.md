@@ -1,0 +1,3 @@
+# Keep Wrela source canonical for the visual editor
+
+The planned agent-and-human graphical editor will use public compiler semantics and perform structured edits against canonical Wrela Forms, Worlds, Views, Materials, and authored source data. It will not own a second authoritative scene document or emit private visual constructs unavailable to handwritten Wrela. Agent changes will be expressible as reviewable semantic transactions with previews, cost changes, and source patches, preserving one versionable representation while allowing graphical collaboration to become a flagship Wrela workflow.

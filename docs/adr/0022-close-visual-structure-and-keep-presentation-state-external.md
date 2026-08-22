@@ -1,0 +1,3 @@
+# Close visual structure and keep presentation state external
+
+Every Image will contain a finite universe of symbolic Form families, Worlds, Views, and structural alternatives. Runtime Data may select admitted variants, transform bounded instances, articulate and deform Forms, and supply pure regional-generation inputs, but it cannot construct new visual structure. A View receives an explicit bounded game snapshot and Display retains only disposable caches; Actors and Event Store Projections remain the sole owners of authoritative game state. This closed boundary makes whole-Image costing and specialization possible without turning visual subjects into a second mutable entity system.

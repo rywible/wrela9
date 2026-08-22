@@ -1,0 +1,7 @@
+# Lock production Event schemas
+
+Event schema development has two explicit lifecycles. Greenfield Mode allows a Creator to reshape Event payloads without preserving compatibility with existing development data. Production Mode generates an Event Schema Lock that is committed with the source repository. Once locked, an Event schema may change only when every released payload representation remains readable through a safe declared upcast path that conforms to the lock. Event payload and Store Snapshot types use compiler-checked Wire Layouts with canonical encoding rather than native in-memory representation.
+
+Wire Layouts support fixed-width integers, strict booleans, fixed arrays, nested Wire Layouts, and IEEE-754 `f32` and `f64`. They have explicit offsets, reserved ranges, padding, and endianness, and permit no pointers, Resources, variable arrays, strings, or implicit padding. Float encoding preserves signed zero and infinities, maps every NaN to one canonical quiet NaN, and rejects noncanonical NaN encodings when reading storage.
+
+This separates rapid early design from the durable compatibility promise made by a released Image. It also prevents source renames, declaration reordering, or compiler implementation details from silently changing persistent identities. The compiler will reject a production build whose Event schemas, Store Snapshot schema, or upcast graph do not satisfy the committed Event Schema Lock.

@@ -1,0 +1,3 @@
+# Keep field rendering CPU-only and use Virtio-GPU for scanout
+
+The flagship Console will render entirely on its virtual CPUs. It will not negotiate Virtio-GPU 3D, VirGL, Venus, Rutabaga, blob resources, or another host-GPU command path. A pinned QEMU Virtio-GPU 2D device will transport complete guest-rendered buffers to Scanout without participating in Field evaluation, lighting, or compositing. The first product performance floor is 1280×720 at 60 Hz on the Reference Console; 1920×1080 at 60 Hz is the next gate. A scalar evaluator remains the semantic oracle while the flagship path may use deterministic SIMD, multicore work, compiled spatial structure, rejection, reconstruction, and bounded reuse.

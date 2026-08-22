@@ -1,0 +1,3 @@
+# JIT only pure editor Preview Kernels
+
+The current version will use Cranelift JIT only for sealed effect-free Preview Kernels lowered from checked World and Transport plans. Interactive graphical authoring cannot plausibly rely on the Typed-HIR evaluator alone, while a second optimized Rust renderer would duplicate the most complex presentation semantics. Preview Kernels accept copied typed fixture Data and expose no Actors, Facilities, Capabilities, host calls, scheduler, or ambient authority; evaluator and scalar presentation paths remain the differential oracle. This deliberately narrows the earlier JIT deferral without creating a macOS Wrela target or weakening the rule that complete Images and gameplay are AOT-only under QEMU.

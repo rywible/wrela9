@@ -1,0 +1,3 @@
+# Preserve explicit resource ownership across recoverable exits
+
+Wrela will retain the `read`/`mut`/`take` model: Data copies implicitly, while every Resource move is explicit and leaves its source uninitialized. Compiler-known Resources such as ordinary Pool handles are automatically reclaimed on `return`, `?`, and cancellation; protocol Resources must be explicitly consumed, transferred, or protected by `defer` on every recoverable path. Image Pools and `own[P] T` will land before scoped Pools, which will reuse the same deterministic cleanup graph. Panic is excluded because it ends the complete Image without source-level cleanup.

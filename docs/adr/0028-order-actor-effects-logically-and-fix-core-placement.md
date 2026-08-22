@@ -1,0 +1,3 @@
+# Order Actor effects logically and fix core placement
+
+Actors will remain permanently assigned to compiler-planned cores, and messages from concurrent senders will enter one global logical destination capacity in a total order derived from stable execution identifiers rather than host arrival time. Cross-core transport queues may hold proposals but cannot create additional admitted capacity. The scheduler may execute independent work in parallel, but cross-Actor effects commit deterministically and no Actor migrates or participates in work stealing. This trades opportunistic host scheduling for reproducible gameplay, Event ordering, Replay, tests, and whole-Image cost analysis.

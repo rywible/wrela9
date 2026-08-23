@@ -1,17 +1,37 @@
+#![forbid(unsafe_code)]
+
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use crate::compiler::{
-    Cancellation, ConstructionObservation, Defect, Diagnostic, EvaluationObservation,
-    EvaluationOutcome, FunctionFactsObservation, InferredErrorObservation, ProjectFile,
-    RecoveryAction, Root, SourceRange, TestApplicationObservation,
+    Cancellation, ConstructionObservation, Defect, Diagnostic, DiagnosticLabelRole,
+    EvaluationObservation, EvaluationOutcome, FunctionFactsObservation, FunctionFactsValues,
+    IdentityDomain, InferredErrorObservation, OwnershipMode, OwnershipObservation, ProjectFile,
+    RecoveryAction, Root, SourceRange, SpecializationObservation, TestApplicationObservation,
+    TestBindingObservation, TypeObservation, TypeRole,
 };
-use crate::evaluator::{Constant, Construction, Engine, Function};
-use crate::syntax::ParsedSource;
-use crate::typed_hir::{self, BuildAuthority};
+use crate::evaluator::{Construction, Engine};
+use crate::identity::IdentityCatalog;
+use crate::model::{
+    BuildKind, BuiltinVariant, DefinitionId, ModuleId, SpecializationId, TestId, Type,
+    TypeParameterId, resolve_builtin_type,
+};
+use crate::syntax::{
+    AttributeSyntax, Declaration, DeclarationKind, DeclarationSyntax, FunctionSyntax,
+    OwnershipSyntax, ParsedSource, TypeSyntax,
+};
+use crate::typed_hir::{
+    self, BuildAuthority, CallTarget, Expression, ExpressionKind, NameKey, ProgramInput,
+    ResolvedConstant, ResolvedFunction, ResolvedName, ResolvedParameter, ResolvedTest, Statement,
+    VerifiedProgram,
+};
 
 pub(crate) struct Analysis {
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) function_facts: Vec<FunctionFactsObservation>,
+    pub(crate) types: Vec<TypeObservation>,
+    pub(crate) ownership: Vec<OwnershipObservation>,
+    pub(crate) specializations: Vec<SpecializationObservation>,
     pub(crate) inferred_errors: Vec<InferredErrorObservation>,
     pub(crate) evaluations: Vec<EvaluationObservation>,
     pub(crate) constructions: Vec<ConstructionObservation>,
@@ -20,119 +40,138 @@ pub(crate) struct Analysis {
     pub(crate) cancelled: bool,
 }
 
+#[derive(Clone)]
+struct DefinitionRecord {
+    id: DefinitionId,
+    module: ModuleId,
+    module_display: String,
+    path: String,
+    name: String,
+    kind: DeclarationKind,
+    public: bool,
+    declaration: Declaration,
+}
+
+#[derive(Clone)]
+struct TestRecord {
+    id: TestId,
+    range: SourceRange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FunctionFacts {
+    pure: bool,
+    may_panic: bool,
+    suspends: bool,
+    evaluator_eligible: bool,
+    ownership_transfer: bool,
+    bounded: bool,
+    logical_cost: u64,
+    constructs: BTreeSet<BuildKind>,
+    calls: BTreeSet<DefinitionId>,
+}
+
 pub(crate) fn analyze<'a>(
     parsed_sources: &BTreeMap<String, ParsedSource>,
-    files: &BTreeMap<&'a str, &'a ProjectFile>,
+    _files: &BTreeMap<&'a str, &'a ProjectFile>,
+    identity_catalog: &mut IdentityCatalog,
     root: Root,
     cancellation: &Cancellation,
     executable_allowed: bool,
     build_authority: &BuildAuthority,
 ) -> Analysis {
     let mut diagnostics = Vec::new();
-    let mut functions = BTreeMap::new();
-    let mut constants = BTreeMap::new();
-    let mut facts = BTreeMap::new();
-    let mut private_types = BTreeSet::new();
-    let mut public_function_headers = Vec::new();
-    let mut nominal_types = BTreeSet::new();
-    let mut image_functions = Vec::new();
-    let mut suites = Vec::new();
-    let mut declared_names = BTreeMap::new();
+    let modules = parsed_sources
+        .keys()
+        .map(|path| {
+            (
+                path.clone(),
+                identity_catalog
+                    .module(path)
+                    .expect("reachable Module was catalogued"),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let module_displays = parsed_sources
+        .keys()
+        .map(|path| (modules[path], module_name(path)))
+        .collect::<BTreeMap<_, _>>();
+    let mut definitions: BTreeMap<DefinitionId, DefinitionRecord> = BTreeMap::new();
+    let mut local_names: BTreeMap<(ModuleId, String), DefinitionId> = BTreeMap::new();
 
     for (path, parsed) in parsed_sources {
         if cancellation.is_cancelled() {
             return cancelled();
         }
-        let file = files[path.as_str()];
-        validate_attributes(file, &mut diagnostics);
+        let module = modules[path];
         for declaration in &parsed.declarations {
-            if !declaration.structurally_valid {
+            if !declaration.structurally_valid || declaration.syntax.is_none() {
                 continue;
             }
-            let declaration_key = format!("{}.{}", module_name(path), declaration.name);
-            if declared_names
-                .insert(declaration_key, declaration.range.clone())
-                .is_some()
-            {
-                diagnostics.push(
-                    Diagnostic::new(
-                        "semantic.duplicate_declaration",
+            for attribute in &declaration.attributes {
+                if *attribute == AttributeSyntax::Unknown {
+                    diagnostics.push(Diagnostic::new(
+                        "semantic.unknown_attribute",
                         declaration.range.clone(),
                         RecoveryAction::None,
-                    )
-                    .with_parameter("name", declaration.name.clone()),
+                    ));
+                }
+            }
+            let id = identity_catalog
+                .definition(path, declaration.kind, &declaration.name)
+                .expect("structurally valid declaration was catalogued");
+            let key = (module, declaration.name.clone());
+            if let Some(previous) = local_names.insert(key, id) {
+                let mut diagnostic = Diagnostic::new(
+                    "semantic.duplicate_declaration",
+                    declaration.range.clone(),
+                    RecoveryAction::None,
+                )
+                .with_parameter("name", declaration.name.clone())
+                .with_identity_parameter(
+                    "definition",
+                    IdentityDomain::Definition,
+                    id.0,
                 );
+                if let Some(previous) = definitions.get(&previous) {
+                    diagnostic = diagnostic.with_label(
+                        previous.declaration.range.clone(),
+                        DiagnosticLabelRole::PreviousDeclaration,
+                    );
+                }
+                diagnostics.push(diagnostic);
                 continue;
             }
-            let bytes = parsed.declaration_bytes(file, declaration);
-            let text = String::from_utf8_lossy(bytes);
-            if matches!(
-                declaration.kind,
-                "struct" | "resource_struct" | "enum" | "type_alias"
-            ) {
-                nominal_types.insert(declaration.name.clone());
-                if !declaration.public {
-                    private_types.insert(declaration.name.clone());
-                }
-            }
-            if declaration.kind == "function" {
-                if let Some(function) =
-                    parse_function(file, declaration.start, declaration.end, declaration.public)
-                {
-                    let qualified = qualify(path, &function.name);
-                    let body_text = function_body(&function);
-                    let suspends = text.trim_start().starts_with("async ")
-                        || text.trim_start().starts_with("pub async ")
-                        || body_text.contains("await ");
-                    let forbidden = body_text.contains("send ")
-                        || body_text.contains("try_send ")
-                        || body_text.contains("Facility.");
-                    let eligible = !suspends && !forbidden;
-                    let pure = eligible
-                        && !body_text.contains("Image.new(")
-                        && !body_text.contains("Test.new(");
-                    let may_panic = body_text.contains("panic ")
-                        || body_text.contains(" / ")
-                        || body_text.contains(" % ");
-                    facts.insert(
-                        qualified.clone(),
-                        FunctionFacts {
-                            name: function.name.clone(),
-                            pure,
-                            may_panic,
-                            suspends,
-                            evaluator_eligible: eligible,
-                        },
-                    );
-                    if declaration.public {
-                        public_function_headers
-                            .push((declaration.range.clone(), first_line(&text).to_owned()));
-                    }
-                    if has_image_attribute(file.bytes(), declaration.start) {
-                        image_functions.push((
-                            path.clone(),
-                            function.name.clone(),
-                            declaration.range.clone(),
-                        ));
-                    }
-                    functions.insert(qualified, function);
-                }
-            } else if declaration.kind == "constant"
-                && let Some(constant) = parse_constant(file, declaration.start)
-            {
-                constants.insert(qualify(path, &constant.name), constant);
-            } else if declaration.kind == "suite" {
-                suites.extend(parse_suite(file, declaration.start, declaration.end));
-                validate_suite(file, declaration, &mut diagnostics);
-            }
+            definitions.insert(
+                id,
+                DefinitionRecord {
+                    id,
+                    module,
+                    module_display: module_displays[&module].clone(),
+                    path: path.clone(),
+                    name: declaration.name.clone(),
+                    kind: declaration.kind,
+                    public: declaration.public,
+                    declaration: declaration.clone(),
+                },
+            );
         }
     }
 
-    let qualified_functions = functions.clone();
-    for (importer_path, parsed) in parsed_sources {
-        let importer_module = module_name(importer_path);
+    let mut names = BTreeMap::new();
+    for definition in definitions.values() {
+        names.insert(
+            NameKey::new(definition.module, Arc::from([definition.name.clone()])),
+            resolved_name(definition),
+        );
+    }
+    for (path, parsed) in parsed_sources {
+        let importer = modules[path];
         for import in &parsed.imports {
-            if declared_names.contains_key(&format!("{importer_module}.{}", import.alias)) {
+            let Some(target) = modules.get(&import.target_path).copied() else {
+                continue;
+            };
+            if local_names.contains_key(&(importer, import.alias.clone())) {
                 diagnostics.push(
                     Diagnostic::new(
                         "semantic.import_alias_conflict",
@@ -143,93 +182,239 @@ pub(crate) fn analyze<'a>(
                 );
                 continue;
             }
-            let target_module = module_name(&import.target_path);
-            for (qualified, function) in &qualified_functions {
-                if function.public
-                    && let Some(member) = qualified.strip_prefix(&format!("{target_module}."))
-                {
-                    functions.insert(
-                        format!("{importer_module}|{}.{}", import.alias, member),
-                        function.clone(),
-                    );
-                }
+            for definition in definitions
+                .values()
+                .filter(|definition| definition.module == target && definition.public)
+            {
+                names.insert(
+                    NameKey::new(
+                        importer,
+                        Arc::from([import.alias.clone(), definition.name.clone()]),
+                    ),
+                    resolved_name(definition),
+                );
             }
         }
     }
 
-    solve_function_facts(&mut facts, &functions);
-    let mut function_facts = facts
-        .into_values()
-        .map(|facts| {
-            FunctionFactsObservation::new(
-                facts.name,
-                facts.pure,
-                facts.may_panic,
-                facts.suspends,
-                facts.evaluator_eligible,
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut nominal_displays = BTreeMap::new();
+    for definition in definitions
+        .values()
+        .filter(|definition| is_nominal(definition.kind))
+    {
+        nominal_displays.insert(definition.id, Arc::from(definition.name.as_str()));
+        identity_catalog
+            .type_for_definition(definition.id)
+            .expect("nominal declaration has a catalogued TypeId");
+    }
 
-    for (range, header) in public_function_headers {
-        if let Some(private) = private_types
-            .iter()
-            .find(|private| contains_type_name(&header, private))
+    let mut input = ProgramInput {
+        names,
+        nominal_displays,
+        ..ProgramInput::default()
+    };
+    for (path, parsed) in parsed_sources {
+        let module = modules[path];
+        input.comptime_roots.extend(
+            parsed
+                .comptime_assertions
+                .iter()
+                .cloned()
+                .map(|assertion| (module, assertion)),
+        );
+    }
+    let mut tests_in_source_order = Vec::new();
+    let mut image_functions = Vec::new();
+    for definition in definitions.values() {
+        if cancellation.is_cancelled() {
+            return cancelled();
+        }
+        match definition
+            .declaration
+            .syntax
+            .as_ref()
+            .expect("catalogued syntax")
         {
-            diagnostics.push(
-                Diagnostic::new(
-                    "semantic.private_type_in_public_signature",
-                    range.clone(),
-                    RecoveryAction::None,
-                )
-                .with_parameter("private_type", private.clone()),
-            );
+            DeclarationSyntax::Function(function) => {
+                let type_parameters = function
+                    .type_parameters
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        (
+                            name.clone(),
+                            Type::Parameter {
+                                owner: definition.id,
+                                id: TypeParameterId(u16::try_from(index).unwrap_or(u16::MAX)),
+                                display: Arc::from(name.as_str()),
+                            },
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let parameters = match resolve_parameters(
+                    function,
+                    definition.module,
+                    &input.names,
+                    &input.nominal_displays,
+                    &type_parameters,
+                    &mut diagnostics,
+                ) {
+                    Some(parameters) => parameters,
+                    None => continue,
+                };
+                let Some(return_type) = resolve_type(
+                    &function.return_type,
+                    definition.module,
+                    &input.names,
+                    &input.nominal_displays,
+                    &type_parameters,
+                ) else {
+                    diagnostics.push(Diagnostic::new(
+                        "semantic.unresolved_type",
+                        definition.declaration.range.clone(),
+                        RecoveryAction::None,
+                    ));
+                    continue;
+                };
+                if definition.public
+                    && (exposes_private_type(&return_type, &definitions)
+                        || parameters
+                            .iter()
+                            .any(|parameter| exposes_private_type(&parameter.type_, &definitions)))
+                {
+                    diagnostics.push(Diagnostic::new(
+                        "semantic.private_type_in_public_signature",
+                        definition.declaration.range.clone(),
+                        RecoveryAction::None,
+                    ));
+                }
+                if definition.public && matches!(return_type, Type::Result { error: None, .. }) {
+                    diagnostics.push(Diagnostic::new(
+                        "semantic.public_result_requires_error_type",
+                        definition.declaration.range.clone(),
+                        RecoveryAction::None,
+                    ));
+                }
+                if definition
+                    .declaration
+                    .attributes
+                    .contains(&AttributeSyntax::Image)
+                {
+                    image_functions.push((definition.id, definition.declaration.range.clone()));
+                }
+                input.functions.insert(
+                    definition.id,
+                    ResolvedFunction {
+                        id: definition.id,
+                        module: definition.module,
+                        module_display: definition.module_display.clone(),
+                        name: definition.name.clone(),
+                        modifier: function.modifier,
+                        type_parameters: (0..function.type_parameters.len())
+                            .map(|index| TypeParameterId(u16::try_from(index).unwrap_or(u16::MAX)))
+                            .collect(),
+                        parameters,
+                        return_type,
+                        body: function.body.clone(),
+                        source: SourceRange::from_u64(
+                            &definition.path,
+                            definition.declaration.start,
+                            definition.declaration.end,
+                        ),
+                    },
+                );
+            }
+            DeclarationSyntax::Constant(constant) => {
+                let Some(type_) = resolve_type(
+                    &constant.type_syntax,
+                    definition.module,
+                    &input.names,
+                    &input.nominal_displays,
+                    &BTreeMap::new(),
+                ) else {
+                    diagnostics.push(Diagnostic::new(
+                        "semantic.unresolved_type",
+                        definition.declaration.range.clone(),
+                        RecoveryAction::None,
+                    ));
+                    continue;
+                };
+                input.constants.insert(
+                    definition.id,
+                    ResolvedConstant {
+                        id: definition.id,
+                        module: definition.module,
+                        name: definition.name.clone(),
+                        type_,
+                        value: constant.value.clone(),
+                        source: SourceRange::from_u64(
+                            &definition.path,
+                            definition.declaration.start,
+                            definition.declaration.end,
+                        ),
+                    },
+                );
+            }
+            DeclarationSyntax::Suite(suite) => {
+                if !definition.public {
+                    diagnostics.push(Diagnostic::new(
+                        "test.suite_must_be_public",
+                        definition.declaration.range.clone(),
+                        RecoveryAction::None,
+                    ));
+                }
+                for test in &suite.tests {
+                    let id = identity_catalog
+                        .test(&definition.path, &definition.name, &test.name)
+                        .expect("structured Test was catalogued");
+                    let parameters = test
+                        .parameters
+                        .iter()
+                        .filter_map(|parameter| {
+                            if parameter.ownership != OwnershipSyntax::Take {
+                                diagnostics.push(Diagnostic::new(
+                                    "test.parameter_requires_take",
+                                    parameter.range.clone(),
+                                    RecoveryAction::None,
+                                ));
+                            }
+                            resolve_type(
+                                &parameter.type_syntax,
+                                definition.module,
+                                &input.names,
+                                &input.nominal_displays,
+                                &BTreeMap::new(),
+                            )
+                            .map(|type_| ResolvedParameter {
+                                name: parameter.name.clone(),
+                                ownership: parameter.ownership,
+                                type_,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let resolved = ResolvedTest {
+                        id,
+                        suite: definition.name.clone(),
+                        test: test.name.clone(),
+                        asynchronous: test.asynchronous,
+                        parameters,
+                    };
+                    input.tests.insert(id, resolved);
+                    input.names.insert(
+                        NameKey::new(
+                            definition.module,
+                            Arc::from([definition.name.clone(), test.name.clone()]),
+                        ),
+                        ResolvedName::Test(id),
+                    );
+                    tests_in_source_order.push(TestRecord {
+                        id,
+                        range: test.range.clone(),
+                    });
+                }
+            }
+            DeclarationSyntax::Enum(_) | DeclarationSyntax::Named => {}
         }
-        if partial_result_return(&header).is_some() {
-            diagnostics.push(Diagnostic::new(
-                "semantic.public_result_requires_error_type",
-                range,
-                RecoveryAction::None,
-            ));
-        }
-    }
-
-    for constant in constants.values() {
-        if contains_build_constructor(&semantic_code_line(&constant.expression)) {
-            diagnostics.push(Diagnostic::new(
-                "semantic.build_constructor_outside_image",
-                constant.source.clone(),
-                RecoveryAction::None,
-            ));
-        }
-    }
-    let image_reachable = image_functions
-        .first()
-        .map_or_else(BTreeSet::new, |(path, name, _)| {
-            reachable_functions(&qualify(path, name), &functions)
-        });
-    let mut checked_sources = BTreeSet::new();
-    for function in functions.values() {
-        if checked_sources.insert(function.source.clone())
-            && contains_build_constructor(&function_body(function))
-            && !image_reachable.contains(&function.source)
-        {
-            diagnostics.push(Diagnostic::new(
-                "semantic.build_constructor_outside_image",
-                function.source.clone(),
-                RecoveryAction::None,
-            ));
-        }
-    }
-
-    let (inferred_errors, error_diagnostics) = infer_private_errors(&functions);
-    diagnostics.extend(error_diagnostics);
-    for range in unproven_recursive_cycles(&functions) {
-        diagnostics.push(Diagnostic::new(
-            "semantic.unproven_recursive_bound",
-            range,
-            RecoveryAction::None,
-        ));
     }
 
     let expected_root_path = match root {
@@ -243,685 +428,943 @@ pub(crate) fn analyze<'a>(
             RecoveryAction::None,
         ));
     } else if executable_allowed && image_functions.len() > 1 {
-        for (_, _, range) in image_functions.iter().skip(1) {
+        for (_, range) in image_functions.iter().skip(1) {
             diagnostics.push(Diagnostic::new(
                 "semantic.multiple_image_constructors",
                 range.clone(),
                 RecoveryAction::None,
             ));
         }
-    } else if executable_allowed && image_functions[0].0 != expected_root_path {
+    } else if executable_allowed
+        && image_functions
+            .first()
+            .is_some_and(|(id, _)| definitions[id].module != modules[expected_root_path])
+    {
         diagnostics.push(Diagnostic::new(
             "semantic.image_constructor_outside_root",
-            image_functions[0].2.clone(),
+            image_functions[0].1.clone(),
             RecoveryAction::None,
         ));
     }
 
-    let mut evaluations = Vec::new();
-    let mut constructions = Vec::new();
-    let mut test_plan = Vec::new();
-    let mut verification_defect = None;
-    let allowed_tests = suites
-        .iter()
-        .map(|test| format!("{}.{}", test.suite, test.test))
-        .collect::<BTreeSet<_>>();
-    let program = match typed_hir::verify(
-        functions,
-        constants.clone(),
-        &allowed_tests,
-        build_authority,
-        &nominal_types,
-        cancellation,
-    ) {
+    let mut type_observations = Vec::new();
+    let mut ownership_observations = Vec::new();
+    for function in input.functions.values() {
+        for parameter in &function.parameters {
+            type_observations.push(TypeObservation::new(
+                function.id.0,
+                parameter.name.clone(),
+                TypeRole::Parameter,
+                parameter.type_.display(),
+            ));
+            ownership_observations.push(OwnershipObservation::new(
+                function.id.0,
+                parameter.name.clone(),
+                match parameter.ownership {
+                    OwnershipSyntax::Value => OwnershipMode::Value,
+                    OwnershipSyntax::Take => OwnershipMode::Take,
+                },
+            ));
+        }
+        type_observations.push(TypeObservation::new(
+            function.id.0,
+            function.name.clone(),
+            TypeRole::Return,
+            function.return_type.display(),
+        ));
+    }
+    for constant in input.constants.values() {
+        type_observations.push(TypeObservation::new(
+            constant.id.0,
+            constant.name.clone(),
+            TypeRole::Constant,
+            constant.type_.display(),
+        ));
+    }
+    for test in input.tests.values() {
+        for parameter in &test.parameters {
+            type_observations.push(TypeObservation::new(
+                test.id.test.0,
+                parameter.name.clone(),
+                TypeRole::Parameter,
+                parameter.type_.display(),
+            ));
+            ownership_observations.push(OwnershipObservation::new(
+                test.id.test.0,
+                parameter.name.clone(),
+                match parameter.ownership {
+                    OwnershipSyntax::Value => OwnershipMode::Value,
+                    OwnershipSyntax::Take => OwnershipMode::Take,
+                },
+            ));
+        }
+    }
+    let program = match typed_hir::verify(input, build_authority, identity_catalog, cancellation) {
         Ok(program) => Some(program),
         Err(typed_hir::VerificationFailure::Defect { evidence }) => {
-            verification_defect = Some(Defect::new("typed HIR verification", evidence));
-            None
+            return defect("typed HIR verification", evidence);
         }
         Err(typed_hir::VerificationFailure::Creator { kind, site }) => {
             diagnostics.push(
                 Diagnostic::new("semantic.invalid_typed_hir", site, RecoveryAction::None)
-                    .with_parameter("kind", kind),
+                    .with_parameter("kind", kind.code()),
             );
             None
         }
         Err(typed_hir::VerificationFailure::Cancelled) => return cancelled(),
     };
-    if executable_allowed && diagnostics.is_empty() {
-        let program = program.as_ref().expect("verified when no diagnostics");
-        let constant_names = constants.keys().cloned().collect::<Vec<_>>();
-        for name in constant_names {
-            let mut engine = Engine::new(program, cancellation);
-            let run = engine.evaluate_constant(&name);
-            if run.outcome == EvaluationOutcome::Cancelled {
-                return cancelled();
-            }
-            map_evaluation_failure(&run.outcome, &constants[&name].source, &mut diagnostics);
-            evaluations.push(EvaluationObservation::new(name, run.outcome, run.receipt));
+
+    let mut function_facts = Vec::new();
+    let mut specialization_observations = Vec::new();
+    let mut inferred_errors = Vec::new();
+    let mut evaluations = Vec::new();
+    let mut constructions = Vec::new();
+    let mut test_plan = Vec::new();
+    if let Some(program) = &program {
+        let facts = solve_function_facts(program, cancellation);
+        if cancellation.is_cancelled() {
+            return cancelled();
         }
-        for (path, expression, range) in compile_time_assertions(parsed_sources, files) {
-            let module = module_name(&path);
-            let Ok(expression) = program.verify_expression(
-                &module,
-                &expression,
-                &range,
-                &allowed_tests,
-                build_authority,
-                &nominal_types,
-                cancellation,
-            ) else {
-                diagnostics.push(Diagnostic::new(
-                    "semantic.invalid_comptime_expression",
-                    range,
-                    RecoveryAction::None,
-                ));
-                continue;
-            };
-            let mut engine = Engine::new(program, cancellation);
-            let run = engine.evaluate_expression(&expression, &range);
-            if run.outcome == EvaluationOutcome::Cancelled {
-                return cancelled();
-            }
-            if run.outcome != EvaluationOutcome::Completed(crate::CanonicalValue::Bool(true)) {
-                diagnostics.push(Diagnostic::new(
-                    "evaluation.assertion_failed",
-                    range,
-                    RecoveryAction::None,
-                ));
-            }
-            evaluations.push(EvaluationObservation::new(
-                format!("{}.comptime_assert", module_name(&path)),
-                run.outcome,
-                run.receipt,
+        for (id, facts) in &facts {
+            function_facts.push(FunctionFactsObservation::new(
+                id.0,
+                program.functions()[id].name.clone(),
+                FunctionFactsValues {
+                    pure: facts.pure,
+                    may_panic: facts.may_panic,
+                    suspends: facts.suspends,
+                    evaluator_eligible: facts.evaluator_eligible,
+                    ownership_transfer: facts.ownership_transfer,
+                    bounded: facts.bounded,
+                    logical_cost: facts.logical_cost,
+                },
             ));
         }
-        if diagnostics.is_empty()
-            && let Some((path, image_name, image_range)) = image_functions.first()
-        {
-            let mut engine = Engine::new(program, cancellation);
-            let run = engine.evaluate_function(&qualify(path, image_name));
-            if run.outcome == EvaluationOutcome::Cancelled {
-                return cancelled();
+        for specialization in program.specializations().values() {
+            let function = &program.functions()[&specialization.definition];
+            specialization_observations.push(SpecializationObservation::new(
+                specialization.id.0,
+                specialization.definition.0,
+                function.name.clone(),
+                specialization
+                    .type_arguments
+                    .iter()
+                    .map(|type_| Arc::<str>::from(type_.display()))
+                    .collect(),
+            ));
+        }
+        let call_graph = facts
+            .iter()
+            .map(|(id, facts)| (*id, facts.calls.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for constant in program.constants().values() {
+            if expression_constructs(&constant.expression) {
+                diagnostics.push(Diagnostic::new(
+                    "semantic.build_constructor_outside_image",
+                    constant.source.clone(),
+                    RecoveryAction::None,
+                ));
             }
-            map_evaluation_failure(&run.outcome, image_range, &mut diagnostics);
-            if root == Root::Test {
-                test_plan = plan_test_applications(
-                    &suites,
-                    &run.test_applications,
-                    image_range,
-                    &mut diagnostics,
-                );
+        }
+        for (id, facts) in &facts {
+            if !facts.constructs.is_empty()
+                && !image_functions
+                    .first()
+                    .is_some_and(|(root, _)| reachable(*root, &call_graph, *id))
+            {
+                diagnostics.push(Diagnostic::new(
+                    "semantic.build_constructor_outside_image",
+                    program.functions()[id].source.clone(),
+                    RecoveryAction::None,
+                ));
             }
-            if let Err(kind) = seal_construction_graph(&run.outcome, &run.constructions) {
-                diagnostics.push(
-                    Diagnostic::new(
-                        "construction.invalid_graph",
-                        image_range.clone(),
-                        RecoveryAction::None,
+        }
+        for range in recursive_functions(program) {
+            diagnostics.push(Diagnostic::new(
+                "semantic.unproven_recursive_bound",
+                range,
+                RecoveryAction::None,
+            ));
+        }
+        let (errors, error_diagnostics) = infer_errors(program, cancellation);
+        inferred_errors = errors;
+        diagnostics.extend(error_diagnostics);
+
+        if executable_allowed && diagnostics.is_empty() {
+            for constant in program.constants().values() {
+                let mut engine = Engine::new(program, cancellation);
+                let run = engine.evaluate_constant(constant.id);
+                if run.outcome == EvaluationOutcome::Cancelled {
+                    return cancelled();
+                }
+                map_evaluation_failure(&run.outcome, &constant.source, &mut diagnostics);
+                let record = definitions.get(&constant.id).expect("constant definition");
+                evaluations.push(EvaluationObservation::new(
+                    format!("{}.{}", record.module_display, record.name),
+                    run.outcome,
+                    run.receipt,
+                ));
+            }
+            for (path, parsed) in parsed_sources {
+                let module = modules[path];
+                for assertion in &parsed.comptime_assertions {
+                    match program.verify_expression(assertion) {
+                        Ok(expression) => {
+                            let mut engine = Engine::new(program, cancellation);
+                            let run = engine.evaluate_expression(&expression);
+                            if run.outcome == EvaluationOutcome::Cancelled {
+                                return cancelled();
+                            }
+                            if run.outcome
+                                != EvaluationOutcome::Completed(crate::CanonicalValue::Bool(true))
+                            {
+                                diagnostics.push(Diagnostic::new(
+                                    "evaluation.assertion_failed",
+                                    assertion.range.clone(),
+                                    RecoveryAction::None,
+                                ));
+                            }
+                            evaluations.push(EvaluationObservation::new(
+                                format!("{}.comptime_assert", module_displays[&module]),
+                                run.outcome,
+                                run.receipt,
+                            ));
+                        }
+                        Err(typed_hir::VerificationFailure::Cancelled) => return cancelled(),
+                        Err(_) => diagnostics.push(Diagnostic::new(
+                            "semantic.invalid_comptime_expression",
+                            assertion.range.clone(),
+                            RecoveryAction::None,
+                        )),
+                    }
+                }
+            }
+            if diagnostics.is_empty()
+                && let Some((image, image_range)) = image_functions.first()
+            {
+                let mut engine = Engine::new(program, cancellation);
+                let run = engine.evaluate_function(*image);
+                if run.outcome == EvaluationOutcome::Cancelled {
+                    return cancelled();
+                }
+                map_evaluation_failure(&run.outcome, image_range, &mut diagnostics);
+                if root == Root::Test {
+                    test_plan = plan_tests(
+                        program,
+                        &tests_in_source_order,
+                        &run.test_applications,
+                        image_range,
+                        &mut diagnostics,
+                    );
+                }
+                if let Err(kind) = seal_construction_graph(run.root_handle, &run.constructions) {
+                    diagnostics.push(
+                        Diagnostic::new(
+                            "construction.invalid_graph",
+                            image_range.clone(),
+                            RecoveryAction::None,
+                        )
+                        .with_parameter("kind", kind),
+                    );
+                }
+                constructions.extend(run.constructions.into_iter().map(|construction| {
+                    ConstructionObservation::new(
+                        construction.identity,
+                        construction.kind.name(),
+                        construction.site,
                     )
-                    .with_parameter("kind", kind),
-                );
+                }));
+                let function = &program.functions()[image];
+                evaluations.push(EvaluationObservation::new(
+                    format!("{}.{}", function.module_display, function.name),
+                    run.outcome,
+                    run.receipt,
+                ));
             }
-            constructions.extend(run.constructions.into_iter().map(|construction| {
-                ConstructionObservation::new(
-                    construction.identity,
-                    construction.kind,
-                    construction.site,
-                )
-            }));
-            evaluations.push(EvaluationObservation::new(
-                format!("{}.{}", module_name(path), image_name),
-                run.outcome,
-                run.receipt,
-            ));
         }
     }
 
     function_facts.sort_by(|left, right| left.name().cmp(right.name()));
+    inferred_errors.sort_by(|left, right| left.function().cmp(right.function()));
     evaluations.sort_by(|left, right| left.root().cmp(right.root()));
     constructions.sort_by_key(ConstructionObservation::identity);
+    type_observations.sort_by(|left, right| {
+        left.owner_identity()
+            .cmp(&right.owner_identity())
+            .then(left.name().cmp(right.name()))
+    });
+    ownership_observations.sort_by(|left, right| {
+        left.owner_identity()
+            .cmp(&right.owner_identity())
+            .then(left.name().cmp(right.name()))
+    });
+    specialization_observations.sort_by_key(SpecializationObservation::identity);
     Analysis {
         diagnostics,
         function_facts,
+        types: type_observations,
+        ownership: ownership_observations,
+        specializations: specialization_observations,
         inferred_errors,
         evaluations,
         constructions,
         test_plan,
-        defect: verification_defect,
+        defect: None,
         cancelled: false,
     }
 }
 
+fn resolved_name(definition: &DefinitionRecord) -> ResolvedName {
+    match definition.kind {
+        DeclarationKind::Function => ResolvedName::Function(definition.id),
+        DeclarationKind::Constant => ResolvedName::Constant(definition.id),
+        kind if is_nominal(kind) => ResolvedName::Nominal(definition.id),
+        _ => ResolvedName::Nominal(definition.id),
+    }
+}
+
+fn is_nominal(kind: DeclarationKind) -> bool {
+    matches!(
+        kind,
+        DeclarationKind::Struct
+            | DeclarationKind::ResourceStruct
+            | DeclarationKind::Enum
+            | DeclarationKind::Interface
+            | DeclarationKind::TypeAlias
+    )
+}
+
+fn resolve_parameters(
+    function: &FunctionSyntax,
+    module: ModuleId,
+    names: &BTreeMap<NameKey, ResolvedName>,
+    displays: &BTreeMap<DefinitionId, Arc<str>>,
+    type_parameters: &BTreeMap<String, Type>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Vec<ResolvedParameter>> {
+    function
+        .parameters
+        .iter()
+        .map(|parameter| {
+            let type_ = resolve_type(
+                &parameter.type_syntax,
+                module,
+                names,
+                displays,
+                type_parameters,
+            );
+            if type_.is_none() {
+                diagnostics.push(Diagnostic::new(
+                    "semantic.unresolved_type",
+                    parameter.range.clone(),
+                    RecoveryAction::None,
+                ));
+            }
+            type_.map(|type_| ResolvedParameter {
+                name: parameter.name.clone(),
+                ownership: parameter.ownership,
+                type_,
+            })
+        })
+        .collect()
+}
+
+fn resolve_type(
+    syntax: &TypeSyntax,
+    module: ModuleId,
+    names: &BTreeMap<NameKey, ResolvedName>,
+    displays: &BTreeMap<DefinitionId, Arc<str>>,
+    type_parameters: &BTreeMap<String, Type>,
+) -> Option<Type> {
+    match syntax {
+        TypeSyntax::Unit => Some(Type::Unit),
+        TypeSyntax::Infer => Some(Type::Infer),
+        TypeSyntax::Array(element) => Some(Type::Array(Arc::new(resolve_type(
+            element,
+            module,
+            names,
+            displays,
+            type_parameters,
+        )?))),
+        TypeSyntax::Tuple(members) => Some(Type::Tuple(
+            members
+                .iter()
+                .map(|member| resolve_type(member, module, names, displays, type_parameters))
+                .collect::<Option<Vec<_>>>()?
+                .into(),
+        )),
+        TypeSyntax::Named(name) => {
+            if let [name] = name.segments.as_slice()
+                && let Some(parameter) = type_parameters.get(name)
+            {
+                return Some(parameter.clone());
+            }
+            if let Some(builtin) = resolve_builtin_type(name) {
+                return Some(builtin);
+            }
+            let ResolvedName::Nominal(id) =
+                names.get(&NameKey::new(module, Arc::from(name.segments.clone())))?
+            else {
+                return None;
+            };
+            Some(Type::Nominal {
+                definition: *id,
+                display: displays.get(id)?.clone(),
+            })
+        }
+        TypeSyntax::Apply { base, arguments } => {
+            let values = arguments
+                .iter()
+                .map(|argument| resolve_type(argument, module, names, displays, type_parameters))
+                .collect::<Option<Vec<_>>>()?;
+            match base
+                .segments
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                ["Result"] if matches!(values.as_slice(), [_] | [_, _]) => Some(Type::Result {
+                    success: Arc::new(values[0].clone()),
+                    error: values.get(1).cloned().map(Arc::new),
+                }),
+                ["Option"] if values.len() == 1 => Some(Type::Option(Arc::new(values[0].clone()))),
+                _ => None,
+            }
+        }
+    }
+}
+
+fn exposes_private_type(
+    type_: &Type,
+    definitions: &BTreeMap<DefinitionId, DefinitionRecord>,
+) -> bool {
+    match type_ {
+        Type::Nominal { definition, .. } => definitions
+            .get(definition)
+            .is_some_and(|definition| !definition.public),
+        Type::Array(value) | Type::Option(value) => exposes_private_type(value, definitions),
+        Type::Tuple(values) => values
+            .iter()
+            .any(|value| exposes_private_type(value, definitions)),
+        Type::Result { success, error } => {
+            exposes_private_type(success, definitions)
+                || error
+                    .as_ref()
+                    .is_some_and(|error| exposes_private_type(error, definitions))
+        }
+        _ => false,
+    }
+}
+
+fn solve_function_facts(
+    program: &VerifiedProgram,
+    cancellation: &Cancellation,
+) -> BTreeMap<DefinitionId, FunctionFacts> {
+    let base = program
+        .functions()
+        .iter()
+        .map(|(id, function)| (*id, local_facts(function)))
+        .collect::<BTreeMap<_, _>>();
+    let mut facts = base.clone();
+    for _ in 0..=facts.len() {
+        if cancellation.is_cancelled() {
+            return BTreeMap::new();
+        }
+        let previous = facts;
+        let mut next = base.clone();
+        for current in next.values_mut() {
+            for call in current.calls.clone() {
+                if let Some(callee) = previous.get(&call) {
+                    current.pure &= callee.pure;
+                    current.may_panic |= callee.may_panic;
+                    current.suspends |= callee.suspends;
+                    current.evaluator_eligible &= callee.evaluator_eligible;
+                    current.constructs.extend(callee.constructs.iter().copied());
+                    current.ownership_transfer |= callee.ownership_transfer;
+                    current.logical_cost = current.logical_cost.saturating_add(callee.logical_cost);
+                }
+            }
+        }
+        if next == previous {
+            facts = next;
+            break;
+        }
+        facts = next;
+    }
+    let graph = facts
+        .iter()
+        .map(|(id, facts)| (*id, facts.calls.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for (id, current) in &mut facts {
+        current.bounded = !reaches_definition(*id, *id, &graph, &mut BTreeSet::new());
+    }
+    facts
+}
+
+fn local_facts(function: &typed_hir::HirFunction) -> FunctionFacts {
+    let mut facts = FunctionFacts {
+        pure: true,
+        may_panic: false,
+        suspends: function.modifier == crate::syntax::FunctionModifier::Async,
+        evaluator_eligible: true,
+        ownership_transfer: function
+            .parameters
+            .iter()
+            .any(|(_, _, access)| *access == typed_hir::AccessMode::Move),
+        bounded: true,
+        logical_cost: 1,
+        constructs: BTreeSet::new(),
+        calls: BTreeSet::new(),
+    };
+    visit_statements(&function.body, &mut facts);
+    facts.pure = facts.constructs.is_empty() && !facts.suspends;
+    facts.evaluator_eligible = !facts.suspends;
+    facts
+}
+
+fn visit_statements(statements: &[Statement], facts: &mut FunctionFacts) {
+    for statement in statements {
+        facts.logical_cost = facts.logical_cost.saturating_add(1);
+        match statement {
+            Statement::Return { value, .. } => {
+                if let Some(value) = value {
+                    visit_expression(value, facts);
+                }
+            }
+            Statement::Panic { value, .. } => {
+                facts.may_panic = true;
+                visit_expression(value, facts);
+            }
+            Statement::Initialize { value, .. } | Statement::Evaluate(value) => {
+                visit_expression(value, facts)
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                visit_expression(condition, facts);
+                visit_statements(then_branch, facts);
+                visit_statements(else_branch, facts);
+            }
+            Statement::Pass(_) => {}
+        }
+    }
+}
+
+fn visit_expression(expression: &Expression, facts: &mut FunctionFacts) {
+    facts.logical_cost = facts.logical_cost.saturating_add(1);
+    match &expression.kind {
+        ExpressionKind::Call { target, arguments } => {
+            match target {
+                CallTarget::TemplateFunction(definition)
+                | CallTarget::Function { definition, .. } => {
+                    facts.calls.insert(*definition);
+                }
+                CallTarget::Build(kind) => {
+                    facts.constructs.insert(*kind);
+                }
+                _ => {}
+            }
+            for argument in &**arguments {
+                visit_expression(argument, facts);
+            }
+        }
+        ExpressionKind::Array(values) => {
+            for value in &**values {
+                visit_expression(value, facts);
+            }
+        }
+        ExpressionKind::Negate(value) | ExpressionKind::Propagate(value) => {
+            visit_expression(value, facts)
+        }
+        ExpressionKind::Await(value) => {
+            facts.suspends = true;
+            visit_expression(value, facts);
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            if matches!(
+                operator,
+                typed_hir::BinaryOperator::Divide | typed_hir::BinaryOperator::Remainder
+            ) {
+                facts.may_panic = true;
+            }
+            visit_expression(left, facts);
+            visit_expression(right, facts);
+        }
+        ExpressionKind::Literal(_) | ExpressionKind::Read(_) | ExpressionKind::Constant(_) => {}
+    }
+}
+
+fn expression_constructs(expression: &Expression) -> bool {
+    match &expression.kind {
+        ExpressionKind::Call { target, arguments } => {
+            matches!(target, CallTarget::Build(_)) || arguments.iter().any(expression_constructs)
+        }
+        ExpressionKind::Array(values) => values.iter().any(expression_constructs),
+        ExpressionKind::Negate(value)
+        | ExpressionKind::Await(value)
+        | ExpressionKind::Propagate(value) => expression_constructs(value),
+        ExpressionKind::Binary { left, right, .. } => {
+            expression_constructs(left) || expression_constructs(right)
+        }
+        ExpressionKind::Literal(_) | ExpressionKind::Read(_) | ExpressionKind::Constant(_) => false,
+    }
+}
+
+fn infer_errors(
+    program: &VerifiedProgram,
+    cancellation: &Cancellation,
+) -> (Vec<InferredErrorObservation>, Vec<Diagnostic>) {
+    let candidates = program
+        .specialized_functions()
+        .iter()
+        .filter(|(_, function)| matches!(function.return_type, Type::Result { error: None, .. }))
+        .map(|(id, _)| *id)
+        .collect::<BTreeSet<_>>();
+    let mut errors = candidates
+        .iter()
+        .map(|id| {
+            (
+                *id,
+                direct_error_types(&program.specialized_functions()[id].body),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for _ in 0..=errors.len() {
+        if cancellation.is_cancelled() {
+            return (Vec::new(), Vec::new());
+        }
+        let previous = errors.clone();
+        for (id, set) in &mut errors {
+            for callee in propagated_specializations(&program.specialized_functions()[id].body) {
+                match &program.specialized_functions()[&callee].return_type {
+                    Type::Result {
+                        error: Some(error), ..
+                    } => {
+                        set.insert((**error).clone());
+                    }
+                    Type::Result { error: None, .. } => {
+                        if let Some(inferred) = previous.get(&callee) {
+                            set.extend(inferred.iter().cloned());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if errors == previous {
+            break;
+        }
+    }
+    let mut observations = Vec::new();
+    let mut diagnostics = Vec::new();
+    for (id, set) in &errors {
+        let function = &program.specialized_functions()[id];
+        if set.len() == 1 {
+            observations.push(InferredErrorObservation::new(
+                id.0,
+                function.name.clone(),
+                set.first().expect("one").display(),
+            ));
+        } else {
+            diagnostics.push(Diagnostic::new(
+                if set.is_empty() {
+                    "semantic.unconstrained_inferred_error"
+                } else {
+                    "semantic.conflicting_inferred_errors"
+                },
+                function.source.clone(),
+                RecoveryAction::None,
+            ));
+        }
+    }
+    for function in program.specialized_functions().values() {
+        let Type::Result {
+            error: Some(caller_error),
+            ..
+        } = &function.return_type
+        else {
+            continue;
+        };
+        for callee in propagated_specializations(&function.body) {
+            let callee_error = match &program.specialized_functions()[&callee].return_type {
+                Type::Result {
+                    error: Some(error), ..
+                } => Some((**error).clone()),
+                Type::Result { error: None, .. } => errors
+                    .get(&callee)
+                    .and_then(|set| (set.len() == 1).then(|| set.first().expect("one").clone())),
+                _ => None,
+            };
+            if callee_error.is_some_and(|error| error != **caller_error) {
+                diagnostics.push(
+                    Diagnostic::new(
+                        "semantic.propagation_error_mismatch",
+                        function.source.clone(),
+                        RecoveryAction::None,
+                    )
+                    .with_identity_parameter("callee", IdentityDomain::Specialization, callee.0)
+                    .with_label(
+                        program.specialized_functions()[&callee].source.clone(),
+                        DiagnosticLabelRole::PropagationSource,
+                    ),
+                );
+            }
+        }
+    }
+    (observations, diagnostics)
+}
+
+fn propagated_specializations(statements: &[Statement]) -> BTreeSet<SpecializationId> {
+    let mut result = BTreeSet::new();
+    walk_expressions(statements, &mut |expression| {
+        if let ExpressionKind::Propagate(value) = &expression.kind
+            && let ExpressionKind::Call {
+                target: CallTarget::Function { specialization, .. },
+                ..
+            } = &value.kind
+        {
+            result.insert(*specialization);
+        }
+    });
+    result
+}
+
+fn direct_error_types(statements: &[Statement]) -> BTreeSet<Type> {
+    let mut result = BTreeSet::new();
+    walk_expressions(statements, &mut |expression| {
+        if let ExpressionKind::Call {
+            target: CallTarget::BuiltinVariant(BuiltinVariant::ResultErr),
+            arguments,
+        } = &expression.kind
+            && let Some(error) = arguments.first()
+        {
+            result.insert(error.type_.clone());
+        }
+    });
+    result
+}
+
+fn walk_expressions(statements: &[Statement], visitor: &mut impl FnMut(&Expression)) {
+    fn expression(value: &Expression, visitor: &mut impl FnMut(&Expression)) {
+        visitor(value);
+        match &value.kind {
+            ExpressionKind::Call { arguments, .. } | ExpressionKind::Array(arguments) => {
+                for argument in &**arguments {
+                    expression(argument, visitor);
+                }
+            }
+            ExpressionKind::Negate(value)
+            | ExpressionKind::Await(value)
+            | ExpressionKind::Propagate(value) => expression(value, visitor),
+            ExpressionKind::Binary { left, right, .. } => {
+                expression(left, visitor);
+                expression(right, visitor);
+            }
+            _ => {}
+        }
+    }
+    for statement in statements {
+        match statement {
+            Statement::Return { value, .. } => {
+                if let Some(value) = value {
+                    expression(value, visitor);
+                }
+            }
+            Statement::Panic { value, .. }
+            | Statement::Initialize { value, .. }
+            | Statement::Evaluate(value) => expression(value, visitor),
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                expression(condition, visitor);
+                walk_expressions(then_branch, visitor);
+                walk_expressions(else_branch, visitor);
+            }
+            Statement::Pass(_) => {}
+        }
+    }
+}
+
+fn recursive_functions(program: &VerifiedProgram) -> Vec<SourceRange> {
+    let graph = program
+        .functions()
+        .iter()
+        .map(|(id, function)| (*id, local_facts(function).calls))
+        .collect::<BTreeMap<_, _>>();
+    graph
+        .keys()
+        .filter(|root| reaches_definition(**root, **root, &graph, &mut BTreeSet::new()))
+        .map(|id| program.functions()[id].source.clone())
+        .collect()
+}
+
+fn reaches_definition(
+    root: DefinitionId,
+    current: DefinitionId,
+    graph: &BTreeMap<DefinitionId, BTreeSet<DefinitionId>>,
+    visited: &mut BTreeSet<DefinitionId>,
+) -> bool {
+    if !visited.insert(current) {
+        return false;
+    }
+    graph.get(&current).is_some_and(|dependencies| {
+        dependencies.contains(&root)
+            || dependencies
+                .iter()
+                .any(|dependency| reaches_definition(root, *dependency, graph, visited))
+    })
+}
+
+fn reachable(
+    root: DefinitionId,
+    graph: &BTreeMap<DefinitionId, BTreeSet<DefinitionId>>,
+    target: DefinitionId,
+) -> bool {
+    if root == target {
+        return true;
+    }
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        if graph
+            .get(&current)
+            .is_some_and(|calls| calls.contains(&target))
+        {
+            return true;
+        }
+        if let Some(calls) = graph.get(&current) {
+            pending.extend(calls.iter().copied());
+        }
+    }
+    false
+}
+
+fn plan_tests(
+    program: &VerifiedProgram,
+    tests: &[TestRecord],
+    applications: &[TestId],
+    range: &SourceRange,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<TestApplicationObservation> {
+    let mut counts = BTreeMap::new();
+    for id in applications {
+        *counts.entry(*id).or_insert(0_u32) += 1;
+    }
+    let known = tests.iter().map(|test| test.id).collect::<BTreeSet<_>>();
+    for id in applications {
+        if !known.contains(id) {
+            diagnostics.push(Diagnostic::new(
+                "test.unknown_application",
+                range.clone(),
+                RecoveryAction::None,
+            ));
+        }
+    }
+    for test in tests {
+        let resolved = program
+            .test(test.id)
+            .expect("planned Test identity resolves");
+        match counts.get(&test.id).copied().unwrap_or(0) {
+            0 => diagnostics.push(
+                Diagnostic::new(
+                    "test.missing_application",
+                    test.range.clone(),
+                    RecoveryAction::None,
+                )
+                .with_parameter("suite", resolved.suite.clone())
+                .with_parameter("test", resolved.test.clone()),
+            ),
+            1 => {}
+            _ => diagnostics.push(
+                Diagnostic::new(
+                    "test.duplicate_application",
+                    test.range.clone(),
+                    RecoveryAction::None,
+                )
+                .with_parameter("suite", resolved.suite.clone())
+                .with_parameter("test", resolved.test.clone()),
+            ),
+        }
+    }
+    let mut plan = Vec::new();
+    for (order, id) in applications.iter().enumerate() {
+        if counts.get(id) != Some(&1) || !known.contains(id) {
+            continue;
+        }
+        let resolved = program.test(*id).expect("applied Test identity resolves");
+        plan.push(TestApplicationObservation::new(
+            resolved.suite.clone(),
+            resolved.test.clone(),
+            u32::try_from(order).unwrap_or(u32::MAX),
+            resolved.asynchronous,
+            resolved
+                .parameters
+                .iter()
+                .map(|parameter| {
+                    TestBindingObservation::new(
+                        parameter.name.clone(),
+                        parameter.type_.display(),
+                        match parameter.ownership {
+                            OwnershipSyntax::Value => OwnershipMode::Value,
+                            OwnershipSyntax::Take => OwnershipMode::Take,
+                        },
+                    )
+                })
+                .collect(),
+        ));
+    }
+    plan
+}
+
 fn seal_construction_graph(
-    outcome: &EvaluationOutcome,
+    root_handle: Option<(BuildKind, u128)>,
     constructions: &[Construction],
 ) -> Result<(), &'static str> {
-    let EvaluationOutcome::Completed(crate::CanonicalValue::SymbolicHandle {
-        kind,
-        identity: root,
-    }) = outcome
-    else {
+    let Some((kind, root)) = root_handle else {
         return Ok(());
     };
-    if kind.as_ref() != "Image" {
+    if kind != BuildKind::Image {
         return Err("returned_root_is_not_image");
     }
     if constructions
         .iter()
-        .filter(|construction| construction.kind == "Image")
+        .filter(|construction| construction.kind == BuildKind::Image)
         .count()
         != 1
     {
-        return Err("image_root_count");
+        return Err("multiple_image_roots");
     }
-    let by_identity = constructions
+    let graph = constructions
         .iter()
-        .map(|construction| (construction.identity, construction))
+        .map(|construction| (construction.identity, construction.edges.as_slice()))
         .collect::<BTreeMap<_, _>>();
-    if by_identity.len() != constructions.len() {
-        return Err("duplicate_construction_identity");
-    }
     let mut reachable = BTreeSet::new();
-    let mut pending = vec![*root];
+    let mut pending = vec![root];
     while let Some(identity) = pending.pop() {
-        if !reachable.insert(identity) {
-            continue;
+        if reachable.insert(identity)
+            && let Some(edges) = graph.get(&identity)
+        {
+            pending.extend(edges.iter().copied());
         }
-        let Some(node) = by_identity.get(&identity) else {
-            return Err("cross_root_handle");
-        };
-        pending.extend(node.edges.iter().copied());
     }
     if reachable.len() != constructions.len() {
         return Err("unreachable_construction");
     }
     Ok(())
-}
-
-fn plan_test_applications(
-    suites: &[SuiteTest],
-    applications: &[String],
-    image_range: &SourceRange,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Vec<TestApplicationObservation> {
-    let expected = suites
-        .iter()
-        .map(|test| format!("{}.{}", test.suite, test.test))
-        .collect::<BTreeSet<_>>();
-    for test in &expected {
-        let count = applications
-            .iter()
-            .filter(|application| *application == test)
-            .count();
-        if count == 0 {
-            diagnostics.push(
-                Diagnostic::new(
-                    "test.missing_application",
-                    image_range.clone(),
-                    RecoveryAction::None,
-                )
-                .with_parameter("test", test.clone()),
-            );
-        } else if count > 1 {
-            diagnostics.push(
-                Diagnostic::new(
-                    "test.duplicate_application",
-                    image_range.clone(),
-                    RecoveryAction::None,
-                )
-                .with_parameter("test", test.clone()),
-            );
-        }
-    }
-    applications
-        .iter()
-        .enumerate()
-        .filter_map(|(order, application)| {
-            let (suite, test) = application.rsplit_once('.')?;
-            Some(TestApplicationObservation::new(
-                suite,
-                test,
-                u32::try_from(order).unwrap_or(u32::MAX),
-            ))
-        })
-        .collect()
-}
-
-#[derive(Clone, Debug)]
-struct SuiteTest {
-    suite: String,
-    test: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FunctionFacts {
-    name: String,
-    pure: bool,
-    may_panic: bool,
-    suspends: bool,
-    evaluator_eligible: bool,
-}
-
-fn solve_function_facts(
-    facts: &mut BTreeMap<String, FunctionFacts>,
-    functions: &BTreeMap<String, Function>,
-) {
-    for _ in 0..=facts.len() {
-        let previous = facts.clone();
-        for (name, current) in &mut *facts {
-            let Some(function) = functions.get(name) else {
-                continue;
-            };
-            for called in called_functions(&function_body(function)) {
-                let imported = format!("{}|{called}", function.module);
-                let local = format!("{}.{}", function.module, called);
-                let resolved = if functions.contains_key(&imported) {
-                    imported
-                } else {
-                    local
-                };
-                let Some(callee) = functions.get(&resolved) else {
-                    continue;
-                };
-                let canonical = format!("{}.{}", callee.module, callee.name);
-                let Some(callee_facts) = previous.get(&canonical) else {
-                    continue;
-                };
-                current.pure &= callee_facts.pure;
-                current.may_panic |= callee_facts.may_panic;
-                current.suspends |= callee_facts.suspends;
-                current.evaluator_eligible &= callee_facts.evaluator_eligible;
-            }
-        }
-        if *facts == previous {
-            break;
-        }
-    }
-}
-
-fn parse_suite(file: &ProjectFile, start: u64, end: u64) -> Vec<SuiteTest> {
-    let Some(bytes) = crate::syntax::checked_slice(file.bytes(), start, end) else {
-        return Vec::new();
-    };
-    let Ok(source) = std::str::from_utf8(bytes) else {
-        return Vec::new();
-    };
-    let Some(header) = source.lines().next() else {
-        return Vec::new();
-    };
-    let Some(suite) = header
-        .trim()
-        .strip_prefix("pub suite ")
-        .or_else(|| header.trim().strip_prefix("suite "))
-        .and_then(|rest| rest.split(':').next())
-    else {
-        return Vec::new();
-    };
-    source
-        .lines()
-        .skip(1)
-        .filter_map(|line| {
-            let rest = line.strip_prefix("    ")?;
-            if rest.starts_with(' ') {
-                return None;
-            }
-            let rest = rest
-                .strip_prefix("async test ")
-                .or_else(|| rest.strip_prefix("test "))?;
-            let test = rest.split('(').next()?.trim();
-            (!test.is_empty()).then(|| SuiteTest {
-                suite: suite.to_owned(),
-                test: test.to_owned(),
-            })
-        })
-        .collect()
-}
-
-fn validate_suite(
-    file: &ProjectFile,
-    declaration: &crate::syntax::Declaration,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    if !declaration.public {
-        diagnostics.push(Diagnostic::new(
-            "test.suite_must_be_public",
-            declaration.range.clone(),
-            RecoveryAction::None,
-        ));
-    }
-    let Some(bytes) =
-        crate::syntax::checked_slice(file.bytes(), declaration.start, declaration.end)
-    else {
-        return;
-    };
-    let Ok(source) = std::str::from_utf8(bytes) else {
-        return;
-    };
-    let mut offset = declaration.start;
-    for line in source.lines() {
-        let trimmed = line.trim_start();
-        if (trimmed.starts_with("test ") || trimmed.starts_with("async test "))
-            && let Some(parameters) = trimmed
-                .split_once('(')
-                .and_then(|(_, rest)| rest.split_once(')'))
-                .map(|(parameters, _)| parameters)
-        {
-            for parameter in split_commas(parameters) {
-                if !parameter.is_empty() && !parameter.starts_with("take ") {
-                    diagnostics.push(Diagnostic::new(
-                        "test.parameter_requires_take",
-                        SourceRange::from_u64(
-                            file.path(),
-                            offset,
-                            offset.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX)),
-                        ),
-                        RecoveryAction::None,
-                    ));
-                }
-            }
-        }
-        offset = offset.saturating_add(u64::try_from(line.len() + 1).unwrap_or(u64::MAX));
-    }
-}
-
-fn parse_function(file: &ProjectFile, start: u64, end: u64, public: bool) -> Option<Function> {
-    let source =
-        std::str::from_utf8(crate::syntax::checked_slice(file.bytes(), start, end)?).ok()?;
-    let mut lines = source.lines();
-    let header = lines.next()?.trim();
-    let fn_offset = header.find("fn ")? + 3;
-    let after_fn = &header[fn_offset..];
-    let open = after_fn.find('(')?;
-    let name = after_fn[..open].split('[').next()?.trim().to_owned();
-    let close = after_fn.rfind(')')?;
-    let parameters = split_commas(&after_fn[open + 1..close])
-        .into_iter()
-        .filter(|parameter| !parameter.is_empty())
-        .filter_map(|parameter| {
-            let (name, type_name) = parameter.split_once(':')?;
-            let name = name
-                .split_ascii_whitespace()
-                .last()
-                .unwrap_or(name)
-                .to_owned();
-            Some((name, type_name.trim().to_owned()))
-        })
-        .collect();
-    let return_type = after_fn[close + 1..]
-        .trim()
-        .strip_prefix("->")
-        .map_or_else(String::new, |value| {
-            value.trim().trim_end_matches(':').trim().to_owned()
-        });
-    let mut line_offset = start
-        .saturating_add(u64::try_from(header.len()).ok()?)
-        .saturating_add(1);
-    let body = lines
-        .map(|line| {
-            let result = (line_offset, line.to_owned());
-            line_offset = line_offset
-                .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX))
-                .saturating_add(1);
-            result
-        })
-        .collect();
-    Some(Function {
-        name,
-        module: module_name(file.path()),
-        public,
-        parameters,
-        return_type,
-        body,
-        source: SourceRange::from_u64(
-            file.path(),
-            start,
-            start.saturating_add(u64::try_from(header.len()).ok()?),
-        ),
-    })
-}
-
-fn parse_constant(file: &ProjectFile, start: u64) -> Option<Constant> {
-    let end = u64::try_from(file.bytes().len()).ok()?;
-    let line = std::str::from_utf8(crate::syntax::checked_slice(file.bytes(), start, end)?)
-        .ok()?
-        .lines()
-        .next()?;
-    let rest = line.trim().strip_prefix("const ")?;
-    let (name, rest) = rest.split_once(':')?;
-    let (type_name, expression) = rest.split_once('=')?;
-    Some(Constant {
-        name: name.trim().to_owned(),
-        module: module_name(file.path()),
-        type_name: type_name.trim().to_owned(),
-        expression: expression.trim().to_owned(),
-        source: SourceRange::from_u64(
-            file.path(),
-            start,
-            start.saturating_add(u64::try_from(line.len()).ok()?),
-        ),
-    })
-}
-
-fn infer_private_errors(
-    functions: &BTreeMap<String, Function>,
-) -> (Vec<InferredErrorObservation>, Vec<Diagnostic>) {
-    let unique = functions
-        .iter()
-        .filter(|(name, function)| *name == &format!("{}.{}", function.module, function.name))
-        .map(|(name, function)| (name.clone(), function.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let mut sets = unique
-        .iter()
-        .filter(|(_, function)| partial_result_return(&function.return_type).is_some())
-        .map(|(name, function)| {
-            let body = function_body(function);
-            (
-                name.clone(),
-                error_contributors(&body)
-                    .into_iter()
-                    .collect::<BTreeSet<_>>(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    for _ in 0..=unique.len() {
-        let previous = sets.clone();
-        for (name, errors) in &mut sets {
-            let function = &unique[name];
-            for callee in propagated_calls(&function_body(function)) {
-                let Some(callee) = resolve_function_key(function, &callee, functions) else {
-                    continue;
-                };
-                if let Some(explicit) =
-                    explicit_result_error(unique.get(&callee).map_or("", |f| &f.return_type))
-                {
-                    errors.insert(explicit.to_owned());
-                } else if let Some(inferred) = previous.get(&callee) {
-                    errors.extend(inferred.iter().cloned());
-                }
-            }
-        }
-        if sets == previous {
-            break;
-        }
-    }
-
-    let mut observations = Vec::new();
-    let mut diagnostics = Vec::new();
-    for (name, errors) in &sets {
-        let function = &unique[name];
-        match errors.iter().collect::<Vec<_>>().as_slice() {
-            [error_type] => observations.push(InferredErrorObservation::new(
-                function.name.clone(),
-                (*error_type).clone(),
-            )),
-            [] => diagnostics.push(Diagnostic::new(
-                "semantic.unconstrained_inferred_error",
-                function.source.clone(),
-                RecoveryAction::None,
-            )),
-            _ => diagnostics.push(Diagnostic::new(
-                "semantic.conflicting_inferred_errors",
-                function.source.clone(),
-                RecoveryAction::None,
-            )),
-        }
-    }
-
-    for function in unique.values() {
-        let Some(caller_error) = explicit_result_error(&function.return_type) else {
-            continue;
-        };
-        for callee in propagated_calls(&function_body(function)) {
-            let Some(callee) = resolve_function_key(function, &callee, functions) else {
-                continue;
-            };
-            let callee_error =
-                explicit_result_error(unique.get(&callee).map_or("", |f| &f.return_type))
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        sets.get(&callee).and_then(|errors| {
-                            (errors.len() == 1).then(|| errors.first().expect("one error").clone())
-                        })
-                    });
-            if callee_error
-                .as_deref()
-                .is_some_and(|error| error != caller_error)
-            {
-                diagnostics.push(Diagnostic::new(
-                    "semantic.propagation_error_mismatch",
-                    function.source.clone(),
-                    RecoveryAction::None,
-                ));
-            }
-        }
-    }
-    observations.sort_by(|left, right| left.function().cmp(right.function()));
-    (observations, diagnostics)
-}
-
-fn resolve_function_key(
-    caller: &Function,
-    called: &str,
-    functions: &BTreeMap<String, Function>,
-) -> Option<String> {
-    let imported = format!("{}|{called}", caller.module);
-    let local = format!("{}.{}", caller.module, called);
-    let function = functions.get(&imported).or_else(|| functions.get(&local))?;
-    Some(format!("{}.{}", function.module, function.name))
-}
-
-fn function_body(function: &Function) -> String {
-    function
-        .body
-        .iter()
-        .map(|(_, line)| semantic_code_line(line))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn semantic_code_line(line: &str) -> String {
-    let mut result = String::with_capacity(line.len());
-    let mut quote = None;
-    let mut escaped = false;
-    for character in line.chars() {
-        if let Some(active) = quote {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == active {
-                quote = None;
-                result.push(character);
-            } else {
-                result.push(' ');
-            }
-        } else if character == '#' {
-            break;
-        } else if matches!(character, '\'' | '"') {
-            quote = Some(character);
-            result.push(character);
-        } else {
-            result.push(character);
-        }
-    }
-    result
-}
-
-fn explicit_result_error(return_type: &str) -> Option<&str> {
-    let inner = return_type.strip_prefix("Result[")?.strip_suffix(']')?;
-    let arguments = split_commas(inner);
-    (arguments.len() == 2).then(|| arguments[1].trim())
-}
-
-fn propagated_calls(body: &str) -> Vec<String> {
-    let mut calls = Vec::new();
-    for (question, _) in body.match_indices('?') {
-        let before = &body[..question];
-        let Some(open) = before.rfind('(') else {
-            continue;
-        };
-        let name = before[..open]
-            .trim_end()
-            .rsplit(|character: char| {
-                !(character.is_ascii_alphanumeric() || matches!(character, '_' | '.'))
-            })
-            .next()
-            .unwrap_or_default()
-            .rsplit('.')
-            .next()
-            .unwrap_or_default();
-        if !name.is_empty() {
-            calls.push(name.to_owned());
-        }
-    }
-    calls
-}
-
-fn error_contributors(body: &str) -> Vec<String> {
-    let mut contributors = BTreeSet::new();
-    let mut remaining = body;
-    let needle = "Result.Err(";
-    while let Some(index) = remaining.find(needle) {
-        let after = &remaining[index + needle.len()..];
-        let candidate = after
-            .trim_start()
-            .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
-            .next()
-            .unwrap_or_default();
-        if !candidate.is_empty() {
-            contributors.insert(candidate.to_owned());
-        }
-        remaining = after;
-    }
-    contributors.into_iter().collect()
-}
-
-fn compile_time_assertions<'a>(
-    parsed_sources: &BTreeMap<String, ParsedSource>,
-    files: &BTreeMap<&'a str, &'a ProjectFile>,
-) -> Vec<(String, String, SourceRange)> {
-    let mut assertions = Vec::new();
-    for path in parsed_sources.keys() {
-        let mut offset = 0;
-        for physical in files[path.as_str()]
-            .bytes()
-            .split_inclusive(|byte| *byte == b'\n')
-        {
-            let line = physical.strip_suffix(b"\n").unwrap_or(physical);
-            if let Ok(text) = std::str::from_utf8(line)
-                && let Some(expression) = text.strip_prefix("comptime assert ")
-            {
-                assertions.push((
-                    path.clone(),
-                    expression.trim().to_owned(),
-                    SourceRange::new(path, offset, offset + line.len()),
-                ));
-            }
-            offset += physical.len();
-        }
-    }
-    assertions
 }
 
 fn map_evaluation_failure(
@@ -930,199 +1373,34 @@ fn map_evaluation_failure(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     match outcome {
-        EvaluationOutcome::Completed(_) => {}
-        EvaluationOutcome::Panicked { kind, .. } => diagnostics.push(
-            Diagnostic::new("evaluation.panicked", range.clone(), RecoveryAction::None)
+        EvaluationOutcome::CreatorRejected { kind } => diagnostics.push(
+            Diagnostic::new("evaluation.rejected", range.clone(), RecoveryAction::None)
                 .with_parameter("kind", kind.clone()),
         ),
-        EvaluationOutcome::LimitExceeded { policy, .. } => diagnostics.push(
+        EvaluationOutcome::Panicked { kind, site } => diagnostics.push(
+            Diagnostic::new("evaluation.panicked", site.clone(), RecoveryAction::None)
+                .with_parameter("kind", kind.clone()),
+        ),
+        EvaluationOutcome::LimitExceeded {
+            policy,
+            ceiling,
+            used,
+        } => diagnostics.push(
             Diagnostic::new(
                 "evaluation.limit_exceeded",
                 range.clone(),
                 RecoveryAction::None,
             )
-            .with_parameter("policy", policy.clone()),
+            .with_parameter("policy", policy.clone())
+            .with_unsigned_parameter("ceiling", u128::from(*ceiling))
+            .with_unsigned_parameter("used", u128::from(*used)),
         ),
-        EvaluationOutcome::CreatorRejected { kind } => diagnostics.push(
-            Diagnostic::new("evaluation.rejected", range.clone(), RecoveryAction::None)
-                .with_parameter("kind", kind.clone()),
+        EvaluationOutcome::Defect { evidence } => diagnostics.push(
+            Diagnostic::new("evaluation.defect", range.clone(), RecoveryAction::None)
+                .with_parameter("evidence", evidence.clone()),
         ),
-        EvaluationOutcome::Cancelled | EvaluationOutcome::Defect { .. } => {}
+        EvaluationOutcome::Completed(_) | EvaluationOutcome::Cancelled => {}
     }
-}
-
-fn has_image_attribute(bytes: &[u8], declaration_start: u64) -> bool {
-    let Some(before) = crate::syntax::checked_slice(bytes, 0, declaration_start) else {
-        return false;
-    };
-    before
-        .split(|byte| *byte == b'\n')
-        .rev()
-        .map(|line| String::from_utf8_lossy(line).trim().to_owned())
-        .find(|line| !line.is_empty())
-        .is_some_and(|line| line == "@image")
-}
-
-fn contains_build_constructor(source: &str) -> bool {
-    source.contains("Image.new(") || source.contains("Test.new(")
-}
-
-fn validate_attributes(file: &ProjectFile, diagnostics: &mut Vec<Diagnostic>) {
-    let mut offset = 0;
-    for physical in file.bytes().split_inclusive(|byte| *byte == b'\n') {
-        let line = physical.strip_suffix(b"\n").unwrap_or(physical);
-        if let Ok(text) = std::str::from_utf8(line) {
-            let attribute = text.trim();
-            if attribute.starts_with('@') && !matches!(attribute, "@image" | "@actor") {
-                diagnostics.push(
-                    Diagnostic::new(
-                        "semantic.unknown_attribute",
-                        SourceRange::new(file.path(), offset, offset + line.len()),
-                        RecoveryAction::None,
-                    )
-                    .with_parameter("attribute", attribute.to_owned()),
-                );
-            }
-        }
-        offset += physical.len();
-    }
-}
-
-fn reachable_functions(
-    root: &str,
-    functions: &BTreeMap<String, Function>,
-) -> BTreeSet<SourceRange> {
-    let mut reachable = BTreeSet::new();
-    let mut visited = BTreeSet::new();
-    let mut pending = BTreeSet::from([root.to_owned()]);
-    while let Some(lookup_name) = pending.pop_first() {
-        if !visited.insert(lookup_name.clone()) {
-            continue;
-        }
-        if let Some(function) = functions.get(&lookup_name) {
-            reachable.insert(function.source.clone());
-            for called in called_functions(&function_body(function)) {
-                let imported = format!("{}|{called}", function.module);
-                let local = format!("{}.{}", function.module, called);
-                if functions.contains_key(&imported) {
-                    pending.insert(imported);
-                } else if functions.contains_key(&local) {
-                    pending.insert(local);
-                }
-            }
-        }
-    }
-    reachable
-}
-
-fn called_functions(source: &str) -> Vec<String> {
-    let bytes = source.as_bytes();
-    let mut calls = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        if matches!(bytes[index], b'A'..=b'Z' | b'a'..=b'z' | b'_') {
-            let start = index;
-            index += 1;
-            while bytes
-                .get(index)
-                .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
-            {
-                index += 1;
-            }
-            let after_name = source[index..].trim_start();
-            if after_name.starts_with('(') {
-                calls.push(source[start..index].to_owned());
-            }
-        } else {
-            index += 1;
-        }
-    }
-    calls
-}
-
-fn unproven_recursive_cycles(functions: &BTreeMap<String, Function>) -> Vec<SourceRange> {
-    let unique = functions
-        .values()
-        .map(|function| (function.source.clone(), function))
-        .collect::<BTreeMap<_, _>>();
-    let graph = unique
-        .iter()
-        .map(|(source, function)| {
-            let dependencies = called_functions(&function_body(function))
-                .into_iter()
-                .filter_map(|called| {
-                    let imported = format!("{}|{called}", function.module);
-                    let local = format!("{}.{}", function.module, called);
-                    functions
-                        .get(&imported)
-                        .or_else(|| functions.get(&local))
-                        .map(|target| target.source.clone())
-                })
-                .collect::<BTreeSet<_>>();
-            (source.clone(), dependencies)
-        })
-        .collect::<BTreeMap<_, _>>();
-    graph
-        .keys()
-        .filter(|root| reaches(root, root, &graph, &mut BTreeSet::new()))
-        .cloned()
-        .collect()
-}
-
-fn reaches(
-    root: &SourceRange,
-    current: &SourceRange,
-    graph: &BTreeMap<SourceRange, BTreeSet<SourceRange>>,
-    visited: &mut BTreeSet<SourceRange>,
-) -> bool {
-    if !visited.insert(current.clone()) {
-        return false;
-    }
-    graph.get(current).is_some_and(|dependencies| {
-        dependencies.contains(root)
-            || dependencies
-                .iter()
-                .any(|dependency| reaches(root, dependency, graph, visited))
-    })
-}
-
-fn partial_result_return(header: &str) -> Option<&str> {
-    let start = header.find("Result[")? + "Result[".len();
-    let end = header[start..].find(']')? + start;
-    (!header[start..end].contains(',')).then_some(&header[start..end])
-}
-
-fn contains_type_name(header: &str, type_name: &str) -> bool {
-    header
-        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-        .any(|word| word == type_name)
-}
-
-fn split_commas(source: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0;
-    let mut start = 0;
-    for (index, character) in source.char_indices() {
-        match character {
-            '[' | '(' => depth += 1,
-            ']' | ')' => depth -= 1,
-            ',' if depth == 0 => {
-                parts.push(source[start..index].trim());
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(source[start..].trim());
-    parts
-}
-
-fn first_line(source: &str) -> &str {
-    source.lines().next().unwrap_or(source)
-}
-
-fn qualify(path: &str, name: &str) -> String {
-    format!("{}.{}", module_name(path), name)
 }
 
 fn module_name(path: &str) -> String {
@@ -1136,6 +1414,9 @@ fn cancelled() -> Analysis {
     Analysis {
         diagnostics: Vec::new(),
         function_facts: Vec::new(),
+        types: Vec::new(),
+        ownership: Vec::new(),
+        specializations: Vec::new(),
         inferred_errors: Vec::new(),
         evaluations: Vec::new(),
         constructions: Vec::new(),
@@ -1145,27 +1426,18 @@ fn cancelled() -> Analysis {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn result_partiality_distinguishes_one_and_two_arguments() {
-        assert_eq!(
-            partial_result_return("fn read() -> Result[i64]:"),
-            Some("i64")
-        );
-        assert_eq!(
-            partial_result_return("fn read() -> Result[i64, Error]:"),
-            None
-        );
-    }
-
-    #[test]
-    fn construction_keys_are_domain_separated() {
-        assert_ne!(
-            xxhash_rust::xxh3::xxh3_128(b"wrela.construction.v1|Image.new|0"),
-            xxhash_rust::xxh3::xxh3_128(b"wrela.identity.v1|Image.new|0")
-        );
+fn defect(phase: &'static str, evidence: Arc<str>) -> Analysis {
+    Analysis {
+        diagnostics: Vec::new(),
+        function_facts: Vec::new(),
+        types: Vec::new(),
+        ownership: Vec::new(),
+        specializations: Vec::new(),
+        inferred_errors: Vec::new(),
+        evaluations: Vec::new(),
+        constructions: Vec::new(),
+        test_plan: Vec::new(),
+        defect: Some(Defect::new(phase, evidence)),
+        cancelled: false,
     }
 }

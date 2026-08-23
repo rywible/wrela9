@@ -1,15 +1,117 @@
+#![forbid(unsafe_code)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use xxhash_rust::xxh3::xxh3_128;
 
-use crate::evaluator::{Constant, Function};
-use crate::{Cancellation, CanonicalValue, SourceRange};
+use crate::identity::IdentityCatalog;
+use crate::model::{
+    BuildKind, BuiltinType, BuiltinVariant, DefinitionId, FloatType, IntegerType, ModuleId,
+    SpecializationId, TestId, Type, TypeId, VariantId, resolve_build_kind, resolve_builtin_variant,
+};
+use crate::syntax::{
+    BinaryOperatorSyntax, ExpressionSyntax, ExpressionSyntaxKind, NameSyntax, OwnershipSyntax,
+    StatementSyntax,
+};
+use crate::{Cancellation, SourceRange};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LocalId(pub(crate) u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Place {
+    pub(crate) local: LocalId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccessMode {
+    Copy,
+    Move,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedParameter {
+    pub(crate) name: String,
+    pub(crate) ownership: OwnershipSyntax,
+    pub(crate) type_: Type,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedFunction {
+    pub(crate) id: DefinitionId,
+    pub(crate) module: ModuleId,
+    pub(crate) module_display: String,
+    pub(crate) name: String,
+    pub(crate) modifier: crate::syntax::FunctionModifier,
+    pub(crate) type_parameters: Arc<[crate::model::TypeParameterId]>,
+    pub(crate) parameters: Vec<ResolvedParameter>,
+    pub(crate) return_type: Type,
+    pub(crate) body: Vec<StatementSyntax>,
+    pub(crate) source: SourceRange,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedConstant {
+    pub(crate) id: DefinitionId,
+    pub(crate) module: ModuleId,
+    pub(crate) name: String,
+    pub(crate) type_: Type,
+    pub(crate) value: ExpressionSyntax,
+    pub(crate) source: SourceRange,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedTest {
+    pub(crate) id: TestId,
+    pub(crate) suite: String,
+    pub(crate) test: String,
+    pub(crate) asynchronous: bool,
+    pub(crate) parameters: Vec<ResolvedParameter>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct NameKey {
+    pub(crate) module: ModuleId,
+    pub(crate) segments: Arc<[String]>,
+}
+
+impl NameKey {
+    pub(crate) fn new(module: ModuleId, segments: impl Into<Arc<[String]>>) -> Self {
+        Self {
+            module,
+            segments: segments.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResolvedName {
+    Function(DefinitionId),
+    Constant(DefinitionId),
+    Nominal(DefinitionId),
+    Test(TestId),
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProgramInput {
+    pub(crate) functions: BTreeMap<DefinitionId, ResolvedFunction>,
+    pub(crate) constants: BTreeMap<DefinitionId, ResolvedConstant>,
+    pub(crate) tests: BTreeMap<TestId, ResolvedTest>,
+    pub(crate) names: BTreeMap<NameKey, ResolvedName>,
+    pub(crate) nominal_displays: BTreeMap<DefinitionId, Arc<str>>,
+    pub(crate) comptime_roots: Vec<(ModuleId, ExpressionSyntax)>,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct VerifiedProgram {
-    functions: BTreeMap<String, HirFunction>,
-    constants: BTreeMap<String, HirConstant>,
+    functions: BTreeMap<DefinitionId, HirFunction>,
+    specialized_functions: BTreeMap<SpecializationId, HirFunction>,
+    default_specializations: BTreeMap<DefinitionId, SpecializationId>,
+    constants: BTreeMap<DefinitionId, HirConstant>,
+    tests: BTreeMap<TestId, ResolvedTest>,
+    specializations: BTreeMap<SpecializationId, SpecializationRecord>,
+    comptime_expressions: BTreeMap<SourceRange, Expression>,
     fingerprint: u128,
     _verified: Verified,
 }
@@ -19,55 +121,70 @@ struct Verified;
 
 #[derive(Clone, Debug)]
 pub(crate) struct HirFunction {
+    pub(crate) id: DefinitionId,
     pub(crate) name: String,
-    pub(crate) module: String,
-    pub(crate) parameters: Vec<(String, String)>,
-    pub(crate) return_type: String,
+    pub(crate) module_display: String,
+    pub(crate) modifier: crate::syntax::FunctionModifier,
+    pub(crate) parameters: Vec<(LocalId, Type, AccessMode)>,
+    pub(crate) return_type: Type,
     pub(crate) body: Arc<[Statement]>,
     pub(crate) source: SourceRange,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct HirConstant {
-    pub(crate) type_name: String,
+    pub(crate) id: DefinitionId,
+    pub(crate) type_: Type,
     pub(crate) expression: Expression,
     pub(crate) source: SourceRange,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum Statement {
-    Return(Option<Expression>),
-    Panic(Expression),
-    Assign {
-        name: String,
+    Return {
+        value: Option<Expression>,
+        source: SourceRange,
+    },
+    Panic {
         value: Expression,
+        source: SourceRange,
+    },
+    Initialize {
+        place: Place,
+        value: Expression,
+        source: SourceRange,
     },
     Evaluate(Expression),
     If {
         condition: Expression,
         then_branch: Arc<[Statement]>,
         else_branch: Arc<[Statement]>,
+        source: SourceRange,
     },
-    Pass,
+    Pass(SourceRange),
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct Expression {
     pub(crate) kind: ExpressionKind,
-    pub(crate) type_name: String,
+    pub(crate) type_id: TypeId,
+    pub(crate) type_: Type,
+    pub(crate) access: AccessMode,
+    pub(crate) source: SourceRange,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum ExpressionKind {
-    Literal(CanonicalValue),
-    Local(String),
-    Constant(String),
+    Literal(Literal),
+    Read(Place),
+    Constant(DefinitionId),
     Call {
         target: CallTarget,
         arguments: Arc<[Expression]>,
     },
     Array(Arc<[Expression]>),
     Negate(Box<Expression>),
+    Await(Box<Expression>),
     Propagate(Box<Expression>),
     Binary {
         operator: BinaryOperator,
@@ -77,54 +194,39 @@ pub(crate) enum ExpressionKind {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) enum Literal {
+    Unit,
+    Bool(bool),
+    Integer { kind: IntegerType, value: i128 },
+    Float { kind: FloatType, bits: u64 },
+    Text(Arc<str>),
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum CallTarget {
-    Function(String),
-    Build(BuildConstructor),
-    Variant { type_name: String, variant: String },
-    TestApplication(String),
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum BuildConstructor {
-    Image,
-    Test,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct BuildAuthority {
-    constructors: BTreeMap<&'static str, BuildConstructor>,
-    _sealed: SealedAuthority,
+    TemplateFunction(DefinitionId),
+    Function {
+        definition: DefinitionId,
+        specialization: SpecializationId,
+    },
+    Build(BuildKind),
+    BuiltinVariant(BuiltinVariant),
+    UserVariant {
+        id: VariantId,
+        type_display: Arc<str>,
+        variant_display: Arc<str>,
+    },
+    Test(TestId),
 }
 
 #[derive(Clone, Debug)]
-struct SealedAuthority;
-
-impl BuildAuthority {
-    pub(crate) fn compiler_distribution() -> Self {
-        Self {
-            constructors: BTreeMap::from([
-                ("Image.new", BuildConstructor::Image),
-                ("Test.new", BuildConstructor::Test),
-            ]),
-            _sealed: SealedAuthority,
-        }
-    }
-
-    fn resolve(&self, name: &str) -> Option<BuildConstructor> {
-        self.constructors.get(name).copied()
-    }
+pub(crate) struct SpecializationRecord {
+    pub(crate) id: SpecializationId,
+    pub(crate) definition: DefinitionId,
+    pub(crate) type_arguments: Arc<[Type]>,
 }
 
-impl BuildConstructor {
-    pub(crate) const fn kind(self) -> &'static str {
-        match self {
-            Self::Image => "Image",
-            Self::Test => "Test",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BinaryOperator {
     Add,
     Subtract,
@@ -139,167 +241,216 @@ pub(crate) enum BinaryOperator {
     GreaterEqual,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CreatorFailureKind {
+    EmptyName,
+    DuplicateParameter,
+    ConstantTypeMismatch,
+    ReturnTypeMismatch,
+    IfConditionRequiresBool,
+    UnresolvedName,
+    UnresolvedCall,
+    UnresolvedNominalType,
+    ArgumentCount,
+    ArgumentTypeMismatch,
+    ArgumentLabelMismatch,
+    GenericArgumentConflict,
+    PropagationRequiresResult,
+    BinaryTypeMismatch,
+    ArrayElementTypeMismatch,
+    InvalidUnaryOperand,
+    InvalidIntegerLiteral,
+    InvalidFloatLiteral,
+}
+
+impl CreatorFailureKind {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::EmptyName => "empty_name",
+            Self::DuplicateParameter => "duplicate_parameter",
+            Self::ConstantTypeMismatch => "constant_type_mismatch",
+            Self::ReturnTypeMismatch => "return_type_mismatch",
+            Self::IfConditionRequiresBool => "if_condition_requires_bool",
+            Self::UnresolvedName => "unresolved_name",
+            Self::UnresolvedCall => "unresolved_call",
+            Self::UnresolvedNominalType => "unresolved_nominal_type",
+            Self::ArgumentCount => "argument_count",
+            Self::ArgumentTypeMismatch => "argument_type_mismatch",
+            Self::ArgumentLabelMismatch => "argument_label_mismatch",
+            Self::GenericArgumentConflict => "generic_argument_conflict",
+            Self::PropagationRequiresResult => "propagation_requires_result",
+            Self::BinaryTypeMismatch => "binary_type_mismatch",
+            Self::ArrayElementTypeMismatch => "array_element_type_mismatch",
+            Self::InvalidUnaryOperand => "invalid_unary_operand",
+            Self::InvalidIntegerLiteral => "invalid_integer_literal",
+            Self::InvalidFloatLiteral => "invalid_float_literal",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum VerificationFailure {
-    Creator { kind: Arc<str>, site: SourceRange },
-    Defect { evidence: Arc<str> },
+    Creator {
+        kind: CreatorFailureKind,
+        site: SourceRange,
+    },
+    Defect {
+        evidence: Arc<str>,
+    },
     Cancelled,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct BuildAuthority {
+    _sealed: SealedAuthority,
+}
+
+#[derive(Clone, Debug)]
+struct SealedAuthority;
+
+impl BuildAuthority {
+    pub(crate) fn compiler_distribution() -> Self {
+        Self {
+            _sealed: SealedAuthority,
+        }
+    }
+
+    fn permits(&self, _kind: BuildKind) -> bool {
+        true
+    }
+}
+
 impl VerifiedProgram {
-    pub(crate) fn functions(&self) -> &BTreeMap<String, HirFunction> {
+    pub(crate) fn functions(&self) -> &BTreeMap<DefinitionId, HirFunction> {
         &self.functions
     }
-
-    pub(crate) fn constants(&self) -> &BTreeMap<String, HirConstant> {
+    pub(crate) fn constants(&self) -> &BTreeMap<DefinitionId, HirConstant> {
         &self.constants
     }
-
+    pub(crate) fn specialization_function(&self, id: SpecializationId) -> Option<&HirFunction> {
+        self.specialized_functions.get(&id)
+    }
+    pub(crate) fn specialized_functions(&self) -> &BTreeMap<SpecializationId, HirFunction> {
+        &self.specialized_functions
+    }
+    pub(crate) fn default_specialization(&self, id: DefinitionId) -> Option<SpecializationId> {
+        self.default_specializations.get(&id).copied()
+    }
+    pub(crate) fn test(&self, id: TestId) -> Option<&ResolvedTest> {
+        let test = self.tests.get(&id)?;
+        debug_assert_eq!(test.id, id);
+        Some(test)
+    }
+    pub(crate) fn specializations(&self) -> &BTreeMap<SpecializationId, SpecializationRecord> {
+        &self.specializations
+    }
     pub(crate) const fn fingerprint(&self) -> u128 {
         self.fingerprint
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn verify_expression(
         &self,
-        module: &str,
-        source: &str,
-        site: &SourceRange,
-        allowed_tests: &BTreeSet<String>,
-        build_authority: &BuildAuthority,
-        nominal_types: &BTreeSet<String>,
-        cancellation: &Cancellation,
+        syntax: &ExpressionSyntax,
     ) -> Result<Expression, VerificationFailure> {
-        let signatures = self
-            .functions
-            .iter()
-            .map(|(name, function)| {
-                (
-                    name.clone(),
-                    (
-                        function
-                            .parameters
-                            .iter()
-                            .map(|(_, type_name)| type_name.clone())
-                            .collect(),
-                        function.return_type.clone(),
-                    ),
-                )
+        self.comptime_expressions
+            .get(&syntax.range)
+            .cloned()
+            .ok_or_else(|| VerificationFailure::Defect {
+                evidence: Arc::from("comptime expression was not included in concrete demand"),
             })
-            .collect();
-        parse_expression(
-            source,
-            site,
-            &Resolution {
-                module,
-                signatures: &signatures,
-                constants: &self
-                    .constants
-                    .iter()
-                    .map(|(name, constant)| (name.clone(), constant.type_name.clone()))
-                    .collect(),
-                locals: &BTreeMap::new(),
-                allowed_tests,
-                build_authority,
-                nominal_types,
-            },
-            cancellation,
-        )
     }
 }
 
 pub(crate) fn verify(
-    functions: BTreeMap<String, Function>,
-    constants: BTreeMap<String, Constant>,
-    allowed_tests: &BTreeSet<String>,
+    input: ProgramInput,
     build_authority: &BuildAuthority,
-    nominal_types: &BTreeSet<String>,
+    identity_catalog: &mut IdentityCatalog,
     cancellation: &Cancellation,
 ) -> Result<VerifiedProgram, VerificationFailure> {
-    validate_artifact(&functions)?;
-    let signatures = functions
-        .iter()
-        .map(|(name, function)| {
-            (
-                name.clone(),
-                (
-                    function
-                        .parameters
-                        .iter()
-                        .map(|(_, type_name)| type_name.clone())
-                        .collect(),
-                    function.return_type.clone(),
-                ),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let constant_types = constants
-        .iter()
-        .map(|(name, constant)| (name.clone(), constant.type_name.clone()))
-        .collect::<BTreeMap<_, _>>();
-
-    let mut hir_constants = BTreeMap::new();
-    for (lookup_name, constant) in &constants {
+    validate_input(&input)?;
+    intern_input_types(&input, identity_catalog)?;
+    let mut specializations = BTreeMap::new();
+    let mut comptime_expressions = BTreeMap::new();
+    let mut constants = BTreeMap::new();
+    for constant in input.constants.values() {
         if cancellation.is_cancelled() {
             return Err(VerificationFailure::Cancelled);
         }
-        let expression = parse_expression(
-            &constant.expression,
-            &constant.source,
-            &Resolution {
-                module: &constant.module,
-                signatures: &signatures,
-                constants: &constant_types,
-                locals: &BTreeMap::new(),
-                allowed_tests,
-                build_authority,
-                nominal_types,
-            },
+        let mut lowerer = Lowerer::new(
+            constant.module,
+            &input,
+            build_authority,
+            identity_catalog,
             cancellation,
-        )?;
-        if !compatible(&expression.type_name, &constant.type_name) {
-            return creator("constant_type_mismatch", &constant.source);
+            &mut specializations,
+            true,
+        );
+        let expression = lowerer.expression(&constant.value)?;
+        if !expression.type_.compatible_with(&constant.type_) {
+            return creator(CreatorFailureKind::ConstantTypeMismatch, &constant.source);
         }
-        hir_constants.insert(
-            lookup_name.clone(),
+        constants.insert(
+            constant.id,
             HirConstant {
-                type_name: constant.type_name.clone(),
+                id: constant.id,
+                type_: constant.type_.clone(),
                 expression,
                 source: constant.source.clone(),
             },
         );
     }
-
-    let mut hir_functions = BTreeMap::new();
-    for (lookup_name, function) in &functions {
+    for (module, root) in &input.comptime_roots {
         if cancellation.is_cancelled() {
             return Err(VerificationFailure::Cancelled);
         }
-        let mut locals = function
-            .parameters
-            .iter()
-            .cloned()
-            .collect::<BTreeMap<_, _>>();
-        let mut index = 0;
-        let body = lower_statements(
-            function,
-            &function.body,
-            &mut index,
-            4,
-            &mut locals,
-            &signatures,
-            &constant_types,
-            allowed_tests,
+        let expression = Lowerer::new(
+            *module,
+            &input,
             build_authority,
-            nominal_types,
+            identity_catalog,
             cancellation,
-        )?;
-        hir_functions.insert(
-            lookup_name.clone(),
+            &mut specializations,
+            true,
+        )
+        .expression(root)?;
+        comptime_expressions.insert(root.range.clone(), expression);
+    }
+
+    let mut functions = BTreeMap::new();
+    for function in input.functions.values() {
+        if cancellation.is_cancelled() {
+            return Err(VerificationFailure::Cancelled);
+        }
+        let mut lowerer = Lowerer::new(
+            function.module,
+            &input,
+            build_authority,
+            identity_catalog,
+            cancellation,
+            &mut specializations,
+            false,
+        );
+        let mut parameters = Vec::new();
+        for parameter in &function.parameters {
+            let local = lowerer.bind_local(&parameter.name, parameter.type_.clone())?;
+            parameters.push((
+                local,
+                parameter.type_.clone(),
+                match parameter.ownership {
+                    OwnershipSyntax::Value => AccessMode::Copy,
+                    OwnershipSyntax::Take => AccessMode::Move,
+                },
+            ));
+        }
+        let body = lowerer.statements(&function.body, &function.return_type)?;
+        functions.insert(
+            function.id,
             HirFunction {
+                id: function.id,
                 name: function.name.clone(),
-                module: function.module.clone(),
-                parameters: function.parameters.clone(),
+                module_display: function.module_display.clone(),
+                modifier: function.modifier,
+                parameters,
                 return_type: function.return_type.clone(),
                 body: body.into(),
                 source: function.source.clone(),
@@ -307,660 +458,1262 @@ pub(crate) fn verify(
         );
     }
 
-    let mut canonical = b"wrela.typed-hir\0\x01".to_vec();
-    for (name, function) in &hir_functions {
-        append_part(&mut canonical, name.as_bytes());
-        append_part(&mut canonical, function.return_type.as_bytes());
-        append_part(
-            &mut canonical,
-            &u64::try_from(function.body.len())
+    let mut default_specializations = BTreeMap::new();
+    for function in input
+        .functions
+        .values()
+        .filter(|function| function.type_parameters.is_empty())
+    {
+        let id = identity_catalog
+            .specialization(function.id, &[])
+            .map_err(|collision| VerificationFailure::Defect {
+                evidence: Arc::from(format!(
+                    "specialization identity collision {:032x}",
+                    collision.digest
+                )),
+            })?;
+        default_specializations.insert(function.id, id);
+        specializations.entry(id).or_insert(SpecializationRecord {
+            id,
+            definition: function.id,
+            type_arguments: Arc::from([]),
+        });
+    }
+
+    let mut specialized_functions = BTreeMap::new();
+    loop {
+        let next = specializations
+            .values()
+            .find(|record| !specialized_functions.contains_key(&record.id))
+            .cloned();
+        let Some(record) = next else {
+            break;
+        };
+        if cancellation.is_cancelled() {
+            return Err(VerificationFailure::Cancelled);
+        }
+        let function =
+            input
+                .functions
+                .get(&record.definition)
+                .ok_or_else(|| VerificationFailure::Defect {
+                    evidence: Arc::from("SpecializationId references an unknown function"),
+                })?;
+        if function.type_parameters.len() != record.type_arguments.len()
+            || record.type_arguments.iter().any(type_has_placeholder)
+        {
+            return defect("SpecializationId does not describe a fully concrete application");
+        }
+        let substitutions = function
+            .type_parameters
+            .iter()
+            .copied()
+            .zip(record.type_arguments.iter().cloned())
+            .collect::<BTreeMap<_, _>>();
+        let mut lowerer = Lowerer::new(
+            function.module,
+            &input,
+            build_authority,
+            identity_catalog,
+            cancellation,
+            &mut specializations,
+            true,
+        );
+        let mut parameters = Vec::new();
+        for parameter in &function.parameters {
+            let type_ = substitute(&parameter.type_, &substitutions);
+            let local = lowerer.bind_local(&parameter.name, type_.clone())?;
+            parameters.push((
+                local,
+                type_,
+                match parameter.ownership {
+                    OwnershipSyntax::Value => AccessMode::Copy,
+                    OwnershipSyntax::Take => AccessMode::Move,
+                },
+            ));
+        }
+        let return_type = substitute(&function.return_type, &substitutions);
+        let body = lowerer.statements(&function.body, &return_type)?;
+        specialized_functions.insert(
+            record.id,
+            HirFunction {
+                id: function.id,
+                name: function.name.clone(),
+                module_display: function.module_display.clone(),
+                modifier: function.modifier,
+                parameters,
+                return_type,
+                body: body.into(),
+                source: function.source.clone(),
+            },
+        );
+    }
+
+    let mut canonical = b"wrela.typed-hir\0\x03".to_vec();
+    canonical.push(0);
+    canonical.extend_from_slice(&identity_catalog.revision_fingerprint().to_be_bytes());
+    append_collection_header(&mut canonical, 1, functions.len());
+    for (id, function) in &functions {
+        append_part(&mut canonical, &id.0.to_be_bytes());
+        append_function(&mut canonical, function);
+    }
+    append_collection_header(&mut canonical, 2, constants.len());
+    for (id, constant) in &constants {
+        append_part(&mut canonical, &id.0.to_be_bytes());
+        append_part(&mut canonical, &constant.type_.canonical_key());
+        append_expression(&mut canonical, &constant.expression);
+    }
+    append_collection_header(&mut canonical, 3, specialized_functions.len());
+    for (id, function) in &specialized_functions {
+        append_part(&mut canonical, &id.0.to_be_bytes());
+        append_function(&mut canonical, function);
+    }
+    append_collection_header(&mut canonical, 4, default_specializations.len());
+    for (definition, specialization) in &default_specializations {
+        canonical.extend_from_slice(&definition.0.to_be_bytes());
+        canonical.extend_from_slice(&specialization.0.to_be_bytes());
+    }
+    append_collection_header(&mut canonical, 5, specializations.len());
+    for (id, specialization) in &specializations {
+        canonical.extend_from_slice(&id.0.to_be_bytes());
+        canonical.extend_from_slice(&specialization.definition.0.to_be_bytes());
+        canonical.extend_from_slice(
+            &u64::try_from(specialization.type_arguments.len())
                 .unwrap_or(u64::MAX)
                 .to_be_bytes(),
         );
+        for argument in &*specialization.type_arguments {
+            append_part(&mut canonical, &argument.canonical_key());
+        }
     }
-    for (name, constant) in &hir_constants {
-        append_part(&mut canonical, name.as_bytes());
-        append_part(&mut canonical, constant.type_name.as_bytes());
+    append_collection_header(&mut canonical, 6, input.tests.len());
+    for (id, test) in &input.tests {
+        canonical.extend_from_slice(&id.suite.0.to_be_bytes());
+        canonical.extend_from_slice(&id.test.0.to_be_bytes());
+        canonical.extend_from_slice(&id.identity.to_be_bytes());
+        append_part(&mut canonical, test.suite.as_bytes());
+        append_part(&mut canonical, test.test.as_bytes());
+        canonical.push(u8::from(test.asynchronous));
+        canonical.extend_from_slice(
+            &u64::try_from(test.parameters.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        for parameter in &test.parameters {
+            append_part(&mut canonical, parameter.name.as_bytes());
+            canonical.push(match parameter.ownership {
+                OwnershipSyntax::Value => 0,
+                OwnershipSyntax::Take => 1,
+            });
+            append_part(&mut canonical, &parameter.type_.canonical_key());
+        }
     }
+    append_collection_header(&mut canonical, 7, comptime_expressions.len());
+    for (source, expression) in &comptime_expressions {
+        append_range(&mut canonical, source);
+        append_expression(&mut canonical, expression);
+    }
+    verify_lowered_artifact(
+        &functions,
+        &specialized_functions,
+        &constants,
+        &specializations,
+        identity_catalog,
+    )?;
     Ok(VerifiedProgram {
-        functions: hir_functions,
-        constants: hir_constants,
+        functions,
+        specialized_functions,
+        default_specializations,
+        constants,
+        tests: input.tests,
+        specializations,
+        comptime_expressions,
         fingerprint: xxh3_128(&canonical),
         _verified: Verified,
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn lower_statements(
-    function: &Function,
-    lines: &[(u64, String)],
-    index: &mut usize,
-    indent: usize,
-    locals: &mut BTreeMap<String, String>,
-    signatures: &BTreeMap<String, (Vec<String>, String)>,
-    constants: &BTreeMap<String, String>,
-    allowed_tests: &BTreeSet<String>,
-    build_authority: &BuildAuthority,
-    nominal_types: &BTreeSet<String>,
-    cancellation: &Cancellation,
-) -> Result<Vec<Statement>, VerificationFailure> {
-    let mut statements = Vec::new();
-    while let Some((_, raw)) = lines.get(*index) {
-        if cancellation.is_cancelled() {
-            return Err(VerificationFailure::Cancelled);
-        }
-        let source = raw.trim();
-        if source.is_empty() || source.starts_with('#') || source.starts_with('@') {
-            *index += 1;
-            continue;
-        }
-        let actual_indent = raw.bytes().take_while(|byte| *byte == b' ').count();
-        if actual_indent < indent {
-            break;
-        }
-        if actual_indent > indent {
-            return creator("unexpected_statement_indentation", &function.source);
-        }
-        if source == "else:" {
-            break;
-        }
-        *index += 1;
-        let resolution = Resolution {
-            module: &function.module,
-            signatures,
-            constants,
-            locals,
-            allowed_tests,
-            build_authority,
-            nominal_types,
-        };
-        if let Some(condition) = source
-            .strip_prefix("if ")
-            .and_then(|value| value.strip_suffix(':'))
-        {
-            let condition =
-                parse_expression(condition, &function.source, &resolution, cancellation)?;
-            if condition.type_name != "bool" {
-                return creator("if_condition_requires_bool", &function.source);
-            }
-            let mut then_locals = locals.clone();
-            let then_branch = lower_statements(
-                function,
-                lines,
-                index,
-                indent + 4,
-                &mut then_locals,
-                signatures,
-                constants,
-                allowed_tests,
-                build_authority,
-                nominal_types,
-                cancellation,
-            )?;
-            let mut else_branch = Vec::new();
-            if let Some((_, next)) = lines.get(*index)
-                && next.bytes().take_while(|byte| *byte == b' ').count() == indent
-                && next.trim() == "else:"
-            {
-                *index += 1;
-                let mut else_locals = locals.clone();
-                else_branch = lower_statements(
-                    function,
-                    lines,
-                    index,
-                    indent + 4,
-                    &mut else_locals,
-                    signatures,
-                    constants,
-                    allowed_tests,
-                    build_authority,
-                    nominal_types,
-                    cancellation,
-                )?;
-            }
-            statements.push(Statement::If {
-                condition,
-                then_branch: then_branch.into(),
-                else_branch: else_branch.into(),
-            });
-        } else if source == "pass" {
-            statements.push(Statement::Pass);
-        } else if source == "return" {
-            if !compatible("()", &function.return_type) {
-                return creator("return_type_mismatch", &function.source);
-            }
-            statements.push(Statement::Return(None));
-        } else if let Some(source) = source.strip_prefix("return ") {
-            let expression = parse_expression(source, &function.source, &resolution, cancellation)?;
-            if !compatible(&expression.type_name, &function.return_type) {
-                return creator("return_type_mismatch", &function.source);
-            }
-            statements.push(Statement::Return(Some(expression)));
-        } else if let Some(source) = source.strip_prefix("panic ") {
-            statements.push(Statement::Panic(parse_expression(
-                source,
-                &function.source,
-                &resolution,
-                cancellation,
-            )?));
-        } else if let Some((name, source)) = source.split_once(" = ") {
-            if !valid_name(name) {
-                return creator("invalid_assignment_target", &function.source);
-            }
-            let value = parse_expression(source, &function.source, &resolution, cancellation)?;
-            locals.insert(name.to_owned(), value.type_name.clone());
-            statements.push(Statement::Assign {
-                name: name.to_owned(),
-                value,
-            });
-        } else {
-            statements.push(Statement::Evaluate(parse_expression(
-                source,
-                &function.source,
-                &resolution,
-                cancellation,
-            )?));
-        }
-    }
-    Ok(statements)
+fn append_collection_header(bytes: &mut Vec<u8>, tag: u8, length: usize) {
+    bytes.push(tag);
+    bytes.extend_from_slice(&u64::try_from(length).unwrap_or(u64::MAX).to_be_bytes());
 }
 
-fn validate_artifact(functions: &BTreeMap<String, Function>) -> Result<(), VerificationFailure> {
-    for (lookup_name, function) in functions {
-        if lookup_name.is_empty() || function.name.is_empty() {
-            return defect("empty resolved function name");
+fn intern_input_types(
+    input: &ProgramInput,
+    identities: &mut IdentityCatalog,
+) -> Result<(), VerificationFailure> {
+    let mut intern = |type_: &Type| {
+        identities
+            .intern_type(type_)
+            .map(|_| ())
+            .map_err(|collision| VerificationFailure::Defect {
+                evidence: Arc::from(format!("type identity collision {:032x}", collision.digest)),
+            })
+    };
+    for function in input.functions.values() {
+        for parameter in &function.parameters {
+            intern(&parameter.type_)?;
         }
-        if function.source.start() > function.source.end() {
-            return defect("reversed function provenance");
-        }
-        let mut parameters = BTreeSet::new();
-        for (name, type_name) in &function.parameters {
-            if name.is_empty() || type_name.is_empty() {
-                return defect("unresolved parameter in concrete function");
-            }
-            if !parameters.insert(name) {
-                return defect("duplicate parameter in concrete function");
-            }
-        }
-        if function
-            .body
-            .iter()
-            .any(|(offset, _)| *offset < function.source.start())
-        {
-            return defect("statement provenance escapes its declaration");
+        intern(&function.return_type)?;
+    }
+    for constant in input.constants.values() {
+        intern(&constant.type_)?;
+    }
+    for test in input.tests.values() {
+        for parameter in &test.parameters {
+            intern(&parameter.type_)?;
         }
     }
     Ok(())
 }
 
-struct Resolution<'a> {
-    module: &'a str,
-    signatures: &'a BTreeMap<String, (Vec<String>, String)>,
-    constants: &'a BTreeMap<String, String>,
-    locals: &'a BTreeMap<String, String>,
-    allowed_tests: &'a BTreeSet<String>,
-    build_authority: &'a BuildAuthority,
-    nominal_types: &'a BTreeSet<String>,
+struct ArtifactCatalog<'a> {
+    templates: &'a BTreeMap<DefinitionId, HirFunction>,
+    specialized: &'a BTreeMap<SpecializationId, HirFunction>,
+    constants: &'a BTreeMap<DefinitionId, HirConstant>,
+    specializations: &'a BTreeMap<SpecializationId, SpecializationRecord>,
+    identities: &'a IdentityCatalog,
 }
 
-fn parse_expression(
-    source: &str,
-    site: &SourceRange,
-    resolution: &Resolution<'_>,
-    cancellation: &Cancellation,
-) -> Result<Expression, VerificationFailure> {
-    let tokens = tokenize(source, cancellation).map_err(|failure| match failure {
-        TokenizeFailure::Invalid => VerificationFailure::Creator {
-            kind: Arc::from("invalid_expression"),
-            site: site.clone(),
-        },
-        TokenizeFailure::Cancelled => VerificationFailure::Cancelled,
-    })?;
-    let mut parser = Parser {
-        tokens: &tokens,
-        index: 0,
-        site,
-        resolution,
+fn type_has_placeholder(type_: &Type) -> bool {
+    match type_ {
+        Type::Parameter { .. } | Type::Infer => true,
+        Type::Array(element) | Type::Option(element) => type_has_placeholder(element),
+        Type::Tuple(members) => members.iter().any(type_has_placeholder),
+        Type::Result { success, error } => {
+            type_has_placeholder(success)
+                || error
+                    .as_ref()
+                    .is_some_and(|error| type_has_placeholder(error))
+        }
+        Type::Unit
+        | Type::Bool
+        | Type::Integer(_)
+        | Type::Float(_)
+        | Type::Text
+        | Type::Bytes
+        | Type::Builtin(_)
+        | Type::Nominal { .. } => false,
+    }
+}
+
+fn verify_specialized_artifact(
+    specialized: &BTreeMap<SpecializationId, HirFunction>,
+    catalog: &ArtifactCatalog<'_>,
+) -> Result<(), VerificationFailure> {
+    for (id, function) in specialized {
+        let record =
+            catalog
+                .specializations
+                .get(id)
+                .ok_or_else(|| VerificationFailure::Defect {
+                    evidence: Arc::from("concrete body has no Specialization record"),
+                })?;
+        if record.definition != function.id
+            || function
+                .parameters
+                .iter()
+                .any(|(_, type_, _)| type_has_placeholder(type_))
+            || type_has_placeholder(&function.return_type)
+        {
+            return defect("concrete Specialization body contains template facts");
+        }
+        let mut locals = function
+            .parameters
+            .iter()
+            .map(|(local, type_, _)| (*local, type_.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut previous_source_start = function.source.start();
+        verify_statements(
+            &function.body,
+            &function.return_type,
+            &mut locals,
+            &mut BTreeSet::new(),
+            catalog,
+            &function.source,
+            &mut previous_source_start,
+        )?;
+        if statements_have_placeholder(&function.body) {
+            return defect("concrete Specialization operation contains a placeholder type");
+        }
+    }
+    Ok(())
+}
+
+fn statements_have_placeholder(statements: &[Statement]) -> bool {
+    fn expression_has_placeholder(expression: &Expression) -> bool {
+        type_has_placeholder(&expression.type_)
+            || match &expression.kind {
+                ExpressionKind::Call { arguments, .. } | ExpressionKind::Array(arguments) => {
+                    arguments.iter().any(expression_has_placeholder)
+                }
+                ExpressionKind::Negate(value)
+                | ExpressionKind::Await(value)
+                | ExpressionKind::Propagate(value) => expression_has_placeholder(value),
+                ExpressionKind::Binary { left, right, .. } => {
+                    expression_has_placeholder(left) || expression_has_placeholder(right)
+                }
+                ExpressionKind::Literal(_)
+                | ExpressionKind::Read(_)
+                | ExpressionKind::Constant(_) => false,
+            }
+    }
+    statements.iter().any(|statement| match statement {
+        Statement::Return { value, .. } => value.as_ref().is_some_and(expression_has_placeholder),
+        Statement::Panic { value, .. }
+        | Statement::Initialize { value, .. }
+        | Statement::Evaluate(value) => expression_has_placeholder(value),
+        Statement::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expression_has_placeholder(condition)
+                || statements_have_placeholder(then_branch)
+                || statements_have_placeholder(else_branch)
+        }
+        Statement::Pass(_) => false,
+    })
+}
+
+fn verify_lowered_artifact(
+    functions: &BTreeMap<DefinitionId, HirFunction>,
+    specialized: &BTreeMap<SpecializationId, HirFunction>,
+    constants: &BTreeMap<DefinitionId, HirConstant>,
+    specializations: &BTreeMap<SpecializationId, SpecializationRecord>,
+    identities: &IdentityCatalog,
+) -> Result<(), VerificationFailure> {
+    let catalog = ArtifactCatalog {
+        templates: functions,
+        specialized,
+        constants,
+        specializations,
+        identities,
     };
-    let expression = parser.expression(0)?;
-    if parser.index != tokens.len() {
-        return creator("trailing_expression_tokens", site);
-    }
-    Ok(expression)
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum Token {
-    Name(String),
-    Integer(i128, Option<String>),
-    Float(f64, Option<String>),
-    Text(String),
-    Symbol(&'static str),
-}
-
-enum TokenizeFailure {
-    Invalid,
-    Cancelled,
-}
-
-fn tokenize(source: &str, cancellation: &Cancellation) -> Result<Vec<Token>, TokenizeFailure> {
-    let bytes = source.as_bytes();
-    let mut tokens = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        if index % 256 == 0 && cancellation.is_cancelled() {
-            return Err(TokenizeFailure::Cancelled);
+    for (key, function) in functions {
+        if key != &function.id {
+            return defect("lowered function key disagrees with its DefinitionId");
         }
-        match bytes[index] {
-            byte if byte.is_ascii_whitespace() => index += 1,
-            b'0'..=b'9' => {
-                let start = index;
-                index += 1;
-                while bytes
-                    .get(index)
-                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-                {
-                    index += 1;
-                }
-                if !["0x", "0X", "0b", "0B", "0o", "0O"]
-                    .iter()
-                    .any(|prefix| source[start..index].starts_with(prefix))
-                    && bytes.get(index) == Some(&b'.')
-                    && bytes.get(index + 1).is_some_and(u8::is_ascii_digit)
-                {
-                    index += 1;
-                    while bytes
-                        .get(index)
-                        .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'_')
-                    {
-                        index += 1;
-                    }
-                    if matches!(bytes.get(index), Some(b'e' | b'E')) {
-                        index += 1;
-                        if matches!(bytes.get(index), Some(b'+' | b'-')) {
-                            index += 1;
-                        }
-                        while bytes
-                            .get(index)
-                            .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'_')
-                        {
-                            index += 1;
-                        }
-                    }
-                    while bytes.get(index).is_some_and(u8::is_ascii_alphanumeric) {
-                        index += 1;
-                    }
-                    let (value, suffix) = parse_float_literal(&source[start..index])
-                        .map_err(|()| TokenizeFailure::Invalid)?;
-                    tokens.push(Token::Float(value, suffix));
+        let mut locals = BTreeMap::new();
+        for (local, type_, _) in &function.parameters {
+            if locals.insert(*local, type_.clone()).is_some() {
+                return defect("lowered function repeats a parameter LocalId");
+            }
+        }
+        let mut moved = BTreeSet::new();
+        let mut previous_source_start = function.source.start();
+        verify_statements(
+            &function.body,
+            &function.return_type,
+            &mut locals,
+            &mut moved,
+            &catalog,
+            &function.source,
+            &mut previous_source_start,
+        )?;
+    }
+    for (key, constant) in constants {
+        if key != &constant.id {
+            return defect("lowered constant key disagrees with its DefinitionId");
+        }
+        let actual = verify_expression_artifact(
+            &constant.expression,
+            &BTreeMap::new(),
+            &mut BTreeSet::new(),
+            &catalog,
+            &constant.source,
+        )?;
+        if !actual.compatible_with(&constant.type_) {
+            return defect("lowered constant expression disagrees with its resolved type");
+        }
+    }
+    verify_specialized_artifact(specialized, &catalog)
+}
+
+fn verify_statements(
+    statements: &[Statement],
+    return_type: &Type,
+    locals: &mut BTreeMap<LocalId, Type>,
+    moved: &mut BTreeSet<LocalId>,
+    catalog: &ArtifactCatalog<'_>,
+    provenance_owner: &SourceRange,
+    previous_source_start: &mut u64,
+) -> Result<(), VerificationFailure> {
+    for statement in statements {
+        let source = statement_source(statement);
+        if source.path() != provenance_owner.path()
+            || source.start() > source.end()
+            || source.start() < provenance_owner.start()
+            || source.end() > provenance_owner.end()
+            || source.start() < *previous_source_start
+        {
+            return defect("lowered statement provenance is outside source order or ownership");
+        }
+        *previous_source_start = source.start();
+        match statement {
+            Statement::Return { value, source: _ } => {
+                let actual = if let Some(value) = value {
+                    verify_expression_artifact(value, locals, moved, catalog, source)?
                 } else {
-                    let (value, suffix) = parse_integer_literal(&source[start..index])
-                        .map_err(|()| TokenizeFailure::Invalid)?;
-                    tokens.push(Token::Integer(value, suffix));
+                    Type::Unit
+                };
+                if !actual.compatible_with(return_type) {
+                    return defect("lowered return expression disagrees with function type");
                 }
             }
-            b'A'..=b'Z' | b'a'..=b'z' | b'_' => {
-                let start = index;
-                index += 1;
-                while bytes
-                    .get(index)
-                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
+            Statement::Panic { value, .. } | Statement::Evaluate(value) => {
+                verify_expression_artifact(value, locals, moved, catalog, source)?;
+            }
+            Statement::Initialize { place, value, .. } => {
+                let type_ = verify_expression_artifact(value, locals, moved, catalog, source)?;
+                if locals.insert(place.local, type_).is_some() {
+                    return defect("lowered initialization repeats a LocalId");
+                }
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                if verify_expression_artifact(condition, locals, moved, catalog, source)?
+                    != Type::Bool
                 {
-                    index += 1;
+                    return defect("lowered if condition is not Bool");
                 }
-                tokens.push(Token::Name(source[start..index].to_owned()));
+                let mut then_locals = locals.clone();
+                let mut then_moved = moved.clone();
+                verify_statements(
+                    then_branch,
+                    return_type,
+                    &mut then_locals,
+                    &mut then_moved,
+                    catalog,
+                    provenance_owner,
+                    previous_source_start,
+                )?;
+                let mut else_locals = locals.clone();
+                let mut else_moved = moved.clone();
+                verify_statements(
+                    else_branch,
+                    return_type,
+                    &mut else_locals,
+                    &mut else_moved,
+                    catalog,
+                    provenance_owner,
+                    previous_source_start,
+                )?;
+                moved.extend(then_moved.union(&else_moved).copied());
             }
-            b'"' => {
-                let start = index + 1;
-                index += 1;
-                while bytes.get(index).is_some_and(|byte| *byte != b'"') {
-                    index += 1;
-                }
-                if index == bytes.len() {
-                    return Err(TokenizeFailure::Invalid);
-                }
-                tokens.push(Token::Text(source[start..index].to_owned()));
-                index += 1;
-            }
-            _ => {
-                let remaining = &source[index..];
-                let symbol = [
-                    "==", "!=", "<=", ">=", "+", "-", "*", "/", "%", "<", ">", "(", ")", "[", "]",
-                    ",", "=", "?",
-                ]
-                .into_iter()
-                .find(|symbol| remaining.starts_with(symbol))
-                .ok_or(TokenizeFailure::Invalid)?;
-                tokens.push(Token::Symbol(symbol));
-                index += symbol.len();
-            }
+            Statement::Pass(_) => {}
         }
     }
-    Ok(tokens)
+    Ok(())
 }
 
-struct Parser<'a> {
-    tokens: &'a [Token],
-    index: usize,
-    site: &'a SourceRange,
-    resolution: &'a Resolution<'a>,
+fn statement_source(statement: &Statement) -> &SourceRange {
+    match statement {
+        Statement::Return { source, .. }
+        | Statement::Panic { source, .. }
+        | Statement::Initialize { source, .. }
+        | Statement::If { source, .. }
+        | Statement::Pass(source) => source,
+        Statement::Evaluate(expression) => &expression.source,
+    }
 }
 
-impl Parser<'_> {
-    fn expression(&mut self, minimum_precedence: u8) -> Result<Expression, VerificationFailure> {
-        let mut left = self.primary()?;
-        if self.tokens.get(self.index) == Some(&Token::Symbol("?")) {
-            self.index += 1;
-            let type_name = left
-                .type_name
-                .strip_prefix("Result[")
-                .and_then(|result| result.split([',', ']']).next())
-                .map(str::trim)
-                .filter(|result| !result.is_empty())
-                .ok_or_else(|| VerificationFailure::Creator {
-                    kind: Arc::from("propagation_requires_result"),
-                    site: self.site.clone(),
-                })?
-                .to_owned();
-            left = Expression {
-                kind: ExpressionKind::Propagate(Box::new(left)),
-                type_name,
-            };
+fn verify_expression_artifact(
+    expression: &Expression,
+    locals: &BTreeMap<LocalId, Type>,
+    moved: &mut BTreeSet<LocalId>,
+    catalog: &ArtifactCatalog<'_>,
+    provenance_owner: &SourceRange,
+) -> Result<Type, VerificationFailure> {
+    if expression.source.start() > expression.source.end()
+        || expression.source.path() != provenance_owner.path()
+        || expression.source.start() < provenance_owner.start()
+        || expression.source.end() > provenance_owner.end()
+    {
+        return defect("lowered expression has reversed or foreign provenance");
+    }
+    if !catalog
+        .identities
+        .type_matches(expression.type_id, &expression.type_)
+    {
+        return defect("lowered expression TypeId disagrees with its canonical type");
+    }
+    let children: Vec<&Expression> = match &expression.kind {
+        ExpressionKind::Call { arguments, .. } | ExpressionKind::Array(arguments) => {
+            arguments.iter().collect()
         }
-        while let Some((operator, precedence)) = self.binary_operator() {
-            if precedence < minimum_precedence {
-                break;
+        ExpressionKind::Negate(value)
+        | ExpressionKind::Await(value)
+        | ExpressionKind::Propagate(value) => vec![value],
+        ExpressionKind::Binary { left, right, .. } => vec![left, right],
+        ExpressionKind::Literal(_) | ExpressionKind::Read(_) | ExpressionKind::Constant(_) => {
+            Vec::new()
+        }
+    };
+    let mut previous_child_start = expression.source.start();
+    for child in children {
+        if child.source.path() != provenance_owner.path()
+            || child.source.start() < expression.source.start()
+            || child.source.end() > expression.source.end()
+            || child.source.start() < previous_child_start
+        {
+            return defect("lowered child expression provenance escapes its owner or source order");
+        }
+        previous_child_start = child.source.start();
+    }
+    let actual = match &expression.kind {
+        ExpressionKind::Literal(literal) => match literal {
+            Literal::Unit => Type::Unit,
+            Literal::Bool(_) => Type::Bool,
+            Literal::Integer { kind, .. } => Type::Integer(*kind),
+            Literal::Float { kind, .. } => Type::Float(*kind),
+            Literal::Text(_) => Type::Text,
+        },
+        ExpressionKind::Read(place) => {
+            let type_ =
+                locals
+                    .get(&place.local)
+                    .cloned()
+                    .ok_or_else(|| VerificationFailure::Defect {
+                        evidence: Arc::from("lowered read references an unknown LocalId"),
+                    })?;
+            if moved.contains(&place.local) {
+                return defect("lowered read uses a LocalId after it was moved");
             }
-            self.index += 1;
-            let right = self.expression(precedence + 1)?;
-            let type_name =
-                binary_type(operator, &left.type_name, &right.type_name).ok_or_else(|| {
-                    VerificationFailure::Creator {
-                        kind: Arc::from("binary_type_mismatch"),
-                        site: self.site.clone(),
+            if expression.access == AccessMode::Move {
+                moved.insert(place.local);
+            }
+            type_
+        }
+        ExpressionKind::Constant(id) => catalog
+            .constants
+            .get(id)
+            .map(|constant| constant.type_.clone())
+            .ok_or_else(|| VerificationFailure::Defect {
+                evidence: Arc::from("lowered expression references an unknown constant"),
+            })?,
+        ExpressionKind::Call { target, arguments } => {
+            let argument_types = arguments
+                .iter()
+                .map(|argument| {
+                    verify_expression_artifact(argument, locals, moved, catalog, &expression.source)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            match target {
+                CallTarget::TemplateFunction(definition) => catalog
+                    .templates
+                    .get(definition)
+                    .map(|function| {
+                        if !arguments_match(&argument_types, &function.parameters) {
+                            return defect("template call operands disagree with parameters");
+                        }
+                        Ok(function.return_type.clone())
+                    })
+                    .transpose()?
+                    .ok_or_else(|| VerificationFailure::Defect {
+                        evidence: Arc::from("template call references an unknown function"),
+                    })?,
+                CallTarget::Function {
+                    definition,
+                    specialization,
+                } => {
+                    let record = catalog.specializations.get(specialization).ok_or_else(|| {
+                        VerificationFailure::Defect {
+                            evidence: Arc::from(
+                                "lowered call references an unknown SpecializationId",
+                            ),
+                        }
+                    })?;
+                    if record.definition != *definition {
+                        return defect("lowered call mixes DefinitionId and SpecializationId");
                     }
-                })?;
-            left = Expression {
-                kind: ExpressionKind::Binary {
-                    operator,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                },
-                type_name,
-            };
+                    let function = catalog.specialized.get(specialization).ok_or_else(|| {
+                        VerificationFailure::Defect {
+                            evidence: Arc::from("lowered call has no concrete specialization body"),
+                        }
+                    })?;
+                    if function.id != *definition
+                        || !arguments_match(&argument_types, &function.parameters)
+                    {
+                        return defect("concrete call operands disagree with specialization");
+                    }
+                    function.return_type.clone()
+                }
+                CallTarget::Build(BuildKind::Image) => Type::Builtin(BuiltinType::Image),
+                CallTarget::Build(BuildKind::Test) => Type::Builtin(BuiltinType::Test),
+                CallTarget::BuiltinVariant(variant) => {
+                    let inferred = builtin_variant_type(*variant, arguments, &expression.source)
+                        .map_err(|_| VerificationFailure::Defect {
+                            evidence: Arc::from("built-in variant operands are malformed"),
+                        })?;
+                    if !inferred.compatible_with(&expression.type_) {
+                        return defect("built-in variant result annotation is inconsistent");
+                    }
+                    expression.type_.clone()
+                }
+                CallTarget::UserVariant { id, .. } => {
+                    let Type::Nominal { definition, .. } = &expression.type_ else {
+                        return defect("user variant result is not its nominal type");
+                    };
+                    if *definition != id.owner {
+                        return defect("user variant owner disagrees with result type");
+                    }
+                    expression.type_.clone()
+                }
+                CallTarget::Test(_) => Type::Builtin(BuiltinType::TestApplication),
+            }
         }
-        Ok(left)
+        ExpressionKind::Array(values) => {
+            let Type::Array(element) = &expression.type_ else {
+                return defect("array operation result is not an Array type");
+            };
+            for value in &**values {
+                let actual =
+                    verify_expression_artifact(value, locals, moved, catalog, &expression.source)?;
+                if actual != **element {
+                    return defect("array element disagrees with aggregate type");
+                }
+            }
+            expression.type_.clone()
+        }
+        ExpressionKind::Negate(value) => {
+            let type_ =
+                verify_expression_artifact(value, locals, moved, catalog, &expression.source)?;
+            if !type_.is_numeric() {
+                return defect("negate operand is not numeric");
+            }
+            type_
+        }
+        ExpressionKind::Await(value) => {
+            verify_expression_artifact(value, locals, moved, catalog, &expression.source)?
+        }
+        ExpressionKind::Propagate(value) => {
+            let Type::Result { success, .. } =
+                verify_expression_artifact(value, locals, moved, catalog, &expression.source)?
+            else {
+                return defect("lowered propagation operand is not Result");
+            };
+            (*success).clone()
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            let left =
+                verify_expression_artifact(left, locals, moved, catalog, &expression.source)?;
+            let right =
+                verify_expression_artifact(right, locals, moved, catalog, &expression.source)?;
+            binary_type(*operator, &left, &right).ok_or_else(|| VerificationFailure::Defect {
+                evidence: Arc::from("binary operation operands are not well typed"),
+            })?
+        }
+    };
+    if actual != expression.type_ {
+        return defect("lowered expression type annotation is inconsistent");
+    }
+    Ok(actual)
+}
+
+fn arguments_match(argument_types: &[Type], parameters: &[(LocalId, Type, AccessMode)]) -> bool {
+    argument_types.len() == parameters.len()
+        && argument_types
+            .iter()
+            .zip(parameters)
+            .all(|(argument, (_, parameter, _))| argument.compatible_with(parameter))
+}
+
+fn validate_input(input: &ProgramInput) -> Result<(), VerificationFailure> {
+    for (lookup, function) in &input.functions {
+        if lookup != &function.id {
+            return defect("function catalog key disagrees with typed identity");
+        }
+        if function.name.is_empty() {
+            return creator(CreatorFailureKind::EmptyName, &function.source);
+        }
+        let mut names = BTreeSet::new();
+        if function
+            .parameters
+            .iter()
+            .any(|parameter| !names.insert(&parameter.name))
+        {
+            return creator(CreatorFailureKind::DuplicateParameter, &function.source);
+        }
+        if function.source.start() > function.source.end() {
+            return defect("reversed function provenance");
+        }
+    }
+    Ok(())
+}
+
+struct Lowerer<'a> {
+    module: ModuleId,
+    functions: &'a BTreeMap<DefinitionId, ResolvedFunction>,
+    constants: &'a BTreeMap<DefinitionId, ResolvedConstant>,
+    tests: &'a BTreeMap<TestId, ResolvedTest>,
+    names: &'a BTreeMap<NameKey, ResolvedName>,
+    nominal_displays: &'a BTreeMap<DefinitionId, Arc<str>>,
+    locals: BTreeMap<String, (LocalId, Type)>,
+    next_local: u32,
+    build_authority: &'a BuildAuthority,
+    identity_catalog: &'a mut IdentityCatalog,
+    cancellation: &'a Cancellation,
+    specializations: &'a mut BTreeMap<SpecializationId, SpecializationRecord>,
+    concrete_context: bool,
+}
+
+impl<'a> Lowerer<'a> {
+    fn new(
+        module: ModuleId,
+        input: &'a ProgramInput,
+        build_authority: &'a BuildAuthority,
+        identity_catalog: &'a mut IdentityCatalog,
+        cancellation: &'a Cancellation,
+        specializations: &'a mut BTreeMap<SpecializationId, SpecializationRecord>,
+        concrete_context: bool,
+    ) -> Self {
+        Self {
+            module,
+            functions: &input.functions,
+            constants: &input.constants,
+            tests: &input.tests,
+            names: &input.names,
+            nominal_displays: &input.nominal_displays,
+            locals: BTreeMap::new(),
+            next_local: 0,
+            build_authority,
+            identity_catalog,
+            cancellation,
+            specializations,
+            concrete_context,
+        }
     }
 
-    fn primary(&mut self) -> Result<Expression, VerificationFailure> {
-        let token =
-            self.tokens
-                .get(self.index)
-                .cloned()
-                .ok_or_else(|| VerificationFailure::Creator {
-                    kind: Arc::from("missing_expression"),
-                    site: self.site.clone(),
+    fn bind_local(&mut self, name: &str, type_: Type) -> Result<LocalId, VerificationFailure> {
+        let id = LocalId(self.next_local);
+        self.next_local =
+            self.next_local
+                .checked_add(1)
+                .ok_or_else(|| VerificationFailure::Defect {
+                    evidence: Arc::from("local identity overflow"),
                 })?;
-        self.index += 1;
-        match token {
-            Token::Integer(value, suffix) => {
-                let type_name = suffix.unwrap_or_else(|| "i64".to_owned());
-                Ok(Expression {
-                    kind: ExpressionKind::Literal(CanonicalValue::Integer {
-                        type_name: Arc::from(type_name.as_str()),
+        self.locals.insert(name.to_owned(), (id, type_));
+        Ok(id)
+    }
+
+    fn statements(
+        &mut self,
+        syntax: &[StatementSyntax],
+        return_type: &Type,
+    ) -> Result<Vec<Statement>, VerificationFailure> {
+        let mut statements = Vec::new();
+        for statement in syntax {
+            if self.cancellation.is_cancelled() {
+                return Err(VerificationFailure::Cancelled);
+            }
+            statements.push(match statement {
+                StatementSyntax::Return { value, range } => {
+                    let mut value = value
+                        .as_ref()
+                        .map(|value| self.expression(value))
+                        .transpose()?;
+                    let actual = value.as_ref().map_or(&Type::Unit, |value| &value.type_);
+                    if !actual.compatible_with(return_type) {
+                        return creator(CreatorFailureKind::ReturnTypeMismatch, range);
+                    }
+                    if let Some(value) = &mut value
+                        && matches!(
+                            value.kind,
+                            ExpressionKind::Call {
+                                target: CallTarget::BuiltinVariant(
+                                    BuiltinVariant::ResultOk | BuiltinVariant::ResultErr
+                                ),
+                                ..
+                            }
+                        )
+                    {
+                        value.type_ = return_type.clone();
+                        value.type_id = self.identity_catalog.intern_type(return_type).map_err(
+                            |collision| VerificationFailure::Defect {
+                                evidence: Arc::from(format!(
+                                    "type identity collision {:032x}",
+                                    collision.digest
+                                )),
+                            },
+                        )?;
+                    }
+                    Statement::Return {
+                        value,
+                        source: range.clone(),
+                    }
+                }
+                StatementSyntax::Panic { value, range } => Statement::Panic {
+                    value: self.expression(value)?,
+                    source: range.clone(),
+                },
+                StatementSyntax::Assign { name, value, range } => {
+                    let value = self.expression(value)?;
+                    let place = self.bind_local(name, value.type_.clone())?;
+                    Statement::Initialize {
+                        place: Place { local: place },
+                        value,
+                        source: range.clone(),
+                    }
+                }
+                StatementSyntax::Evaluate(expression) => {
+                    Statement::Evaluate(self.expression(expression)?)
+                }
+                StatementSyntax::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                    range,
+                } => {
+                    let condition = self.expression(condition)?;
+                    if condition.type_ != Type::Bool {
+                        return creator(CreatorFailureKind::IfConditionRequiresBool, range);
+                    }
+                    let before = self.locals.clone();
+                    let then_branch = self.statements(then_branch, return_type)?;
+                    self.locals.clone_from(&before);
+                    let else_branch = self.statements(else_branch, return_type)?;
+                    self.locals = before;
+                    Statement::If {
+                        condition,
+                        then_branch: then_branch.into(),
+                        else_branch: else_branch.into(),
+                        source: range.clone(),
+                    }
+                }
+                StatementSyntax::Pass(range) => Statement::Pass(range.clone()),
+            });
+        }
+        Ok(statements)
+    }
+
+    fn expression(&mut self, syntax: &ExpressionSyntax) -> Result<Expression, VerificationFailure> {
+        if self.cancellation.is_cancelled() {
+            return Err(VerificationFailure::Cancelled);
+        }
+        let (kind, type_) = match &syntax.kind {
+            ExpressionSyntaxKind::Integer(authored) => {
+                let (value, integer) = parse_integer_literal(authored).map_err(|()| {
+                    creator_value(CreatorFailureKind::InvalidIntegerLiteral, &syntax.range)
+                })?;
+                (
+                    ExpressionKind::Literal(Literal::Integer {
+                        kind: integer,
                         value,
                     }),
-                    type_name,
-                })
+                    Type::Integer(integer),
+                )
             }
-            Token::Float(value, suffix) => {
-                let type_name = suffix.unwrap_or_else(|| "f64".to_owned());
-                Ok(Expression {
-                    kind: ExpressionKind::Literal(CanonicalValue::Float {
-                        type_name: Arc::from(type_name.as_str()),
-                        bits: encode_float(&type_name, value),
+            ExpressionSyntaxKind::Float(authored) => {
+                let (value, float) = parse_float_literal(authored).map_err(|()| {
+                    creator_value(CreatorFailureKind::InvalidFloatLiteral, &syntax.range)
+                })?;
+                (
+                    ExpressionKind::Literal(Literal::Float {
+                        kind: float,
+                        bits: encode_float(float, value),
                     }),
-                    type_name,
-                })
+                    Type::Float(float),
+                )
             }
-            Token::Text(value) => Ok(Expression {
-                kind: ExpressionKind::Literal(CanonicalValue::Text(value.into())),
-                type_name: "Text".to_owned(),
-            }),
-            Token::Name(name) if matches!(name.as_str(), "true" | "false") => Ok(Expression {
-                kind: ExpressionKind::Literal(CanonicalValue::Bool(name == "true")),
-                type_name: "bool".to_owned(),
-            }),
-            Token::Name(name) if self.tokens.get(self.index) == Some(&Token::Symbol("(")) => {
-                self.index += 1;
-                let mut arguments = Vec::new();
-                while self.tokens.get(self.index) != Some(&Token::Symbol(")")) {
-                    if let (Some(Token::Name(_)), Some(Token::Symbol("="))) =
-                        (self.tokens.get(self.index), self.tokens.get(self.index + 1))
+            ExpressionSyntaxKind::Text(value) => (
+                ExpressionKind::Literal(Literal::Text(Arc::from(value.as_str()))),
+                Type::Text,
+            ),
+            ExpressionSyntaxKind::Bool(value) => {
+                (ExpressionKind::Literal(Literal::Bool(*value)), Type::Bool)
+            }
+            ExpressionSyntaxKind::Unit => (ExpressionKind::Literal(Literal::Unit), Type::Unit),
+            ExpressionSyntaxKind::Name(name) => return self.value(name, syntax),
+            ExpressionSyntaxKind::Call { callee, arguments } => {
+                let mut lowered = arguments
+                    .iter()
+                    .map(|argument| self.expression(&argument.value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let (target, type_) = self.call(callee, &lowered, &syntax.range)?;
+                if let CallTarget::Function { definition, .. } = &target {
+                    let function = &self.functions[definition];
+                    for (value, parameter) in lowered.iter_mut().zip(&function.parameters) {
+                        value.access = match parameter.ownership {
+                            OwnershipSyntax::Value => AccessMode::Copy,
+                            OwnershipSyntax::Take => AccessMode::Move,
+                        };
+                    }
+                }
+                if let CallTarget::Test(id) = &target {
+                    let test = &self.tests[id];
+                    for ((syntax_argument, value), parameter) in
+                        arguments.iter().zip(&mut lowered).zip(&test.parameters)
                     {
-                        self.index += 2;
-                    }
-                    arguments.push(self.expression(0)?);
-                    if self.tokens.get(self.index) == Some(&Token::Symbol(",")) {
-                        self.index += 1;
-                    } else {
-                        break;
+                        if syntax_argument
+                            .label
+                            .as_ref()
+                            .is_some_and(|label| label != &parameter.name)
+                        {
+                            return creator(
+                                CreatorFailureKind::ArgumentLabelMismatch,
+                                &syntax_argument.value.range,
+                            );
+                        }
+                        value.access = match parameter.ownership {
+                            OwnershipSyntax::Value => AccessMode::Copy,
+                            OwnershipSyntax::Take => AccessMode::Move,
+                        };
                     }
                 }
-                if self.tokens.get(self.index) != Some(&Token::Symbol(")")) {
-                    return creator("missing_call_closer", self.site);
-                }
-                self.index += 1;
-                let (target, type_name) = self.resolve_call(&name, &arguments)?;
-                Ok(Expression {
-                    kind: ExpressionKind::Call {
+                (
+                    ExpressionKind::Call {
                         target,
-                        arguments: arguments.into(),
+                        arguments: lowered.into(),
                     },
-                    type_name,
-                })
+                    type_,
+                )
             }
-            Token::Name(name) => self.resolve_value(&name),
-            Token::Symbol("(") => {
-                if self.tokens.get(self.index) == Some(&Token::Symbol(")")) {
-                    self.index += 1;
-                    return Ok(Expression {
-                        kind: ExpressionKind::Literal(CanonicalValue::Unit),
-                        type_name: "()".to_owned(),
-                    });
-                }
-                let expression = self.expression(0)?;
-                if self.tokens.get(self.index) != Some(&Token::Symbol(")")) {
-                    return creator("missing_group_closer", self.site);
-                }
-                self.index += 1;
-                Ok(expression)
-            }
-            Token::Symbol("[") => {
-                let mut values = Vec::new();
-                while self.tokens.get(self.index) != Some(&Token::Symbol("]")) {
-                    values.push(self.expression(0)?);
-                    if self.tokens.get(self.index) == Some(&Token::Symbol(",")) {
-                        self.index += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if self.tokens.get(self.index) != Some(&Token::Symbol("]")) {
-                    return creator("missing_array_closer", self.site);
-                }
-                self.index += 1;
+            ExpressionSyntaxKind::Array(values) => {
+                let values = values
+                    .iter()
+                    .map(|value| self.expression(value))
+                    .collect::<Result<Vec<_>, _>>()?;
                 let element = values
                     .first()
-                    .map_or_else(|| "_".to_owned(), |expression| expression.type_name.clone());
+                    .map_or(Type::Infer, |value| value.type_.clone());
                 if values
                     .iter()
-                    .any(|expression| !compatible(&expression.type_name, &element))
+                    .any(|value| !value.type_.compatible_with(&element))
                 {
-                    return creator("array_element_type_mismatch", self.site);
+                    return creator(CreatorFailureKind::ArrayElementTypeMismatch, &syntax.range);
                 }
-                Ok(Expression {
-                    kind: ExpressionKind::Array(values.into()),
-                    type_name: format!("[{element}]"),
-                })
+                (
+                    ExpressionKind::Array(values.into()),
+                    Type::Array(Arc::new(element)),
+                )
             }
-            Token::Symbol("-") => {
-                let expression = self.expression(12)?;
-                if !numeric(&expression.type_name) {
-                    return creator("invalid_unary_operand", self.site);
+            ExpressionSyntaxKind::Negate(value) => {
+                let value = self.expression(value)?;
+                if !value.type_.is_numeric() {
+                    return creator(CreatorFailureKind::InvalidUnaryOperand, &syntax.range);
                 }
-                let type_name = expression.type_name.clone();
-                Ok(Expression {
-                    kind: ExpressionKind::Negate(Box::new(expression)),
-                    type_name,
-                })
+                let type_ = value.type_.clone();
+                (ExpressionKind::Negate(Box::new(value)), type_)
             }
-            _ => creator("invalid_primary", self.site),
-        }
-    }
-
-    fn resolve_value(&self, name: &str) -> Result<Expression, VerificationFailure> {
-        if let Some(type_name) = self.resolution.locals.get(name) {
-            return Ok(Expression {
-                kind: ExpressionKind::Local(name.to_owned()),
-                type_name: type_name.clone(),
-            });
-        }
-        let qualified = qualify_lookup(self.resolution.module, name, self.resolution.constants);
-        if let Some(type_name) = self.resolution.constants.get(&qualified) {
-            return Ok(Expression {
-                kind: ExpressionKind::Constant(qualified),
-                type_name: type_name.clone(),
-            });
-        }
-        if let Some((type_name, variant)) = name.split_once('.')
-            && type_name
-                .as_bytes()
-                .first()
-                .is_some_and(u8::is_ascii_uppercase)
-        {
-            if !self.resolution.nominal_types.contains(type_name)
-                && !matches!(type_name, "Result" | "Option")
-            {
-                return creator("unresolved_nominal_type", self.site);
+            ExpressionSyntaxKind::Await(value) => {
+                let value = self.expression(value)?;
+                let type_ = value.type_.clone();
+                (ExpressionKind::Await(Box::new(value)), type_)
             }
-            return Ok(Expression {
-                kind: ExpressionKind::Call {
-                    target: CallTarget::Variant {
-                        type_name: type_name.to_owned(),
-                        variant: variant.to_owned(),
+            ExpressionSyntaxKind::Propagate(value) => {
+                let value = self.expression(value)?;
+                let Type::Result { success, .. } = &value.type_ else {
+                    return creator(CreatorFailureKind::PropagationRequiresResult, &syntax.range);
+                };
+                let type_ = (**success).clone();
+                (ExpressionKind::Propagate(Box::new(value)), type_)
+            }
+            ExpressionSyntaxKind::Binary {
+                operator,
+                left,
+                right,
+            } => {
+                let left = self.expression(left)?;
+                let right = self.expression(right)?;
+                let operator = BinaryOperator::from(*operator);
+                let type_ = binary_type(operator, &left.type_, &right.type_).ok_or_else(|| {
+                    creator_value(CreatorFailureKind::BinaryTypeMismatch, &syntax.range)
+                })?;
+                (
+                    ExpressionKind::Binary {
+                        operator,
+                        left: Box::new(left),
+                        right: Box::new(right),
                     },
-                    arguments: Arc::from([]),
-                },
-                type_name: type_name.to_owned(),
-            });
-        }
-        creator("unresolved_name", self.site)
-    }
-
-    fn resolve_call(
-        &self,
-        name: &str,
-        arguments: &[Expression],
-    ) -> Result<(CallTarget, String), VerificationFailure> {
-        let qualified = qualify_lookup(self.resolution.module, name, self.resolution.signatures);
-        if let Some((parameters, return_type)) = self.resolution.signatures.get(&qualified) {
-            if parameters.len() != arguments.len() {
-                return creator("argument_count", self.site);
+                    type_,
+                )
             }
-            let mut substitutions = BTreeMap::new();
-            for (parameter, argument) in parameters.iter().zip(arguments) {
-                if generic_type_parameter(parameter) {
-                    if let Some(previous) =
-                        substitutions.insert(parameter, argument.type_name.as_str())
-                        && previous != argument.type_name
-                    {
-                        return creator("generic_argument_conflict", self.site);
-                    }
-                } else if !compatible(&argument.type_name, parameter) {
-                    return creator("argument_type_mismatch", self.site);
-                }
-            }
-            let return_type = substitutions
-                .get(&return_type)
-                .map_or_else(|| return_type.clone(), |concrete| (*concrete).to_owned());
-            return Ok((CallTarget::Function(qualified), return_type));
-        }
-        if let Some(constructor) = self.resolution.build_authority.resolve(name) {
-            return Ok((
-                CallTarget::Build(constructor),
-                constructor.kind().to_owned(),
-            ));
-        }
-        if self.resolution.allowed_tests.contains(name) {
-            return Ok((
-                CallTarget::TestApplication(name.to_owned()),
-                "TestApplication".into(),
-            ));
-        }
-        if let Some((type_name, variant)) = name.split_once('.')
-            && type_name
-                .as_bytes()
-                .first()
-                .is_some_and(u8::is_ascii_uppercase)
-        {
-            if !self.resolution.nominal_types.contains(type_name)
-                && !matches!(type_name, "Result" | "Option")
-            {
-                return creator("unresolved_nominal_type", self.site);
-            }
-            let resolved_type = match (type_name, variant, arguments.first()) {
-                ("Result", "Ok", Some(value)) => format!("Result[{}, _]", value.type_name),
-                ("Result", "Err", Some(error)) => format!("Result[_, {}]", error.type_name),
-                _ => type_name.to_owned(),
-            };
-            return Ok((
-                CallTarget::Variant {
-                    type_name: type_name.to_owned(),
-                    variant: variant.to_owned(),
-                },
-                resolved_type,
-            ));
-        }
-        creator("unresolved_call", self.site)
-    }
-
-    fn binary_operator(&self) -> Option<(BinaryOperator, u8)> {
-        let Token::Symbol(operator) = self.tokens.get(self.index)? else {
-            return None;
         };
-        Some(match *operator {
-            "==" => (BinaryOperator::Equal, 5),
-            "!=" => (BinaryOperator::NotEqual, 5),
-            "<" => (BinaryOperator::Less, 5),
-            "<=" => (BinaryOperator::LessEqual, 5),
-            ">" => (BinaryOperator::Greater, 5),
-            ">=" => (BinaryOperator::GreaterEqual, 5),
-            "+" => (BinaryOperator::Add, 10),
-            "-" => (BinaryOperator::Subtract, 10),
-            "*" => (BinaryOperator::Multiply, 11),
-            "/" => (BinaryOperator::Divide, 11),
-            "%" => (BinaryOperator::Remainder, 11),
-            _ => return None,
+        self.finish_expression(kind, type_, syntax.range.clone())
+    }
+
+    fn finish_expression(
+        &mut self,
+        kind: ExpressionKind,
+        type_: Type,
+        source: SourceRange,
+    ) -> Result<Expression, VerificationFailure> {
+        let type_id = self
+            .identity_catalog
+            .intern_type(&type_)
+            .map_err(|collision| VerificationFailure::Defect {
+                evidence: Arc::from(format!("type identity collision {:032x}", collision.digest)),
+            })?;
+        Ok(Expression {
+            kind,
+            type_id,
+            type_,
+            access: AccessMode::Copy,
+            source,
         })
     }
-}
 
-fn qualify_lookup<T>(module: &str, name: &str, map: &BTreeMap<String, T>) -> String {
-    if map.contains_key(name) {
-        name.to_owned()
-    } else {
-        let imported = format!("{module}|{name}");
-        if map.contains_key(&imported) {
-            imported
-        } else {
-            format!("{module}.{name}")
+    fn value(
+        &mut self,
+        name: &NameSyntax,
+        syntax: &ExpressionSyntax,
+    ) -> Result<Expression, VerificationFailure> {
+        if let [local] = name.segments.as_slice()
+            && let Some((id, type_)) = self.locals.get(local)
+        {
+            return self.finish_expression(
+                ExpressionKind::Read(Place { local: *id }),
+                type_.clone(),
+                syntax.range.clone(),
+            );
         }
+        let key = NameKey::new(self.module, Arc::from(name.segments.clone()));
+        if let Some(ResolvedName::Constant(id)) = self.names.get(&key) {
+            let constant = self
+                .constants
+                .get(id)
+                .ok_or_else(|| VerificationFailure::Defect {
+                    evidence: Arc::from("resolved constant absent from catalog"),
+                })?;
+            return self.finish_expression(
+                ExpressionKind::Constant(*id),
+                constant.type_.clone(),
+                syntax.range.clone(),
+            );
+        }
+        if resolve_builtin_variant(name).is_some() || name.segments.len() == 2 {
+            let (target, type_) = self.call(name, &[], &syntax.range)?;
+            return self.finish_expression(
+                ExpressionKind::Call {
+                    target,
+                    arguments: Arc::from([]),
+                },
+                type_,
+                syntax.range.clone(),
+            );
+        }
+        creator(CreatorFailureKind::UnresolvedName, &syntax.range)
+    }
+
+    fn call(
+        &mut self,
+        name: &NameSyntax,
+        arguments: &[Expression],
+        site: &SourceRange,
+    ) -> Result<(CallTarget, Type), VerificationFailure> {
+        let key = NameKey::new(self.module, Arc::from(name.segments.clone()));
+        if let Some(ResolvedName::Function(id)) = self.names.get(&key) {
+            let function = self
+                .functions
+                .get(id)
+                .ok_or_else(|| VerificationFailure::Defect {
+                    evidence: Arc::from("resolved function absent from catalog"),
+                })?;
+            if function.parameters.len() != arguments.len() {
+                return creator(CreatorFailureKind::ArgumentCount, site);
+            }
+            let mut substitutions = BTreeMap::new();
+            for (parameter, argument) in function.parameters.iter().zip(arguments) {
+                bind_type(&parameter.type_, &argument.type_, &mut substitutions, site)?;
+            }
+            let return_type = substitute(&function.return_type, &substitutions);
+            if !self.concrete_context {
+                return Ok((CallTarget::TemplateFunction(*id), return_type));
+            }
+            let type_arguments = function
+                .type_parameters
+                .iter()
+                .map(|parameter| {
+                    substitutions.get(parameter).cloned().ok_or_else(|| {
+                        VerificationFailure::Creator {
+                            kind: CreatorFailureKind::GenericArgumentConflict,
+                            site: site.clone(),
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let specialization_id = self
+                .identity_catalog
+                .specialization(*id, &type_arguments)
+                .map_err(|collision| VerificationFailure::Defect {
+                    evidence: Arc::from(format!(
+                        "specialization identity collision {:032x}",
+                        collision.digest
+                    )),
+                })?;
+            let specialization = SpecializationRecord {
+                id: specialization_id,
+                definition: *id,
+                type_arguments: type_arguments.into(),
+            };
+            self.specializations
+                .entry(specialization.id)
+                .or_insert_with(|| specialization.clone());
+            return Ok((
+                CallTarget::Function {
+                    definition: *id,
+                    specialization: specialization.id,
+                },
+                return_type,
+            ));
+        }
+        if let Some(kind) = resolve_build_kind(name)
+            && self.build_authority.permits(kind)
+        {
+            return Ok((
+                CallTarget::Build(kind),
+                Type::Builtin(match kind {
+                    BuildKind::Image => BuiltinType::Image,
+                    BuildKind::Test => BuiltinType::Test,
+                }),
+            ));
+        }
+        if let Some(ResolvedName::Test(id)) = self.names.get(&key) {
+            let test = self
+                .tests
+                .get(id)
+                .ok_or_else(|| VerificationFailure::Defect {
+                    evidence: Arc::from("resolved test absent from catalog"),
+                })?;
+            if test.parameters.len() != arguments.len() {
+                return creator(CreatorFailureKind::ArgumentCount, site);
+            }
+            for (parameter, argument) in test.parameters.iter().zip(arguments) {
+                if !argument.type_.compatible_with(&parameter.type_) {
+                    return creator(CreatorFailureKind::ArgumentTypeMismatch, site);
+                }
+            }
+            return Ok((
+                CallTarget::Test(*id),
+                Type::Builtin(BuiltinType::TestApplication),
+            ));
+        }
+        if let Some(variant) = resolve_builtin_variant(name) {
+            return Ok((
+                CallTarget::BuiltinVariant(variant),
+                builtin_variant_type(variant, arguments, site)?,
+            ));
+        }
+        if name.segments.len() == 2 {
+            let owner_key = NameKey::new(self.module, Arc::from([name.segments[0].clone()]));
+            let Some(ResolvedName::Nominal(owner)) = self.names.get(&owner_key) else {
+                return creator(CreatorFailureKind::UnresolvedNominalType, site);
+            };
+            let display = self.nominal_displays.get(owner).cloned().ok_or_else(|| {
+                VerificationFailure::Defect {
+                    evidence: Arc::from("nominal display absent from catalog"),
+                }
+            })?;
+            let Some(variant_id) = self.identity_catalog.variant(*owner, &name.segments[1]) else {
+                return creator(CreatorFailureKind::UnresolvedCall, site);
+            };
+            return Ok((
+                CallTarget::UserVariant {
+                    id: variant_id,
+                    type_display: display.clone(),
+                    variant_display: Arc::from(name.segments[1].as_str()),
+                },
+                Type::Nominal {
+                    definition: *owner,
+                    display,
+                },
+            ));
+        }
+        creator(CreatorFailureKind::UnresolvedCall, site)
     }
 }
 
-fn binary_type(operator: BinaryOperator, left: &str, right: &str) -> Option<String> {
-    if !compatible(left, right) {
+fn bind_type(
+    expected: &Type,
+    actual: &Type,
+    substitutions: &mut BTreeMap<crate::model::TypeParameterId, Type>,
+    site: &SourceRange,
+) -> Result<(), VerificationFailure> {
+    if let Type::Parameter { id, .. } = expected {
+        if let Some(previous) = substitutions.insert(*id, actual.clone())
+            && previous != *actual
+        {
+            return creator(CreatorFailureKind::GenericArgumentConflict, site);
+        }
+    } else if !actual.compatible_with(expected) {
+        return creator(CreatorFailureKind::ArgumentTypeMismatch, site);
+    }
+    Ok(())
+}
+
+fn substitute(type_: &Type, substitutions: &BTreeMap<crate::model::TypeParameterId, Type>) -> Type {
+    match type_ {
+        Type::Parameter { id, .. } => substitutions
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| type_.clone()),
+        Type::Array(element) => Type::Array(Arc::new(substitute(element, substitutions))),
+        Type::Tuple(members) => Type::Tuple(
+            members
+                .iter()
+                .map(|member| substitute(member, substitutions))
+                .collect(),
+        ),
+        Type::Result { success, error } => Type::Result {
+            success: Arc::new(substitute(success, substitutions)),
+            error: error
+                .as_ref()
+                .map(|error| Arc::new(substitute(error, substitutions))),
+        },
+        Type::Option(value) => Type::Option(Arc::new(substitute(value, substitutions))),
+        _ => type_.clone(),
+    }
+}
+
+fn builtin_variant_type(
+    variant: BuiltinVariant,
+    arguments: &[Expression],
+    site: &SourceRange,
+) -> Result<Type, VerificationFailure> {
+    Ok(match variant {
+        BuiltinVariant::ResultOk => Type::Result {
+            success: Arc::new(
+                arguments
+                    .first()
+                    .ok_or_else(|| creator_value(CreatorFailureKind::ArgumentCount, site))?
+                    .type_
+                    .clone(),
+            ),
+            error: Some(Arc::new(Type::Infer)),
+        },
+        BuiltinVariant::ResultErr => Type::Result {
+            success: Arc::new(Type::Infer),
+            error: Some(Arc::new(
+                arguments
+                    .first()
+                    .ok_or_else(|| creator_value(CreatorFailureKind::ArgumentCount, site))?
+                    .type_
+                    .clone(),
+            )),
+        },
+        BuiltinVariant::OptionSome => Type::Option(Arc::new(
+            arguments
+                .first()
+                .ok_or_else(|| creator_value(CreatorFailureKind::ArgumentCount, site))?
+                .type_
+                .clone(),
+        )),
+        BuiltinVariant::OptionNone => Type::Option(Arc::new(Type::Infer)),
+    })
+}
+
+fn binary_type(operator: BinaryOperator, left: &Type, right: &Type) -> Option<Type> {
+    if !left.compatible_with(right) {
         return None;
     }
     if matches!(
@@ -972,138 +1725,316 @@ fn binary_type(operator: BinaryOperator, left: &str, right: &str) -> Option<Stri
             | BinaryOperator::Greater
             | BinaryOperator::GreaterEqual
     ) {
-        return Some("bool".to_owned());
+        return Some(Type::Bool);
     }
-    numeric(left).then(|| left.to_owned())
+    left.is_numeric().then(|| left.clone())
 }
 
-fn compatible(actual: &str, expected: &str) -> bool {
-    actual == expected
-        || (numeric(actual) && numeric(expected))
-        || generic_type_parameter(actual)
-        || generic_type_parameter(expected)
-        || compatible_result(actual, expected)
-        || (actual == "()" && expected.is_empty())
+impl From<BinaryOperatorSyntax> for BinaryOperator {
+    fn from(value: BinaryOperatorSyntax) -> Self {
+        match value {
+            BinaryOperatorSyntax::Add => Self::Add,
+            BinaryOperatorSyntax::Subtract => Self::Subtract,
+            BinaryOperatorSyntax::Multiply => Self::Multiply,
+            BinaryOperatorSyntax::Divide => Self::Divide,
+            BinaryOperatorSyntax::Remainder => Self::Remainder,
+            BinaryOperatorSyntax::Equal => Self::Equal,
+            BinaryOperatorSyntax::NotEqual => Self::NotEqual,
+            BinaryOperatorSyntax::Less => Self::Less,
+            BinaryOperatorSyntax::LessEqual => Self::LessEqual,
+            BinaryOperatorSyntax::Greater => Self::Greater,
+            BinaryOperatorSyntax::GreaterEqual => Self::GreaterEqual,
+        }
+    }
 }
 
-fn compatible_result(actual: &str, expected: &str) -> bool {
-    let Some(expected) = expected
-        .strip_prefix("Result[")
-        .and_then(|value| value.strip_suffix(']'))
-    else {
-        return false;
-    };
-    let expected = expected.split(',').map(str::trim).collect::<Vec<_>>();
-    let Some(actual_result) = actual
-        .strip_prefix("Result[")
-        .and_then(|value| value.strip_suffix(']'))
-    else {
-        return expected
-            .first()
-            .is_some_and(|success| compatible(actual, success));
-    };
-    let actual = actual_result.split(',').map(str::trim).collect::<Vec<_>>();
-    let success_matches = actual.first().is_some_and(|actual| {
-        *actual == "_"
-            || expected
-                .first()
-                .is_some_and(|expected| compatible(actual, expected))
-    });
-    let error_matches = expected.len() == 1
-        || actual.get(1).is_some_and(|actual| {
-            *actual == "_"
-                || expected
-                    .get(1)
-                    .is_some_and(|expected| compatible(actual, expected))
-        });
-    success_matches && error_matches
-}
-
-fn numeric(type_name: &str) -> bool {
-    matches!(
-        type_name,
-        "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64" | "f16" | "f32" | "f64"
-    )
-}
-
-fn generic_type_parameter(type_name: &str) -> bool {
-    let mut characters = type_name.chars();
-    matches!(characters.next(), Some('A'..='Z'))
-        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
-        && !matches!(
-            type_name,
-            "Text" | "Bytes" | "Image" | "Result" | "Option" | "Test"
-        )
-}
-
-fn parse_integer_literal(source: &str) -> Result<(i128, Option<String>), ()> {
-    const SUFFIXES: [&str; 8] = ["u16", "u32", "u64", "i16", "i32", "i64", "u8", "i8"];
-    let suffix = SUFFIXES.into_iter().find(|suffix| source.ends_with(suffix));
-    let digits = suffix.map_or(source, |suffix| &source[..source.len() - suffix.len()]);
+fn parse_integer_literal(source: &str) -> Result<(i128, IntegerType), ()> {
+    let kinds = [
+        ("u8", IntegerType::U8),
+        ("u16", IntegerType::U16),
+        ("u32", IntegerType::U32),
+        ("u64", IntegerType::U64),
+        ("i8", IntegerType::I8),
+        ("i16", IntegerType::I16),
+        ("i32", IntegerType::I32),
+        ("i64", IntegerType::I64),
+    ];
+    let (digits, kind) = kinds
+        .iter()
+        .find_map(|(suffix, kind)| source.strip_suffix(suffix).map(|digits| (digits, *kind)))
+        .unwrap_or((source, IntegerType::I64));
     let digits = digits.replace('_', "");
-    let (radix, digits) = if let Some(digits) = digits.strip_prefix("0x") {
+    let (radix, digits) = if let Some(digits) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
         (16, digits)
-    } else if let Some(digits) = digits.strip_prefix("0b") {
+    } else if let Some(digits) = digits
+        .strip_prefix("0b")
+        .or_else(|| digits.strip_prefix("0B"))
+    {
         (2, digits)
-    } else if let Some(digits) = digits.strip_prefix("0o") {
+    } else if let Some(digits) = digits
+        .strip_prefix("0o")
+        .or_else(|| digits.strip_prefix("0O"))
+    {
         (8, digits)
     } else {
         (10, digits.as_str())
     };
+    let value = i128::from_str_radix(digits, radix).map_err(|_| ())?;
+    kind.fits(value).then_some((value, kind)).ok_or(())
+}
+
+fn parse_float_literal(source: &str) -> Result<(f64, FloatType), ()> {
+    let kinds = [
+        ("f16", FloatType::F16),
+        ("f32", FloatType::F32),
+        ("f64", FloatType::F64),
+    ];
+    let (digits, kind) = kinds
+        .iter()
+        .find_map(|(suffix, kind)| source.strip_suffix(suffix).map(|digits| (digits, *kind)))
+        .unwrap_or((source, FloatType::F64));
     Ok((
-        i128::from_str_radix(digits, radix).map_err(|_| ())?,
-        suffix.map(str::to_owned),
+        digits.replace('_', "").parse::<f64>().map_err(|_| ())?,
+        kind,
     ))
 }
 
-fn parse_float_literal(source: &str) -> Result<(f64, Option<String>), ()> {
-    let suffix = ["f16", "f32", "f64"]
-        .into_iter()
-        .find(|suffix| source.ends_with(suffix));
-    let number = suffix.map_or(source, |suffix| &source[..source.len() - suffix.len()]);
-    Ok((
-        number.replace('_', "").parse().map_err(|_| ())?,
-        suffix.map(str::to_owned),
-    ))
-}
-
-fn encode_float(type_name: &str, value: f64) -> u64 {
+fn encode_float(kind: FloatType, value: f64) -> u64 {
     if value.is_nan() {
-        return match type_name {
-            "f16" => 0x7e00,
-            "f32" => 0x7fc0_0000,
-            _ => 0x7ff8_0000_0000_0000,
+        return match kind {
+            FloatType::F16 => 0x7e00,
+            FloatType::F32 => 0x7fc0_0000,
+            FloatType::F64 => 0x7ff8_0000_0000_0000,
         };
     }
-    match type_name {
-        "f16" => u64::from(half::f16::from_f64(value).to_bits()),
-        "f32" => u64::from((value as f32).to_bits()),
-        _ => value.to_bits(),
+    match kind {
+        FloatType::F16 => u64::from(half::f16::from_f64(value).to_bits()),
+        FloatType::F32 => u64::from((value as f32).to_bits()),
+        FloatType::F64 => value.to_bits(),
     }
 }
 
-fn valid_name(name: &str) -> bool {
-    let mut bytes = name.bytes();
-    matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+fn creator<T>(kind: CreatorFailureKind, site: &SourceRange) -> Result<T, VerificationFailure> {
+    Err(creator_value(kind, site))
 }
-
-fn append_part(target: &mut Vec<u8>, part: &[u8]) {
-    target.extend_from_slice(&u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
-    target.extend_from_slice(part);
-}
-
-fn creator<T>(kind: &'static str, site: &SourceRange) -> Result<T, VerificationFailure> {
-    Err(VerificationFailure::Creator {
-        kind: Arc::from(kind),
+fn creator_value(kind: CreatorFailureKind, site: &SourceRange) -> VerificationFailure {
+    VerificationFailure::Creator {
+        kind,
         site: site.clone(),
-    })
+    }
 }
-
 fn defect<T>(evidence: &'static str) -> Result<T, VerificationFailure> {
     Err(VerificationFailure::Defect {
         evidence: Arc::from(evidence),
     })
+}
+
+fn append_part(bytes: &mut Vec<u8>, part: &[u8]) {
+    bytes.extend_from_slice(&u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
+    bytes.extend_from_slice(part);
+}
+
+fn append_function(bytes: &mut Vec<u8>, function: &HirFunction) {
+    bytes.push(function.modifier as u8);
+    bytes.extend_from_slice(
+        &u64::try_from(function.parameters.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for (local, type_, access) in &function.parameters {
+        bytes.extend_from_slice(&local.0.to_be_bytes());
+        append_part(bytes, &type_.canonical_key());
+        bytes.push(*access as u8);
+    }
+    append_part(bytes, &function.return_type.canonical_key());
+    append_statements(bytes, &function.body);
+}
+
+fn append_statements(bytes: &mut Vec<u8>, statements: &[Statement]) {
+    bytes.extend_from_slice(
+        &u64::try_from(statements.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for statement in statements {
+        match statement {
+            Statement::Return { value, source } => {
+                bytes.push(1);
+                append_range(bytes, source);
+                if let Some(value) = value {
+                    bytes.push(1);
+                    append_expression(bytes, value);
+                } else {
+                    bytes.push(0);
+                }
+            }
+            Statement::Panic { value, source } => {
+                bytes.push(2);
+                append_range(bytes, source);
+                append_expression(bytes, value);
+            }
+            Statement::Initialize {
+                place,
+                value,
+                source,
+            } => {
+                bytes.push(3);
+                bytes.extend_from_slice(&place.local.0.to_be_bytes());
+                append_range(bytes, source);
+                append_expression(bytes, value);
+            }
+            Statement::Evaluate(value) => {
+                bytes.push(4);
+                append_expression(bytes, value);
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+                source,
+            } => {
+                bytes.push(5);
+                append_range(bytes, source);
+                append_expression(bytes, condition);
+                append_statements(bytes, then_branch);
+                append_statements(bytes, else_branch);
+            }
+            Statement::Pass(source) => {
+                bytes.push(6);
+                append_range(bytes, source);
+            }
+        }
+    }
+}
+
+fn append_expression(bytes: &mut Vec<u8>, expression: &Expression) {
+    append_range(bytes, &expression.source);
+    bytes.extend_from_slice(&expression.type_id.0.to_be_bytes());
+    bytes.push(match expression.access {
+        AccessMode::Copy => 0,
+        AccessMode::Move => 1,
+    });
+    append_part(bytes, &expression.type_.canonical_key());
+    match &expression.kind {
+        ExpressionKind::Literal(literal) => {
+            bytes.push(0);
+            match literal {
+                Literal::Unit => bytes.push(0),
+                Literal::Bool(value) => {
+                    bytes.push(1);
+                    bytes.push(u8::from(*value));
+                }
+                Literal::Integer { kind, value } => {
+                    bytes.push(2);
+                    append_part(bytes, kind.name().as_bytes());
+                    bytes.extend_from_slice(&value.to_be_bytes());
+                }
+                Literal::Float { kind, bits } => {
+                    bytes.push(3);
+                    append_part(bytes, kind.name().as_bytes());
+                    bytes.extend_from_slice(&bits.to_be_bytes());
+                }
+                Literal::Text(value) => {
+                    bytes.push(4);
+                    append_part(bytes, value.as_bytes());
+                }
+            }
+        }
+        ExpressionKind::Read(place) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&place.local.0.to_be_bytes());
+        }
+        ExpressionKind::Constant(id) => {
+            bytes.push(2);
+            bytes.extend_from_slice(&id.0.to_be_bytes());
+        }
+        ExpressionKind::Call { target, arguments } => {
+            bytes.push(3);
+            match target {
+                CallTarget::TemplateFunction(definition) => {
+                    bytes.push(0);
+                    bytes.extend_from_slice(&definition.0.to_be_bytes());
+                }
+                CallTarget::Function {
+                    definition,
+                    specialization,
+                } => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&definition.0.to_be_bytes());
+                    bytes.extend_from_slice(&specialization.0.to_be_bytes());
+                }
+                CallTarget::Build(kind) => {
+                    bytes.push(2);
+                    append_part(bytes, kind.name().as_bytes());
+                }
+                CallTarget::BuiltinVariant(variant) => {
+                    bytes.push(3);
+                    bytes.push(*variant as u8);
+                }
+                CallTarget::UserVariant { id, .. } => {
+                    bytes.push(4);
+                    bytes.extend_from_slice(&id.owner.0.to_be_bytes());
+                    bytes.extend_from_slice(&id.variant.to_be_bytes());
+                }
+                CallTarget::Test(id) => {
+                    bytes.push(5);
+                    bytes.extend_from_slice(&id.suite.0.to_be_bytes());
+                    bytes.extend_from_slice(&id.test.0.to_be_bytes());
+                    bytes.extend_from_slice(&id.identity.to_be_bytes());
+                }
+            }
+            bytes.extend_from_slice(
+                &u64::try_from(arguments.len())
+                    .unwrap_or(u64::MAX)
+                    .to_be_bytes(),
+            );
+            for argument in &**arguments {
+                append_expression(bytes, argument);
+            }
+        }
+        ExpressionKind::Array(values) => {
+            bytes.push(4);
+            bytes.extend_from_slice(
+                &u64::try_from(values.len())
+                    .unwrap_or(u64::MAX)
+                    .to_be_bytes(),
+            );
+            for value in &**values {
+                append_expression(bytes, value);
+            }
+        }
+        ExpressionKind::Negate(value) => {
+            bytes.push(5);
+            append_expression(bytes, value);
+        }
+        ExpressionKind::Await(value) => {
+            bytes.push(6);
+            append_expression(bytes, value);
+        }
+        ExpressionKind::Propagate(value) => {
+            bytes.push(7);
+            append_expression(bytes, value);
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            bytes.push(8);
+            bytes.push(*operator as u8);
+            append_expression(bytes, left);
+            append_expression(bytes, right);
+        }
+    }
+}
+
+fn append_range(bytes: &mut Vec<u8>, range: &SourceRange) {
+    append_part(bytes, range.path().as_bytes());
+    bytes.extend_from_slice(&range.start().to_be_bytes());
+    bytes.extend_from_slice(&range.end().to_be_bytes());
 }
 
 #[cfg(test)]
@@ -1112,78 +2043,95 @@ mod tests {
 
     #[test]
     fn malformed_compiler_artifact_is_contained_as_a_verification_defect() {
-        let malformed = Function {
-            name: String::new(),
-            module: "image".to_owned(),
-            public: false,
-            parameters: Vec::new(),
-            return_type: "i64".to_owned(),
-            body: vec![(0, "return 1".to_owned())],
-            source: SourceRange::new("src/image.wr", 0, 1),
-        };
-        let failure = verify(
-            BTreeMap::from([(String::new(), malformed)]),
-            BTreeMap::new(),
-            &BTreeSet::new(),
-            &BuildAuthority::compiler_distribution(),
-            &BTreeSet::new(),
-            &Cancellation::new(),
-        )
-        .expect_err("malformed artifact must not receive verified marker");
-        assert_eq!(
-            failure,
-            VerificationFailure::Defect {
-                evidence: Arc::from("empty resolved function name")
-            }
+        let mut identities = crate::identity::IdentityCatalog::empty();
+        let id = DefinitionId(1);
+        let mut input = ProgramInput::default();
+        input.functions.insert(
+            DefinitionId(2),
+            ResolvedFunction {
+                id,
+                module: ModuleId(1),
+                module_display: "image".to_owned(),
+                name: "broken".to_owned(),
+                modifier: crate::syntax::FunctionModifier::Ordinary,
+                type_parameters: Arc::from([]),
+                parameters: Vec::new(),
+                return_type: Type::Unit,
+                body: Vec::new(),
+                source: SourceRange::from_u64("src/image.wr", 1, 2),
+            },
         );
-    }
-
-    #[test]
-    fn unused_unresolved_calls_are_creator_errors() {
-        let function = Function {
-            name: "unused".to_owned(),
-            module: "image".to_owned(),
-            public: false,
-            parameters: Vec::new(),
-            return_type: "i64".to_owned(),
-            body: vec![(1, "    return missing()".to_owned())],
-            source: SourceRange::new("src/image.wr", 0, 1),
-        };
         assert!(matches!(
             verify(
-                BTreeMap::from([("image.unused".to_owned(), function)]),
-                BTreeMap::new(),
-                &BTreeSet::new(),
+                input,
                 &BuildAuthority::compiler_distribution(),
-                &BTreeSet::new(),
+                &mut identities,
                 &Cancellation::new()
             ),
-            Err(VerificationFailure::Creator { kind, .. }) if kind.as_ref() == "unresolved_call"
+            Err(VerificationFailure::Defect { .. })
         ));
     }
 
     #[test]
-    fn invented_nominal_variants_cannot_enter_verified_hir() {
-        let function = Function {
-            name: "unused".to_owned(),
-            module: "image".to_owned(),
-            public: false,
-            parameters: Vec::new(),
-            return_type: "Missing".to_owned(),
-            body: vec![(1, "    return Missing.Invented".to_owned())],
-            source: SourceRange::new("src/image.wr", 0, 1),
+    fn post_lowering_verifier_recomputes_operation_types() {
+        let range = SourceRange::from_u64("src/image.wr", 0, 1);
+        let mut identities = crate::identity::IdentityCatalog::empty();
+        let bool_id = identities.intern_type(&Type::Bool).expect("type interns");
+        let boolean = || Expression {
+            kind: ExpressionKind::Literal(Literal::Bool(true)),
+            type_id: bool_id,
+            type_: Type::Bool,
+            access: AccessMode::Copy,
+            source: range.clone(),
+        };
+        let malformed = Expression {
+            kind: ExpressionKind::Binary {
+                operator: BinaryOperator::Add,
+                left: Box::new(boolean()),
+                right: Box::new(boolean()),
+            },
+            type_id: bool_id,
+            type_: Type::Bool,
+            access: AccessMode::Copy,
+            source: range,
+        };
+        let templates = BTreeMap::new();
+        let specialized = BTreeMap::new();
+        let constants = BTreeMap::new();
+        let specializations = BTreeMap::new();
+        let catalog = ArtifactCatalog {
+            templates: &templates,
+            specialized: &specialized,
+            constants: &constants,
+            specializations: &specializations,
+            identities: &identities,
         };
         assert!(matches!(
-            verify(
-                BTreeMap::from([("image.unused".to_owned(), function)]),
-                BTreeMap::new(),
-                &BTreeSet::new(),
-                &BuildAuthority::compiler_distribution(),
-                &BTreeSet::new(),
-                &Cancellation::new()
+            verify_expression_artifact(
+                &malformed,
+                &BTreeMap::new(),
+                &mut BTreeSet::new(),
+                &catalog,
+                &SourceRange::from_u64("src/image.wr", 0, 1),
             ),
-            Err(VerificationFailure::Creator { kind, .. })
-                if kind.as_ref() == "unresolved_nominal_type"
+            Err(VerificationFailure::Defect { .. })
+        ));
+
+        let owner = SourceRange::from_u64("src/image.wr", 0, 1);
+        let mut previous = owner.start();
+        assert!(matches!(
+            verify_statements(
+                &[Statement::Pass(
+                    SourceRange::from_u64("src/image.wr", 2, 3,)
+                )],
+                &Type::Unit,
+                &mut BTreeMap::new(),
+                &mut BTreeSet::new(),
+                &catalog,
+                &owner,
+                &mut previous,
+            ),
+            Err(VerificationFailure::Defect { .. })
         ));
     }
 }

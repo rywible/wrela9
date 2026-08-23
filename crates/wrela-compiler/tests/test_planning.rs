@@ -66,6 +66,35 @@ fn build() -> Image:
 }
 
 #[test]
+fn test_plan_preserves_application_order_in_the_image_constructor() {
+    let source = br#"pub suite arithmetic:
+    test adds():
+        expect true
+
+    test subtracts():
+        expect true
+
+@image
+fn build() -> Image:
+    tests = Test.new(cases=[arithmetic.subtracts(), arithmetic.adds()])
+    return Image.new(tests=tests)
+"#;
+    let outcome = compile(vec![ProjectFile::new("src/test.wr", source)], Root::Test);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("reordered complete Test Image must compile: {outcome:#?}");
+    };
+    assert_eq!(
+        accepted
+            .inspection()
+            .test_plan()
+            .iter()
+            .map(|application| (application.test(), application.order()))
+            .collect::<Vec<_>>(),
+        [("subtracts", 0), ("adds", 1)]
+    );
+}
+
+#[test]
 fn missing_and_duplicate_test_applications_are_rejected() {
     let source = br#"pub suite arithmetic:
     test adds():
@@ -91,6 +120,30 @@ fn build() -> Image:
             .map(|diagnostic| diagnostic.code())
             .collect::<Vec<_>>(),
         ["test.duplicate_application", "test.missing_application",]
+    );
+}
+
+#[test]
+fn unrelated_test_calls_do_not_satisfy_the_test_facility_cases_list() {
+    let source = br#"pub suite arithmetic:
+    test adds():
+        expect 2 + 2 == 4
+
+@image
+fn build() -> Image:
+    ignored = arithmetic.adds()
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) =
+        compile(vec![ProjectFile::new("src/test.wr", source)], Root::Test)
+    else {
+        panic!("a Test Application belongs inside Test.new cases");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "test.missing_application")
     );
 }
 
@@ -181,6 +234,31 @@ fn build() -> Image:
             .iter()
             .any(|diagnostic| diagnostic.code() == "test.parameter_requires_take")
     );
+}
+
+#[test]
+fn test_plan_exposes_typed_exclusive_bindings() {
+    let source = br#"pub suite values:
+    test consumes(take value: i64):
+        expect true
+
+@image
+fn build() -> Image:
+    tests = Test.new(cases=[values.consumes(1)])
+    return Image.new(tests=tests)
+"#;
+    let CompilationOutcome::Accepted(accepted) =
+        compile(vec![ProjectFile::new("src/test.wr", source)], Root::Test)
+    else {
+        panic!("typed Test binding must compile");
+    };
+    let binding = &accepted.inspection().test_plan()[0].bindings()[0];
+    assert_eq!(binding.name(), "value");
+    assert_eq!(binding.type_name(), "i64");
+    assert_eq!(binding.ownership(), wrela_compiler::OwnershipMode::Take);
+    assert!(accepted.inspection().ownership().iter().any(|ownership| {
+        ownership.name() == "value" && ownership.mode() == wrela_compiler::OwnershipMode::Take
+    }));
 }
 
 #[test]

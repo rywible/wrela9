@@ -1,6 +1,7 @@
 use wrela_compiler::{
     Cancellation, CanonicalValue, CompilationOutcome, CompilationRequest, Compiler,
-    CompilerInstallation, EvaluationOutcome, InspectSelection, ProjectFile, ProjectSnapshot, Root,
+    CompilerInstallation, DiagnosticValue, EvaluationOutcome, IdentityDomain, InspectSelection,
+    ProjectFile, ProjectSnapshot, Root,
 };
 
 fn compile(source: &[u8]) -> CompilationOutcome {
@@ -54,6 +55,11 @@ fn build() -> Image:
     assert!(add.is_pure());
     assert!(add.evaluator_eligible());
     assert!(!add.may_panic());
+    assert!(accepted.inspection().identities().iter().any(|identity| {
+        identity.domain() == IdentityDomain::Definition
+            && identity.name() == "add"
+            && identity.digest() == add.identity()
+    }));
 }
 
 #[test]
@@ -72,6 +78,36 @@ fn build() -> Image:
             .diagnostics()
             .iter()
             .any(|diagnostic| diagnostic.code() == "evaluation.assertion_failed")
+    );
+}
+
+#[test]
+fn comptime_generic_demand_materializes_one_shared_specialization() {
+    let source = br#"pure fn identity[T](value: T) -> T:
+    return value
+
+comptime assert identity(42) == 42
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("comptime generic demand must materialize before evaluation");
+    };
+    assert!(
+        accepted
+            .inspection()
+            .specializations()
+            .iter()
+            .any(|specialization| {
+                specialization.function() == "identity"
+                    && specialization
+                        .argument_types()
+                        .iter()
+                        .map(AsRef::as_ref)
+                        .eq(["i64"])
+            })
     );
 }
 
@@ -110,8 +146,9 @@ fn read() -> Result[i64]:
 fn build() -> Image:
     return Image.new()
 "#;
-    let CompilationOutcome::Accepted(accepted) = compile(source) else {
-        panic!("one nominal error must infer");
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("one nominal error must infer: {outcome:#?}");
     };
     let inferred = accepted
         .inspection()
@@ -120,6 +157,33 @@ fn build() -> Image:
         .find(|error| error.function() == "read")
         .expect("inferred error");
     assert_eq!(inferred.error_type(), "ReadError");
+}
+
+#[test]
+fn creator_variants_must_be_declared_by_their_enum() {
+    let source = br#"enum ReadError:
+    Missing
+
+fn broken() -> ReadError:
+    return ReadError.NotDeclared
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("an undeclared creator variant must reject");
+    };
+    assert!(
+        rejected.diagnostics().iter().any(|diagnostic| {
+            diagnostic.code() == "semantic.invalid_typed_hir"
+                && diagnostic.parameters().iter().any(|(name, value)| {
+                    name.as_ref() == "kind" && value.as_ref() == "unresolved_call"
+                })
+        }),
+        "{:#?}",
+        rejected.diagnostics()
+    );
 }
 
 #[test]
@@ -213,6 +277,43 @@ fn build() -> Image:
 }
 
 #[test]
+fn typed_hir_fingerprint_includes_literal_payloads_and_operations() {
+    fn fingerprint(value: i32, operator: &str) -> u128 {
+        let source = format!(
+            "const ANSWER: i64 = {value} {operator} 1\n\n@image\nfn build() -> Image:\n    return Image.new()\n"
+        );
+        let CompilationOutcome::Accepted(accepted) = compile(source.as_bytes()) else {
+            panic!("fingerprint fixture must compile");
+        };
+        accepted
+            .inspection()
+            .evaluations()
+            .iter()
+            .find(|evaluation| evaluation.root() == "image.ANSWER")
+            .expect("constant evaluation")
+            .receipt()
+            .typed_hir_fingerprint()
+    }
+
+    assert_ne!(fingerprint(1, "+"), fingerprint(2, "+"));
+    assert_ne!(fingerprint(1, "+"), fingerprint(1, "*"));
+
+    fn signature_fingerprint(parameter: &str) -> u128 {
+        let source = format!(
+            "pure fn unused(value: {parameter}) -> {parameter}:\n    return value\n\n@image\nfn build() -> Image:\n    return Image.new()\n"
+        );
+        let CompilationOutcome::Accepted(accepted) = compile(source.as_bytes()) else {
+            panic!("signature fingerprint fixture must compile");
+        };
+        accepted.inspection().evaluations()[0]
+            .receipt()
+            .typed_hir_fingerprint()
+    }
+
+    assert_ne!(signature_fingerprint("i32"), signature_fingerprint("i64"));
+}
+
+#[test]
 fn recursive_facts_propagate_panic_and_evaluator_ineligibility() {
     let source = br#"fn dangerous() -> i64:
     panic "boom"
@@ -250,12 +351,23 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = compile(source) else {
         panic!("duplicate declarations must reject");
     };
-    assert!(
-        rejected
-            .diagnostics()
-            .iter()
-            .any(|diagnostic| diagnostic.code() == "semantic.duplicate_declaration")
-    );
+    let diagnostic = rejected
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.code() == "semantic.duplicate_declaration")
+        .expect("structured duplicate diagnostic");
+    assert_eq!(diagnostic.labels().len(), 1);
+    assert_eq!(diagnostic.labels()[0].role(), "previous_declaration");
+    assert!(diagnostic.typed_parameters().iter().any(|(name, value)| {
+        name.as_ref() == "definition"
+            && matches!(
+                value,
+                DiagnosticValue::Identity {
+                    domain: IdentityDomain::Definition,
+                    ..
+                }
+            )
+    }));
 }
 
 #[test]
@@ -420,6 +532,44 @@ fn build() -> Image:
             value: 42,
         })
     );
+    let identity = accepted
+        .inspection()
+        .specializations()
+        .iter()
+        .find(|specialization| specialization.function() == "identity")
+        .expect("concrete identity body");
+    assert_eq!(
+        identity
+            .argument_types()
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>(),
+        ["i64"]
+    );
+    assert!(accepted.inspection().identities().iter().any(|identity| {
+        identity.domain() == wrela_compiler::IdentityDomain::Specialization
+            && identity.digest()
+                == accepted
+                    .inspection()
+                    .specializations()
+                    .iter()
+                    .find(|specialization| specialization.function() == "identity")
+                    .expect("identity specialization")
+                    .identity()
+    }));
+    assert!(accepted.inspection().types().iter().any(|type_| {
+        type_.name() == "value"
+            && type_.role() == wrela_compiler::TypeRole::Parameter
+            && type_.type_name() == "T"
+    }));
+    let facts = accepted
+        .inspection()
+        .function_facts()
+        .iter()
+        .find(|facts| facts.name() == "identity")
+        .expect("identity facts");
+    assert!(facts.is_bounded());
+    assert!(facts.logical_cost() > 0);
 }
 
 #[test]

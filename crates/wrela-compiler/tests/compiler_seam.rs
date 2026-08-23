@@ -1,6 +1,7 @@
 use wrela_compiler::{
-    Cancellation, CompilationOutcome, CompilationRequest, Compiler, CompilerInstallation,
-    IdentityDomain, InspectSelection, ProjectFile, ProjectSnapshot, Root,
+    Cancellation, CanonicalValue, CompilationOutcome, CompilationRequest, Compiler,
+    CompilerInstallation, EvaluationOutcome, IdentityDomain, InspectSelection, ProjectFile,
+    ProjectSnapshot, Root,
 };
 
 #[test]
@@ -27,7 +28,76 @@ fn valid_image_is_accepted_without_losing_source_bytes() {
             .iter()
             .any(|node| node.kind() == "function" && node.depth() == 1)
     );
+    assert!(
+        syntax[0]
+            .nodes()
+            .iter()
+            .any(|node| node.kind() == "return_statement" && node.depth() >= 3)
+    );
+    assert!(
+        syntax[0]
+            .nodes()
+            .iter()
+            .any(|node| node.kind() == "call_expression" && node.depth() >= 4)
+    );
     assert!(accepted.diagnostics().is_empty());
+}
+
+#[test]
+fn syntax_exposes_closed_exact_token_kinds_instead_of_broad_categories() {
+    let compiler = Compiler::open(CompilerInstallation::empty()).expect("distribution opens");
+    let source = b"@image\nfn build() -> Image:\n    return Image.new()\n";
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_inspection(InspectSelection::syntax()),
+        &Cancellation::new(),
+    );
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("closed-token example must accept");
+    };
+    let names: Vec<_> = accepted.inspection().syntax().expect("syntax")[0]
+        .elements()
+        .iter()
+        .map(|element| element.name())
+        .collect();
+    assert!(names.contains(&"fn"));
+    assert!(names.contains(&"identifier"));
+    assert!(names.contains(&"left_paren"));
+    assert!(names.contains(&"arrow"));
+    assert!(names.contains(&"return"));
+    assert!(
+        !names
+            .iter()
+            .any(|name| matches!(*name, "word" | "number" | "symbol" | "punctuation"))
+    );
+}
+
+#[test]
+fn exponent_float_is_one_exact_literal_token() {
+    let compiler = Compiler::open(CompilerInstallation::empty()).expect("distribution opens");
+    let source =
+        b"const SCALE: f64 = 1e+2f64\n\n@image\nfn build() -> Image:\n    return Image.new()\n";
+    let CompilationOutcome::Accepted(accepted) = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_inspection(InspectSelection::syntax()),
+        &Cancellation::new(),
+    ) else {
+        panic!("exponent literal must compile");
+    };
+    assert_eq!(
+        accepted.inspection().syntax().expect("syntax")[0]
+            .elements()
+            .iter()
+            .filter(|element| element.name() == "float_literal")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -89,6 +159,134 @@ fn arbitrary_invalid_bytes_are_rejected_but_exactly_partitioned() {
             "syntax.tab_outside_literal",
         ]
     );
+}
+
+#[test]
+fn every_individual_byte_is_losslessly_contained() {
+    let compiler = Compiler::open(CompilerInstallation::empty()).expect("distribution opens");
+    for value in 0_u8..=u8::MAX {
+        let source = [value];
+        let outcome = compiler.compile(
+            CompilationRequest::new(
+                ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+                Root::Image,
+            )
+            .with_inspection(InspectSelection::syntax()),
+            &Cancellation::new(),
+        );
+        let syntax = match &outcome {
+            CompilationOutcome::Accepted(accepted) => accepted.inspection().syntax(),
+            CompilationOutcome::Rejected(rejected) => rejected.inspection().syntax(),
+            other => panic!("byte {value:#04x} escaped creator containment: {other:#?}"),
+        }
+        .expect("syntax requested");
+        assert_eq!(syntax[0].source_bytes(), source, "byte {value:#04x}");
+        assert_eq!(
+            syntax[0]
+                .elements()
+                .iter()
+                .map(|element| element.range().end() - element.range().start())
+                .sum::<u64>(),
+            1,
+            "byte {value:#04x} must have one physical owner"
+        );
+    }
+}
+
+#[test]
+fn compact_deterministic_mutations_never_escape_creator_containment() {
+    let compiler = Compiler::open(CompilerInstallation::empty()).expect("distribution opens");
+    let seed = b"@image\nfn build() -> Image:\n    return Image.new()\n";
+    let selected = (0..seed.len()).step_by(3).collect::<Vec<_>>();
+    let mut mutations = Vec::new();
+    for position in selected {
+        let mut deleted = seed.to_vec();
+        deleted.remove(position);
+        mutations.push(deleted);
+
+        let mut replaced = seed.to_vec();
+        replaced[position] ^= 0x80;
+        mutations.push(replaced);
+
+        let mut inserted = seed.to_vec();
+        inserted.insert(position, b']');
+        mutations.push(inserted);
+    }
+    for source in mutations {
+        let outcome = compiler.compile(
+            CompilationRequest::new(
+                ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", &source)]),
+                Root::Image,
+            )
+            .with_inspection(InspectSelection::syntax()),
+            &Cancellation::new(),
+        );
+        let syntax = match &outcome {
+            CompilationOutcome::Accepted(accepted) => accepted.inspection().syntax(),
+            CompilationOutcome::Rejected(rejected) => rejected.inspection().syntax(),
+            other => panic!("bounded source mutation escaped containment: {other:#?}"),
+        }
+        .expect("syntax requested");
+        assert_eq!(syntax[0].source_bytes(), source);
+    }
+}
+
+#[test]
+fn generated_eligible_pure_programs_have_exact_wrela_outcomes() {
+    let compiler = Compiler::open(CompilerInstallation::empty()).expect("distribution opens");
+    for left in -8_i64..8 {
+        let right = left * 3 + 1;
+        let expected = left + right;
+        let source = format!(
+            "const VALUE: i64 = {left} + {right}\n\n@image\nfn build() -> Image:\n    return Image.new(value=VALUE)\n"
+        );
+        let CompilationOutcome::Accepted(accepted) = compiler.compile(
+            CompilationRequest::new(
+                ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source.as_bytes())]),
+                Root::Image,
+            )
+            .with_inspection(InspectSelection::all()),
+            &Cancellation::new(),
+        ) else {
+            panic!("generated pure program must compile");
+        };
+        let value = accepted
+            .inspection()
+            .evaluations()
+            .iter()
+            .find(|evaluation| evaluation.root() == "image.VALUE")
+            .expect("generated constant is evaluated");
+        assert_eq!(
+            value.outcome(),
+            &EvaluationOutcome::Completed(CanonicalValue::Integer {
+                type_name: "i64".into(),
+                value: i128::from(expected),
+            })
+        );
+    }
+}
+
+#[test]
+fn one_compiler_and_reopened_compiler_produce_identical_outcomes() {
+    fn request() -> CompilationRequest {
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new(
+                "src/image.wr",
+                b"const VALUE: i64 = 6 * 7\n\n@image\nfn build() -> Image:\n    return Image.new(value=VALUE)\n",
+            )]),
+            Root::Image,
+        )
+        .with_inspection(InspectSelection::all())
+    }
+
+    let compiler = Compiler::open(CompilerInstallation::empty()).expect("distribution opens");
+    let first = compiler.compile(request(), &Cancellation::new());
+    let repeated = compiler.compile(request(), &Cancellation::new());
+    let reopened = Compiler::open(CompilerInstallation::empty())
+        .expect("distribution reopens")
+        .compile(request(), &Cancellation::new());
+    assert_eq!(first, repeated);
+    assert_eq!(first, reopened);
 }
 
 #[test]
@@ -321,6 +519,38 @@ fn identities_do_not_depend_on_snapshot_enumeration_order() {
         compile(vec![root.clone(), cards.clone()]),
         compile(vec![cards, root])
     );
+}
+
+#[test]
+fn nominal_type_identity_is_domain_separated_from_definition_identity() {
+    let compiler = Compiler::open(CompilerInstallation::empty()).expect("distribution opens");
+    let source =
+        b"struct Card:\n    value: i64\n\n@image\nfn build() -> Image:\n    return Image.new()\n";
+    let CompilationOutcome::Accepted(accepted) = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    ) else {
+        panic!("nominal identity fixture must compile");
+    };
+    let definition = accepted
+        .inspection()
+        .identities()
+        .iter()
+        .find(|identity| {
+            identity.domain() == IdentityDomain::Definition && identity.name() == "Card"
+        })
+        .expect("Card DefinitionId");
+    let type_ = accepted
+        .inspection()
+        .identities()
+        .iter()
+        .find(|identity| identity.domain() == IdentityDomain::Type && identity.name() == "Card")
+        .expect("Card TypeId");
+    assert_ne!(definition.digest(), type_.digest());
 }
 
 #[test]

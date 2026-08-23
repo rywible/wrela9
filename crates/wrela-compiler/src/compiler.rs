@@ -6,7 +6,12 @@ use std::sync::{
 };
 
 use crate::syntax;
-use crate::{identity, identity::IdentityCollision, semantic, typed_hir::BuildAuthority};
+use crate::{
+    identity,
+    identity::{IdentityCollision, IdentityFailure},
+    semantic,
+    typed_hir::BuildAuthority,
+};
 
 #[derive(Clone, Debug)]
 pub struct CompilerInstallation {
@@ -228,7 +233,14 @@ impl SourceRange {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiagnosticLabel {
     range: SourceRange,
-    role: Arc<str>,
+    role: DiagnosticLabelRole,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagnosticLabelRole {
+    PreviousDeclaration,
+    PropagationSource,
+    Related,
 }
 
 impl DiagnosticLabel {
@@ -239,8 +251,23 @@ impl DiagnosticLabel {
 
     #[must_use]
     pub fn role(&self) -> &str {
-        &self.role
+        match self.role {
+            DiagnosticLabelRole::PreviousDeclaration => "previous_declaration",
+            DiagnosticLabelRole::PropagationSource => "propagation_source",
+            DiagnosticLabelRole::Related => "related",
+        }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiagnosticValue {
+    Text(Arc<str>),
+    Unsigned(u128),
+    Signed(i128),
+    Identity {
+        domain: IdentityDomain,
+        digest: u128,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -258,6 +285,7 @@ pub struct Diagnostic {
     primary: SourceRange,
     labels: Arc<[DiagnosticLabel]>,
     parameters: Arc<[(Arc<str>, Arc<str>)]>,
+    typed_parameters: Arc<[(Arc<str>, DiagnosticValue)]>,
     recovery: RecoveryAction,
 }
 
@@ -268,12 +296,54 @@ impl Diagnostic {
             primary,
             labels: Arc::from([]),
             parameters: Arc::from([]),
+            typed_parameters: Arc::from([]),
             recovery,
         }
     }
 
     pub(crate) fn with_parameter(mut self, name: &'static str, value: impl Into<Arc<str>>) -> Self {
-        self.parameters = Arc::from([(Arc::from(name), value.into())]);
+        let value = value.into();
+        let mut parameters = self.parameters.to_vec();
+        parameters.push((Arc::from(name), value.clone()));
+        self.parameters = parameters.into();
+        let mut typed = self.typed_parameters.to_vec();
+        typed.push((Arc::from(name), DiagnosticValue::Text(value)));
+        self.typed_parameters = typed.into();
+        self
+    }
+
+    pub(crate) fn with_unsigned_parameter(mut self, name: &'static str, value: u128) -> Self {
+        let mut parameters = self.parameters.to_vec();
+        parameters.push((Arc::from(name), Arc::from(value.to_string())));
+        self.parameters = parameters.into();
+        let mut typed = self.typed_parameters.to_vec();
+        typed.push((Arc::from(name), DiagnosticValue::Unsigned(value)));
+        self.typed_parameters = typed.into();
+        self
+    }
+
+    pub(crate) fn with_identity_parameter(
+        mut self,
+        name: &'static str,
+        domain: IdentityDomain,
+        digest: u128,
+    ) -> Self {
+        let mut parameters = self.parameters.to_vec();
+        parameters.push((Arc::from(name), Arc::from(format!("{digest:032x}"))));
+        self.parameters = parameters.into();
+        let mut typed = self.typed_parameters.to_vec();
+        typed.push((
+            Arc::from(name),
+            DiagnosticValue::Identity { domain, digest },
+        ));
+        self.typed_parameters = typed.into();
+        self
+    }
+
+    pub(crate) fn with_label(mut self, range: SourceRange, role: DiagnosticLabelRole) -> Self {
+        let mut labels = self.labels.to_vec();
+        labels.push(DiagnosticLabel { range, role });
+        self.labels = labels.into();
         self
     }
 
@@ -295,6 +365,11 @@ impl Diagnostic {
     #[must_use]
     pub fn parameters(&self) -> &[(Arc<str>, Arc<str>)] {
         &self.parameters
+    }
+
+    #[must_use]
+    pub fn typed_parameters(&self) -> &[(Arc<str>, DiagnosticValue)] {
+        &self.typed_parameters
     }
 
     #[must_use]
@@ -432,6 +507,9 @@ pub struct Inspection {
     closure: Arc<[Arc<str>]>,
     identities: Arc<[IdentityObservation]>,
     function_facts: Arc<[FunctionFactsObservation]>,
+    types: Arc<[TypeObservation]>,
+    ownership: Arc<[OwnershipObservation]>,
+    specializations: Arc<[SpecializationObservation]>,
     inferred_errors: Arc<[InferredErrorObservation]>,
     evaluations: Arc<[EvaluationObservation]>,
     constructions: Arc<[ConstructionObservation]>,
@@ -460,6 +538,21 @@ impl Inspection {
     }
 
     #[must_use]
+    pub fn types(&self) -> &[TypeObservation] {
+        &self.types
+    }
+
+    #[must_use]
+    pub fn ownership(&self) -> &[OwnershipObservation] {
+        &self.ownership
+    }
+
+    #[must_use]
+    pub fn specializations(&self) -> &[SpecializationObservation] {
+        &self.specializations
+    }
+
+    #[must_use]
     pub fn inferred_errors(&self) -> &[InferredErrorObservation] {
         &self.inferred_errors
     }
@@ -485,14 +578,24 @@ pub struct TestApplicationObservation {
     suite: Arc<str>,
     test: Arc<str>,
     order: u32,
+    asynchronous: bool,
+    bindings: Arc<[TestBindingObservation]>,
 }
 
 impl TestApplicationObservation {
-    pub(crate) fn new(suite: impl Into<Arc<str>>, test: impl Into<Arc<str>>, order: u32) -> Self {
+    pub(crate) fn new(
+        suite: impl Into<Arc<str>>,
+        test: impl Into<Arc<str>>,
+        order: u32,
+        asynchronous: bool,
+        bindings: Vec<TestBindingObservation>,
+    ) -> Self {
         Self {
             suite: suite.into(),
             test: test.into(),
             order,
+            asynchronous,
+            bindings: bindings.into(),
         }
     }
 
@@ -509,6 +612,49 @@ impl TestApplicationObservation {
     #[must_use]
     pub const fn order(&self) -> u32 {
         self.order
+    }
+
+    #[must_use]
+    pub const fn is_async(&self) -> bool {
+        self.asynchronous
+    }
+
+    #[must_use]
+    pub fn bindings(&self) -> &[TestBindingObservation] {
+        &self.bindings
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestBindingObservation {
+    name: Arc<str>,
+    type_name: Arc<str>,
+    ownership: OwnershipMode,
+}
+
+impl TestBindingObservation {
+    pub(crate) fn new(
+        name: impl Into<Arc<str>>,
+        type_name: impl Into<Arc<str>>,
+        ownership: OwnershipMode,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            type_name: type_name.into(),
+            ownership,
+        }
+    }
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    #[must_use]
+    pub fn type_name(&self) -> &str {
+        &self.type_name
+    }
+    #[must_use]
+    pub const fn ownership(&self) -> OwnershipMode {
+        self.ownership
     }
 }
 
@@ -636,28 +782,39 @@ impl EvaluationObservation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionFactsObservation {
+    identity: u128,
     name: Arc<str>,
     pure: bool,
     may_panic: bool,
     suspends: bool,
     evaluator_eligible: bool,
+    ownership_transfer: bool,
+    bounded: bool,
+    logical_cost: u64,
 }
 
 impl FunctionFactsObservation {
     pub(crate) fn new(
+        identity: u128,
         name: impl Into<Arc<str>>,
-        pure: bool,
-        may_panic: bool,
-        suspends: bool,
-        evaluator_eligible: bool,
+        facts: FunctionFactsValues,
     ) -> Self {
         Self {
+            identity,
             name: name.into(),
-            pure,
-            may_panic,
-            suspends,
-            evaluator_eligible,
+            pure: facts.pure,
+            may_panic: facts.may_panic,
+            suspends: facts.suspends,
+            evaluator_eligible: facts.evaluator_eligible,
+            ownership_transfer: facts.ownership_transfer,
+            bounded: facts.bounded,
+            logical_cost: facts.logical_cost,
         }
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> u128 {
+        self.identity
     }
 
     #[must_use]
@@ -684,20 +841,182 @@ impl FunctionFactsObservation {
     pub const fn evaluator_eligible(&self) -> bool {
         self.evaluator_eligible
     }
+
+    #[must_use]
+    pub const fn transfers_ownership(&self) -> bool {
+        self.ownership_transfer
+    }
+
+    #[must_use]
+    pub const fn is_bounded(&self) -> bool {
+        self.bounded
+    }
+
+    #[must_use]
+    pub const fn logical_cost(&self) -> u64 {
+        self.logical_cost
+    }
+}
+
+pub(crate) struct FunctionFactsValues {
+    pub(crate) pure: bool,
+    pub(crate) may_panic: bool,
+    pub(crate) suspends: bool,
+    pub(crate) evaluator_eligible: bool,
+    pub(crate) ownership_transfer: bool,
+    pub(crate) bounded: bool,
+    pub(crate) logical_cost: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeRole {
+    Parameter,
+    Return,
+    Constant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeObservation {
+    owner_identity: u128,
+    name: Arc<str>,
+    role: TypeRole,
+    type_name: Arc<str>,
+}
+
+impl TypeObservation {
+    pub(crate) fn new(
+        owner_identity: u128,
+        name: impl Into<Arc<str>>,
+        role: TypeRole,
+        type_name: impl Into<Arc<str>>,
+    ) -> Self {
+        Self {
+            owner_identity,
+            name: name.into(),
+            role,
+            type_name: type_name.into(),
+        }
+    }
+    #[must_use]
+    pub const fn owner_identity(&self) -> u128 {
+        self.owner_identity
+    }
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    #[must_use]
+    pub const fn role(&self) -> TypeRole {
+        self.role
+    }
+    #[must_use]
+    pub fn type_name(&self) -> &str {
+        &self.type_name
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnershipMode {
+    Value,
+    Take,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnershipObservation {
+    owner_identity: u128,
+    name: Arc<str>,
+    mode: OwnershipMode,
+}
+
+impl OwnershipObservation {
+    pub(crate) fn new(
+        owner_identity: u128,
+        name: impl Into<Arc<str>>,
+        mode: OwnershipMode,
+    ) -> Self {
+        Self {
+            owner_identity,
+            name: name.into(),
+            mode,
+        }
+    }
+    #[must_use]
+    pub const fn owner_identity(&self) -> u128 {
+        self.owner_identity
+    }
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    #[must_use]
+    pub const fn mode(&self) -> OwnershipMode {
+        self.mode
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpecializationObservation {
+    identity: u128,
+    function_identity: u128,
+    function: Arc<str>,
+    argument_types: Arc<[Arc<str>]>,
+}
+
+impl SpecializationObservation {
+    pub(crate) fn new(
+        identity: u128,
+        function_identity: u128,
+        function: impl Into<Arc<str>>,
+        argument_types: Vec<Arc<str>>,
+    ) -> Self {
+        Self {
+            identity,
+            function_identity,
+            function: function.into(),
+            argument_types: argument_types.into(),
+        }
+    }
+    #[must_use]
+    pub const fn identity(&self) -> u128 {
+        self.identity
+    }
+    #[must_use]
+    pub const fn function_identity(&self) -> u128 {
+        self.function_identity
+    }
+    #[must_use]
+    pub fn function(&self) -> &str {
+        &self.function
+    }
+    #[must_use]
+    pub fn argument_types(&self) -> &[Arc<str>] {
+        &self.argument_types
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferredErrorObservation {
+    specialization_identity: u128,
     function: Arc<str>,
     error_type: Arc<str>,
 }
 
 impl InferredErrorObservation {
-    pub(crate) fn new(function: impl Into<Arc<str>>, error_type: impl Into<Arc<str>>) -> Self {
+    pub(crate) fn new(
+        specialization_identity: u128,
+        function: impl Into<Arc<str>>,
+        error_type: impl Into<Arc<str>>,
+    ) -> Self {
         Self {
+            specialization_identity,
             function: function.into(),
             error_type: error_type.into(),
         }
+    }
+
+    #[must_use]
+    pub const fn specialization_identity(&self) -> u128 {
+        self.specialization_identity
     }
 
     #[must_use]
@@ -976,16 +1295,24 @@ impl Compiler {
         let _sealed_distribution = &self.installation;
         let mut files = BTreeMap::new();
         let mut diagnostics = Vec::new();
-        for file in &*request.project.files {
+        let mut project_files = request.project.files.iter().collect::<Vec<_>>();
+        project_files.sort_by(|left, right| {
+            left.path()
+                .cmp(right.path())
+                .then(left.bytes().cmp(right.bytes()))
+        });
+        for file in project_files {
             if cancellation.is_cancelled() {
                 return CompilationOutcome::Cancelled;
             }
-            if files.insert(file.path(), file).is_some() {
+            if files.contains_key(file.path()) {
                 diagnostics.push(Diagnostic::new(
                     "project.duplicate_path",
                     SourceRange::new(file.path(), 0, 0),
                     RecoveryAction::None,
                 ));
+            } else {
+                files.insert(file.path(), file);
             }
             if !valid_module_path(file.path(), true) {
                 diagnostics.push(Diagnostic::new(
@@ -1072,13 +1399,19 @@ impl Compiler {
                 .then(left.code.cmp(&right.code))
         });
 
-        let identities = match identity::catalog(&parsed_sources, &files, &authenticated_paths) {
+        let mut identity_catalog = match identity::catalog(
+            &parsed_sources,
+            &files,
+            &authenticated_paths,
+            cancellation,
+        ) {
             Ok(identities) => identities,
-            Err(IdentityCollision {
+            Err(IdentityFailure::Cancelled) => return CompilationOutcome::Cancelled,
+            Err(IdentityFailure::Collision(IdentityCollision {
                 digest,
                 first_key,
                 second_key,
-            }) => {
+            })) => {
                 return CompilationOutcome::Defect(Defect {
                     phase: Arc::from("identity catalog"),
                     evidence: format!(
@@ -1092,6 +1425,7 @@ impl Compiler {
         let analysis = semantic::analyze(
             &parsed_sources,
             &files,
+            &mut identity_catalog,
             request.root,
             cancellation,
             front_end_clean,
@@ -1138,12 +1472,27 @@ impl Compiler {
                 Arc::from([])
             },
             identities: if request.inspection.identities {
-                identities.into()
+                identity_catalog.observations().to_vec().into()
             } else {
                 Arc::from([])
             },
             function_facts: if request.inspection.semantics {
                 analysis.function_facts.into()
+            } else {
+                Arc::from([])
+            },
+            types: if request.inspection.semantics {
+                analysis.types.into()
+            } else {
+                Arc::from([])
+            },
+            ownership: if request.inspection.semantics {
+                analysis.ownership.into()
+            } else {
+                Arc::from([])
+            },
+            specializations: if request.inspection.semantics {
+                analysis.specializations.into()
             } else {
                 Arc::from([])
             },

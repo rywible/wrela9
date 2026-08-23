@@ -24,6 +24,10 @@ _Avoid_: Package, crate, dependency graph
 A single hierarchical `.wr` source file whose identity derives from its canonical path beneath a Project's `src/` directory or from an authenticated Compiler Distribution registry; one `from parent import leaf [as alias]` form imports its complete namespace, through which its `pub` declarations are accessed.
 _Avoid_: Package, path declaration, implicit global namespace
 
+**Native Wrela**:
+Code or behavior authored in the Wrela language rather than Rust, assembly, or another implementation language; it includes Creator, standard-library, Test, authenticated runtime, and Driver Modules written in Wrela.
+_Avoid_: Host-native code, generated machine code, Creator code only
+
 **Image Constructor**:
 The single `@image` function reachable from one Image root, evaluated as effect-free ordinary Wrela during the build to select Image Facilities, declare bounded resources, create graph structure, and return that root's closed Image graph.
 _Avoid_: Configuration file, macro language, runtime entry point

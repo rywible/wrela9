@@ -50,11 +50,11 @@ Every Telemetry record has a build-known typed schema and fixed maximum encoded 
 
 ## Event Store binding
 
-A Deployment Image admits zero or one Event Store Facility; the flagship admits exactly one. This is a current product and domain rule: one production Store is the Image's authoritative ordered history, Store Identity, and schema lifecycle. It is not an inference that one disk can technically host only one database.
+A Deployment Image or Test Image admits zero or one Event Store Facility; the flagship admits exactly one. This is a current product and domain rule: one Store is the Image's authoritative ordered history, Store Identity, and schema lifecycle. It is not an inference that one disk can technically host only one database.
 
-The Event Store Runtime owns storage semantics above a private Store Media Interface. The production Adapter implements that Interface through the selected Virtio-Block Driver. A Test Case Graph may instead construct its own bounded Memory Media Adapter and an independent instance of the same Event Store Runtime. Multiple memory-backed test instances inside one Test Image do not create multiple production Event Store Facilities or expose Store Media to Creators.
+The Event Store Runtime owns storage semantics above a private Store Media Interface. The production Adapter implements that Interface through the selected Virtio-Block Driver. A Test Image may instead select one bounded Memory Media Adapter for the same Event Store Runtime. This does not change Facility cardinality or expose Store Media to Creators.
 
-Memory Media models committed and uncommitted writes, flush barriers, finite geometry, injected failures, and deterministic power loss and reopen. It proves Event Store behavior at the Store Media Seam, not real physical durability or Virtio-Block conformance. Those obligations use the production Adapter and Driver Conformance Image described in the testing design.
+Memory Media models committed and uncommitted writes, flush barriers, finite geometry, injected failures, and deterministic power loss and reopen. It proves Event Store behavior at the Store Media Seam, not real physical durability or Virtio-Block conformance. Tests inside one Test Image observe the ordinary shared Store state in registration order. A scenario requiring a fresh Store uses another Test Project/Image. Physical obligations use the production Adapter and Driver Conformance Image described in the testing design.
 
 The launcher binds one Store Identity to one exclusive host-managed fixed-size block image and exposes it only as the Event Store Facility's admitted Virtio-Block device. Creator source cannot name a host path, block device, mount, or volume. The launcher validates expected geometry, Store Identity, and schema lifecycle before the Image becomes running.
 

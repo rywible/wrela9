@@ -11,16 +11,18 @@ Research date: 2026-08-22.
 The later design session accepted the note's separation among Facility kind,
 Facility instance, external binding, and build-known graph node, but did not
 accept the candidate persistence-substrate model. The current version keeps
-zero or one production Event Store Facility and the flagship keeps exactly one
-authoritative history, Store Identity, and schema lifecycle.
+zero or one Event Store Facility in every Deployment Image or Test Image, and
+the flagship keeps exactly one authoritative history, Store Identity, and
+schema lifecycle.
 
-Testing applies substitution one layer lower. The unchanged Event Store Runtime
-depends on a private Store Media Interface: production uses a Virtio-Block
-Adapter, while each isolated Test Case Graph may use an independent bounded
-Memory Media Adapter. Many memory-backed Event Store Runtime instances may
-therefore coexist inside one Test Image without changing production Facility
-cardinality. The Memory Adapter models flush, failure, and reopen semantics but
-does not claim to prove physical durability.
+Testing ultimately rejected graph partitioning and Facility multiplicity as a
+parallel semantic universe. One Test Image contains one ordinary shared graph,
+and its Wrela Tests execute serially in explicit registration order. The same
+Event Store Runtime may select a bounded Memory Media Adapter behind its private
+Store Media Interface, but the Image still contains at most one Store. Tests
+that share it observe ordinary state; a scenario needing a fresh Store belongs
+in another Test Project/Image. The Memory Adapter models flush, failure, and
+reopen semantics but does not claim to prove physical durability.
 
 The Driver Seam was also clarified. Drivers are substantial authenticated Wrela
 Modules, not thin host shims. Only irreducible MMIO, interrupt and fault entry,
@@ -31,7 +33,8 @@ ordinary constructible Modules and private media Adapters rather than fake
 Drivers.
 
 The accepted architecture is recorded in the testing, Facility, language, and
-compiler design documents and in ADRs 0047 and 0048. The remainder of this file
+compiler design documents and in ADRs 0048 and 0049. ADR-0049 supersedes
+ADR-0047's isolated Test Case Graph decision. The remainder of this file
 preserves the research path and alternatives that informed that decision.
 
 ## Conclusion

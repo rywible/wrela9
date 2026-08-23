@@ -197,23 +197,23 @@ A sealed, typed operation available only to authenticated Wrela runtime and Driv
 _Avoid_: Intrinsic string, unsafe escape hatch, inline assembly
 
 **Wrela Test**:
-A dedicated Wrela-language declaration whose compiled guest execution checks one isolated Test Case Graph and reports either `Passed` or `ExpectationFailed`.
+A dedicated compiled guest declaration nested inside a Test Suite, explicitly applied by the Test Image Constructor, and executed in registration order against the ordinary shared Image graph.
 _Avoid_: Rust compiler test, host evaluator substitution, callable helper function
 
 **Test Image**:
-The real bootable Image rooted at `src/test.wr` that explicitly registers Test Suites, contains their Test Case Graphs, and emits one complete typed Test Report.
+The ordinary bootable Image rooted at `src/test.wr` whose Image Constructor builds one shared graph, registers an ordered list of Wrela Tests, and emits one complete typed Test Report.
 _Avoid_: Host test harness, Deployment Image with a flag, filesystem test discovery
 
 **Test Suite**:
-A named collection of Wrela Tests explicitly exposed by one Module and registered by the Test Root; its exact source export form remains a Layer 1 decision.
-_Avoid_: Discovered directory, shared fixture object, mutable test scope
+A source declaration that owns and names a group of nested Wrela Tests without becoming a runtime class, value, fixture, isolation unit, or parameterized scope.
+_Avoid_: TestSuite class, discovered directory, shared fixture object, isolation boundary
 
-**Test Case Graph**:
-A closed build-known subset of a Test Image graph owned by one Wrela Test, including its Actors, Mailboxes, Pools, fake-media state, Facility endpoints, and root Group; it shares no reachable mutable state or observable Facility endpoint with another case.
-_Avoid_: Dynamically created runtime, resettable global fixture, separate Image launch
+**Test Application**:
+One build-known binding of a nested Wrela Test to ordinary Image values in the Test Image Constructor's ordered `cases` list; it records a later invocation rather than executing the Test during construction.
+_Avoid_: Runtime function call, fixture instantiation, isolated sub-Image
 
 **Test Report**:
-The complete typed VM ABI result of one Test Image, ordered by canonical Test Identity and containing every case's `Passed` or `ExpectationFailed` outcome; Panic or terminal runtime failure ends the Image without fabricating a partial report.
+The complete typed VM ABI result of one Test Image, ordered exactly like its Test Applications and containing every Wrela Test's `Passed` or `ExpectationFailed` outcome; Panic or terminal runtime failure ends the Image without fabricating a partial report.
 _Avoid_: Parsed logs, stdout transcript, timing dashboard
 
 **Evidence Bundle**:

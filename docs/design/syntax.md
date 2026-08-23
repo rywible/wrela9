@@ -36,7 +36,7 @@ not
 or own
 panic pass pool pub pure
 read resource return
-self send struct
+self send struct suite
 take test true try_send type
 while with
 ```
@@ -45,9 +45,9 @@ Keywords are reserved globally rather than contextually. Retired Wrela8 words in
 
 ## Layout, trivia, and delimiters
 
-Suites use significant indentation of exactly four spaces per level. Tabs are invalid outside literals and comments. Blank and comment-only lines do not affect layout. Every colon-introduced suite begins on the following indented line; inline suites and semicolon-separated statements are invalid. EOF may follow the last statement without a final newline.
+Indented blocks use exactly four spaces per level. Tabs are invalid outside literals and comments. Blank and comment-only lines do not affect layout. Every colon-introduced block begins on the following indented line; inline blocks and semicolon-separated statements are invalid. EOF may follow the last statement without a final newline.
 
-The lexer preserves physical leading whitespace and line endings. A layout pass adds distinguishable zero-width `Indent` and `Dedent` events that refer to the physical whitespace responsible for them. EOF may close otherwise valid open suites through zero-width dedents. Newlines are insignificant inside parentheses and brackets, where continuation indentation is trivia and need not be a multiple of four. Backslash continuation and curly-brace constructs are absent.
+The lexer preserves physical leading whitespace and line endings. A layout pass adds distinguishable zero-width `Indent` and `Dedent` events that refer to the physical whitespace responsible for them. EOF may close otherwise valid open blocks through zero-width dedents. Newlines are insignificant inside parentheses and brackets, where continuation indentation is trivia and need not be a multiple of four. Backslash continuation and curly-brace constructs are absent.
 
 Parentheses delimit calls and tuples. Brackets delimit generic arguments, fixed arrays, and indexing. A trailing comma is accepted in every comma-separated delimited form. A one-element tuple requires `(value,)`; `(value)` is grouping.
 
@@ -57,7 +57,23 @@ Each attribute occupies its own line at the declaration's indentation. It has `@
 
 ## Declarations and types
 
-Module declarations are imports, `const`, `fn`, `async fn`, `test`, `async test`, `struct`, `resource struct`, `enum`, `interface`, `pool`, transparent `type` aliases, attributes, `comptime if`, and `comptime assert`. There are no runtime executable top-level statements, mutable statics, nested types or Pools, or declaration re-opening blocks. Declarations and members are private unless prefixed `pub`. `expect` is a Test-body statement rather than an ordinary function. The exact Test construction-clause and Test Suite spelling remains open in the active Layer 1 decision and is not fixed here.
+Module declarations are imports, `const`, `fn`, `async fn`, `suite`, `struct`, `resource struct`, `enum`, `interface`, `pool`, transparent `type` aliases, attributes, `comptime if`, and `comptime assert`. There are no runtime executable top-level statements, mutable statics, nested types or Pools, or declaration re-opening blocks. Declarations and members are private unless prefixed `pub`.
+
+A Suite declaration has `pub suite name:` form, takes no parameters, and contains only nested `test` or `async test` declarations. Tests use ordinary function parameter modes and have no return value. They cannot appear at Module level, be marked `pub`, or be called as runtime functions. `expect expression` is legal only in a Test body and records a typed failed expectation without changing control flow.
+
+```wrela
+pub suite counter_behavior:
+    async test starts_at_zero(counter: CounterHandle):
+        value = await counter.value()
+        expect value == 0
+
+    async test increments(counter: CounterHandle):
+        await counter.increment()
+        value = await counter.value()
+        expect value == 1
+```
+
+A Test Application uses ordinary qualified call and argument spelling inside the Test Facility's Image-construction `cases` list. It binds already constructed Image values and records a later statically dispatched invocation rather than executing the Test. The list is source-ordered, every reachable Test must appear exactly once, and no other expression context may apply a Test.
 
 Representative forms are:
 
@@ -86,7 +102,7 @@ interface Drawable:
     fn bounds(read self) -> Bounds
 ```
 
-A plain struct may contain only Data; a Resource struct is explicitly single-owner. Struct and Resource struct members are fields, associated constants, functions, async functions, and compile-time conditionals. Enums additionally contain unit or named-payload variants. Interfaces contain required function signatures and optional associated constants, with no stored fields, default bodies, or associated types. A required interface signature has no colon; every implemented function has a colon and following suite.
+A plain struct may contain only Data; a Resource struct is explicitly single-owner. Struct and Resource struct members are fields, associated constants, functions, async functions, and compile-time conditionals. Enums additionally contain unit or named-payload variants. Interfaces contain required function signatures and optional associated constants, with no stored fields, default bodies, or associated types. A required interface signature has no colon; every implemented function has a colon and following block.
 
 Functions without `self` inside a type are associated functions and are called through the type namespace, such as `Card.new(...)`. There is no magic constructor or `init` form. Struct fields have explicit types, optional `pub` and `mut`, and no inline default. Direct construction initializes every visible field by name.
 
@@ -108,7 +124,7 @@ Patterns include wildcard, literal, binding, enum variant, struct, tuple, fixed 
 
 Primary expressions include literals, names, qualified members, calls, indexing, tuples, fixed arrays, direct struct and enum construction, and closures. `.` uniformly spells Module namespace, associated function, enum variant, field, and method access. Direct struct construction uses a type call with every field named; enum variants use qualified calls. Ordinary calls accept positional or named arguments, but no positional argument may follow a named one. Array literals are fixed, and `[value; N]` repeats a value. Pooled collections use explicit constructors.
 
-Closures use `|parameters| expression` or `|parameters|:` followed by an indented suite. Parameter and return types may be inferred from context. Runtime closures capture bounded Data only; async closures and explicit capture lists are absent.
+Closures use `|parameters| expression` or `|parameters|:` followed by an indented block. Parameter and return types may be inferred from context. Runtime closures capture bounded Data only; async closures and explicit capture lists are absent.
 
 From lowest to highest, operator precedence is:
 
@@ -151,7 +167,7 @@ Every input byte belongs to exactly one token, trivia region, or invalid-token n
 
 Lexing does not abort. Invalid encoding, characters, escapes, numbers, and literals become preserved invalid tokens with diagnostics. An ordinary malformed string or scalar consumes through its closer or physical line ending; a malformed number remains one token; an unclosed multiline literal consumes through EOF.
 
-Parsing synchronizes at closing delimiters, physical line boundaries, dedents, and recognizable declaration or statement starts. An unexpected indent becomes an error block until its dedent. An inconsistent dedent resumes at the nearest smaller established level. A missing suite inserts one zero-width missing-suite node and leaves the next same-level statement outside it. An unmatched closer is an error node without changing the delimiter stack; a missing closer is inserted at EOF or before a recognizable same-or-lower-indentation boundary. Recovery never invents indentation structure.
+Parsing synchronizes at closing delimiters, physical line boundaries, dedents, and recognizable declaration or statement starts. An unexpected indent becomes an error block until its dedent. An inconsistent dedent resumes at the nearest smaller established level. A missing block inserts one zero-width missing-block node and leaves the next same-level statement outside it. An unmatched closer is an error node without changing the delimiter stack; a missing closer is inserted at EOF or before a recognizable same-or-lower-indentation boundary. Recovery never invents indentation structure.
 
 A declaration lowers only when its complete syntax, including its body, is structurally valid. Diagnostics may use a malformed declaration's visible name to suppress cascades without creating a semantic placeholder or error type. No invalid token, missing node, error node, or placeholder type crosses into semantic artifacts. The compiler reports at most 64 syntax diagnostics per file followed by one truncation diagnostic while retaining the complete tree.
 
@@ -161,4 +177,4 @@ Syntax diagnostics carry a compiler-version-stable code, primary range, optional
 
 ## Wrela8 classification
 
-Wrela9 adopts the valuable Wrela8 indentation, comments, documentation, literals, declarations, generics, patterns, ownership modes, control flow, closures, and compile-time shapes. It revises Module topology and imports, visibility, losslessness, recovery, Actor admission, constructors, interfaces, automatic standard capabilities, bounded loops, multiline Text, numeric types, and evaluation order. It retires source compatibility, Module declarations, mutable statics, magic initialization, `resource(manual)`, derivation declarations, selective and re-export imports, general f-strings, inline suites, semicolons, machine/backend/runtime-layout/Pixels syntax, priority and budget annotations, and fail-fast parsing.
+Wrela9 adopts the valuable Wrela8 indentation, comments, documentation, literals, declarations, generics, patterns, ownership modes, control flow, closures, and compile-time shapes. It revises Module topology and imports, visibility, losslessness, recovery, Actor admission, constructors, interfaces, automatic standard capabilities, bounded loops, multiline Text, numeric types, and evaluation order. It retires source compatibility, Module declarations, mutable statics, magic initialization, `resource(manual)`, derivation declarations, selective and re-export imports, general f-strings, inline blocks, semicolons, machine/backend/runtime-layout/Pixels syntax, priority and budget annotations, and fail-fast parsing.

@@ -4,7 +4,7 @@ Status: accepted Facility architecture through shared failure policy, Input owne
 
 ## Failure policy
 
-Every Image Facility owns a typed bounded recovery and reset protocol for the Driver Errors it can contain. A Facility that cannot restore its contract reports a typed outcome to a statically Image-wired supervisor Actor. The Image Constructor must provide the required policy for loss of every selected Facility; neither the runtime nor the Facility silently continues, invents a requester, or automatically labels a contained environmental failure as Panic.
+Every Image Facility owns a typed bounded recovery and reset protocol for the Driver Errors it can contain. A Facility that cannot restore its contract reports a typed outcome to a build-wired supervisor Actor. The Image Constructor must provide the required policy for loss of every selected Facility; neither the runtime nor the Facility silently continues, invents a requester, or automatically labels a contained environmental failure as Panic.
 
 An uncontainable device state, broken ownership invariant, or violated compiler/runtime assumption remains Panic. Recovery attempts, reset counts, resource restoration, reporting, and escalation all fit compiler-admitted bounds.
 
@@ -28,7 +28,7 @@ Focus loss produces one admitted Input Sample that marks focus lost, releases ev
 
 The Monotonic Clock Facility normalizes a sealed architecture counter into typed `Duration` values. Creator code never observes native counter registers, counter frequency, host timestamps, a wall date, or a calendar. Realtime observations cannot influence Replay state unless they are captured as admitted Replay input.
 
-Cadence is not an Image Facility, Console intrinsic, or language construct. It is an ordinary safe standard-library Wrela module built over Monotonic Clock and scheduler deadline operations. An Image Constructor may instantiate zero, one, or several Cadence Actors with compile-time frequencies and statically wired destinations; the flagship Console conventionally uses one for gameplay. Images without recurring logical work have no Update concept.
+Cadence is not an Image Facility, Console intrinsic, or language construct. It is an ordinary safe standard-library Wrela Module built over Monotonic Clock and scheduler deadline operations. An Image Constructor may instantiate zero, one, or several Cadence Actors with compile-time frequencies and build-known destinations; the flagship Console conventionally uses one for gameplay. Images without recurring logical work have no Update concept.
 
 Because Cadence uses ordinary Actors, messages, and deadlines, its state, Mailbox, placement, frequency, and cost participate in normal whole-Image analysis. It receives no hidden authority and cannot introduce dynamic Actor destinations or an unbounded loop.
 
@@ -49,6 +49,12 @@ Wrela has no semantic stdout, stderr, `printf`, or Creator-visible console strea
 Every Telemetry record has a build-known typed schema and fixed maximum encoded size. The Image carries only compact diagnostic identities and bounded values; its Evidence Bundle relates those identities to Project declarations, field schemas, and human-facing names. Runtime formatting, open-ended strings, and dynamically invented record shapes are outside the guest contract.
 
 ## Event Store binding
+
+A Deployment Image admits zero or one Event Store Facility; the flagship admits exactly one. This is a current product and domain rule: one production Store is the Image's authoritative ordered history, Store Identity, and schema lifecycle. It is not an inference that one disk can technically host only one database.
+
+The Event Store Runtime owns storage semantics above a private Store Media Interface. The production Adapter implements that Interface through the selected Virtio-Block Driver. A Test Case Graph may instead construct its own bounded Memory Media Adapter and an independent instance of the same Event Store Runtime. Multiple memory-backed test instances inside one Test Image do not create multiple production Event Store Facilities or expose Store Media to Creators.
+
+Memory Media models committed and uncommitted writes, flush barriers, finite geometry, injected failures, and deterministic power loss and reopen. It proves Event Store behavior at the Store Media Seam, not real physical durability or Virtio-Block conformance. Those obligations use the production Adapter and Driver Conformance Image described in the testing design.
 
 The launcher binds one Store Identity to one exclusive host-managed fixed-size block image and exposes it only as the Event Store Facility's admitted Virtio-Block device. Creator source cannot name a host path, block device, mount, or volume. The launcher validates expected geometry, Store Identity, and schema lifecycle before the Image becomes running.
 

@@ -6,7 +6,7 @@ Status: accepted initial grammar and lossless syntax contract. Semantic rules li
 
 A valid source file is UTF-8 without a byte-order mark. LF and CRLF line endings are accepted, a final line ending is optional, and bare CR is invalid. Lossless parsing nevertheless preserves arbitrary bytes so malformed encoding can be inspected and repaired.
 
-`src/image.wr` is the only root-level source and defines the non-importable root Module `image`. Every other Project Module is nested beneath at least one directory. Path segments match `[a-z][a-z0-9_]*`, so `src/game/card_effects.wr` defines `game.card_effects`. Root-level `.wr` files other than `image.wr` are invalid Project topology. Authenticated Modules use the same hierarchical identity profile.
+`src/image.wr` defines the non-importable Deployment root Module `image`, while `src/test.wr` defines the non-importable Test root Module `test`. A Project contains one or both; a Test-only Project is valid. Every other Project Module is nested beneath at least one directory. Path segments match `[a-z][a-z0-9_]*`, so `src/game/card_effects.wr` defines `game.card_effects`. Root-level `.wr` files other than `image.wr` and `test.wr` are invalid Project topology. Authenticated Modules use the same hierarchical identity profile.
 
 There is exactly one import form:
 
@@ -28,7 +28,7 @@ and any as assert async await
 break
 case comptime const continue
 defer
-elif else enum
+elif else enum expect
 false fn for from
 if implements import in interface is
 match mut
@@ -37,7 +37,7 @@ or own
 panic pass pool pub pure
 read resource return
 self send struct
-take true try_send type
+take test true try_send type
 while with
 ```
 
@@ -57,7 +57,7 @@ Each attribute occupies its own line at the declaration's indentation. It has `@
 
 ## Declarations and types
 
-Module declarations are imports, `const`, `fn`, `async fn`, `struct`, `resource struct`, `enum`, `interface`, `pool`, transparent `type` aliases, attributes, `comptime if`, and `comptime assert`. There are no runtime executable top-level statements, mutable statics, nested types or Pools, or declaration re-opening blocks. Declarations and members are private unless prefixed `pub`.
+Module declarations are imports, `const`, `fn`, `async fn`, `test`, `async test`, `struct`, `resource struct`, `enum`, `interface`, `pool`, transparent `type` aliases, attributes, `comptime if`, and `comptime assert`. There are no runtime executable top-level statements, mutable statics, nested types or Pools, or declaration re-opening blocks. Declarations and members are private unless prefixed `pub`. `expect` is a Test-body statement rather than an ordinary function. The exact Test construction-clause and Test Suite spelling remains open in the active Layer 1 decision and is not fixed here.
 
 Representative forms are:
 

@@ -6,6 +6,34 @@ current glossary, design documents, or ADRs.
 
 Research date: 2026-08-22.
 
+## Accepted resolution after research
+
+The later design session accepted the note's separation among Facility kind,
+Facility instance, external binding, and build-known graph node, but did not
+accept the candidate persistence-substrate model. The current version keeps
+zero or one production Event Store Facility and the flagship keeps exactly one
+authoritative history, Store Identity, and schema lifecycle.
+
+Testing applies substitution one layer lower. The unchanged Event Store Runtime
+depends on a private Store Media Interface: production uses a Virtio-Block
+Adapter, while each isolated Test Case Graph may use an independent bounded
+Memory Media Adapter. Many memory-backed Event Store Runtime instances may
+therefore coexist inside one Test Image without changing production Facility
+cardinality. The Memory Adapter models flush, failure, and reopen semantics but
+does not claim to prove physical durability.
+
+The Driver Seam was also clarified. Drivers are substantial authenticated Wrela
+Modules, not thin host shims. Only irreducible MMIO, interrupt and fault entry,
+barrier, context-switch, and similar effects remain in thin compiler-owned
+architecture primitive Adapters. Internal Driver Conformance Projects exercise
+the real Wrela Drivers against controlled QEMU devices; Creator Test Images use
+ordinary constructible Modules and private media Adapters rather than fake
+Drivers.
+
+The accepted architecture is recorded in the testing, Facility, language, and
+compiler design documents and in ADRs 0047 and 0048. The remainder of this file
+preserves the research path and alternatives that informed that decision.
+
 ## Conclusion
 
 Wrela's current design has **partially conflated four different things in its

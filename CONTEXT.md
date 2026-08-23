@@ -12,8 +12,12 @@ _Avoid_: Every Wrela artifact, generic runtime
 A self-contained bootable artifact containing all system software, selected device support, immutable content, and behavior needed for one closed Wrela system.
 _Avoid_: Console Image, executable, program, application bundle
 
+**Deployment Image**:
+An Image rooted at `src/image.wr` and intended to perform its declared behavior rather than run a Wrela Test Suite.
+_Avoid_: Production Mode, Test Image with a flag, Console as every deployment
+
 **Project**:
-A manifest-free source tree whose only root source is `src/image.wr`, with one reachable Image Constructor and no external dependencies; every other Module is hierarchically nested and derives identity from its conventional Project-relative path.
+A manifest-free source tree with no external dependencies and at least one conventional root: `src/image.wr` builds a Deployment Image and `src/test.wr` builds a Test Image. A Test-only Project is valid; every other Module is hierarchically nested and derives identity from its conventional Project-relative path.
 _Avoid_: Package, crate, dependency graph
 
 **Module**:
@@ -21,7 +25,7 @@ A single hierarchical `.wr` source file whose identity derives from its canonica
 _Avoid_: Package, path declaration, implicit global namespace
 
 **Image Constructor**:
-The single `@image` function evaluated as effect-free ordinary Wrela during the build to select Image Facilities, declare bounded resources, create Actors, and return the closed Image graph.
+The single `@image` function reachable from one Image root, evaluated as effect-free ordinary Wrela during the build to select Image Facilities, declare bounded resources, create graph structure, and return that root's closed Image graph.
 _Avoid_: Configuration file, macro language, runtime entry point
 
 **Build Constructor**:
@@ -49,8 +53,12 @@ A build-produced declaration of the Virtio devices and VM ABI resources required
 _Avoid_: Hardware profile, device discovery
 
 **Driver**:
-A safe guest implementation of a supported Virtio device contract that may be selected into an Image.
+A substantial authenticated Wrela Module implementing a supported guest device protocol, selected and wired by a Facility planner and limited to its specifically granted Compiler Primitives.
 _Avoid_: Device model, host adapter
+
+**Architecture Primitive Adapter**:
+The minimal compiler-owned Rust, assembly, or lowering implementation beneath authenticated runtime and Driver Modules for effects ordinary safe Wrela cannot express, such as MMIO, interrupt entry, barriers, and context switching.
+_Avoid_: Driver, general unsafe mode, Creator FFI
 
 **Space**:
 A compiler-known topology and coordinate domain in which Forms, Regions, and spatial mappings are defined.
@@ -184,6 +192,26 @@ _Avoid_: Permission flag, raw handle
 A sealed, typed operation available only to authenticated Wrela runtime and Driver modules when ordinary safe language operations cannot express the required effect.
 _Avoid_: Intrinsic string, unsafe escape hatch, inline assembly
 
+**Wrela Test**:
+A dedicated Wrela-language declaration whose compiled guest execution checks one isolated Test Case Graph and reports either `Passed` or `ExpectationFailed`.
+_Avoid_: Rust compiler test, host evaluator substitution, callable helper function
+
+**Test Image**:
+The real bootable Image rooted at `src/test.wr` that explicitly registers Test Suites, contains their Test Case Graphs, and emits one complete typed Test Report.
+_Avoid_: Host test harness, Deployment Image with a flag, filesystem test discovery
+
+**Test Suite**:
+A named collection of Wrela Tests explicitly exposed by one Module and registered by the Test Root; its exact source export form remains a Layer 1 decision.
+_Avoid_: Discovered directory, shared fixture object, mutable test scope
+
+**Test Case Graph**:
+A closed build-known subset of a Test Image graph owned by one Wrela Test, including its Actors, Mailboxes, Pools, fake-media state, Facility endpoints, and root Group; it shares no reachable mutable state or observable Facility endpoint with another case.
+_Avoid_: Dynamically created runtime, resettable global fixture, separate Image launch
+
+**Test Report**:
+The complete typed VM ABI result of one Test Image, ordered by canonical Test Identity and containing every case's `Passed` or `ExpectationFailed` outcome; Panic or terminal runtime failure ends the Image without fabricating a partial report.
+_Avoid_: Parsed logs, stdout transcript, timing dashboard
+
 **Evidence Bundle**:
 A canonical host-side artifact keyed by Image digest that relates compact Image diagnostic identities to Project-relative source spans, symbols, layouts, plans, and compiler receipts.
 _Avoid_: Embedded source archive, text build log, host-path dump
@@ -209,7 +237,7 @@ The Image Facility exposing game-facing keyboard and mouse state. A host control
 _Avoid_: Host keycode, evdev device, mandatory gamepad protocol
 
 **Input Sample**:
-A bounded typed pull observation containing normalized current controls, accumulated transitions and movement, and focus state, consumed by the one Actor statically wired as an Image's Input owner.
+A bounded typed pull observation containing normalized current controls, accumulated transitions and movement, and focus state, consumed by the one Actor build-known as an Image's Input owner.
 _Avoid_: Broadcast host event, dynamically routed callback, raw device packet, host interrupt order
 
 **Action Map**:
@@ -301,7 +329,7 @@ The Image's architecture-independent elapsed-time source; deterministic state an
 _Avoid_: Wall clock, calendar clock
 
 **Cadence**:
-An ordinary standard-library Wrela module that turns bounded Monotonic Clock wakeups into exactly-once numbered recurring messages for statically wired Actors, with at most one occurrence outstanding.
+An ordinary standard-library Wrela Module that turns bounded Monotonic Clock wakeups into exactly-once numbered recurring messages for build-known Actors, with at most one occurrence outstanding.
 _Avoid_: Image Update, Console intrinsic, timer Facility
 
 **Entropy**:
@@ -317,7 +345,7 @@ A one-shot Resource reserving capacity for a future infallible allocation from o
 _Avoid_: Memory pointer, optional capacity hint
 
 **Actor**:
-The Image-lifetime owner of mutable state and the unit that receives bounded messages through an explicitly Image-wired handle. Initial Wrela permits only statically named destinations, not runtime collections or selection of Actor handles.
+The Image-lifetime owner of mutable state and the unit that receives bounded messages through an explicitly build-wired handle. Initial Wrela permits only build-known destinations, not runtime collections or selection of Actor handles.
 _Avoid_: Object, service thread
 
 **Mailbox**:

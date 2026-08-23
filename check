@@ -1,0 +1,36 @@
+#!/bin/sh
+
+set -u
+
+check_started="$(perl -MTime::HiRes=time -e 'printf "%.9f", time')" || {
+    echo "Unable: Perl Time::HiRes is required to measure Check latency."
+    exit 2
+}
+
+if ! cargo fmt --all --check; then
+    echo "Failed: formatting is not canonical."
+    exit 1
+fi
+
+if ! cargo clippy --workspace --all-targets --all-features -- -D warnings; then
+    echo "Failed: static validation failed."
+    exit 1
+fi
+
+if ! cargo test --workspace --all-targets --all-features; then
+    echo "Failed: a Regression Case failed."
+    exit 1
+fi
+
+check_elapsed="$(perl -MTime::HiRes=time -e 'printf "%.3f", time - $ARGV[0]' "$check_started")" || {
+    echo "Unable: Check latency could not be measured."
+    exit 2
+}
+
+if ! perl -e 'exit !($ARGV[0] < 2.0)' "$check_elapsed"; then
+    echo "Failed: warm Check latency was ${check_elapsed}s; the hard ceiling is 2.000s."
+    exit 1
+fi
+
+echo "Passed (${check_elapsed}s)."
+

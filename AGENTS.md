@@ -12,6 +12,10 @@ The tracker uses the five default triage labels. See `docs/agents/triage-labels.
 
 Domain documentation uses the single-context layout. See `docs/agents/domain.md`.
 
+### Release evidence
+
+Run `./check` before declaring implementation complete. It is the sole merge and release authority. Run a named Challenge only to answer a stated investigative question; all Challenge work is bounded to one minute unless the user authorizes more. See `docs/design/release-gates.md`.
+
 ### Development evidence
 
 Run Check before declaring implementation complete. Treat Challenges as bounded investigations rather than routine validation: state the question first and stay within the total one-minute budget unless the user authorizes more. A Challenge earns durable value by producing a Finding that reduces into a Regression Case for Check.

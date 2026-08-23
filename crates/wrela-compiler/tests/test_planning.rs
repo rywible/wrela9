@@ -132,8 +132,32 @@ fn imported_private_declarations_do_not_enter_the_module_namespace() {
         rejected
             .diagnostics()
             .iter()
-            .any(|diagnostic| diagnostic.code() == "evaluation.rejected")
+            .any(|diagnostic| diagnostic.code() == "semantic.invalid_typed_hir")
     );
+}
+
+#[test]
+fn imports_never_leak_bare_members_into_local_scope() {
+    let files = vec![
+        ProjectFile::new(
+            "src/image.wr",
+            b"from game import cards\n\n@image\nfn build() -> Image:\n    return Image.new(answer=answer())\n",
+        ),
+        ProjectFile::new(
+            "src/game/cards.wr",
+            b"pub fn answer() -> i64:\n    return 42\n",
+        ),
+    ];
+    let CompilationOutcome::Rejected(rejected) = compile(files, Root::Image) else {
+        panic!("an imported public member requires its Module alias");
+    };
+    assert!(rejected.diagnostics().iter().any(|diagnostic| {
+        diagnostic.code() == "semantic.invalid_typed_hir"
+            && diagnostic
+                .parameters()
+                .iter()
+                .any(|(name, value)| name.as_ref() == "kind" && value.as_ref() == "unresolved_call")
+    }));
 }
 
 #[test]
@@ -156,5 +180,51 @@ fn build() -> Image:
             .diagnostics()
             .iter()
             .any(|diagnostic| diagnostic.code() == "test.parameter_requires_take")
+    );
+}
+
+#[test]
+fn authenticated_modules_resolve_from_the_sealed_distribution_and_cannot_be_shadowed() {
+    let installation = CompilerInstallation::with_authenticated_modules(vec![ProjectFile::new(
+        "src/core/images.wr",
+        b"pub fn blank() -> Image:\n    return Image.new()\n",
+    )]);
+    let compiler = Compiler::open(installation).expect("distribution opens");
+    let root = ProjectFile::new(
+        "src/image.wr",
+        b"from core import images\n\n@image\nfn build() -> Image:\n    return images.blank()\n",
+    );
+    let CompilationOutcome::Accepted(accepted) = compiler.compile(
+        CompilationRequest::new(ProjectSnapshot::new(vec![root.clone()]), Root::Image)
+            .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    ) else {
+        panic!("authenticated Module must resolve");
+    };
+    assert!(accepted.inspection().identities().iter().any(|identity| {
+        identity.origin() == wrela_compiler::IdentityOrigin::Authenticated
+            && identity.name() == "core.images"
+    }));
+
+    let CompilationOutcome::Rejected(rejected) = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![
+                root,
+                ProjectFile::new(
+                    "src/core/images.wr",
+                    b"pub fn blank() -> Image:\n    return Image.new()\n",
+                ),
+            ]),
+            Root::Image,
+        ),
+        &Cancellation::new(),
+    ) else {
+        panic!("Project cannot forge authenticated origin");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "project.authenticated_module_shadow")
     );
 }

@@ -180,6 +180,63 @@ fn build() -> Image:
 }
 
 #[test]
+fn verified_control_flow_preserves_branch_evaluation() {
+    let source = br#"fn choose(flag: bool) -> i64:
+    if flag:
+        return 41
+    else:
+        return 42
+
+const ANSWER: i64 = choose(false)
+
+@image
+fn build() -> Image:
+    return Image.new(answer=ANSWER)
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("typed control flow must compile and evaluate");
+    };
+    assert!(
+        accepted
+            .inspection()
+            .evaluations()
+            .iter()
+            .any(|evaluation| {
+                evaluation.root() == "image.ANSWER"
+                    && evaluation.outcome()
+                        == &EvaluationOutcome::Completed(CanonicalValue::Integer {
+                            type_name: "i64".into(),
+                            value: 42,
+                        })
+            })
+    );
+}
+
+#[test]
+fn recursive_facts_propagate_panic_and_evaluator_ineligibility() {
+    let source = br#"fn dangerous() -> i64:
+    panic "boom"
+
+fn wrapper() -> i64:
+    return dangerous()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("unreached panic remains valid Wrela");
+    };
+    let wrapper = accepted
+        .inspection()
+        .function_facts()
+        .iter()
+        .find(|facts| facts.name() == "wrapper")
+        .expect("wrapper facts");
+    assert!(wrapper.may_panic());
+}
+
+#[test]
 fn exact_propagation_rejects_implicit_error_conversion() {
     let source = br#"enum ReadError:
     Missing
@@ -301,7 +358,7 @@ fn build() -> Image:
 }
 
 #[test]
-fn unbounded_recursion_is_contained_by_a_logical_limit() {
+fn unbounded_recursion_is_rejected_before_evaluation() {
     let source = br#"fn recurse() -> i64:
     return recurse()
 
@@ -312,15 +369,14 @@ fn build() -> Image:
     return Image.new()
 "#;
     let CompilationOutcome::Rejected(rejected) = compile(source) else {
-        panic!("unbounded recursion must reject without a host overflow");
+        panic!("unbounded recursion must reject before evaluator containment");
     };
-    assert!(rejected.diagnostics().iter().any(|diagnostic| {
-        diagnostic.code() == "evaluation.limit_exceeded"
-            && diagnostic
-                .parameters()
-                .iter()
-                .any(|(name, value)| name.as_ref() == "policy" && value.as_ref() == "call_depth")
-    }));
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.unproven_recursive_bound")
+    );
 }
 
 #[test]

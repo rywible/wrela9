@@ -1,6 +1,6 @@
 use wrela_compiler::{
     Cancellation, CompilationOutcome, CompilationRequest, Compiler, CompilerInstallation,
-    InspectSelection, ProjectFile, ProjectSnapshot, Root,
+    IdentityDomain, InspectSelection, ProjectFile, ProjectSnapshot, Root,
 };
 
 #[test]
@@ -20,7 +20,39 @@ fn valid_image_is_accepted_without_losing_source_bytes() {
     assert_eq!(syntax.len(), 1);
     assert_eq!(syntax[0].path(), "src/image.wr");
     assert_eq!(syntax[0].source_bytes(), source);
+    assert_eq!(syntax[0].nodes()[0].kind(), "source");
+    assert!(
+        syntax[0]
+            .nodes()
+            .iter()
+            .any(|node| node.kind() == "function" && node.depth() == 1)
+    );
     assert!(accepted.diagnostics().is_empty());
+}
+
+#[test]
+fn requesting_inspection_changes_only_the_projection() {
+    let compiler = Compiler::open(CompilerInstallation::empty()).expect("distribution opens");
+    let source = ProjectFile::new(
+        "src/image.wr",
+        b"@image\nfn build() -> Image:\n    return Image.new()\n",
+    );
+    let compile = |selection| {
+        compiler.compile(
+            CompilationRequest::new(ProjectSnapshot::new(vec![source.clone()]), Root::Image)
+                .with_inspection(selection),
+            &Cancellation::new(),
+        )
+    };
+    let CompilationOutcome::Accepted(without) = compile(InspectSelection::none()) else {
+        panic!("source accepts without inspection");
+    };
+    let CompilationOutcome::Accepted(with) = compile(InspectSelection::all()) else {
+        panic!("source accepts with inspection");
+    };
+    assert_eq!(without.diagnostics(), with.diagnostics());
+    assert!(without.inspection().syntax().is_none());
+    assert!(with.inspection().syntax().is_some());
 }
 
 #[test]
@@ -160,7 +192,7 @@ fn layout_recovery_keeps_later_declaration_visible() {
     let project = ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]);
 
     let CompilationOutcome::Rejected(rejected) = compiler.compile(
-        CompilationRequest::new(project, Root::Image).with_inspection(InspectSelection::syntax()),
+        CompilationRequest::new(project, Root::Image).with_inspection(InspectSelection::all()),
         &Cancellation::new(),
     ) else {
         panic!("missing block must reject");
@@ -171,6 +203,13 @@ fn layout_recovery_keeps_later_declaration_visible() {
         element.name() == "missing_block" && element.range().start() == element.range().end()
     }));
     assert_eq!(syntax.source_bytes(), source);
+    assert!(
+        rejected
+            .inspection()
+            .function_facts()
+            .iter()
+            .any(|facts| facts.name() == "later")
+    );
 }
 
 #[test]
@@ -241,13 +280,13 @@ fn semantic_identity_survives_body_edits_while_fingerprint_changes() {
 
     assert_eq!(before_answer.domain(), after_answer.domain());
     assert_eq!(before_answer.digest(), after_answer.digest());
-    assert_eq!(before_answer.canonical_key(), after_answer.canonical_key());
+    assert_eq!(before_answer.origin(), after_answer.origin());
     assert_ne!(before_answer.fingerprint(), after_answer.fingerprint());
 }
 
 #[test]
 fn identities_do_not_depend_on_snapshot_enumeration_order() {
-    fn compile(files: Vec<ProjectFile>) -> Vec<(String, u128)> {
+    fn compile(files: Vec<ProjectFile>) -> Vec<(IdentityDomain, String, u128)> {
         let compiler = Compiler::open(CompilerInstallation::empty()).expect("distribution opens");
         let CompilationOutcome::Accepted(accepted) = compiler.compile(
             CompilationRequest::new(ProjectSnapshot::new(files), Root::Image)
@@ -260,7 +299,13 @@ fn identities_do_not_depend_on_snapshot_enumeration_order() {
             .inspection()
             .identities()
             .iter()
-            .map(|identity| (identity.canonical_key().to_owned(), identity.digest()))
+            .map(|identity| {
+                (
+                    identity.domain(),
+                    identity.name().to_owned(),
+                    identity.digest(),
+                )
+            })
             .collect()
     }
 

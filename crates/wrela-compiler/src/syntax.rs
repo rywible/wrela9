@@ -2,7 +2,7 @@
 
 use crate::{
     Cancellation, Diagnostic, ProjectFile, RecoveryAction, SourceRange, SyntaxElement,
-    SyntaxElementKind,
+    SyntaxElementKind, SyntaxNodeObservation,
 };
 
 const MAX_SOURCE_BYTES: usize = 1_048_576;
@@ -13,7 +13,33 @@ pub(crate) struct ParsedSource {
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) imports: Vec<Import>,
     pub(crate) declarations: Vec<Declaration>,
+    tree: GreenNode,
     pub(crate) cancelled: bool,
+}
+
+#[derive(Clone, Debug)]
+struct GreenNode {
+    kind: GreenKind,
+    range: SourceRange,
+    children: std::sync::Arc<[GreenChild]>,
+}
+
+#[derive(Clone, Debug)]
+enum GreenChild {
+    Node(GreenNode),
+    Leaf(SyntaxElement),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GreenKind {
+    Source,
+    Declaration(&'static str),
+}
+
+enum Event {
+    Start(GreenKind, SourceRange),
+    Leaf(usize),
+    Finish,
 }
 
 #[derive(Clone, Debug)]
@@ -22,8 +48,9 @@ pub(crate) struct Declaration {
     pub(crate) name: String,
     pub(crate) public: bool,
     pub(crate) range: SourceRange,
-    pub(crate) start: usize,
-    pub(crate) end: usize,
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    pub(crate) structurally_valid: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -31,6 +58,65 @@ pub(crate) struct Import {
     pub(crate) target_path: String,
     pub(crate) alias: String,
     pub(crate) range: SourceRange,
+}
+
+impl ParsedSource {
+    pub(crate) fn declaration_bytes<'a>(
+        &self,
+        file: &'a ProjectFile,
+        declaration: &Declaration,
+    ) -> &'a [u8] {
+        checked_slice(file.bytes(), declaration.start, declaration.end).unwrap_or_default()
+    }
+
+    pub(crate) fn node_observations(&self) -> Vec<SyntaxNodeObservation> {
+        let mut result = Vec::new();
+        self.tree.project(0, &mut result);
+        result
+    }
+}
+
+impl GreenNode {
+    fn project(&self, depth: u16, output: &mut Vec<SyntaxNodeObservation>) {
+        let kind = match self.kind {
+            GreenKind::Source => "source",
+            GreenKind::Declaration(kind) => kind,
+        };
+        output.push(SyntaxNodeObservation::new(kind, self.range.clone(), depth));
+        for child in &*self.children {
+            if let GreenChild::Node(node) = child {
+                node.project(depth.saturating_add(1), output);
+            }
+        }
+    }
+
+    fn empty(path: &str) -> Self {
+        Self {
+            kind: GreenKind::Source,
+            range: SourceRange::new(path, 0, 0),
+            children: std::sync::Arc::from([]),
+        }
+    }
+
+    fn authored_bytes(&self) -> u64 {
+        self.children
+            .iter()
+            .map(|child| match child {
+                GreenChild::Node(node) => node.authored_bytes(),
+                GreenChild::Leaf(leaf)
+                    if matches!(
+                        leaf.kind(),
+                        SyntaxElementKind::Token
+                            | SyntaxElementKind::Trivia
+                            | SyntaxElementKind::Invalid
+                    ) =>
+                {
+                    leaf.range().end().saturating_sub(leaf.range().start())
+                }
+                GreenChild::Leaf(_) => 0,
+            })
+            .sum()
+    }
 }
 
 pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSource {
@@ -52,19 +138,21 @@ pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSo
             )],
             imports: Vec::new(),
             declarations: Vec::new(),
+            tree: GreenNode::empty(path),
             cancelled: false,
         };
     }
     let mut elements = Vec::new();
     let mut diagnostics = Vec::new();
     let imports = scan_imports(file, &mut diagnostics);
-    let declarations = scan_declarations(file);
+    let mut declarations = scan_declarations(file);
     validate_top_level(file, &mut diagnostics);
     let mut offset = 0;
 
     while offset < bytes.len() {
         if offset % 256 == 0 && cancellation.is_cancelled() {
             return ParsedSource {
+                tree: build_green_tree(file, &declarations, &elements),
                 elements,
                 diagnostics,
                 imports,
@@ -227,6 +315,23 @@ pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSo
     }
 
     scan_layout_and_delimiters(file, &mut elements, &mut diagnostics);
+    for declaration in &mut declarations {
+        declaration.structurally_valid = !diagnostics.iter().any(|diagnostic| {
+            let start = diagnostic.primary().start();
+            let direct = start >= declaration.start
+                && (start < declaration.end
+                    || (start == declaration.end
+                        && declaration.end == u64::try_from(bytes.len()).unwrap_or(u64::MAX)));
+            let unmatched_opener = diagnostic.code() == "syntax.missing_closer"
+                && diagnostic.parameters().iter().any(|(name, value)| {
+                    name.as_ref() == "opener_offset"
+                        && value.parse::<u64>().is_ok_and(|offset| {
+                            offset >= declaration.start && offset < declaration.end
+                        })
+                });
+            direct || unmatched_opener
+        });
+    }
     elements.sort_by(|left, right| {
         left.range()
             .start()
@@ -242,13 +347,84 @@ pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSo
         ));
     }
 
+    let tree = build_green_tree(file, &declarations, &elements);
+    debug_assert_eq!(
+        tree.authored_bytes(),
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+    );
     ParsedSource {
         elements,
         diagnostics,
         imports,
         declarations,
+        tree,
         cancelled: false,
     }
+}
+
+fn build_green_tree(
+    file: &ProjectFile,
+    declarations: &[Declaration],
+    elements: &[SyntaxElement],
+) -> GreenNode {
+    let mut events = vec![Event::Start(
+        GreenKind::Source,
+        SourceRange::new(file.path(), 0, file.bytes().len()),
+    )];
+    let mut element_index = 0;
+    for declaration in declarations {
+        while elements
+            .get(element_index)
+            .is_some_and(|element| element.range().start() < declaration.range.start())
+        {
+            events.push(Event::Leaf(element_index));
+            element_index += 1;
+        }
+        events.push(Event::Start(
+            GreenKind::Declaration(declaration.kind),
+            SourceRange::from_u64(file.path(), declaration.start, declaration.end),
+        ));
+        while elements
+            .get(element_index)
+            .is_some_and(|element| element.range().start() < declaration.end)
+        {
+            events.push(Event::Leaf(element_index));
+            element_index += 1;
+        }
+        events.push(Event::Finish);
+    }
+    while element_index < elements.len() {
+        events.push(Event::Leaf(element_index));
+        element_index += 1;
+    }
+    events.push(Event::Finish);
+
+    let mut stack: Vec<(GreenKind, SourceRange, Vec<GreenChild>)> = Vec::new();
+    let mut root = None;
+    for event in events {
+        match event {
+            Event::Start(kind, range) => stack.push((kind, range, Vec::new())),
+            Event::Leaf(index) => stack
+                .last_mut()
+                .expect("event parser has an open node")
+                .2
+                .push(GreenChild::Leaf(elements[index].clone())),
+            Event::Finish => {
+                let (kind, range, children) = stack.pop().expect("balanced parser events");
+                let node = GreenNode {
+                    kind,
+                    range,
+                    children: children.into(),
+                };
+                if let Some(parent) = stack.last_mut() {
+                    parent.2.push(GreenChild::Node(node));
+                } else {
+                    root = Some(node);
+                }
+            }
+        }
+    }
+    root.expect("source event produces a root")
 }
 
 fn validate_top_level(file: &ProjectFile, diagnostics: &mut Vec<Diagnostic>) {
@@ -306,8 +482,9 @@ fn scan_declarations(file: &ProjectFile) -> Vec<Declaration> {
                 name: name.clone(),
                 public: *public,
                 range: SourceRange::new(file.path(), *start, *header_end),
-                start: *start,
-                end,
+                start: u64::try_from(*start).expect("admitted source offset fits u64"),
+                end: u64::try_from(end).expect("admitted source offset fits u64"),
+                structurally_valid: true,
             }
         })
         .collect()
@@ -640,4 +817,13 @@ fn valid_identifier(identifier: &str) -> bool {
     let mut bytes = identifier.bytes();
     matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+pub(crate) fn checked_slice(bytes: &[u8], start: u64, end: u64) -> Option<&[u8]> {
+    if start > end {
+        return None;
+    }
+    let start = usize::try_from(start).ok()?;
+    let end = usize::try_from(end).ok()?;
+    bytes.get(start..end)
 }

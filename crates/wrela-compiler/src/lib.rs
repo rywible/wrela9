@@ -11,7 +11,8 @@ pub use compiler::{
     AcceptedCompilation, Cancellation, CanonicalValue, CompilationOutcome, CompilationRequest,
     Compiler, CompilerInstallation, ConstructionObservation, Defect, Diagnostic, DiagnosticLabel,
     EvaluationObservation, EvaluationOutcome, EvaluationReceipt, FunctionFactsObservation,
-    HostFailure, IdentityDomain, IdentityObservation, InferredErrorObservation, InspectSelection,
-    Inspection, OpenError, ProjectFile, ProjectSnapshot, RecoveryAction, RejectedCompilation, Root,
-    SourceRange, SyntaxElement, SyntaxElementKind, SyntaxObservation, TestApplicationObservation,
+    HostFailure, IdentityDomain, IdentityObservation, IdentityOrigin, InferredErrorObservation,
+    InspectSelection, Inspection, OpenError, ProjectFile, ProjectSnapshot, RecoveryAction,
+    RejectedCompilation, Root, SourceRange, SyntaxElement, SyntaxElementKind,
+    SyntaxNodeObservation, SyntaxObservation, TestApplicationObservation,
 };

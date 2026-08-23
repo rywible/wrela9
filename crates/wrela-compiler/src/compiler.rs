@@ -6,11 +6,21 @@ use std::sync::{
 };
 
 use crate::syntax;
-use crate::{identity, identity::IdentityCollision, semantic};
+use crate::{identity, identity::IdentityCollision, semantic, typed_hir::BuildAuthority};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CompilerInstallation {
     authenticated_modules: Arc<[ProjectFile]>,
+    build_authority: BuildAuthority,
+}
+
+impl Default for CompilerInstallation {
+    fn default() -> Self {
+        Self {
+            authenticated_modules: Arc::from([]),
+            build_authority: BuildAuthority::compiler_distribution(),
+        }
+    }
 }
 
 impl CompilerInstallation {
@@ -23,6 +33,7 @@ impl CompilerInstallation {
     pub fn with_authenticated_modules(modules: Vec<ProjectFile>) -> Self {
         Self {
             authenticated_modules: modules.into(),
+            build_authority: BuildAuthority::compiler_distribution(),
         }
     }
 }
@@ -189,6 +200,15 @@ impl SourceRange {
         }
     }
 
+    pub(crate) fn from_u64(path: &str, start: u64, end: u64) -> Self {
+        debug_assert!(start <= end);
+        Self {
+            path: Arc::from(path),
+            start,
+            end,
+        }
+    }
+
     #[must_use]
     pub fn path(&self) -> &str {
         &self.path
@@ -336,14 +356,20 @@ pub struct SyntaxObservation {
     path: Arc<str>,
     bytes: Arc<[u8]>,
     elements: Arc<[SyntaxElement]>,
+    nodes: Arc<[SyntaxNodeObservation]>,
 }
 
 impl SyntaxObservation {
-    pub(crate) fn new(file: &ProjectFile, elements: Vec<SyntaxElement>) -> Self {
+    pub(crate) fn new(
+        file: &ProjectFile,
+        elements: Vec<SyntaxElement>,
+        nodes: Vec<SyntaxNodeObservation>,
+    ) -> Self {
         Self {
             path: Arc::clone(&file.path),
             bytes: Arc::clone(&file.bytes),
             elements: elements.into(),
+            nodes: nodes.into(),
         }
     }
 
@@ -360,6 +386,43 @@ impl SyntaxObservation {
     #[must_use]
     pub fn elements(&self) -> &[SyntaxElement] {
         &self.elements
+    }
+
+    #[must_use]
+    pub fn nodes(&self) -> &[SyntaxNodeObservation] {
+        &self.nodes
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyntaxNodeObservation {
+    kind: Arc<str>,
+    range: SourceRange,
+    depth: u16,
+}
+
+impl SyntaxNodeObservation {
+    pub(crate) fn new(kind: impl Into<Arc<str>>, range: SourceRange, depth: u16) -> Self {
+        Self {
+            kind: kind.into(),
+            range,
+            depth,
+        }
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    #[must_use]
+    pub const fn range(&self) -> &SourceRange {
+        &self.range
+    }
+
+    #[must_use]
+    pub const fn depth(&self) -> u16 {
+        self.depth
     }
 }
 
@@ -693,11 +756,19 @@ pub enum IdentityDomain {
     Construction,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum IdentityOrigin {
+    Project,
+    Authenticated,
+    Generated,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityObservation {
     domain: IdentityDomain,
+    origin: IdentityOrigin,
     name: Arc<str>,
-    canonical_key: Arc<str>,
+    canonical_key: Arc<[u8]>,
     digest: u128,
     fingerprint: u128,
 }
@@ -705,13 +776,15 @@ pub struct IdentityObservation {
 impl IdentityObservation {
     pub(crate) fn new(
         domain: IdentityDomain,
+        origin: IdentityOrigin,
         name: impl Into<Arc<str>>,
-        canonical_key: Arc<str>,
+        canonical_key: Arc<[u8]>,
         digest: u128,
         fingerprint: u128,
     ) -> Self {
         Self {
             domain,
+            origin,
             name: name.into(),
             canonical_key,
             digest,
@@ -725,12 +798,16 @@ impl IdentityObservation {
     }
 
     #[must_use]
+    pub const fn origin(&self) -> IdentityOrigin {
+        self.origin
+    }
+
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    #[must_use]
-    pub fn canonical_key(&self) -> &str {
+    pub(crate) fn canonical_key_bytes(&self) -> &[u8] {
         &self.canonical_key
     }
 
@@ -800,6 +877,13 @@ pub struct Defect {
 }
 
 impl Defect {
+    pub(crate) fn new(phase: impl Into<Arc<str>>, evidence: impl Into<Arc<str>>) -> Self {
+        Self {
+            phase: phase.into(),
+            evidence: evidence.into(),
+        }
+    }
+
     #[must_use]
     pub fn phase(&self) -> &str {
         &self.phase
@@ -909,6 +993,23 @@ impl Compiler {
                 ));
             }
         }
+        let authenticated_paths = self
+            .installation
+            .authenticated_modules
+            .iter()
+            .map(ProjectFile::path)
+            .collect::<BTreeSet<_>>();
+        for module in &*self.installation.authenticated_modules {
+            if files.contains_key(module.path()) {
+                diagnostics.push(Diagnostic::new(
+                    "project.authenticated_module_shadow",
+                    SourceRange::new(module.path(), 0, 0),
+                    RecoveryAction::None,
+                ));
+            } else {
+                files.insert(module.path(), module);
+            }
+        }
 
         let Some(_root) = files.get(request.root.path()).copied() else {
             diagnostics.push(Diagnostic::new(
@@ -973,7 +1074,7 @@ impl Compiler {
                 .then(left.code.cmp(&right.code))
         });
 
-        let identities = match identity::catalog(&parsed_sources, &files) {
+        let identities = match identity::catalog(&parsed_sources, &files, &authenticated_paths) {
             Ok(identities) => identities,
             Err(IdentityCollision {
                 digest,
@@ -983,19 +1084,26 @@ impl Compiler {
                 return CompilationOutcome::Defect(Defect {
                     phase: Arc::from("identity catalog"),
                     evidence: format!(
-                        "XXH3-128 collision {digest:032x} between {first_key} and {second_key}"
+                        "XXH3-128 collision {digest:032x} between {first_key:02x?} and {second_key:02x?}"
                     )
                     .into(),
                 });
             }
         };
-        let analysis = if diagnostics.is_empty() {
-            semantic::analyze(&parsed_sources, &files, request.root, cancellation)
-        } else {
-            semantic::empty()
-        };
+        let front_end_clean = diagnostics.is_empty();
+        let analysis = semantic::analyze(
+            &parsed_sources,
+            &files,
+            request.root,
+            cancellation,
+            front_end_clean,
+            &self.installation.build_authority,
+        );
         if analysis.cancelled {
             return CompilationOutcome::Cancelled;
+        }
+        if let Some(defect) = analysis.defect.clone() {
+            return CompilationOutcome::Defect(defect);
         }
         diagnostics.extend(analysis.diagnostics.iter().cloned());
         diagnostics.sort_by(|left, right| {
@@ -1011,7 +1119,11 @@ impl Compiler {
                 parsed_sources
                     .iter()
                     .map(|(path, parsed)| {
-                        SyntaxObservation::new(files[path.as_str()], parsed.elements.clone())
+                        SyntaxObservation::new(
+                            files[path.as_str()],
+                            parsed.elements.clone(),
+                            parsed.node_observations(),
+                        )
                     })
                     .collect::<Vec<_>>()
                     .into()
@@ -1123,8 +1235,14 @@ fn valid_module_path(path: &str, project: bool) -> bool {
     let mut segments = stem.split('/');
     let first = segments.next().unwrap_or_default();
     let rest: Vec<_> = segments.collect();
-    if project && rest.is_empty() && !matches!(first, "image" | "test") {
-        return false;
+    if rest.is_empty() {
+        if project {
+            if !matches!(first, "image" | "test") {
+                return false;
+            }
+        } else {
+            return false;
+        }
     }
     [first].into_iter().chain(rest).all(valid_path_segment)
 }

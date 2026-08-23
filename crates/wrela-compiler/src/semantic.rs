@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::compiler::{
-    Cancellation, ConstructionObservation, Diagnostic, EvaluationObservation, EvaluationOutcome,
-    FunctionFactsObservation, InferredErrorObservation, ProjectFile, RecoveryAction, Root,
-    SourceRange, TestApplicationObservation,
+    Cancellation, ConstructionObservation, Defect, Diagnostic, EvaluationObservation,
+    EvaluationOutcome, FunctionFactsObservation, InferredErrorObservation, ProjectFile,
+    RecoveryAction, Root, SourceRange, TestApplicationObservation,
 };
 use crate::evaluator::{Constant, Engine, Function};
 use crate::syntax::ParsedSource;
-use crate::typed_hir;
+use crate::typed_hir::{self, BuildAuthority};
 
 pub(crate) struct Analysis {
     pub(crate) diagnostics: Vec<Diagnostic>,
@@ -16,6 +16,7 @@ pub(crate) struct Analysis {
     pub(crate) evaluations: Vec<EvaluationObservation>,
     pub(crate) constructions: Vec<ConstructionObservation>,
     pub(crate) test_plan: Vec<TestApplicationObservation>,
+    pub(crate) defect: Option<Defect>,
     pub(crate) cancelled: bool,
 }
 
@@ -24,11 +25,13 @@ pub(crate) fn analyze<'a>(
     files: &BTreeMap<&'a str, &'a ProjectFile>,
     root: Root,
     cancellation: &Cancellation,
+    executable_allowed: bool,
+    build_authority: &BuildAuthority,
 ) -> Analysis {
     let mut diagnostics = Vec::new();
     let mut functions = BTreeMap::new();
     let mut constants = BTreeMap::new();
-    let mut function_facts = Vec::new();
+    let mut facts = BTreeMap::new();
     let mut private_types = BTreeSet::new();
     let mut public_function_headers = Vec::new();
     let mut image_functions = Vec::new();
@@ -41,7 +44,10 @@ pub(crate) fn analyze<'a>(
         let file = files[path.as_str()];
         validate_attributes(file, &mut diagnostics);
         for declaration in &parsed.declarations {
-            let bytes = &file.bytes()[declaration.start..declaration.end];
+            if !declaration.structurally_valid {
+                continue;
+            }
+            let bytes = parsed.declaration_bytes(file, declaration);
             let text = String::from_utf8_lossy(bytes);
             if matches!(
                 declaration.kind,
@@ -74,13 +80,16 @@ pub(crate) fn analyze<'a>(
                     let may_panic = body_text.contains("panic ")
                         || body_text.contains(" / ")
                         || body_text.contains(" % ");
-                    function_facts.push(FunctionFactsObservation::new(
-                        function.name.clone(),
-                        pure,
-                        may_panic,
-                        suspends,
-                        eligible,
-                    ));
+                    facts.insert(
+                        qualified.clone(),
+                        FunctionFacts {
+                            name: function.name.clone(),
+                            pure,
+                            may_panic,
+                            suspends,
+                            evaluator_eligible: eligible,
+                        },
+                    );
                     if declaration.public {
                         public_function_headers
                             .push((declaration.range.clone(), first_line(&text).to_owned()));
@@ -92,13 +101,12 @@ pub(crate) fn analyze<'a>(
                             declaration.range.clone(),
                         ));
                     }
-                    functions.insert(function.name.clone(), function.clone());
                     functions.insert(qualified, function);
                 }
             } else if declaration.kind == "constant"
                 && let Some(constant) = parse_constant(file, declaration.start)
             {
-                constants.insert(constant.name.clone(), constant);
+                constants.insert(qualify(path, &constant.name), constant);
             } else if declaration.kind == "suite" {
                 suites.extend(parse_suite(file, declaration.start, declaration.end));
                 validate_suite(file, declaration, &mut diagnostics);
@@ -107,18 +115,36 @@ pub(crate) fn analyze<'a>(
     }
 
     let qualified_functions = functions.clone();
-    for parsed in parsed_sources.values() {
+    for (importer_path, parsed) in parsed_sources {
+        let importer_module = module_name(importer_path);
         for import in &parsed.imports {
             let target_module = module_name(&import.target_path);
             for (qualified, function) in &qualified_functions {
                 if function.public
                     && let Some(member) = qualified.strip_prefix(&format!("{target_module}."))
                 {
-                    functions.insert(format!("{}.{}", import.alias, member), function.clone());
+                    functions.insert(
+                        format!("{importer_module}|{}.{}", import.alias, member),
+                        function.clone(),
+                    );
                 }
             }
         }
     }
+
+    solve_function_facts(&mut facts, &functions);
+    let mut function_facts = facts
+        .into_values()
+        .map(|facts| {
+            FunctionFactsObservation::new(
+                facts.name,
+                facts.pure,
+                facts.may_panic,
+                facts.suspends,
+                facts.evaluator_eligible,
+            )
+        })
+        .collect::<Vec<_>>();
 
     for (range, header) in public_function_headers {
         if let Some(private) = private_types
@@ -154,14 +180,14 @@ pub(crate) fn analyze<'a>(
     }
     let image_reachable = image_functions
         .first()
-        .map_or_else(BTreeSet::new, |(_, name, _)| {
-            reachable_functions(name, &functions)
+        .map_or_else(BTreeSet::new, |(path, name, _)| {
+            reachable_functions(&qualify(path, name), &functions)
         });
     let mut checked_sources = BTreeSet::new();
     for function in functions.values() {
         if checked_sources.insert(function.source.clone())
             && contains_build_constructor(&function_body(function))
-            && !image_reachable.contains(&function.name)
+            && !image_reachable.contains(&function.source)
         {
             diagnostics.push(Diagnostic::new(
                 "semantic.build_constructor_outside_image",
@@ -173,18 +199,25 @@ pub(crate) fn analyze<'a>(
 
     let (inferred_errors, error_diagnostics) = infer_private_errors(&functions);
     diagnostics.extend(error_diagnostics);
+    for range in unproven_recursive_cycles(&functions) {
+        diagnostics.push(Diagnostic::new(
+            "semantic.unproven_recursive_bound",
+            range,
+            RecoveryAction::None,
+        ));
+    }
 
     let expected_root_path = match root {
         Root::Image => "src/image.wr",
         Root::Test => "src/test.wr",
     };
-    if image_functions.is_empty() {
+    if executable_allowed && image_functions.is_empty() {
         diagnostics.push(Diagnostic::new(
             "semantic.missing_image_constructor",
             SourceRange::new(expected_root_path, 0, 0),
             RecoveryAction::None,
         ));
-    } else if image_functions.len() > 1 {
+    } else if executable_allowed && image_functions.len() > 1 {
         for (_, _, range) in image_functions.iter().skip(1) {
             diagnostics.push(Diagnostic::new(
                 "semantic.multiple_image_constructors",
@@ -192,7 +225,7 @@ pub(crate) fn analyze<'a>(
                 RecoveryAction::None,
             ));
         }
-    } else if image_functions[0].0 != expected_root_path {
+    } else if executable_allowed && image_functions[0].0 != expected_root_path {
         diagnostics.push(Diagnostic::new(
             "semantic.image_constructor_outside_root",
             image_functions[0].2.clone(),
@@ -203,7 +236,7 @@ pub(crate) fn analyze<'a>(
     let mut evaluations = Vec::new();
     let mut constructions = Vec::new();
     let mut test_plan = Vec::new();
-    if root == Root::Test {
+    if executable_allowed && root == Root::Test {
         let image_range = image_functions.first().map_or_else(
             || SourceRange::new(expected_root_path, 0, 0),
             |entry| entry.2.clone(),
@@ -255,41 +288,56 @@ pub(crate) fn analyze<'a>(
             })
             .collect();
     }
-    let program = match typed_hir::verify(functions) {
+    let mut verification_defect = None;
+    let allowed_tests = suites
+        .iter()
+        .map(|test| format!("{}.{}", test.suite, test.test))
+        .collect::<BTreeSet<_>>();
+    let program = match typed_hir::verify(
+        functions,
+        constants.clone(),
+        &allowed_tests,
+        build_authority,
+    ) {
         Ok(program) => Some(program),
-        Err(defect) => {
+        Err(typed_hir::VerificationFailure::Defect { evidence }) => {
+            verification_defect = Some(Defect::new("typed HIR verification", evidence));
+            None
+        }
+        Err(typed_hir::VerificationFailure::Creator { kind, site }) => {
             diagnostics.push(
-                Diagnostic::new(
-                    "compiler.typed_hir_verification_failed",
-                    SourceRange::new(expected_root_path, 0, 0),
-                    RecoveryAction::None,
-                )
-                .with_parameter("evidence", defect.evidence),
+                Diagnostic::new("semantic.invalid_typed_hir", site, RecoveryAction::None)
+                    .with_parameter("kind", kind),
             );
             None
         }
     };
-    if diagnostics.is_empty() {
+    if executable_allowed && diagnostics.is_empty() {
         let program = program.as_ref().expect("verified when no diagnostics");
-        let allowed_tests = suites
-            .iter()
-            .map(|test| format!("{}.{}", test.suite, test.test))
-            .collect::<Vec<_>>();
         let constant_names = constants.keys().cloned().collect::<Vec<_>>();
         for name in constant_names {
-            let mut engine =
-                Engine::new(program, &constants).with_test_applications(allowed_tests.clone());
+            let mut engine = Engine::new(program);
             let run = engine.evaluate_constant(&name);
             map_evaluation_failure(&run.outcome, &constants[&name].source, &mut diagnostics);
-            evaluations.push(EvaluationObservation::new(
-                format!("{}.{}", module_name(expected_root_path), name),
-                run.outcome,
-                run.receipt,
-            ));
+            evaluations.push(EvaluationObservation::new(name, run.outcome, run.receipt));
         }
         for (path, expression, range) in compile_time_assertions(parsed_sources, files) {
-            let mut engine =
-                Engine::new(program, &constants).with_test_applications(allowed_tests.clone());
+            let module = module_name(&path);
+            let Ok(expression) = program.verify_expression(
+                &module,
+                &expression,
+                &range,
+                &allowed_tests,
+                build_authority,
+            ) else {
+                diagnostics.push(Diagnostic::new(
+                    "semantic.invalid_comptime_expression",
+                    range,
+                    RecoveryAction::None,
+                ));
+                continue;
+            };
+            let mut engine = Engine::new(program);
             let run = engine.evaluate_expression(&expression, &range);
             if run.outcome != EvaluationOutcome::Completed(crate::CanonicalValue::Bool(true)) {
                 diagnostics.push(Diagnostic::new(
@@ -307,9 +355,8 @@ pub(crate) fn analyze<'a>(
         if diagnostics.is_empty()
             && let Some((path, image_name, image_range)) = image_functions.first()
         {
-            let mut engine =
-                Engine::new(program, &constants).with_test_applications(allowed_tests.clone());
-            let run = engine.evaluate_function(image_name);
+            let mut engine = Engine::new(program);
+            let run = engine.evaluate_function(&qualify(path, image_name));
             map_evaluation_failure(&run.outcome, image_range, &mut diagnostics);
             constructions.extend(
                 run.constructions.into_iter().map(|(identity, kind, site)| {
@@ -334,6 +381,7 @@ pub(crate) fn analyze<'a>(
         evaluations,
         constructions,
         test_plan,
+        defect: verification_defect,
         cancelled: false,
     }
 }
@@ -344,8 +392,57 @@ struct SuiteTest {
     test: String,
 }
 
-fn parse_suite(file: &ProjectFile, start: usize, end: usize) -> Vec<SuiteTest> {
-    let Ok(source) = std::str::from_utf8(&file.bytes()[start..end]) else {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FunctionFacts {
+    name: String,
+    pure: bool,
+    may_panic: bool,
+    suspends: bool,
+    evaluator_eligible: bool,
+}
+
+fn solve_function_facts(
+    facts: &mut BTreeMap<String, FunctionFacts>,
+    functions: &BTreeMap<String, Function>,
+) {
+    for _ in 0..=facts.len() {
+        let previous = facts.clone();
+        for (name, current) in &mut *facts {
+            let Some(function) = functions.get(name) else {
+                continue;
+            };
+            for called in called_functions(&function_body(function)) {
+                let imported = format!("{}|{called}", function.module);
+                let local = format!("{}.{}", function.module, called);
+                let resolved = if functions.contains_key(&imported) {
+                    imported
+                } else {
+                    local
+                };
+                let Some(callee) = functions.get(&resolved) else {
+                    continue;
+                };
+                let canonical = format!("{}.{}", callee.module, callee.name);
+                let Some(callee_facts) = previous.get(&canonical) else {
+                    continue;
+                };
+                current.pure &= callee_facts.pure;
+                current.may_panic |= callee_facts.may_panic;
+                current.suspends |= callee_facts.suspends;
+                current.evaluator_eligible &= callee_facts.evaluator_eligible;
+            }
+        }
+        if *facts == previous {
+            break;
+        }
+    }
+}
+
+fn parse_suite(file: &ProjectFile, start: u64, end: u64) -> Vec<SuiteTest> {
+    let Some(bytes) = crate::syntax::checked_slice(file.bytes(), start, end) else {
+        return Vec::new();
+    };
+    let Ok(source) = std::str::from_utf8(bytes) else {
         return Vec::new();
     };
     let Some(header) = source.lines().next() else {
@@ -391,7 +488,12 @@ fn validate_suite(
             RecoveryAction::None,
         ));
     }
-    let Ok(source) = std::str::from_utf8(&file.bytes()[declaration.start..declaration.end]) else {
+    let Some(bytes) =
+        crate::syntax::checked_slice(file.bytes(), declaration.start, declaration.end)
+    else {
+        return;
+    };
+    let Ok(source) = std::str::from_utf8(bytes) else {
         return;
     };
     let mut offset = declaration.start;
@@ -407,18 +509,23 @@ fn validate_suite(
                 if !parameter.is_empty() && !parameter.starts_with("take ") {
                     diagnostics.push(Diagnostic::new(
                         "test.parameter_requires_take",
-                        SourceRange::new(file.path(), offset, offset + line.len()),
+                        SourceRange::from_u64(
+                            file.path(),
+                            offset,
+                            offset.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX)),
+                        ),
                         RecoveryAction::None,
                     ));
                 }
             }
         }
-        offset += line.len() + 1;
+        offset = offset.saturating_add(u64::try_from(line.len() + 1).unwrap_or(u64::MAX));
     }
 }
 
-fn parse_function(file: &ProjectFile, start: usize, end: usize, public: bool) -> Option<Function> {
-    let source = std::str::from_utf8(&file.bytes()[start..end]).ok()?;
+fn parse_function(file: &ProjectFile, start: u64, end: u64, public: bool) -> Option<Function> {
+    let source =
+        std::str::from_utf8(crate::syntax::checked_slice(file.bytes(), start, end)?).ok()?;
     let mut lines = source.lines();
     let header = lines.next()?.trim();
     let fn_offset = header.find("fn ")? + 3;
@@ -445,26 +552,36 @@ fn parse_function(file: &ProjectFile, start: usize, end: usize, public: bool) ->
         .map_or_else(String::new, |value| {
             value.trim().trim_end_matches(':').trim().to_owned()
         });
-    let mut line_offset = start + header.len() + 1;
+    let mut line_offset = start
+        .saturating_add(u64::try_from(header.len()).ok()?)
+        .saturating_add(1);
     let body = lines
         .map(|line| {
             let result = (line_offset, line.to_owned());
-            line_offset += line.len() + 1;
+            line_offset = line_offset
+                .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX))
+                .saturating_add(1);
             result
         })
         .collect();
     Some(Function {
         name,
+        module: module_name(file.path()),
         public,
         parameters,
         return_type,
         body,
-        source: SourceRange::new(file.path(), start, start + header.len()),
+        source: SourceRange::from_u64(
+            file.path(),
+            start,
+            start.saturating_add(u64::try_from(header.len()).ok()?),
+        ),
     })
 }
 
-fn parse_constant(file: &ProjectFile, start: usize) -> Option<Constant> {
-    let line = std::str::from_utf8(&file.bytes()[start..])
+fn parse_constant(file: &ProjectFile, start: u64) -> Option<Constant> {
+    let end = u64::try_from(file.bytes().len()).ok()?;
+    let line = std::str::from_utf8(crate::syntax::checked_slice(file.bytes(), start, end)?)
         .ok()?
         .lines()
         .next()?;
@@ -473,9 +590,14 @@ fn parse_constant(file: &ProjectFile, start: usize) -> Option<Constant> {
     let (type_name, expression) = rest.split_once('=')?;
     Some(Constant {
         name: name.trim().to_owned(),
+        module: module_name(file.path()),
         type_name: type_name.trim().to_owned(),
         expression: expression.trim().to_owned(),
-        source: SourceRange::new(file.path(), start, start + line.len()),
+        source: SourceRange::from_u64(
+            file.path(),
+            start,
+            start.saturating_add(u64::try_from(line.len()).ok()?),
+        ),
     })
 }
 
@@ -685,8 +807,10 @@ fn map_evaluation_failure(
     }
 }
 
-fn has_image_attribute(bytes: &[u8], declaration_start: usize) -> bool {
-    let before = &bytes[..declaration_start];
+fn has_image_attribute(bytes: &[u8], declaration_start: u64) -> bool {
+    let Some(before) = crate::syntax::checked_slice(bytes, 0, declaration_start) else {
+        return false;
+    };
     before
         .split(|byte| *byte == b'\n')
         .rev()
@@ -720,17 +844,26 @@ fn validate_attributes(file: &ProjectFile, diagnostics: &mut Vec<Diagnostic>) {
     }
 }
 
-fn reachable_functions(root: &str, functions: &BTreeMap<String, Function>) -> BTreeSet<String> {
+fn reachable_functions(
+    root: &str,
+    functions: &BTreeMap<String, Function>,
+) -> BTreeSet<SourceRange> {
     let mut reachable = BTreeSet::new();
+    let mut visited = BTreeSet::new();
     let mut pending = BTreeSet::from([root.to_owned()]);
-    while let Some(name) = pending.pop_first() {
-        if !reachable.insert(name.clone()) {
+    while let Some(lookup_name) = pending.pop_first() {
+        if !visited.insert(lookup_name.clone()) {
             continue;
         }
-        if let Some(function) = functions.get(&name) {
+        if let Some(function) = functions.get(&lookup_name) {
+            reachable.insert(function.source.clone());
             for called in called_functions(&function_body(function)) {
-                if functions.contains_key(&called) && !reachable.contains(&called) {
-                    pending.insert(called);
+                let imported = format!("{}|{called}", function.module);
+                let local = format!("{}.{}", function.module, called);
+                if functions.contains_key(&imported) {
+                    pending.insert(imported);
+                } else if functions.contains_key(&local) {
+                    pending.insert(local);
                 }
             }
         }
@@ -754,19 +887,59 @@ fn called_functions(source: &str) -> Vec<String> {
             }
             let after_name = source[index..].trim_start();
             if after_name.starts_with('(') {
-                calls.push(
-                    source[start..index]
-                        .rsplit('.')
-                        .next()
-                        .unwrap_or_default()
-                        .to_owned(),
-                );
+                calls.push(source[start..index].to_owned());
             }
         } else {
             index += 1;
         }
     }
     calls
+}
+
+fn unproven_recursive_cycles(functions: &BTreeMap<String, Function>) -> Vec<SourceRange> {
+    let unique = functions
+        .values()
+        .map(|function| (function.source.clone(), function))
+        .collect::<BTreeMap<_, _>>();
+    let graph = unique
+        .iter()
+        .map(|(source, function)| {
+            let dependencies = called_functions(&function_body(function))
+                .into_iter()
+                .filter_map(|called| {
+                    let imported = format!("{}|{called}", function.module);
+                    let local = format!("{}.{}", function.module, called);
+                    functions
+                        .get(&imported)
+                        .or_else(|| functions.get(&local))
+                        .map(|target| target.source.clone())
+                })
+                .collect::<BTreeSet<_>>();
+            (source.clone(), dependencies)
+        })
+        .collect::<BTreeMap<_, _>>();
+    graph
+        .keys()
+        .filter(|root| reaches(root, root, &graph, &mut BTreeSet::new()))
+        .cloned()
+        .collect()
+}
+
+fn reaches(
+    root: &SourceRange,
+    current: &SourceRange,
+    graph: &BTreeMap<SourceRange, BTreeSet<SourceRange>>,
+    visited: &mut BTreeSet<SourceRange>,
+) -> bool {
+    if !visited.insert(current.clone()) {
+        return false;
+    }
+    graph.get(current).is_some_and(|dependencies| {
+        dependencies.contains(root)
+            || dependencies
+                .iter()
+                .any(|dependency| reaches(root, dependency, graph, visited))
+    })
 }
 
 fn partial_result_return(header: &str) -> Option<&str> {
@@ -823,19 +996,8 @@ fn cancelled() -> Analysis {
         evaluations: Vec::new(),
         constructions: Vec::new(),
         test_plan: Vec::new(),
+        defect: None,
         cancelled: true,
-    }
-}
-
-pub(crate) fn empty() -> Analysis {
-    Analysis {
-        diagnostics: Vec::new(),
-        function_facts: Vec::new(),
-        inferred_errors: Vec::new(),
-        evaluations: Vec::new(),
-        constructions: Vec::new(),
-        test_plan: Vec::new(),
-        cancelled: false,
     }
 }
 

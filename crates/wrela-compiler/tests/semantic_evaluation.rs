@@ -237,6 +237,71 @@ fn build() -> Image:
 }
 
 #[test]
+fn duplicate_declarations_are_rejected_in_one_module_namespace() {
+    let source = br#"fn answer() -> i64:
+    return 41
+
+const answer: i64 = 42
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("duplicate declarations must reject");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.duplicate_declaration")
+    );
+}
+
+#[test]
+fn comments_and_text_cannot_fabricate_semantic_calls_or_effects() {
+    let source = br#"fn harmless() -> Text:
+    # panic "not real"; missing()?; Result.Err(Fake.Bad)
+    return "Image.new( / missing()? )"
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("trivia and text are semantically inert");
+    };
+    let harmless = accepted
+        .inspection()
+        .function_facts()
+        .iter()
+        .find(|facts| facts.name() == "harmless")
+        .expect("harmless facts");
+    assert!(!harmless.may_panic());
+    assert!(harmless.is_pure());
+}
+
+#[test]
+fn symbolic_graph_sealing_rejects_multiple_image_roots() {
+    let source = br#"fn child() -> Image:
+    return Image.new()
+
+@image
+fn build() -> Image:
+    return Image.new(child=child())
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("one evaluation may seal exactly one Image root");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "construction.invalid_graph")
+    );
+}
+
+#[test]
 fn exact_propagation_rejects_implicit_error_conversion() {
     let source = br#"enum ReadError:
     Missing

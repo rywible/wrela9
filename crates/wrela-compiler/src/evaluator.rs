@@ -7,7 +7,7 @@ use crate::typed_hir::{
     BinaryOperator, BuildConstructor, CallTarget, Expression, ExpressionKind, HirFunction,
     Statement, VerifiedProgram,
 };
-use crate::{CanonicalValue, EvaluationOutcome, EvaluationReceipt, SourceRange};
+use crate::{Cancellation, CanonicalValue, EvaluationOutcome, EvaluationReceipt, SourceRange};
 
 pub(crate) const FUEL_LIMIT: u64 = 100_000;
 const MEMORY_LIMIT: u64 = 1_048_576;
@@ -35,29 +35,34 @@ pub(crate) struct Constant {
 
 pub(crate) struct Engine<'a> {
     program: &'a VerifiedProgram,
+    cancellation: &'a Cancellation,
     constant_values: BTreeMap<String, CanonicalValue>,
     evaluating_constants: Vec<String>,
     fuel: u64,
     peak_memory: u64,
-    constructions: Vec<(u128, String, SourceRange)>,
+    constructions: Vec<Construction>,
+    test_applications: Vec<String>,
     call_stack: Vec<(String, String, SourceRange)>,
 }
 
 pub(crate) struct Run {
     pub(crate) outcome: EvaluationOutcome,
     pub(crate) receipt: EvaluationReceipt,
-    pub(crate) constructions: Vec<(u128, String, SourceRange)>,
+    pub(crate) constructions: Vec<Construction>,
+    pub(crate) test_applications: Vec<String>,
 }
 
 impl<'a> Engine<'a> {
-    pub(crate) fn new(program: &'a VerifiedProgram) -> Self {
+    pub(crate) fn new(program: &'a VerifiedProgram, cancellation: &'a Cancellation) -> Self {
         Self {
             program,
+            cancellation,
             constant_values: BTreeMap::new(),
             evaluating_constants: Vec::new(),
             fuel: 0,
             peak_memory: 0,
             constructions: Vec::new(),
+            test_applications: Vec::new(),
             call_stack: Vec::new(),
         }
     }
@@ -96,10 +101,14 @@ impl<'a> Engine<'a> {
                 self.peak_memory,
             ),
             constructions: std::mem::take(&mut self.constructions),
+            test_applications: std::mem::take(&mut self.test_applications),
         }
     }
 
     fn charge(&mut self, amount: u64) -> Result<(), EvaluationOutcome> {
+        if self.cancellation.is_cancelled() {
+            return Err(EvaluationOutcome::Cancelled);
+        }
         self.fuel = self.fuel.saturating_add(amount);
         if self.fuel > FUEL_LIMIT {
             return Err(EvaluationOutcome::LimitExceeded {
@@ -394,23 +403,27 @@ impl<'a> Engine<'a> {
     ) -> Result<CanonicalValue, EvaluationOutcome> {
         match target {
             CallTarget::Function(name) => self.call_function(name, arguments),
-            CallTarget::Build(constructor) => self.construct(*constructor, site),
+            CallTarget::Build(constructor) => self.construct(*constructor, &arguments, site),
             CallTarget::Variant { type_name, variant } => Ok(CanonicalValue::Variant {
                 type_name: Arc::from(type_name.as_str()),
                 variant: Arc::from(variant.as_str()),
                 payload: arguments.into(),
             }),
-            CallTarget::TestApplication(name) => Ok(CanonicalValue::Variant {
-                type_name: Arc::from("TestApplication"),
-                variant: Arc::from(name.as_str()),
-                payload: arguments.into(),
-            }),
+            CallTarget::TestApplication(name) => {
+                self.test_applications.push(name.clone());
+                Ok(CanonicalValue::Variant {
+                    type_name: Arc::from("TestApplication"),
+                    variant: Arc::from(name.as_str()),
+                    payload: arguments.into(),
+                })
+            }
         }
     }
 
     fn construct(
         &mut self,
         constructor: BuildConstructor,
+        arguments: &[CanonicalValue],
         site: &SourceRange,
     ) -> Result<CanonicalValue, EvaluationOutcome> {
         self.charge(3)?;
@@ -435,13 +448,49 @@ impl<'a> Engine<'a> {
         key.extend_from_slice(&site.end().to_be_bytes());
         key.extend_from_slice(&u64::try_from(coordinate).unwrap_or(u64::MAX).to_be_bytes());
         let identity = xxh3_128(&key);
-        self.constructions
-            .push((identity, kind.to_owned(), site.clone()));
+        let mut edges = Vec::new();
+        for argument in arguments {
+            collect_construction_edges(argument, &mut edges);
+        }
+        self.constructions.push(Construction {
+            identity,
+            kind: kind.to_owned(),
+            site: site.clone(),
+            edges,
+        });
         Ok(CanonicalValue::SymbolicHandle {
             kind: Arc::from(kind),
             identity,
         })
     }
+}
+
+fn collect_construction_edges(value: &CanonicalValue, edges: &mut Vec<u128>) {
+    match value {
+        CanonicalValue::SymbolicHandle { identity, .. } => edges.push(*identity),
+        CanonicalValue::Array(values)
+        | CanonicalValue::Tuple(values)
+        | CanonicalValue::Variant {
+            payload: values, ..
+        } => {
+            for value in &**values {
+                collect_construction_edges(value, edges);
+            }
+        }
+        CanonicalValue::Unit
+        | CanonicalValue::Bool(_)
+        | CanonicalValue::Integer { .. }
+        | CanonicalValue::Float { .. }
+        | CanonicalValue::Text(_) => {}
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Construction {
+    pub(crate) identity: u128,
+    pub(crate) kind: String,
+    pub(crate) site: SourceRange,
+    pub(crate) edges: Vec<u128>,
 }
 
 fn apply_binary(
@@ -654,9 +703,12 @@ mod tests {
             BTreeMap::new(),
             &BTreeSet::new(),
             &typed_hir::BuildAuthority::compiler_distribution(),
+            &BTreeSet::new(),
+            &Cancellation::new(),
         )
         .expect("empty program verifies");
-        let mut engine = Engine::new(&program);
+        let cancellation = Cancellation::new();
+        let mut engine = Engine::new(&program, &cancellation);
         engine.charge(FUEL_LIMIT).expect("at ceiling is admitted");
         assert_eq!(
             engine.charge(1),
@@ -666,5 +718,22 @@ mod tests {
                 used: FUEL_LIMIT + 1,
             })
         );
+    }
+
+    #[test]
+    fn cancellation_is_polled_during_evaluation() {
+        let program = typed_hir::verify(
+            BTreeMap::new(),
+            BTreeMap::new(),
+            &BTreeSet::new(),
+            &typed_hir::BuildAuthority::compiler_distribution(),
+            &BTreeSet::new(),
+            &Cancellation::new(),
+        )
+        .expect("empty program verifies");
+        let cancellation = Cancellation::new();
+        let mut engine = Engine::new(&program, &cancellation);
+        cancellation.cancel();
+        assert_eq!(engine.charge(1), Err(EvaluationOutcome::Cancelled));
     }
 }

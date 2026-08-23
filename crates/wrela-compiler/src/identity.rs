@@ -69,6 +69,23 @@ where
                 &hasher,
                 &mut digests,
             )?);
+            observations.push(intern(
+                IdentityDomain::SourceSite,
+                origin,
+                format!("{}:{}@{}", module, declaration.name, declaration.start),
+                key(
+                    IdentityDomain::SourceSite,
+                    origin,
+                    &[
+                        module.as_bytes(),
+                        &declaration.start.to_be_bytes(),
+                        &declaration.end.to_be_bytes(),
+                    ],
+                ),
+                fingerprint(bytes),
+                &hasher,
+                &mut digests,
+            )?);
             let extra_domain = match declaration.kind {
                 "struct" | "resource_struct" | "enum" | "interface" | "type_alias" => {
                     Some(IdentityDomain::Type)
@@ -102,9 +119,31 @@ where
                     &mut digests,
                 )?);
             }
+            if declaration.kind == "suite" {
+                for test in suite_tests(bytes) {
+                    observations.push(intern(
+                        IdentityDomain::Test,
+                        origin,
+                        format!("{}.{}", declaration.name, test),
+                        key(
+                            IdentityDomain::Test,
+                            origin,
+                            &[
+                                module.as_bytes(),
+                                declaration.name.as_bytes(),
+                                test.as_bytes(),
+                            ],
+                        ),
+                        fingerprint(test.as_bytes()),
+                        &hasher,
+                        &mut digests,
+                    )?);
+                }
+            }
         }
     }
     observations.sort_by(|left, right| left.canonical_key_bytes().cmp(right.canonical_key_bytes()));
+    observations.dedup_by(|left, right| left.canonical_key_bytes() == right.canonical_key_bytes());
     Ok(observations)
 }
 
@@ -167,6 +206,29 @@ fn module_name(path: &str) -> String {
         .and_then(|path| path.strip_suffix(".wr"))
         .unwrap_or(path)
         .replace('/', ".")
+}
+
+fn suite_tests(bytes: &[u8]) -> Vec<String> {
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    source
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let line = line.strip_prefix("    ")?;
+            if line.starts_with(' ') {
+                return None;
+            }
+            let test = line
+                .strip_prefix("test ")
+                .or_else(|| line.strip_prefix("async test "))?
+                .split('(')
+                .next()?
+                .trim();
+            (!test.is_empty()).then(|| test.to_owned())
+        })
+        .collect()
 }
 
 impl IdentityDomain {

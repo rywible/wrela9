@@ -90,14 +90,6 @@ impl GreenNode {
         }
     }
 
-    fn empty(path: &str) -> Self {
-        Self {
-            kind: GreenKind::Source,
-            range: SourceRange::new(path, 0, 0),
-            children: std::sync::Arc::from([]),
-        }
-    }
-
     fn authored_bytes(&self) -> u64 {
         self.children
             .iter()
@@ -123,14 +115,16 @@ pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSo
     let bytes = file.bytes();
     let path = file.path();
     if bytes.len() > MAX_SOURCE_BYTES {
+        let elements = vec![SyntaxElement::new(
+            SyntaxElementKind::Invalid,
+            "oversized_source",
+            path,
+            0,
+            bytes.len(),
+        )];
         return ParsedSource {
-            elements: vec![SyntaxElement::new(
-                SyntaxElementKind::Invalid,
-                "oversized_source",
-                path,
-                0,
-                bytes.len(),
-            )],
+            tree: build_green_tree(file, &[], &elements),
+            elements,
             diagnostics: vec![Diagnostic::new(
                 "syntax.source_too_large",
                 SourceRange::new(path, MAX_SOURCE_BYTES, bytes.len()),
@@ -138,7 +132,6 @@ pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSo
             )],
             imports: Vec::new(),
             declarations: Vec::new(),
-            tree: GreenNode::empty(path),
             cancelled: false,
         };
     }

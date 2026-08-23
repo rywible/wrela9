@@ -216,7 +216,8 @@ fn authenticated_modules_resolve_from_the_sealed_distribution_and_cannot_be_shad
                 ),
             ]),
             Root::Image,
-        ),
+        )
+        .with_inspection(InspectSelection::all()),
         &Cancellation::new(),
     ) else {
         panic!("Project cannot forge authenticated origin");
@@ -227,4 +228,8 @@ fn authenticated_modules_resolve_from_the_sealed_distribution_and_cannot_be_shad
             .iter()
             .any(|diagnostic| diagnostic.code() == "project.authenticated_module_shadow")
     );
+    assert!(rejected.inspection().identities().iter().all(|identity| {
+        identity.name() != "core.images"
+            || identity.origin() == wrela_compiler::IdentityOrigin::Project
+    }));
 }

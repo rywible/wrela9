@@ -5,7 +5,7 @@ use crate::compiler::{
     EvaluationOutcome, FunctionFactsObservation, InferredErrorObservation, ProjectFile,
     RecoveryAction, Root, SourceRange, TestApplicationObservation,
 };
-use crate::evaluator::{Constant, Engine, Function};
+use crate::evaluator::{Constant, Construction, Engine, Function};
 use crate::syntax::ParsedSource;
 use crate::typed_hir::{self, BuildAuthority};
 
@@ -34,8 +34,10 @@ pub(crate) fn analyze<'a>(
     let mut facts = BTreeMap::new();
     let mut private_types = BTreeSet::new();
     let mut public_function_headers = Vec::new();
+    let mut nominal_types = BTreeSet::new();
     let mut image_functions = Vec::new();
     let mut suites = Vec::new();
+    let mut declared_names = BTreeMap::new();
 
     for (path, parsed) in parsed_sources {
         if cancellation.is_cancelled() {
@@ -47,26 +49,38 @@ pub(crate) fn analyze<'a>(
             if !declaration.structurally_valid {
                 continue;
             }
+            let declaration_key = format!("{}.{}", module_name(path), declaration.name);
+            if declared_names
+                .insert(declaration_key, declaration.range.clone())
+                .is_some()
+            {
+                diagnostics.push(
+                    Diagnostic::new(
+                        "semantic.duplicate_declaration",
+                        declaration.range.clone(),
+                        RecoveryAction::None,
+                    )
+                    .with_parameter("name", declaration.name.clone()),
+                );
+                continue;
+            }
             let bytes = parsed.declaration_bytes(file, declaration);
             let text = String::from_utf8_lossy(bytes);
             if matches!(
                 declaration.kind,
                 "struct" | "resource_struct" | "enum" | "type_alias"
-            ) && !declaration.public
-            {
-                private_types.insert(declaration.name.clone());
+            ) {
+                nominal_types.insert(declaration.name.clone());
+                if !declaration.public {
+                    private_types.insert(declaration.name.clone());
+                }
             }
             if declaration.kind == "function" {
                 if let Some(function) =
                     parse_function(file, declaration.start, declaration.end, declaration.public)
                 {
                     let qualified = qualify(path, &function.name);
-                    let body_text = function
-                        .body
-                        .iter()
-                        .map(|(_, line)| line.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    let body_text = function_body(&function);
                     let suspends = text.trim_start().starts_with("async ")
                         || text.trim_start().starts_with("pub async ")
                         || body_text.contains("await ");
@@ -118,6 +132,17 @@ pub(crate) fn analyze<'a>(
     for (importer_path, parsed) in parsed_sources {
         let importer_module = module_name(importer_path);
         for import in &parsed.imports {
+            if declared_names.contains_key(&format!("{importer_module}.{}", import.alias)) {
+                diagnostics.push(
+                    Diagnostic::new(
+                        "semantic.import_alias_conflict",
+                        import.range.clone(),
+                        RecoveryAction::None,
+                    )
+                    .with_parameter("alias", import.alias.clone()),
+                );
+                continue;
+            }
             let target_module = module_name(&import.target_path);
             for (qualified, function) in &qualified_functions {
                 if function.public
@@ -170,7 +195,7 @@ pub(crate) fn analyze<'a>(
     }
 
     for constant in constants.values() {
-        if contains_build_constructor(&constant.expression) {
+        if contains_build_constructor(&semantic_code_line(&constant.expression)) {
             diagnostics.push(Diagnostic::new(
                 "semantic.build_constructor_outside_image",
                 constant.source.clone(),
@@ -236,58 +261,6 @@ pub(crate) fn analyze<'a>(
     let mut evaluations = Vec::new();
     let mut constructions = Vec::new();
     let mut test_plan = Vec::new();
-    if executable_allowed && root == Root::Test {
-        let image_range = image_functions.first().map_or_else(
-            || SourceRange::new(expected_root_path, 0, 0),
-            |entry| entry.2.clone(),
-        );
-        let source = files
-            .get(expected_root_path)
-            .map_or(&[][..], |file| file.bytes());
-        let source_text = String::from_utf8_lossy(source);
-        let mut applications = Vec::new();
-        for test in &suites {
-            let qualified = format!("{}.{}(", test.suite, test.test);
-            let positions = source_text
-                .match_indices(&qualified)
-                .map(|(position, _)| position)
-                .collect::<Vec<_>>();
-            if positions.is_empty() {
-                diagnostics.push(
-                    Diagnostic::new(
-                        "test.missing_application",
-                        image_range.clone(),
-                        RecoveryAction::None,
-                    )
-                    .with_parameter("test", format!("{}.{}", test.suite, test.test)),
-                );
-            } else {
-                applications.push((positions[0], test.clone()));
-                if positions.len() > 1 {
-                    diagnostics.push(
-                        Diagnostic::new(
-                            "test.duplicate_application",
-                            image_range.clone(),
-                            RecoveryAction::None,
-                        )
-                        .with_parameter("test", format!("{}.{}", test.suite, test.test)),
-                    );
-                }
-            }
-        }
-        applications.sort_by_key(|(position, _)| *position);
-        test_plan = applications
-            .into_iter()
-            .enumerate()
-            .map(|(order, (_, test))| {
-                TestApplicationObservation::new(
-                    test.suite,
-                    test.test,
-                    u32::try_from(order).unwrap_or(u32::MAX),
-                )
-            })
-            .collect();
-    }
     let mut verification_defect = None;
     let allowed_tests = suites
         .iter()
@@ -298,6 +271,8 @@ pub(crate) fn analyze<'a>(
         constants.clone(),
         &allowed_tests,
         build_authority,
+        &nominal_types,
+        cancellation,
     ) {
         Ok(program) => Some(program),
         Err(typed_hir::VerificationFailure::Defect { evidence }) => {
@@ -311,13 +286,17 @@ pub(crate) fn analyze<'a>(
             );
             None
         }
+        Err(typed_hir::VerificationFailure::Cancelled) => return cancelled(),
     };
     if executable_allowed && diagnostics.is_empty() {
         let program = program.as_ref().expect("verified when no diagnostics");
         let constant_names = constants.keys().cloned().collect::<Vec<_>>();
         for name in constant_names {
-            let mut engine = Engine::new(program);
+            let mut engine = Engine::new(program, cancellation);
             let run = engine.evaluate_constant(&name);
+            if run.outcome == EvaluationOutcome::Cancelled {
+                return cancelled();
+            }
             map_evaluation_failure(&run.outcome, &constants[&name].source, &mut diagnostics);
             evaluations.push(EvaluationObservation::new(name, run.outcome, run.receipt));
         }
@@ -329,6 +308,8 @@ pub(crate) fn analyze<'a>(
                 &range,
                 &allowed_tests,
                 build_authority,
+                &nominal_types,
+                cancellation,
             ) else {
                 diagnostics.push(Diagnostic::new(
                     "semantic.invalid_comptime_expression",
@@ -337,8 +318,11 @@ pub(crate) fn analyze<'a>(
                 ));
                 continue;
             };
-            let mut engine = Engine::new(program);
+            let mut engine = Engine::new(program, cancellation);
             let run = engine.evaluate_expression(&expression, &range);
+            if run.outcome == EvaluationOutcome::Cancelled {
+                return cancelled();
+            }
             if run.outcome != EvaluationOutcome::Completed(crate::CanonicalValue::Bool(true)) {
                 diagnostics.push(Diagnostic::new(
                     "evaluation.assertion_failed",
@@ -355,14 +339,37 @@ pub(crate) fn analyze<'a>(
         if diagnostics.is_empty()
             && let Some((path, image_name, image_range)) = image_functions.first()
         {
-            let mut engine = Engine::new(program);
+            let mut engine = Engine::new(program, cancellation);
             let run = engine.evaluate_function(&qualify(path, image_name));
+            if run.outcome == EvaluationOutcome::Cancelled {
+                return cancelled();
+            }
             map_evaluation_failure(&run.outcome, image_range, &mut diagnostics);
-            constructions.extend(
-                run.constructions.into_iter().map(|(identity, kind, site)| {
-                    ConstructionObservation::new(identity, kind, site)
-                }),
-            );
+            if root == Root::Test {
+                test_plan = plan_test_applications(
+                    &suites,
+                    &run.test_applications,
+                    image_range,
+                    &mut diagnostics,
+                );
+            }
+            if let Err(kind) = seal_construction_graph(&run.outcome, &run.constructions) {
+                diagnostics.push(
+                    Diagnostic::new(
+                        "construction.invalid_graph",
+                        image_range.clone(),
+                        RecoveryAction::None,
+                    )
+                    .with_parameter("kind", kind),
+                );
+            }
+            constructions.extend(run.constructions.into_iter().map(|construction| {
+                ConstructionObservation::new(
+                    construction.identity,
+                    construction.kind,
+                    construction.site,
+                )
+            }));
             evaluations.push(EvaluationObservation::new(
                 format!("{}.{}", module_name(path), image_name),
                 run.outcome,
@@ -384,6 +391,101 @@ pub(crate) fn analyze<'a>(
         defect: verification_defect,
         cancelled: false,
     }
+}
+
+fn seal_construction_graph(
+    outcome: &EvaluationOutcome,
+    constructions: &[Construction],
+) -> Result<(), &'static str> {
+    let EvaluationOutcome::Completed(crate::CanonicalValue::SymbolicHandle {
+        kind,
+        identity: root,
+    }) = outcome
+    else {
+        return Ok(());
+    };
+    if kind.as_ref() != "Image" {
+        return Err("returned_root_is_not_image");
+    }
+    if constructions
+        .iter()
+        .filter(|construction| construction.kind == "Image")
+        .count()
+        != 1
+    {
+        return Err("image_root_count");
+    }
+    let by_identity = constructions
+        .iter()
+        .map(|construction| (construction.identity, construction))
+        .collect::<BTreeMap<_, _>>();
+    if by_identity.len() != constructions.len() {
+        return Err("duplicate_construction_identity");
+    }
+    let mut reachable = BTreeSet::new();
+    let mut pending = vec![*root];
+    while let Some(identity) = pending.pop() {
+        if !reachable.insert(identity) {
+            continue;
+        }
+        let Some(node) = by_identity.get(&identity) else {
+            return Err("cross_root_handle");
+        };
+        pending.extend(node.edges.iter().copied());
+    }
+    if reachable.len() != constructions.len() {
+        return Err("unreachable_construction");
+    }
+    Ok(())
+}
+
+fn plan_test_applications(
+    suites: &[SuiteTest],
+    applications: &[String],
+    image_range: &SourceRange,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<TestApplicationObservation> {
+    let expected = suites
+        .iter()
+        .map(|test| format!("{}.{}", test.suite, test.test))
+        .collect::<BTreeSet<_>>();
+    for test in &expected {
+        let count = applications
+            .iter()
+            .filter(|application| *application == test)
+            .count();
+        if count == 0 {
+            diagnostics.push(
+                Diagnostic::new(
+                    "test.missing_application",
+                    image_range.clone(),
+                    RecoveryAction::None,
+                )
+                .with_parameter("test", test.clone()),
+            );
+        } else if count > 1 {
+            diagnostics.push(
+                Diagnostic::new(
+                    "test.duplicate_application",
+                    image_range.clone(),
+                    RecoveryAction::None,
+                )
+                .with_parameter("test", test.clone()),
+            );
+        }
+    }
+    applications
+        .iter()
+        .enumerate()
+        .filter_map(|(order, application)| {
+            let (suite, test) = application.rsplit_once('.')?;
+            Some(TestApplicationObservation::new(
+                suite,
+                test,
+                u32::try_from(order).unwrap_or(u32::MAX),
+            ))
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -605,13 +707,10 @@ fn infer_private_errors(
     functions: &BTreeMap<String, Function>,
 ) -> (Vec<InferredErrorObservation>, Vec<Diagnostic>) {
     let unique = functions
-        .values()
-        .fold(BTreeMap::new(), |mut unique, function| {
-            unique
-                .entry(function.name.clone())
-                .or_insert_with(|| function.clone());
-            unique
-        });
+        .iter()
+        .filter(|(name, function)| *name == &format!("{}.{}", function.module, function.name))
+        .map(|(name, function)| (name.clone(), function.clone()))
+        .collect::<BTreeMap<_, _>>();
     let mut sets = unique
         .iter()
         .filter(|(_, function)| partial_result_return(&function.return_type).is_some())
@@ -630,6 +729,9 @@ fn infer_private_errors(
         for (name, errors) in &mut sets {
             let function = &unique[name];
             for callee in propagated_calls(&function_body(function)) {
+                let Some(callee) = resolve_function_key(function, &callee, functions) else {
+                    continue;
+                };
                 if let Some(explicit) =
                     explicit_result_error(unique.get(&callee).map_or("", |f| &f.return_type))
                 {
@@ -650,7 +752,7 @@ fn infer_private_errors(
         let function = &unique[name];
         match errors.iter().collect::<Vec<_>>().as_slice() {
             [error_type] => observations.push(InferredErrorObservation::new(
-                name.clone(),
+                function.name.clone(),
                 (*error_type).clone(),
             )),
             [] => diagnostics.push(Diagnostic::new(
@@ -671,6 +773,9 @@ fn infer_private_errors(
             continue;
         };
         for callee in propagated_calls(&function_body(function)) {
+            let Some(callee) = resolve_function_key(function, &callee, functions) else {
+                continue;
+            };
             let callee_error =
                 explicit_result_error(unique.get(&callee).map_or("", |f| &f.return_type))
                     .map(str::to_owned)
@@ -695,13 +800,52 @@ fn infer_private_errors(
     (observations, diagnostics)
 }
 
+fn resolve_function_key(
+    caller: &Function,
+    called: &str,
+    functions: &BTreeMap<String, Function>,
+) -> Option<String> {
+    let imported = format!("{}|{called}", caller.module);
+    let local = format!("{}.{}", caller.module, called);
+    let function = functions.get(&imported).or_else(|| functions.get(&local))?;
+    Some(format!("{}.{}", function.module, function.name))
+}
+
 fn function_body(function: &Function) -> String {
     function
         .body
         .iter()
-        .map(|(_, line)| line.as_str())
+        .map(|(_, line)| semantic_code_line(line))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn semantic_code_line(line: &str) -> String {
+    let mut result = String::with_capacity(line.len());
+    let mut quote = None;
+    let mut escaped = false;
+    for character in line.chars() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active {
+                quote = None;
+                result.push(character);
+            } else {
+                result.push(' ');
+            }
+        } else if character == '#' {
+            break;
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            result.push(character);
+        } else {
+            result.push(character);
+        }
+    }
+    result
 }
 
 fn explicit_result_error(return_type: &str) -> Option<&str> {

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_128;
 
 use crate::evaluator::{Constant, Function};
-use crate::{CanonicalValue, SourceRange};
+use crate::{Cancellation, CanonicalValue, SourceRange};
 
 #[derive(Clone, Debug)]
 pub(crate) struct VerifiedProgram {
@@ -143,6 +143,7 @@ pub(crate) enum BinaryOperator {
 pub(crate) enum VerificationFailure {
     Creator { kind: Arc<str>, site: SourceRange },
     Defect { evidence: Arc<str> },
+    Cancelled,
 }
 
 impl VerifiedProgram {
@@ -158,6 +159,7 @@ impl VerifiedProgram {
         self.fingerprint
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn verify_expression(
         &self,
         module: &str,
@@ -165,6 +167,8 @@ impl VerifiedProgram {
         site: &SourceRange,
         allowed_tests: &BTreeSet<String>,
         build_authority: &BuildAuthority,
+        nominal_types: &BTreeSet<String>,
+        cancellation: &Cancellation,
     ) -> Result<Expression, VerificationFailure> {
         let signatures = self
             .functions
@@ -197,7 +201,9 @@ impl VerifiedProgram {
                 locals: &BTreeMap::new(),
                 allowed_tests,
                 build_authority,
+                nominal_types,
             },
+            cancellation,
         )
     }
 }
@@ -207,6 +213,8 @@ pub(crate) fn verify(
     constants: BTreeMap<String, Constant>,
     allowed_tests: &BTreeSet<String>,
     build_authority: &BuildAuthority,
+    nominal_types: &BTreeSet<String>,
+    cancellation: &Cancellation,
 ) -> Result<VerifiedProgram, VerificationFailure> {
     validate_artifact(&functions)?;
     let signatures = functions
@@ -232,6 +240,9 @@ pub(crate) fn verify(
 
     let mut hir_constants = BTreeMap::new();
     for (lookup_name, constant) in &constants {
+        if cancellation.is_cancelled() {
+            return Err(VerificationFailure::Cancelled);
+        }
         let expression = parse_expression(
             &constant.expression,
             &constant.source,
@@ -242,7 +253,9 @@ pub(crate) fn verify(
                 locals: &BTreeMap::new(),
                 allowed_tests,
                 build_authority,
+                nominal_types,
             },
+            cancellation,
         )?;
         if !compatible(&expression.type_name, &constant.type_name) {
             return creator("constant_type_mismatch", &constant.source);
@@ -259,6 +272,9 @@ pub(crate) fn verify(
 
     let mut hir_functions = BTreeMap::new();
     for (lookup_name, function) in &functions {
+        if cancellation.is_cancelled() {
+            return Err(VerificationFailure::Cancelled);
+        }
         let mut locals = function
             .parameters
             .iter()
@@ -275,6 +291,8 @@ pub(crate) fn verify(
             &constant_types,
             allowed_tests,
             build_authority,
+            nominal_types,
+            cancellation,
         )?;
         hir_functions.insert(
             lookup_name.clone(),
@@ -323,9 +341,14 @@ fn lower_statements(
     constants: &BTreeMap<String, String>,
     allowed_tests: &BTreeSet<String>,
     build_authority: &BuildAuthority,
+    nominal_types: &BTreeSet<String>,
+    cancellation: &Cancellation,
 ) -> Result<Vec<Statement>, VerificationFailure> {
     let mut statements = Vec::new();
     while let Some((_, raw)) = lines.get(*index) {
+        if cancellation.is_cancelled() {
+            return Err(VerificationFailure::Cancelled);
+        }
         let source = raw.trim();
         if source.is_empty() || source.starts_with('#') || source.starts_with('@') {
             *index += 1;
@@ -349,12 +372,14 @@ fn lower_statements(
             locals,
             allowed_tests,
             build_authority,
+            nominal_types,
         };
         if let Some(condition) = source
             .strip_prefix("if ")
             .and_then(|value| value.strip_suffix(':'))
         {
-            let condition = parse_expression(condition, &function.source, &resolution)?;
+            let condition =
+                parse_expression(condition, &function.source, &resolution, cancellation)?;
             if condition.type_name != "bool" {
                 return creator("if_condition_requires_bool", &function.source);
             }
@@ -369,6 +394,8 @@ fn lower_statements(
                 constants,
                 allowed_tests,
                 build_authority,
+                nominal_types,
+                cancellation,
             )?;
             let mut else_branch = Vec::new();
             if let Some((_, next)) = lines.get(*index)
@@ -387,6 +414,8 @@ fn lower_statements(
                     constants,
                     allowed_tests,
                     build_authority,
+                    nominal_types,
+                    cancellation,
                 )?;
             }
             statements.push(Statement::If {
@@ -402,7 +431,7 @@ fn lower_statements(
             }
             statements.push(Statement::Return(None));
         } else if let Some(source) = source.strip_prefix("return ") {
-            let expression = parse_expression(source, &function.source, &resolution)?;
+            let expression = parse_expression(source, &function.source, &resolution, cancellation)?;
             if !compatible(&expression.type_name, &function.return_type) {
                 return creator("return_type_mismatch", &function.source);
             }
@@ -412,12 +441,13 @@ fn lower_statements(
                 source,
                 &function.source,
                 &resolution,
+                cancellation,
             )?));
         } else if let Some((name, source)) = source.split_once(" = ") {
             if !valid_name(name) {
                 return creator("invalid_assignment_target", &function.source);
             }
-            let value = parse_expression(source, &function.source, &resolution)?;
+            let value = parse_expression(source, &function.source, &resolution, cancellation)?;
             locals.insert(name.to_owned(), value.type_name.clone());
             statements.push(Statement::Assign {
                 name: name.to_owned(),
@@ -428,6 +458,7 @@ fn lower_statements(
                 source,
                 &function.source,
                 &resolution,
+                cancellation,
             )?));
         }
     }
@@ -469,16 +500,21 @@ struct Resolution<'a> {
     locals: &'a BTreeMap<String, String>,
     allowed_tests: &'a BTreeSet<String>,
     build_authority: &'a BuildAuthority,
+    nominal_types: &'a BTreeSet<String>,
 }
 
 fn parse_expression(
     source: &str,
     site: &SourceRange,
     resolution: &Resolution<'_>,
+    cancellation: &Cancellation,
 ) -> Result<Expression, VerificationFailure> {
-    let tokens = tokenize(source).map_err(|()| VerificationFailure::Creator {
-        kind: Arc::from("invalid_expression"),
-        site: site.clone(),
+    let tokens = tokenize(source, cancellation).map_err(|failure| match failure {
+        TokenizeFailure::Invalid => VerificationFailure::Creator {
+            kind: Arc::from("invalid_expression"),
+            site: site.clone(),
+        },
+        TokenizeFailure::Cancelled => VerificationFailure::Cancelled,
     })?;
     let mut parser = Parser {
         tokens: &tokens,
@@ -502,11 +538,19 @@ enum Token {
     Symbol(&'static str),
 }
 
-fn tokenize(source: &str) -> Result<Vec<Token>, ()> {
+enum TokenizeFailure {
+    Invalid,
+    Cancelled,
+}
+
+fn tokenize(source: &str, cancellation: &Cancellation) -> Result<Vec<Token>, TokenizeFailure> {
     let bytes = source.as_bytes();
     let mut tokens = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
+        if index % 256 == 0 && cancellation.is_cancelled() {
+            return Err(TokenizeFailure::Cancelled);
+        }
         match bytes[index] {
             byte if byte.is_ascii_whitespace() => index += 1,
             b'0'..=b'9' => {
@@ -546,10 +590,12 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ()> {
                     while bytes.get(index).is_some_and(u8::is_ascii_alphanumeric) {
                         index += 1;
                     }
-                    let (value, suffix) = parse_float_literal(&source[start..index])?;
+                    let (value, suffix) = parse_float_literal(&source[start..index])
+                        .map_err(|()| TokenizeFailure::Invalid)?;
                     tokens.push(Token::Float(value, suffix));
                 } else {
-                    let (value, suffix) = parse_integer_literal(&source[start..index])?;
+                    let (value, suffix) = parse_integer_literal(&source[start..index])
+                        .map_err(|()| TokenizeFailure::Invalid)?;
                     tokens.push(Token::Integer(value, suffix));
                 }
             }
@@ -571,7 +617,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ()> {
                     index += 1;
                 }
                 if index == bytes.len() {
-                    return Err(());
+                    return Err(TokenizeFailure::Invalid);
                 }
                 tokens.push(Token::Text(source[start..index].to_owned()));
                 index += 1;
@@ -584,7 +630,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>, ()> {
                 ]
                 .into_iter()
                 .find(|symbol| remaining.starts_with(symbol))
-                .ok_or(())?;
+                .ok_or(TokenizeFailure::Invalid)?;
                 tokens.push(Token::Symbol(symbol));
                 index += symbol.len();
             }
@@ -793,6 +839,11 @@ impl Parser<'_> {
                 .first()
                 .is_some_and(u8::is_ascii_uppercase)
         {
+            if !self.resolution.nominal_types.contains(type_name)
+                && !matches!(type_name, "Result" | "Option")
+            {
+                return creator("unresolved_nominal_type", self.site);
+            }
             return Ok(Expression {
                 kind: ExpressionKind::Call {
                     target: CallTarget::Variant {
@@ -853,12 +904,22 @@ impl Parser<'_> {
                 .first()
                 .is_some_and(u8::is_ascii_uppercase)
         {
+            if !self.resolution.nominal_types.contains(type_name)
+                && !matches!(type_name, "Result" | "Option")
+            {
+                return creator("unresolved_nominal_type", self.site);
+            }
+            let resolved_type = match (type_name, variant, arguments.first()) {
+                ("Result", "Ok", Some(value)) => format!("Result[{}, _]", value.type_name),
+                ("Result", "Err", Some(error)) => format!("Result[_, {}]", error.type_name),
+                _ => type_name.to_owned(),
+            };
             return Ok((
                 CallTarget::Variant {
                     type_name: type_name.to_owned(),
                     variant: variant.to_owned(),
                 },
-                type_name.to_owned(),
+                resolved_type,
             ));
         }
         creator("unresolved_call", self.site)
@@ -921,8 +982,41 @@ fn compatible(actual: &str, expected: &str) -> bool {
         || (numeric(actual) && numeric(expected))
         || generic_type_parameter(actual)
         || generic_type_parameter(expected)
-        || expected.starts_with("Result[")
+        || compatible_result(actual, expected)
         || (actual == "()" && expected.is_empty())
+}
+
+fn compatible_result(actual: &str, expected: &str) -> bool {
+    let Some(expected) = expected
+        .strip_prefix("Result[")
+        .and_then(|value| value.strip_suffix(']'))
+    else {
+        return false;
+    };
+    let expected = expected.split(',').map(str::trim).collect::<Vec<_>>();
+    let Some(actual_result) = actual
+        .strip_prefix("Result[")
+        .and_then(|value| value.strip_suffix(']'))
+    else {
+        return expected
+            .first()
+            .is_some_and(|success| compatible(actual, success));
+    };
+    let actual = actual_result.split(',').map(str::trim).collect::<Vec<_>>();
+    let success_matches = actual.first().is_some_and(|actual| {
+        *actual == "_"
+            || expected
+                .first()
+                .is_some_and(|expected| compatible(actual, expected))
+    });
+    let error_matches = expected.len() == 1
+        || actual.get(1).is_some_and(|actual| {
+            *actual == "_"
+                || expected
+                    .get(1)
+                    .is_some_and(|expected| compatible(actual, expected))
+        });
+    success_matches && error_matches
 }
 
 fn numeric(type_name: &str) -> bool {
@@ -1032,6 +1126,8 @@ mod tests {
             BTreeMap::new(),
             &BTreeSet::new(),
             &BuildAuthority::compiler_distribution(),
+            &BTreeSet::new(),
+            &Cancellation::new(),
         )
         .expect_err("malformed artifact must not receive verified marker");
         assert_eq!(
@@ -1058,9 +1154,36 @@ mod tests {
                 BTreeMap::from([("image.unused".to_owned(), function)]),
                 BTreeMap::new(),
                 &BTreeSet::new(),
-                &BuildAuthority::compiler_distribution()
+                &BuildAuthority::compiler_distribution(),
+                &BTreeSet::new(),
+                &Cancellation::new()
             ),
             Err(VerificationFailure::Creator { kind, .. }) if kind.as_ref() == "unresolved_call"
+        ));
+    }
+
+    #[test]
+    fn invented_nominal_variants_cannot_enter_verified_hir() {
+        let function = Function {
+            name: "unused".to_owned(),
+            module: "image".to_owned(),
+            public: false,
+            parameters: Vec::new(),
+            return_type: "Missing".to_owned(),
+            body: vec![(1, "    return Missing.Invented".to_owned())],
+            source: SourceRange::new("src/image.wr", 0, 1),
+        };
+        assert!(matches!(
+            verify(
+                BTreeMap::from([("image.unused".to_owned(), function)]),
+                BTreeMap::new(),
+                &BTreeSet::new(),
+                &BuildAuthority::compiler_distribution(),
+                &BTreeSet::new(),
+                &Cancellation::new()
+            ),
+            Err(VerificationFailure::Creator { kind, .. })
+                if kind.as_ref() == "unresolved_nominal_type"
         ));
     }
 }

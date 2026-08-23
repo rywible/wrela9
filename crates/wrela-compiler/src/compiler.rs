@@ -952,9 +952,11 @@ impl Compiler {
         if cancellation.is_cancelled() {
             return CompilationOutcome::Cancelled;
         }
-        match catch_unwind(AssertUnwindSafe(|| {
-            self.compile_inner(&request, cancellation)
-        })) {
+        self.contain(|| self.compile_inner(&request, cancellation))
+    }
+
+    fn contain(&self, operation: impl FnOnce() -> CompilationOutcome) -> CompilationOutcome {
+        match catch_unwind(AssertUnwindSafe(operation)) {
             Ok(outcome) => outcome,
             Err(_) => {
                 self.poisoned.store(true, Ordering::Release);
@@ -993,12 +995,7 @@ impl Compiler {
                 ));
             }
         }
-        let authenticated_paths = self
-            .installation
-            .authenticated_modules
-            .iter()
-            .map(ProjectFile::path)
-            .collect::<BTreeSet<_>>();
+        let mut authenticated_paths = BTreeSet::new();
         for module in &*self.installation.authenticated_modules {
             if files.contains_key(module.path()) {
                 diagnostics.push(Diagnostic::new(
@@ -1008,6 +1005,7 @@ impl Compiler {
                 ));
             } else {
                 files.insert(module.path(), module);
+                authenticated_paths.insert(module.path());
             }
         }
 
@@ -1251,4 +1249,26 @@ fn valid_path_segment(segment: &str) -> bool {
     let mut bytes = segment.bytes();
     matches!(bytes.next(), Some(b'a'..=b'z'))
         && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unexpected_panics_poison_the_compiler_instance() {
+        let compiler = Compiler::open(CompilerInstallation::empty()).expect("installation opens");
+        assert!(matches!(
+            compiler.contain(|| panic!("injected private invariant failure")),
+            CompilationOutcome::Defect(_)
+        ));
+        assert!(matches!(
+            compiler.compile(
+                CompilationRequest::new(ProjectSnapshot::default(), Root::Image),
+                &Cancellation::new(),
+            ),
+            CompilationOutcome::Defect(defect)
+                if defect.evidence() == "compiler instance is poisoned"
+        ));
+    }
 }

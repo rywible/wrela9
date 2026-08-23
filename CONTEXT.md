@@ -228,6 +228,10 @@ _Avoid_: Plain old data
 A value with one owner that moves only through explicit `take` and must be reclaimed, consumed, or transferred on every recoverable path.
 _Avoid_: Object, implicitly moved value
 
+**Nominal Error**:
+A named Wrela Data or Resource type carried as the error alternative of `Result`; a public function names it explicitly, while a private function may infer one such type but never an anonymous structural error union.
+_Avoid_: Exception class, inferred error set, anonymous error union
+
 **Untrusted**:
 A sealed wrapper around an external control value that cannot influence indexing, allocation, or dispatch until checked into a bounded value.
 _Avoid_: General taint, untrusted payload bytes

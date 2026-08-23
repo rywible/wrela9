@@ -1,0 +1,9 @@
+# Infer at most one Nominal Error for private functions
+
+Wrela permits a private named function, async function, method, or associated function to write `Result[T]`. The compiler infers exactly one ordinary Nominal Error from error alternatives that flow out of the body. Public functions and every other type position spell `Result[T, E]`. Wrela has no anonymous structural error union and never synthesizes a wrapper error type.
+
+Inference is a deterministic caller-independent constraint solve over the concrete private call graph. Returned error alternatives and `?` propagation contribute their normalized error type; locally handled errors do not. Recursive groups solve together, declaration order is irrelevant, and generic inference occurs independently after substitution for each demanded Specialization. Zero contributors, conflicting types, and unconstrained cycles require an explicit error annotation.
+
+`?` propagates only an exact error type. Creators use ordinary explicit `map_error` conversion when composing different vocabularies. Nominal Errors may be named Data or Resource types, receive no implicit trace or runtime metadata, and remain ordinary values under matching, ownership, layout, and standard capabilities. Function values and finite callable families likewise retain their exact resolved error type.
+
+This revises rather than ports Wrela8's private inferred error sets. That experiment reduced annotations but introduced an incomplete structural-union type: inference depended on declaration order, failed across important generic and recursive shapes, could not be usefully matched, and had no demonstrated executable representation. Single-type private inference preserves the common ergonomic win without creating a second anonymous sum-type system. Inferred errors affect resolved signature and implementation fingerprints while `DefId`, `SpecializationId`, and ordinary nominal `TypeId` rules remain unchanged.

@@ -57,7 +57,7 @@ Each attribute occupies its own line at the declaration's indentation. It has `@
 
 ## Declarations and types
 
-Module declarations are imports, `const`, `fn`, `async fn`, `suite`, `struct`, `resource struct`, `enum`, `interface`, `pool`, transparent `type` aliases, attributes, `comptime if`, and `comptime assert`. There are no runtime executable top-level statements, mutable statics, nested types or Pools, or declaration re-opening blocks. Declarations and members are private unless prefixed `pub`.
+Module declarations are imports, `const`, `fn`, `async fn`, `suite`, `struct`, `resource struct`, `enum`, `interface`, `pool`, transparent `type` aliases, attributes, `comptime if`, and `comptime assert`. There are no runtime executable top-level statements, mutable statics, nested types or Pools, or declaration re-opening blocks. Declarations and members are private unless prefixed `pub`. Only the return annotation of a private named function or method may use one-argument `Result[T]`; it requests inference of one Nominal Error and is not general partial type syntax. Public returns and every other type position use `Result[T, E]`.
 
 A Suite declaration has `pub suite name:` form, takes no parameters, and contains only nested `test` or `async test` declarations. Tests use ordinary function parameter modes and have no return value. They cannot appear at Module level, be marked `pub`, or be called as runtime functions. `expect expression` is legal only in a Test body and records a typed failed expectation without changing control flow.
 
@@ -145,7 +145,7 @@ From lowest to highest, operator precedence is:
 
 The fixed operator vocabulary is arithmetic `+ - * / %`, bitwise `& | ^ ~ << >>`, comparisons `== != < <= > >=`, Boolean `not and or`, unary numeric signs, ranges, and postfix propagation. Comparisons do not chain. Arithmetic is checked; wrapping, saturating, narrowing, widening, fused, stepping, and exponentiation behavior uses named operations. Compiler-known operator interfaces may admit Data types, but Creators cannot define operator spellings or precedence.
 
-Prefix `take` moves only from an assignable Resource location. Postfix `?` propagates compatible `Result` and `Option` alternatives. `await actor.method(...)` performs request/reply, `await send actor.method(...)` waits only for admission, and `try_send actor.method(...)` performs immediate deterministic admission arbitration. `await` is legal only in async functions, and borrows cannot cross it.
+Prefix `take` moves only from an assignable Resource location. Postfix `?` propagates an exact matching `Result` error type or compatible `Option` alternative. Converting an error uses an explicit ordinary call such as `result.map_error(TargetError.Variant)` before propagation. `await actor.method(...)` performs request/reply, `await send actor.method(...)` waits only for admission, and `try_send actor.method(...)` performs immediate deterministic admission arbitration. `await` is legal only in async functions, and borrows cannot cross it.
 
 Receivers, operands, arguments, collection elements, and field initializers evaluate exactly once from left to right. Boolean short-circuiting is the only ordinary conditional operand skipping. Expression statements may discard ordinary Data but not Resources, Replies, Result, or other must-use values; `_ = expression` cannot erase an unresolved failure or ownership obligation.
 

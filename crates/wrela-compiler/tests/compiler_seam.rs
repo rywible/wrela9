@@ -333,6 +333,32 @@ fn requesting_inspection_changes_only_the_projection() {
 }
 
 #[test]
+fn inspection_selection_does_not_skip_unreachable_source_validation() {
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let files = vec![
+        ProjectFile::new(
+            "src/image.wr",
+            b"@image\nfn build() -> Image:\n    return Image.new()\n",
+        ),
+        ProjectFile::new("src/unreachable.wr", b"fn broken(\n"),
+    ];
+    let compile = |selection| {
+        compiler.compile(
+            CompilationRequest::new(ProjectSnapshot::new(files.clone()), Root::Image)
+                .with_inspection(selection),
+            &Cancellation::new(),
+        )
+    };
+    let CompilationOutcome::Rejected(without) = compile(InspectSelection::none()) else {
+        panic!("unreachable malformed source must reject without inspection");
+    };
+    let CompilationOutcome::Rejected(with) = compile(InspectSelection::all()) else {
+        panic!("unreachable malformed source must reject with inspection");
+    };
+    assert_eq!(without.diagnostics(), with.diagnostics());
+}
+
+#[test]
 fn compilation_receipts_distinguish_project_revision_from_semantic_closure() {
     let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
     let root = ProjectFile::new(
@@ -1131,6 +1157,65 @@ fn identities_do_not_depend_on_snapshot_enumeration_order() {
         compile(vec![root.clone(), cards.clone()]),
         compile(vec![cards, root])
     );
+}
+
+#[test]
+fn identity_catalog_covers_nested_declarations_and_callable_parameters() {
+    let source = br#"interface Measured:
+    fn measure(read self) -> i64
+
+struct Box[T]:
+    value: T
+    fn replace[U](self, next: U) -> U:
+        return next
+
+enum Choice:
+    Item(value: i64)
+
+fn choose(flag: bool) -> i64:
+    return 1
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = Compiler::open(CompilerInstallation::layer1())
+        .expect("distribution opens")
+        .compile(
+            CompilationRequest::new(
+                ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+                Root::Image,
+            )
+            .with_inspection(InspectSelection::all()),
+            &Cancellation::new(),
+        );
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("nested identity fixture must compile: {outcome:#?}");
+    };
+    let names = accepted
+        .inspection()
+        .identities()
+        .iter()
+        .filter(|identity| identity.domain() == IdentityDomain::Definition)
+        .map(|identity| identity.name())
+        .collect::<std::collections::BTreeSet<_>>();
+    for expected in [
+        "Measured.measure",
+        "Measured.measure.self",
+        "Box.T",
+        "Box.value",
+        "Box.replace",
+        "Box.replace.U",
+        "Box.replace.self",
+        "Box.replace.next",
+        "Choice.Item.value",
+        "choose.flag",
+    ] {
+        assert!(
+            names.contains(expected),
+            "missing nested DefId for {expected}"
+        );
+    }
 }
 
 #[test]

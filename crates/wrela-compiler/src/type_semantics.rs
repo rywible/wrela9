@@ -124,7 +124,12 @@ pub(crate) fn can_unify(actual: &Type, expected: &Type) -> bool {
                 element: expected,
                 length: expected_length,
             },
-        ) => actual_length == expected_length && can_unify(actual, expected),
+        ) => {
+            (actual_length == expected_length
+                || matches!(actual_length, crate::model::ArrayLength::Parameter { .. })
+                || matches!(expected_length, crate::model::ArrayLength::Parameter { .. }))
+                && can_unify(actual, expected)
+        }
         (
             Type::Function {
                 parameters: actual_parameters,
@@ -151,7 +156,12 @@ pub(crate) fn can_unify(actual: &Type, expected: &Type) -> bool {
                 pool: expected_pool,
                 value: expected,
             },
-        ) => actual_pool == expected_pool && can_unify(actual, expected),
+        ) => {
+            (actual_pool == expected_pool
+                || matches!(actual_pool, crate::model::PoolTerm::Parameter { .. })
+                || matches!(expected_pool, crate::model::PoolTerm::Parameter { .. }))
+                && can_unify(actual, expected)
+        }
         (
             Type::Any {
                 interface: actual, ..
@@ -161,6 +171,7 @@ pub(crate) fn can_unify(actual: &Type, expected: &Type) -> bool {
                 ..
             },
         ) => actual == expected,
+        (Type::Nominal { .. }, Type::Any { .. }) => true,
         (
             Type::Nominal {
                 definition: actual_definition,
@@ -248,6 +259,8 @@ pub(crate) fn contains_resource(
         | Type::Text
         | Type::Scalar
         | Type::Bytes
+        | Type::ConstU64(_)
+        | Type::PoolArgument(_)
         | Type::Builtin(_)
         | Type::Parameter { .. }
         | Type::Infer => false,

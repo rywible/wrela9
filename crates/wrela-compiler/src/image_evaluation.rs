@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::compiler::{
     ConstructionKind, ConstructionObservation, EvaluationOutcome, EvaluationReceipt,
 };
-use crate::evaluator::{Construction, Run};
-use crate::model::{BuildKind, TestId};
+use crate::evaluator::{AppliedTest, Construction, Run};
+use crate::model::BuildKind;
 
 pub(crate) struct FinishedImageEvaluation {
     pub(crate) outcome: EvaluationOutcome,
@@ -22,7 +22,7 @@ pub(crate) enum ImageEvaluationStatus {
 
 pub(crate) struct SealedImage {
     pub(crate) constructions: Vec<ConstructionObservation>,
-    pub(crate) test_applications: Vec<TestId>,
+    pub(crate) test_applications: Vec<AppliedTest>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +49,17 @@ pub(crate) fn finish(run: Run) -> FinishedImageEvaluation {
                                 },
                             },
                             construction.site,
+                            construction.edges,
+                            construction
+                                .operands
+                                .into_iter()
+                                .map(|operand| {
+                                    crate::ConstructionOperandObservation::new(
+                                        operand.label,
+                                        operand.value,
+                                    )
+                                })
+                                .collect(),
                         )
                     })
                     .collect(),
@@ -193,6 +204,7 @@ mod tests {
             kind: BuildKind::Image,
             site: site.clone(),
             edges,
+            operands: Vec::new(),
         };
         assert!(matches!(
             finish(completed_run(
@@ -230,12 +242,14 @@ mod tests {
                 kind: BuildKind::Image,
                 site: site.clone(),
                 edges: vec![2],
+                operands: Vec::new(),
             },
             Construction {
                 identity: 2,
                 kind: BuildKind::Test,
                 site: site.clone(),
                 edges: vec![1],
+                operands: Vec::new(),
             },
         ];
         assert!(matches!(
@@ -248,6 +262,7 @@ mod tests {
             kind: BuildKind::Test,
             site,
             edges: Vec::new(),
+            operands: Vec::new(),
         });
         assert!(matches!(
             finish(completed_run(Some((BuildKind::Image, 1)), unreachable)).status,

@@ -1077,6 +1077,7 @@ pub struct TestBindingObservation {
     name: Arc<str>,
     type_name: Arc<str>,
     ownership: OwnershipMode,
+    value: CanonicalValue,
 }
 
 impl TestBindingObservation {
@@ -1084,11 +1085,13 @@ impl TestBindingObservation {
         name: impl Into<Arc<str>>,
         type_name: impl Into<Arc<str>>,
         ownership: OwnershipMode,
+        value: CanonicalValue,
     ) -> Self {
         Self {
             name: name.into(),
             type_name: type_name.into(),
             ownership,
+            value,
         }
     }
     #[must_use]
@@ -1102,6 +1105,10 @@ impl TestBindingObservation {
     #[must_use]
     pub const fn ownership(&self) -> OwnershipMode {
         self.ownership
+    }
+    #[must_use]
+    pub const fn value(&self) -> &CanonicalValue {
+        &self.value
     }
 }
 
@@ -1258,6 +1265,63 @@ pub struct EvaluationReceipt {
     typed_hir_fingerprint: u128,
     fuel_used: u64,
     peak_memory: u64,
+    provenance: Option<SourceRange>,
+    relevant_identity: Option<u128>,
+    call_chain: Arc<[EvaluationFrameObservation]>,
+    contributors: Arc<[EvaluationContributorObservation]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvaluationFrameObservation {
+    identity: u128,
+    callable: Arc<str>,
+    call_site: SourceRange,
+}
+
+impl EvaluationFrameObservation {
+    pub(crate) fn new(
+        identity: u128,
+        callable: impl Into<Arc<str>>,
+        call_site: SourceRange,
+    ) -> Self {
+        Self {
+            identity,
+            callable: callable.into(),
+            call_site,
+        }
+    }
+    #[must_use]
+    pub const fn identity(&self) -> u128 {
+        self.identity
+    }
+    #[must_use]
+    pub fn callable(&self) -> &str {
+        &self.callable
+    }
+    #[must_use]
+    pub const fn call_site(&self) -> &SourceRange {
+        &self.call_site
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvaluationContributorObservation {
+    site: SourceRange,
+    fuel: u64,
+}
+
+impl EvaluationContributorObservation {
+    pub(crate) const fn new(site: SourceRange, fuel: u64) -> Self {
+        Self { site, fuel }
+    }
+    #[must_use]
+    pub const fn site(&self) -> &SourceRange {
+        &self.site
+    }
+    #[must_use]
+    pub const fn fuel(&self) -> u64 {
+        self.fuel
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1286,7 +1350,25 @@ impl EvaluationReceipt {
             typed_hir_fingerprint,
             fuel_used,
             peak_memory,
+            provenance: None,
+            relevant_identity: None,
+            call_chain: Arc::from([]),
+            contributors: Arc::from([]),
         }
+    }
+
+    pub(crate) fn with_failure_evidence(
+        mut self,
+        provenance: Option<SourceRange>,
+        relevant_identity: Option<u128>,
+        call_chain: Vec<EvaluationFrameObservation>,
+        contributors: Vec<EvaluationContributorObservation>,
+    ) -> Self {
+        self.provenance = provenance;
+        self.relevant_identity = relevant_identity;
+        self.call_chain = call_chain.into();
+        self.contributors = contributors.into();
+        self
     }
 
     #[must_use]
@@ -1332,6 +1414,22 @@ impl EvaluationReceipt {
     #[must_use]
     pub const fn peak_memory(&self) -> u64 {
         self.peak_memory
+    }
+    #[must_use]
+    pub const fn provenance(&self) -> Option<&SourceRange> {
+        self.provenance.as_ref()
+    }
+    #[must_use]
+    pub const fn relevant_identity(&self) -> Option<u128> {
+        self.relevant_identity
+    }
+    #[must_use]
+    pub fn call_chain(&self) -> &[EvaluationFrameObservation] {
+        &self.call_chain
+    }
+    #[must_use]
+    pub fn contributors(&self) -> &[EvaluationContributorObservation] {
+        &self.contributors
     }
 }
 
@@ -1628,14 +1726,24 @@ pub struct ConstructionObservation {
     identity: u128,
     kind: ConstructionKind,
     site: SourceRange,
+    edges: Arc<[u128]>,
+    operands: Arc<[ConstructionOperandObservation]>,
 }
 
 impl ConstructionObservation {
-    pub(crate) const fn new(identity: u128, kind: ConstructionKind, site: SourceRange) -> Self {
+    pub(crate) fn new(
+        identity: u128,
+        kind: ConstructionKind,
+        site: SourceRange,
+        edges: Vec<u128>,
+        operands: Vec<ConstructionOperandObservation>,
+    ) -> Self {
         Self {
             identity,
             kind,
             site,
+            edges: edges.into(),
+            operands: operands.into(),
         }
     }
 
@@ -1652,6 +1760,39 @@ impl ConstructionObservation {
     #[must_use]
     pub const fn site(&self) -> &SourceRange {
         &self.site
+    }
+    #[must_use]
+    pub fn edges(&self) -> &[u128] {
+        &self.edges
+    }
+    #[must_use]
+    pub fn operands(&self) -> &[ConstructionOperandObservation] {
+        &self.operands
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConstructionOperandObservation {
+    label: Arc<str>,
+    value: CanonicalValue,
+}
+
+impl ConstructionOperandObservation {
+    pub(crate) fn new(label: impl Into<Arc<str>>, value: CanonicalValue) -> Self {
+        Self {
+            label: label.into(),
+            value,
+        }
+    }
+
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    #[must_use]
+    pub const fn value(&self) -> &CanonicalValue {
+        &self.value
     }
 }
 
@@ -1952,16 +2093,19 @@ impl Compiler {
                 SourceRange::new(request.root.path(), 0, 0),
                 RecoveryAction::None,
             ));
+            // Inspection is a projection of completed compiler work.  Always perform the
+            // same parse work so changing the projection cannot change cancellation or
+            // diagnostics.
+            let Some(unreachable_syntax) = parse_unreachable_project_syntax(
+                &request.project,
+                &BTreeMap::new(),
+                &files,
+                cancellation,
+            ) else {
+                return CompilationOutcome::Cancelled;
+            };
             let syntax = if request.inspection.syntax {
-                let Some(syntax) = parse_unreachable_project_syntax(
-                    &request.project,
-                    &BTreeMap::new(),
-                    &files,
-                    cancellation,
-                ) else {
-                    return CompilationOutcome::Cancelled;
-                };
-                syntax.into()
+                unreachable_syntax.into()
             } else {
                 Arc::from([])
             };
@@ -2110,18 +2254,13 @@ impl Compiler {
                 .then(left.code.cmp(&right.code))
         });
 
-        let unreachable_project_syntax = if request.inspection.syntax {
-            let Some(syntax) = parse_unreachable_project_syntax(
-                &request.project,
-                &parsed_sources,
-                &files,
-                cancellation,
-            ) else {
-                return CompilationOutcome::Cancelled;
-            };
-            syntax
-        } else {
-            Vec::new()
+        let Some(unreachable_project_syntax) = parse_unreachable_project_syntax(
+            &request.project,
+            &parsed_sources,
+            &files,
+            cancellation,
+        ) else {
+            return CompilationOutcome::Cancelled;
         };
 
         let inspection = Inspection {

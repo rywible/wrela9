@@ -7,9 +7,9 @@ use xxhash_rust::xxh3::{Xxh3, xxh3_128};
 
 use crate::identity::IdentityCatalog;
 use crate::model::{
-    BuildKind, BuiltinType, BuiltinVariant, DefinitionId, FloatType, IntegerType, ModuleId, PoolId,
-    SpecializationId, TestId, Type, TypeId, VariantId, resolve_builtin_type,
-    resolve_builtin_variant,
+    ArrayLength, BuildKind, BuiltinType, BuiltinVariant, DefinitionId, FloatType, IntegerType,
+    ModuleId, PoolId, PoolTerm, SpecializationId, TestId, Type, TypeId, TypeParameterId, VariantId,
+    resolve_builtin_type, resolve_builtin_variant,
 };
 use crate::syntax::{
     BinaryOperatorSyntax, ExpressionSyntax, ExpressionSyntaxKind, MatchCaseSyntax, NameSyntax,
@@ -164,6 +164,7 @@ impl AccessMode {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedParameter {
+    pub(crate) definition: DefinitionId,
     pub(crate) name: String,
     pub(crate) ownership: OwnershipSyntax,
     pub(crate) type_: Type,
@@ -177,6 +178,7 @@ pub(crate) struct ResolvedFunction {
     pub(crate) name: String,
     pub(crate) modifier: crate::syntax::FunctionModifier,
     pub(crate) type_parameters: Arc<[crate::model::TypeParameterId]>,
+    pub(crate) generic_constraints: Arc<[GenericConstraint]>,
     pub(crate) parameters: Vec<ResolvedParameter>,
     pub(crate) return_type: Type,
     pub(crate) body: Vec<StatementSyntax>,
@@ -207,7 +209,9 @@ pub(crate) struct ResolvedTest {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedVariant {
+    pub(crate) order: u32,
     pub(crate) type_parameters: Vec<crate::model::TypeParameterId>,
+    pub(crate) generic_constraints: Arc<[GenericConstraint]>,
     pub(crate) parameters: Vec<ResolvedParameter>,
 }
 
@@ -218,15 +222,36 @@ pub(crate) struct ResolvedStruct {
     pub(crate) display: Arc<str>,
     pub(crate) resource: bool,
     pub(crate) type_parameters: Vec<crate::model::TypeParameterId>,
+    pub(crate) generic_constraints: Arc<[GenericConstraint]>,
     pub(crate) fields: Vec<ResolvedField>,
 }
 
 #[derive(Clone, Debug)]
+pub(crate) enum GenericConstraint {
+    Type { interface: Option<DefinitionId> },
+    Const { type_: Type },
+    Pool,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ResolvedField {
+    pub(crate) definition: DefinitionId,
     pub(crate) name: String,
     pub(crate) public: bool,
     pub(crate) mutable: bool,
     pub(crate) type_: Type,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedInterface {
+    pub(crate) requirements: BTreeMap<String, ResolvedInterfaceRequirement>,
+    pub(crate) implementations: BTreeMap<DefinitionId, BTreeMap<String, DefinitionId>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedInterfaceRequirement {
+    pub(crate) parameters: Vec<ResolvedParameter>,
+    pub(crate) return_type: Type,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -339,6 +364,7 @@ pub(crate) struct ProgramInput {
     pub(crate) tests: BTreeMap<TestId, ResolvedTest>,
     pub(crate) variants: BTreeMap<VariantId, ResolvedVariant>,
     pub(crate) structs: BTreeMap<DefinitionId, ResolvedStruct>,
+    pub(crate) interfaces: BTreeMap<DefinitionId, ResolvedInterface>,
     pub(crate) aliases: BTreeMap<DefinitionId, Type>,
     pub(crate) namespace: NamespaceCatalog,
     pub(crate) nominal_displays: BTreeMap<DefinitionId, Arc<str>>,
@@ -370,6 +396,7 @@ pub(crate) struct HirFunction {
     pub(crate) module_display: String,
     pub(crate) modifier: crate::syntax::FunctionModifier,
     pub(crate) parameters: Vec<(LocalId, Type, AccessMode)>,
+    pub(crate) parameter_definitions: Arc<[DefinitionId]>,
     pub(crate) return_type: Type,
     pub(crate) body: Arc<[Statement]>,
     pub(crate) source: SourceRange,
@@ -378,6 +405,8 @@ pub(crate) struct HirFunction {
 #[derive(Clone, Debug)]
 pub(crate) struct HirConstant {
     pub(crate) id: DefinitionId,
+    pub(crate) module: ModuleId,
+    pub(crate) name: String,
     pub(crate) type_: Type,
     pub(crate) expression: Expression,
     pub(crate) source: SourceRange,
@@ -513,6 +542,7 @@ pub(crate) struct Expression {
     pub(crate) kind: ExpressionKind,
     pub(crate) type_id: TypeId,
     pub(crate) type_: Type,
+    pub(crate) coerced_from: Option<Type>,
     pub(crate) access: AccessMode,
     pub(crate) source: SourceRange,
 }
@@ -621,29 +651,44 @@ pub(crate) enum CallTarget {
     TemplateFunction {
         definition: DefinitionId,
         argument_order: Arc<[u16]>,
+        argument_parameters: Arc<[DefinitionId]>,
     },
     Function {
         definition: DefinitionId,
         specialization: SpecializationId,
         argument_order: Arc<[u16]>,
+        argument_parameters: Arc<[DefinitionId]>,
     },
-    Build(BuildPrimitive),
+    Build {
+        primitive: BuildPrimitive,
+        labels: Arc<[Arc<str>]>,
+    },
     BuiltinVariant(BuiltinVariant),
     UserVariant {
         id: VariantId,
+        variant_order: u32,
         type_display: Arc<str>,
         variant_display: Arc<str>,
         argument_order: Arc<[u16]>,
+        argument_parameters: Arc<[DefinitionId]>,
+    },
+    Interface {
+        interface: DefinitionId,
+        alternatives: Arc<[(DefinitionId, DefinitionId, SpecializationId)]>,
+        argument_order: Arc<[u16]>,
+        argument_parameters: Arc<[DefinitionId]>,
     },
     Struct {
         definition: DefinitionId,
         type_display: Arc<str>,
         field_order: Arc<[Arc<str>]>,
         argument_fields: Arc<[Arc<str>]>,
+        argument_field_definitions: Arc<[DefinitionId]>,
     },
     Test {
         id: TestId,
         argument_order: Arc<[u16]>,
+        argument_parameters: Arc<[DefinitionId]>,
     },
 }
 
@@ -750,6 +795,8 @@ pub(crate) enum CreatorFailureKind {
     DeferReturnsRecoverableError,
     UnreachableMatchCase,
     UnresolvedType,
+    ResourceRequiresTake,
+    MustUseValue,
 }
 
 impl CreatorFailureKind {
@@ -791,6 +838,8 @@ impl CreatorFailureKind {
             Self::DeferReturnsRecoverableError => "semantic.defer_returns_recoverable_error",
             Self::UnreachableMatchCase => "semantic.unreachable_match_case",
             Self::UnresolvedType => "semantic.unresolved_type",
+            Self::ResourceRequiresTake => "semantic.resource_requires_take",
+            Self::MustUseValue => "semantic.must_use_value",
         }
     }
 }
@@ -1014,6 +1063,8 @@ pub(crate) fn verify(
             constant.id,
             HirConstant {
                 id: constant.id,
+                module: constant.module,
+                name: constant.name.clone(),
                 type_: constant.type_.clone(),
                 expression,
                 source: constant.source.clone(),
@@ -1057,6 +1108,7 @@ pub(crate) fn verify(
             },
             function.type_parameters.is_empty(),
         );
+        lowerer.set_generic_context(function);
         let mut parameters = Vec::new();
         for parameter in &function.parameters {
             let local = lowerer.bind_parameter(
@@ -1084,6 +1136,11 @@ pub(crate) fn verify(
                 module_display: function.module_display.clone(),
                 modifier: function.modifier,
                 parameters,
+                parameter_definitions: function
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.definition)
+                    .collect(),
                 return_type: function.return_type.clone(),
                 body: body.into(),
                 source: function.source.clone(),
@@ -1300,6 +1357,7 @@ pub(crate) fn verify(
         identities: identity_catalog,
         variants: &input.variants,
         structs: &input.structs,
+        interfaces: &input.interfaces,
     };
     verify_lowered_artifact(&artifact_catalog, &test_bodies)?;
     Ok(VerifiedProgram {
@@ -1400,6 +1458,8 @@ pub(crate) fn verify_comptime_condition(
                 id,
                 HirConstant {
                     id,
+                    module: constant.module,
+                    name: constant.name.clone(),
                     type_: constant.type_.clone(),
                     expression: value,
                     source: constant.source.clone(),
@@ -1518,6 +1578,7 @@ fn lower_concrete_function(
         },
         true,
     );
+    lowerer.set_generic_context(function);
     let mut parameters = Vec::new();
     for parameter in &function.parameters {
         let local = lowerer.bind_parameter(
@@ -1543,6 +1604,11 @@ fn lower_concrete_function(
         module_display: function.module_display.clone(),
         modifier: function.modifier,
         parameters,
+        parameter_definitions: function
+            .parameters
+            .iter()
+            .map(|parameter| parameter.definition)
+            .collect(),
         return_type: function.return_type.clone(),
         body: body.into(),
         source: function.source.clone(),
@@ -1635,7 +1701,10 @@ fn collect_expression_demands(
                 | CallTarget::Function { definition, .. } => {
                     functions.insert(*definition);
                 }
-                CallTarget::Build(_)
+                CallTarget::Interface { alternatives, .. } => {
+                    functions.extend(alternatives.iter().map(|(_, definition, _)| *definition));
+                }
+                CallTarget::Build { .. }
                 | CallTarget::BuiltinVariant(_)
                 | CallTarget::UserVariant { .. }
                 | CallTarget::Struct { .. }
@@ -1705,6 +1774,7 @@ pub(crate) fn lower_functions_for_error_inference(
             },
             false,
         );
+        lowerer.set_generic_context(function);
         let mut parameters = Vec::new();
         for parameter in &function.parameters {
             let local = lowerer.bind_parameter(
@@ -1732,6 +1802,11 @@ pub(crate) fn lower_functions_for_error_inference(
                 module_display: function.module_display.clone(),
                 modifier: function.modifier,
                 parameters,
+                parameter_definitions: function
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.definition)
+                    .collect(),
                 return_type: function.return_type.clone(),
                 body: body.into(),
                 source: function.source.clone(),
@@ -1804,6 +1879,7 @@ fn materialize_missing_specializations(
             },
             true,
         );
+        lowerer.set_generic_context(function);
         let mut parameters = Vec::new();
         for parameter in &function.parameters {
             let type_ = substitute(&parameter.type_, &substitutions);
@@ -1830,6 +1906,11 @@ fn materialize_missing_specializations(
                 module_display: function.module_display.clone(),
                 modifier: function.modifier,
                 parameters,
+                parameter_definitions: function
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.definition)
+                    .collect(),
                 return_type,
                 body: body.into(),
                 source: function.source.clone(),
@@ -1888,6 +1969,7 @@ struct ArtifactCatalog<'a> {
     identities: &'a IdentityCatalog,
     variants: &'a BTreeMap<VariantId, ResolvedVariant>,
     structs: &'a BTreeMap<DefinitionId, ResolvedStruct>,
+    interfaces: &'a BTreeMap<DefinitionId, ResolvedInterface>,
 }
 
 fn type_has_placeholder(type_: &Type) -> bool {
@@ -1916,6 +1998,8 @@ fn type_has_placeholder(type_: &Type) -> bool {
         | Type::Text
         | Type::Scalar
         | Type::Bytes
+        | Type::ConstU64(_)
+        | Type::PoolArgument(_)
         | Type::Builtin(_)
         | Type::Any { .. } => false,
     }
@@ -1933,7 +2017,14 @@ fn verify_specialized_artifact(
                 .ok_or_else(|| VerificationFailure::Defect {
                     evidence: Arc::from("concrete body has no Specialization record"),
                 })?;
+        let template = catalog.templates.get(&record.definition).ok_or_else(|| {
+            VerificationFailure::Defect {
+                evidence: Arc::from("concrete body has no definition template"),
+            }
+        })?;
         if record.definition != function.id
+            || function.parameters.len() != function.parameter_definitions.len()
+            || function.parameter_definitions != template.parameter_definitions
             || function
                 .parameters
                 .iter()
@@ -2224,6 +2315,16 @@ fn verify_lowered_artifact(
     for (key, function) in catalog.templates {
         if key != &function.id {
             return defect("lowered function key disagrees with its DefinitionId");
+        }
+        if function.parameters.len() != function.parameter_definitions.len()
+            || function
+                .parameter_definitions
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != function.parameter_definitions.len()
+        {
+            return defect("lowered function parameter identities are malformed");
         }
         let mut locals = BTreeMap::new();
         for (local, type_, _) in &function.parameters {
@@ -2873,10 +2974,18 @@ fn verify_expression_artifact(
                 CallTarget::TemplateFunction {
                     definition,
                     argument_order,
+                    argument_parameters,
                 } => catalog
                     .templates
                     .get(definition)
                     .map(|function| {
+                        let expected_parameters = argument_order
+                            .iter()
+                            .map(|index| function.parameter_definitions[usize::from(*index)])
+                            .collect::<Vec<_>>();
+                        if argument_parameters.as_ref() != expected_parameters {
+                            return defect("template call parameter identities disagree");
+                        }
                         let ordered = reorder_types(&argument_types, argument_order)?;
                         if !arguments_match(&ordered, &function.parameters) {
                             return defect("template call operands disagree with parameters");
@@ -2891,6 +3000,7 @@ fn verify_expression_artifact(
                     definition,
                     specialization,
                     argument_order,
+                    argument_parameters,
                 } => {
                     let record = catalog.specializations.get(specialization).ok_or_else(|| {
                         VerificationFailure::Defect {
@@ -2907,15 +3017,96 @@ fn verify_expression_artifact(
                             evidence: Arc::from("lowered call has no concrete specialization body"),
                         }
                     })?;
+                    let expected_parameters = argument_order
+                        .iter()
+                        .map(|index| function.parameter_definitions[usize::from(*index)])
+                        .collect::<Vec<_>>();
                     let ordered = reorder_types(&argument_types, argument_order)?;
                     if function.id != *definition
+                        || argument_parameters.as_ref() != expected_parameters
                         || !arguments_match(&ordered, &function.parameters)
                     {
                         return defect("concrete call operands disagree with specialization");
                     }
                     function.return_type.clone()
                 }
-                CallTarget::Build(primitive) => match primitive.kind {
+                CallTarget::Interface {
+                    interface,
+                    alternatives,
+                    argument_order,
+                    argument_parameters,
+                } => {
+                    let declaration = catalog.interfaces.get(interface).ok_or_else(|| {
+                        VerificationFailure::Defect {
+                            evidence: Arc::from("interface call references an unknown interface"),
+                        }
+                    })?;
+                    let requirement = declaration
+                        .requirements
+                        .values()
+                        .find(|requirement| {
+                            let expected = argument_order
+                                .iter()
+                                .map(|index| requirement.parameters[usize::from(*index)].definition)
+                                .collect::<Vec<_>>();
+                            argument_parameters.as_ref() == expected
+                        })
+                        .ok_or_else(|| VerificationFailure::Defect {
+                            evidence: Arc::from(
+                                "interface call parameter identities match no requirement",
+                            ),
+                        })?;
+                    if requirement.parameters.len() != argument_order.len() {
+                        return defect("interface call requirement arity is malformed");
+                    }
+                    if alternatives.is_empty() {
+                        if !argument_types.iter().any(type_has_placeholder) {
+                            return defect("concrete interface call has no closed alternatives");
+                        }
+                        return Ok(expression.type_.clone());
+                    }
+                    if declaration.implementations.is_empty() {
+                        return defect("interface call has no declared implementations");
+                    }
+                    for (nominal, definition, specialization) in alternatives.iter() {
+                        if declaration
+                            .implementations
+                            .get(nominal)
+                            .is_none_or(|members| !members.values().any(|id| id == definition))
+                        {
+                            return defect("interface call alternative is not an implementation");
+                        }
+                        let function =
+                            catalog.specialized.get(specialization).ok_or_else(|| {
+                                VerificationFailure::Defect {
+                                    evidence: Arc::from(
+                                        "interface call alternative has no specialization",
+                                    ),
+                                }
+                            })?;
+                        if function.id != *definition
+                            || function.parameters.len() != argument_types.len()
+                            || argument_order.len() != argument_types.len()
+                        {
+                            return defect("interface call alternative signature is malformed");
+                        }
+                        for (source, parameter) in argument_order.iter().enumerate().skip(1) {
+                            if !can_pass(
+                                &argument_types[source],
+                                &function.parameters[usize::from(*parameter)].1,
+                            ) {
+                                return defect(
+                                    "interface call operand disagrees with an alternative",
+                                );
+                            }
+                        }
+                        if !can_unify(&function.return_type, &expression.type_) {
+                            return defect("interface alternatives disagree on return type");
+                        }
+                    }
+                    expression.type_.clone()
+                }
+                CallTarget::Build { primitive, .. } => match primitive.kind {
                     BuildKind::Image => Type::Builtin(BuiltinType::Image),
                     BuildKind::Test => Type::Builtin(BuiltinType::Test),
                     BuildKind::Node { definition, .. } => {
@@ -2947,7 +3138,10 @@ fn verify_expression_artifact(
                         definition,
                         arguments: type_arguments,
                         ..
-                    } = &expression.type_
+                    } = expression
+                        .coerced_from
+                        .as_ref()
+                        .unwrap_or(&expression.type_)
                     else {
                         return defect("user variant result is not its nominal type");
                     };
@@ -2993,7 +3187,10 @@ fn verify_expression_artifact(
                         definition: result_definition,
                         arguments: type_arguments,
                         ..
-                    } = &expression.type_
+                    } = expression
+                        .coerced_from
+                        .as_ref()
+                        .unwrap_or(&expression.type_)
                     else {
                         return defect("struct construction result is not its nominal type");
                     };
@@ -3057,7 +3254,7 @@ fn verify_expression_artifact(
             let Type::FixedArray { element, length } = &expression.type_ else {
                 return defect("array literal result is not a fixed-array type");
             };
-            if *length != u64::try_from(values.len()).unwrap_or(u64::MAX) {
+            if length.value() != Some(u64::try_from(values.len()).unwrap_or(u64::MAX)) {
                 return defect("array literal length disagrees with its fixed-array type");
             }
             for value in &**values {
@@ -3077,7 +3274,7 @@ fn verify_expression_artifact(
             else {
                 return defect("repeated array result is not a fixed-array type");
             };
-            if length != type_length {
+            if Some(*length) != type_length.value() {
                 return defect("repeated array length disagrees with its fixed-array type");
             }
             let actual =
@@ -3189,10 +3386,20 @@ fn verify_expression_artifact(
     {
         return defect("lowered move reads a containing LocalId after it was moved");
     }
-    if actual != expression.type_ {
+    let valid_existential_coercion = expression.coerced_from.as_ref() == Some(&actual)
+        && matches!(
+            (&actual, &expression.type_),
+            (
+                Type::Nominal { definition, .. },
+                Type::Any { interface, .. }
+            ) if catalog.interfaces.get(interface).is_some_and(|interface| {
+                interface.implementations.contains_key(definition)
+            })
+        );
+    if actual != expression.type_ && !valid_existential_coercion {
         return defect("lowered expression type annotation is inconsistent");
     }
-    Ok(actual)
+    Ok(expression.type_.clone())
 }
 
 fn arguments_match(argument_types: &[Type], parameters: &[(LocalId, Type, AccessMode)]) -> bool {
@@ -3261,6 +3468,7 @@ struct Lowerer<'a> {
     tests: &'a BTreeMap<TestId, ResolvedTest>,
     variants: &'a BTreeMap<VariantId, ResolvedVariant>,
     structs: &'a BTreeMap<DefinitionId, ResolvedStruct>,
+    interfaces: &'a BTreeMap<DefinitionId, ResolvedInterface>,
     aliases: &'a BTreeMap<DefinitionId, Type>,
     namespace: &'a NamespaceCatalog,
     nominal_displays: &'a BTreeMap<DefinitionId, Arc<str>>,
@@ -3277,6 +3485,7 @@ struct Lowerer<'a> {
     concrete_context: bool,
     test_application_context: u16,
     expected_expression_type: Option<Type>,
+    generic_interface_bounds: BTreeMap<TypeParameterId, DefinitionId>,
 }
 
 struct SpecializationDemands<'a> {
@@ -3301,6 +3510,7 @@ impl<'a> Lowerer<'a> {
             tests: &input.tests,
             variants: &input.variants,
             structs: &input.structs,
+            interfaces: &input.interfaces,
             aliases: &input.aliases,
             namespace: &input.namespace,
             nominal_displays: &input.nominal_displays,
@@ -3317,7 +3527,23 @@ impl<'a> Lowerer<'a> {
             concrete_context,
             test_application_context: 0,
             expected_expression_type: None,
+            generic_interface_bounds: BTreeMap::new(),
         }
+    }
+
+    fn set_generic_context(&mut self, function: &ResolvedFunction) {
+        self.generic_interface_bounds = function
+            .type_parameters
+            .iter()
+            .copied()
+            .zip(function.generic_constraints.iter())
+            .filter_map(|(parameter, constraint)| match constraint {
+                GenericConstraint::Type {
+                    interface: Some(interface),
+                } => Some((parameter, *interface)),
+                _ => None,
+            })
+            .collect();
     }
 
     fn bind_local(&mut self, name: &str, type_: Type) -> Result<LocalId, VerificationFailure> {
@@ -3646,6 +3872,7 @@ impl<'a> Lowerer<'a> {
                             place_syntax.range.clone(),
                         )?;
                         let operator = BinaryOperator::from(*operator);
+                        self.validate_binary_capability(operator, &left.type_, range)?;
                         let result_type = binary_type(operator, &left.type_, &value.type_)
                             .ok_or_else(|| {
                                 creator_value(CreatorFailureKind::BinaryTypeMismatch, range)
@@ -3665,8 +3892,21 @@ impl<'a> Lowerer<'a> {
                     {
                         return creator(CreatorFailureKind::ArgumentTypeMismatch, range);
                     }
-                    let known_integer = expression_integer_value(&value);
-                    if let Some((place, type_, writable)) = lowered_place {
+                    self.require_owned_transfer(&value)?;
+                    if name == "_" {
+                        if !place_syntax.projections.is_empty()
+                            || operator.is_some()
+                            || declared_type.is_some()
+                            || *mutable_binding
+                        {
+                            return creator(CreatorFailureKind::UnresolvedName, range);
+                        }
+                        if self.is_must_use(&value.type_) {
+                            return creator(CreatorFailureKind::MustUseValue, range);
+                        }
+                        Statement::Evaluate(value)
+                    } else if let Some((place, type_, writable)) = lowered_place {
+                        let known_integer = expression_integer_value(&value);
                         if *mutable_binding || declared_type.is_some() {
                             return creator(CreatorFailureKind::DuplicateLocal, range);
                         }
@@ -3689,6 +3929,7 @@ impl<'a> Lowerer<'a> {
                             source: range.clone(),
                         }
                     } else {
+                        let known_integer = expression_integer_value(&value);
                         if !place_syntax.projections.is_empty() || operator.is_some() {
                             return creator(CreatorFailureKind::UnresolvedName, range);
                         }
@@ -3709,7 +3950,11 @@ impl<'a> Lowerer<'a> {
                     }
                 }
                 StatementSyntax::Evaluate(expression) => {
-                    Statement::Evaluate(self.expression(expression)?)
+                    let expression = self.expression(expression)?;
+                    if self.is_must_use(&expression.type_) {
+                        return creator(CreatorFailureKind::MustUseValue, &expression.source);
+                    }
+                    Statement::Evaluate(expression)
                 }
                 StatementSyntax::If {
                     condition,
@@ -4120,16 +4365,38 @@ impl<'a> Lowerer<'a> {
                             },
                             syntax,
                         )?;
-                        let Type::Nominal { definition, .. } = &receiver_expression.type_ else {
-                            return creator(CreatorFailureKind::UnresolvedCall, &syntax.range);
-                        };
-                        let Some(ResolvedName::Function(id)) =
-                            self.namespace
-                                .resolve_member(self.module, *definition, member)
-                        else {
-                            return creator(CreatorFailureKind::UnresolvedCall, &syntax.range);
-                        };
-                        Some((receiver_expression, id))
+                        match receiver_expression.type_.clone() {
+                            Type::Nominal { definition, .. } => {
+                                let Some(ResolvedName::Function(id)) = self
+                                    .namespace
+                                    .resolve_member(self.module, definition, member)
+                                else {
+                                    return creator(
+                                        CreatorFailureKind::UnresolvedCall,
+                                        &syntax.range,
+                                    );
+                                };
+                                Some((receiver_expression, Some(id), None))
+                            }
+                            Type::Any { interface, .. } => {
+                                Some((receiver_expression, None, Some((interface, member.clone()))))
+                            }
+                            Type::Parameter { id, .. } => {
+                                let interface =
+                                    self.generic_interface_bounds.get(&id).copied().ok_or_else(
+                                        || {
+                                            creator_value(
+                                                CreatorFailureKind::UnresolvedCall,
+                                                &syntax.range,
+                                            )
+                                        },
+                                    )?;
+                                Some((receiver_expression, None, Some((interface, member.clone()))))
+                            }
+                            _ => {
+                                return creator(CreatorFailureKind::UnresolvedCall, &syntax.range);
+                            }
+                        }
                     }
                     _ => None,
                 };
@@ -4144,7 +4411,7 @@ impl<'a> Lowerer<'a> {
                 }
                 let mut lowered = Vec::new();
                 let mut labels = Vec::new();
-                if let Some((receiver, _)) = &receiver {
+                if let Some((receiver, _, _)) = &receiver {
                     lowered.push(receiver.clone());
                     labels.push(None);
                 }
@@ -4210,8 +4477,10 @@ impl<'a> Lowerer<'a> {
                         },
                         return_type,
                     )
-                } else if let Some((_, id)) = receiver {
-                    self.function_call(id, &lowered, &labels, &syntax.range)?
+                } else if let Some((_, Some(id), _)) = &receiver {
+                    self.function_call(*id, &lowered, &labels, &syntax.range)?
+                } else if let Some((_, _, Some((interface, member)))) = &receiver {
+                    self.interface_call(*interface, member, &lowered, &labels, &syntax.range)?
                 } else {
                     self.call(callee, &lowered, &labels, &syntax.range)?
                 };
@@ -4252,13 +4521,102 @@ impl<'a> Lowerer<'a> {
                         self.apply_authored_ownership(value, *ownership)?;
                     }
                 }
-                if let CallTarget::Build(primitive) = &target {
+                if let CallTarget::Build { primitive, .. } = &target {
                     self.apply_build_argument_types_and_modes(
                         *primitive,
                         &mut lowered,
                         &labels,
                         &syntax.range,
                     )?;
+                }
+                if let CallTarget::Struct { definition, .. } = &target {
+                    let resource_fields = self
+                        .structs
+                        .get(definition)
+                        .map(|struct_| {
+                            labels
+                                .iter()
+                                .map(|label| {
+                                    label.as_deref().and_then(|label| {
+                                        struct_
+                                            .fields
+                                            .iter()
+                                            .find(|field| field.name == label)
+                                            .map(|field| self.type_owns_resource(&field.type_))
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    for (argument, resource) in lowered.iter().zip(resource_fields) {
+                        if resource == Some(true) {
+                            self.require_owned_transfer(argument)?;
+                        }
+                    }
+                }
+                if let CallTarget::Test {
+                    id, argument_order, ..
+                } = &target
+                {
+                    let ownership = argument_order
+                        .iter()
+                        .map(|parameter| {
+                            self.tests[id].parameters[usize::from(*parameter)].ownership
+                        })
+                        .collect::<Vec<_>>();
+                    for (argument, ownership) in lowered.iter_mut().zip(ownership) {
+                        self.apply_authored_ownership(argument, ownership)?;
+                    }
+                }
+                if let CallTarget::Interface {
+                    alternatives,
+                    argument_order,
+                    argument_parameters,
+                    interface,
+                    ..
+                } = &target
+                {
+                    let ownership = if let Some((_, definition, _)) = alternatives.first() {
+                        argument_order
+                            .iter()
+                            .map(|parameter| {
+                                self.functions[definition].parameters[usize::from(*parameter)]
+                                    .ownership
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        let requirement = self.interfaces[interface]
+                            .requirements
+                            .values()
+                            .find(|requirement| {
+                                argument_order
+                                    .iter()
+                                    .map(|parameter| {
+                                        requirement.parameters[usize::from(*parameter)].definition
+                                    })
+                                    .eq(argument_parameters.iter().copied())
+                            })
+                            .ok_or_else(|| {
+                                creator_value(CreatorFailureKind::UnresolvedCall, &syntax.range)
+                            })?;
+                        argument_order
+                            .iter()
+                            .map(|parameter| {
+                                requirement.parameters[usize::from(*parameter)].ownership
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    for (argument, ownership) in lowered.iter_mut().zip(ownership) {
+                        self.apply_authored_ownership(argument, ownership)?;
+                    }
+                }
+                if matches!(
+                    &target,
+                    CallTarget::BuiltinVariant(_) | CallTarget::UserVariant { .. }
+                ) {
+                    for argument in &lowered {
+                        self.require_owned_transfer(argument)?;
+                    }
                 }
                 if let CallTarget::Test { .. } = &target
                     && self.test_application_context == 0
@@ -4281,6 +4639,9 @@ impl<'a> Lowerer<'a> {
                     .iter()
                     .map(|value| self.expression(value))
                     .collect::<Result<Vec<_>, _>>()?;
+                for value in &values {
+                    self.require_owned_transfer(value)?;
+                }
                 let element = values
                     .first()
                     .map_or(Type::Infer, |value| value.type_.clone());
@@ -4295,15 +4656,18 @@ impl<'a> Lowerer<'a> {
                     ExpressionKind::Array(values.into()),
                     Type::FixedArray {
                         element: Arc::new(element),
-                        length,
+                        length: ArrayLength::Value(length),
                     },
                 )
             }
             ExpressionSyntaxKind::RepeatedArray { value, length } => {
                 let value = self.expression(value)?;
+                if self.type_owns_resource(&value.type_) {
+                    return creator(CreatorFailureKind::ResourceRequiresTake, &value.source);
+                }
                 let type_ = Type::FixedArray {
                     element: Arc::new(value.type_.clone()),
-                    length: *length,
+                    length: ArrayLength::Value(*length),
                 };
                 (
                     ExpressionKind::RepeatedArray {
@@ -4318,6 +4682,9 @@ impl<'a> Lowerer<'a> {
                     .iter()
                     .map(|value| self.expression(value))
                     .collect::<Result<Vec<_>, _>>()?;
+                for value in &values {
+                    self.require_owned_transfer(value)?;
+                }
                 let type_ = Type::Tuple(
                     values
                         .iter()
@@ -4589,6 +4956,7 @@ impl<'a> Lowerer<'a> {
                 let left = self.expression(left)?;
                 let right = self.expression(right)?;
                 let operator = BinaryOperator::from(*operator);
+                self.validate_binary_capability(operator, &left.type_, &syntax.range)?;
                 let type_ = binary_type(operator, &left.type_, &right.type_).ok_or_else(|| {
                     creator_value(CreatorFailureKind::BinaryTypeMismatch, &syntax.range)
                 })?;
@@ -4624,6 +4992,7 @@ impl<'a> Lowerer<'a> {
             kind,
             type_id,
             type_,
+            coerced_from: None,
             access: AccessMode::Copy,
             source,
         })
@@ -4634,6 +5003,29 @@ impl<'a> Lowerer<'a> {
         expression: &mut Expression,
         expected: &Type,
     ) -> Result<(), VerificationFailure> {
+        if let (Type::Nominal { definition, .. }, Type::Any { interface, .. }) =
+            (&expression.type_, expected)
+        {
+            if self
+                .interfaces
+                .get(interface)
+                .is_none_or(|interface| !interface.implementations.contains_key(definition))
+            {
+                return creator(CreatorFailureKind::ArgumentTypeMismatch, &expression.source);
+            }
+            expression.coerced_from = Some(expression.type_.clone());
+            expression.type_ = expected.clone();
+            expression.type_id =
+                self.identity_catalog
+                    .intern_type(expected)
+                    .map_err(|collision| VerificationFailure::Defect {
+                        evidence: Arc::from(format!(
+                            "type identity collision {:032x}",
+                            collision.digest
+                        )),
+                    })?;
+            return Ok(());
+        }
         if expression.type_ == *expected
             || matches!(expected, Type::Infer | Type::Parameter { .. })
             || matches!(
@@ -4688,7 +5080,7 @@ impl<'a> Lowerer<'a> {
                 }
                 let concrete = Type::FixedArray {
                     element: element.clone(),
-                    length: u64::try_from(values.len()).unwrap_or(u64::MAX),
+                    length: ArrayLength::Value(u64::try_from(values.len()).unwrap_or(u64::MAX)),
                 };
                 expression.type_id =
                     self.identity_catalog
@@ -4706,7 +5098,7 @@ impl<'a> Lowerer<'a> {
                 self.apply_expected_type(value, element)?;
                 let concrete = Type::FixedArray {
                     element: element.clone(),
-                    length: *length,
+                    length: ArrayLength::Value(*length),
                 };
                 expression.type_id =
                     self.identity_catalog
@@ -4759,16 +5151,135 @@ impl<'a> Lowerer<'a> {
         })
     }
 
+    fn require_owned_transfer(&self, expression: &Expression) -> Result<(), VerificationFailure> {
+        if self.type_owns_resource(&expression.type_)
+            && root_place(expression).is_some()
+            && expression.access != AccessMode::Move
+        {
+            return creator(CreatorFailureKind::ResourceRequiresTake, &expression.source);
+        }
+        Ok(())
+    }
+
+    fn is_must_use(&self, type_: &Type) -> bool {
+        self.type_owns_resource(type_) || matches!(type_, Type::Result { .. })
+    }
+
+    fn validate_binary_capability(
+        &self,
+        operator: BinaryOperator,
+        type_: &Type,
+        site: &SourceRange,
+    ) -> Result<(), VerificationFailure> {
+        let supported = if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual) {
+            self.type_supports_comparison(type_, false, &mut BTreeSet::new())
+        } else if matches!(
+            operator,
+            BinaryOperator::Less
+                | BinaryOperator::LessEqual
+                | BinaryOperator::Greater
+                | BinaryOperator::GreaterEqual
+        ) {
+            self.type_supports_comparison(type_, true, &mut BTreeSet::new())
+        } else {
+            true
+        };
+        if !supported {
+            return creator(CreatorFailureKind::BinaryTypeMismatch, site);
+        }
+        Ok(())
+    }
+
+    fn type_supports_comparison(
+        &self,
+        type_: &Type,
+        ordered: bool,
+        visiting: &mut BTreeSet<DefinitionId>,
+    ) -> bool {
+        match type_ {
+            Type::Unit | Type::Bool => !ordered,
+            Type::Integer(_) | Type::Float(_) | Type::Text | Type::Scalar | Type::Bytes => true,
+            Type::Array(value) | Type::FixedArray { element: value, .. } | Type::Option(value) => {
+                self.type_supports_comparison(value, ordered, visiting)
+            }
+            Type::Tuple(values) => values
+                .iter()
+                .all(|value| self.type_supports_comparison(value, ordered, visiting)),
+            Type::Result { success, error } => {
+                self.type_supports_comparison(success, ordered, visiting)
+                    && error
+                        .as_ref()
+                        .is_none_or(|error| self.type_supports_comparison(error, ordered, visiting))
+            }
+            Type::Nominal {
+                definition,
+                arguments,
+                ..
+            } => {
+                if !visiting.insert(*definition) {
+                    return true;
+                }
+                let result = if let Some(struct_) = self.structs.get(definition) {
+                    !struct_.resource
+                        && struct_.fields.iter().all(|field| {
+                            let substitutions = struct_
+                                .type_parameters
+                                .iter()
+                                .copied()
+                                .zip(arguments.iter().cloned())
+                                .collect::<BTreeMap<_, _>>();
+                            self.type_supports_comparison(
+                                &substitute(&field.type_, &substitutions),
+                                ordered,
+                                visiting,
+                            )
+                        })
+                } else {
+                    self.variants
+                        .iter()
+                        .filter(|(id, _)| id.owner == *definition)
+                        .all(|(_, variant)| {
+                            let substitutions = variant
+                                .type_parameters
+                                .iter()
+                                .copied()
+                                .zip(arguments.iter().cloned())
+                                .collect::<BTreeMap<_, _>>();
+                            variant.parameters.iter().all(|parameter| {
+                                self.type_supports_comparison(
+                                    &substitute(&parameter.type_, &substitutions),
+                                    ordered,
+                                    visiting,
+                                )
+                            })
+                        })
+                };
+                visiting.remove(definition);
+                result
+            }
+            Type::Function { .. }
+            | Type::Own { .. }
+            | Type::Any { .. }
+            | Type::Builtin(_)
+            | Type::ConstU64(_)
+            | Type::PoolArgument(_)
+            | Type::Parameter { .. }
+            | Type::Infer => false,
+        }
+    }
+
     fn resolve_local_type(&self, syntax: &crate::syntax::TypeSyntax) -> Option<Type> {
         use crate::syntax::TypeSyntax;
         match syntax {
             TypeSyntax::Unit => Some(Type::Unit),
+            TypeSyntax::ConstU64(value) => Some(Type::ConstU64(*value)),
             TypeSyntax::Infer => None,
             TypeSyntax::Named(name) => {
                 if let Some(type_) = resolve_builtin_type(name) {
                     return Some(type_);
                 }
                 match self.namespace.resolve(self.module, &name.segments)? {
+                    ResolvedName::Pool(pool) => Some(Type::PoolArgument(pool)),
                     ResolvedName::Nominal(definition)
                         if self.namespace.nominal_arity(definition) == Some(0) =>
                     {
@@ -4830,7 +5341,15 @@ impl<'a> Lowerer<'a> {
             )),
             TypeSyntax::FixedArray { element, length } => Some(Type::FixedArray {
                 element: Arc::new(self.resolve_local_type(element)?),
-                length: *length,
+                length: match length {
+                    crate::syntax::FixedArrayLengthSyntax::Literal(value) => {
+                        ArrayLength::Value(*value)
+                    }
+                    crate::syntax::FixedArrayLengthSyntax::Parameter(name) => {
+                        let _ = name;
+                        return None;
+                    }
+                },
             }),
             TypeSyntax::Function {
                 parameters,
@@ -4850,7 +5369,7 @@ impl<'a> Lowerer<'a> {
                     return None;
                 };
                 Some(Type::Own {
-                    pool,
+                    pool: PoolTerm::Concrete(pool),
                     value: Arc::new(self.resolve_local_type(value)?),
                 })
             }
@@ -4928,7 +5447,9 @@ impl<'a> Lowerer<'a> {
             HirMatchPattern::FixedArray(patterns) => {
                 let (element, length) = match type_ {
                     Type::Array(element) => (element.as_ref(), patterns.len() as u64),
-                    Type::FixedArray { element, length } => (element.as_ref(), *length),
+                    Type::FixedArray { element, length } => {
+                        (element.as_ref(), length.value().unwrap_or(u64::MAX))
+                    }
                     _ => return false,
                 };
                 patterns.len() as u64 == length
@@ -5096,7 +5617,9 @@ impl<'a> Lowerer<'a> {
             }
             PatternSyntaxKind::FixedArray(members) => {
                 let (element, length) = match expected {
-                    Type::FixedArray { element, length } => (element.as_ref(), *length),
+                    Type::FixedArray { element, length } => {
+                        (element.as_ref(), length.value().unwrap_or(u64::MAX))
+                    }
                     Type::Array(element) => (element.as_ref(), members.len() as u64),
                     _ => return creator(CreatorFailureKind::BinaryTypeMismatch, &pattern.range),
                 };
@@ -5476,7 +5999,22 @@ impl<'a> Lowerer<'a> {
                 function.return_type.clone()
             }
         };
-        Ok((CallTarget::Build(primitive), return_type))
+        let labels = labels
+            .iter()
+            .map(|label| {
+                label
+                    .as_deref()
+                    .map(Arc::from)
+                    .ok_or_else(|| creator_value(CreatorFailureKind::ArgumentLabelMismatch, site))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((
+            CallTarget::Build {
+                primitive,
+                labels: labels.into(),
+            },
+            return_type,
+        ))
     }
 
     fn apply_build_argument_types_and_modes(
@@ -5530,7 +6068,12 @@ impl<'a> Lowerer<'a> {
                 Ok(())
             }
             OwnershipSyntax::Mut if argument.access == AccessMode::Mut => Ok(()),
-            OwnershipSyntax::Take if argument.access == AccessMode::Move => Ok(()),
+            OwnershipSyntax::Take
+                if argument.access == AccessMode::Move || root_place(argument).is_none() =>
+            {
+                argument.access = AccessMode::Move;
+                Ok(())
+            }
             _ => creator(
                 CreatorFailureKind::ArgumentOwnershipMismatch,
                 &argument.source,
@@ -5613,12 +6156,29 @@ impl<'a> Lowerer<'a> {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            self.validate_generic_arguments(&struct_.generic_constraints, &type_arguments, site)?;
             let argument_fields = labels
                 .iter()
                 .map(|label| {
                     label.as_deref().map(Arc::from).ok_or_else(|| {
                         creator_value(CreatorFailureKind::ArgumentLabelMismatch, site)
                     })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let argument_field_definitions = labels
+                .iter()
+                .map(|label| {
+                    let label = label.as_deref().ok_or_else(|| {
+                        creator_value(CreatorFailureKind::ArgumentLabelMismatch, site)
+                    })?;
+                    struct_
+                        .fields
+                        .iter()
+                        .find(|field| field.name == label)
+                        .map(|field| field.definition)
+                        .ok_or_else(|| {
+                            creator_value(CreatorFailureKind::ArgumentLabelMismatch, site)
+                        })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             return Ok((
@@ -5631,6 +6191,7 @@ impl<'a> Lowerer<'a> {
                         .map(|field| Arc::from(field.name.as_str()))
                         .collect(),
                     argument_fields: argument_fields.into(),
+                    argument_field_definitions: argument_field_definitions.into(),
                 },
                 Type::Nominal {
                     definition: id,
@@ -5656,8 +6217,16 @@ impl<'a> Lowerer<'a> {
                 LabelMode::Optional,
                 site,
             )?;
+            let argument_parameters = argument_order
+                .iter()
+                .map(|parameter| test.parameters[usize::from(*parameter)].definition)
+                .collect();
             return Ok((
-                CallTarget::Test { id, argument_order },
+                CallTarget::Test {
+                    id,
+                    argument_order,
+                    argument_parameters,
+                },
                 Type::Builtin(BuiltinType::TestApplication),
             ));
         }
@@ -5754,12 +6323,19 @@ impl<'a> Lowerer<'a> {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            self.validate_generic_arguments(&variant.generic_constraints, &type_arguments, site)?;
+            let argument_parameters = argument_order
+                .iter()
+                .map(|parameter| variant.parameters[usize::from(*parameter)].definition)
+                .collect();
             return Ok((
                 CallTarget::UserVariant {
                     id: variant_id,
+                    variant_order: variant.order,
                     type_display: display.clone(),
                     variant_display: Arc::from(name.segments[1].as_str()),
                     argument_order,
+                    argument_parameters,
                 },
                 Type::Nominal {
                     definition: owner,
@@ -5809,11 +6385,26 @@ impl<'a> Lowerer<'a> {
             )?;
         }
         let return_type = substitute(&function.return_type, &substitutions);
+        if !self.concrete_result_type_is_well_formed(&return_type)
+            || function.parameters.iter().any(|parameter| {
+                !self.concrete_result_type_is_well_formed(&substitute(
+                    &parameter.type_,
+                    &substitutions,
+                ))
+            })
+        {
+            return creator(CreatorFailureKind::GenericArgumentConflict, site);
+        }
+        let argument_parameters = argument_order
+            .iter()
+            .map(|parameter| function.parameters[usize::from(*parameter)].definition)
+            .collect::<Arc<[_]>>();
         if !self.concrete_context {
             return Ok((
                 CallTarget::TemplateFunction {
                     definition: id,
                     argument_order,
+                    argument_parameters,
                 },
                 return_type,
             ));
@@ -5831,6 +6422,7 @@ impl<'a> Lowerer<'a> {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        self.validate_generic_arguments(&function.generic_constraints, &type_arguments, site)?;
         let specialization_id = self
             .identity_catalog
             .specialization(id, &type_arguments)
@@ -5858,9 +6450,179 @@ impl<'a> Lowerer<'a> {
                 definition: id,
                 specialization: specialization.id,
                 argument_order,
+                argument_parameters,
             },
             return_type,
         ))
+    }
+
+    fn interface_call(
+        &mut self,
+        interface_id: DefinitionId,
+        member: &str,
+        arguments: &[Expression],
+        labels: &[Option<String>],
+        site: &SourceRange,
+    ) -> Result<(CallTarget, Type), VerificationFailure> {
+        let interface = self
+            .interfaces
+            .get(&interface_id)
+            .ok_or_else(|| creator_value(CreatorFailureKind::UnresolvedCall, site))?;
+        let requirement = interface
+            .requirements
+            .get(member)
+            .cloned()
+            .ok_or_else(|| creator_value(CreatorFailureKind::UnresolvedCall, site))?;
+        let argument_order = check_callable(
+            &requirement.parameters,
+            arguments,
+            labels,
+            LabelMode::Optional,
+            site,
+        )?;
+        let argument_parameters = argument_order
+            .iter()
+            .map(|parameter| requirement.parameters[usize::from(*parameter)].definition)
+            .collect();
+        if !self.concrete_context {
+            return Ok((
+                CallTarget::Interface {
+                    interface: interface_id,
+                    alternatives: Arc::from([]),
+                    argument_order,
+                    argument_parameters,
+                },
+                requirement.return_type,
+            ));
+        }
+        let implementation_ids = interface
+            .implementations
+            .iter()
+            .map(|(nominal, members)| {
+                members
+                    .get(member)
+                    .copied()
+                    .map(|implementation| (*nominal, implementation))
+                    .ok_or_else(|| creator_value(CreatorFailureKind::UnresolvedCall, site))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if implementation_ids.is_empty() {
+            return creator(CreatorFailureKind::UnresolvedCall, site);
+        }
+        let mut alternatives = Vec::with_capacity(implementation_ids.len());
+        for (nominal, implementation) in implementation_ids {
+            let function = &self.functions[&implementation];
+            if !function.type_parameters.is_empty() {
+                return creator(CreatorFailureKind::GenericArgumentConflict, site);
+            }
+            let specialization_id = self
+                .identity_catalog
+                .specialization(implementation, &[])
+                .map_err(|collision| VerificationFailure::Defect {
+                    evidence: Arc::from(format!(
+                        "specialization identity collision {:032x}",
+                        collision.digest
+                    )),
+                })?;
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                self.specialization_demands.records.entry(specialization_id)
+            {
+                entry.insert(SpecializationRecord {
+                    id: specialization_id,
+                    definition: implementation,
+                    type_arguments: Arc::from([]),
+                });
+                self.specialization_demands
+                    .pending
+                    .insert(specialization_id);
+            }
+            alternatives.push((nominal, implementation, specialization_id));
+        }
+        Ok((
+            CallTarget::Interface {
+                interface: interface_id,
+                alternatives: alternatives.into(),
+                argument_order,
+                argument_parameters,
+            },
+            requirement.return_type.clone(),
+        ))
+    }
+
+    fn validate_generic_arguments(
+        &self,
+        constraints: &[GenericConstraint],
+        arguments: &[Type],
+        site: &SourceRange,
+    ) -> Result<(), VerificationFailure> {
+        if constraints.len() != arguments.len() {
+            return creator(CreatorFailureKind::GenericArgumentConflict, site);
+        }
+        for (constraint, argument) in constraints.iter().zip(arguments) {
+            let valid = match constraint {
+                GenericConstraint::Type { interface: None } => !matches!(
+                    argument,
+                    Type::ConstU64(_)
+                        | Type::PoolArgument(_)
+                        | Type::Infer
+                        | Type::Parameter { .. }
+                ),
+                GenericConstraint::Type {
+                    interface: Some(interface),
+                } => {
+                    let Type::Nominal { definition, .. } = argument else {
+                        return creator(CreatorFailureKind::GenericArgumentConflict, site);
+                    };
+                    self.interfaces
+                        .get(interface)
+                        .is_some_and(|interface| interface.implementations.contains_key(definition))
+                }
+                GenericConstraint::Const { type_ } => match (type_, argument) {
+                    (Type::Integer(kind), Type::ConstU64(value)) => kind.fits(i128::from(*value)),
+                    _ => false,
+                },
+                GenericConstraint::Pool => matches!(argument, Type::PoolArgument(_)),
+            };
+            if !valid {
+                return creator(CreatorFailureKind::GenericArgumentConflict, site);
+            }
+        }
+        Ok(())
+    }
+
+    fn concrete_result_type_is_well_formed(&self, type_: &Type) -> bool {
+        match type_ {
+            Type::Result { success, error } => {
+                self.concrete_result_type_is_well_formed(success)
+                    && error.as_ref().is_none_or(|error| {
+                        matches!(
+                            error.as_ref(),
+                            Type::Nominal { definition, .. }
+                                if !self.interfaces.contains_key(definition)
+                        ) && self.concrete_result_type_is_well_formed(error)
+                    })
+            }
+            Type::Array(value)
+            | Type::FixedArray { element: value, .. }
+            | Type::Own { value, .. }
+            | Type::Option(value) => self.concrete_result_type_is_well_formed(value),
+            Type::Tuple(values) => values
+                .iter()
+                .all(|value| self.concrete_result_type_is_well_formed(value)),
+            Type::Function {
+                parameters,
+                return_type,
+            } => {
+                parameters
+                    .iter()
+                    .all(|value| self.concrete_result_type_is_well_formed(value))
+                    && self.concrete_result_type_is_well_formed(return_type)
+            }
+            Type::Nominal { arguments, .. } => arguments
+                .iter()
+                .all(|value| self.concrete_result_type_is_well_formed(value)),
+            _ => true,
+        }
     }
 
     fn function_value(
@@ -6025,7 +6787,21 @@ fn bind_type(
                 element: actual,
                 length: actual_length,
             },
-        ) if expected_length == actual_length => bind_type(expected, actual, substitutions, site),
+        ) => {
+            match (expected_length, actual_length) {
+                (ArrayLength::Value(expected), ArrayLength::Value(actual))
+                    if expected == actual => {}
+                (ArrayLength::Parameter { id, .. }, ArrayLength::Value(actual)) => {
+                    if let Some(previous) = substitutions.insert(*id, Type::ConstU64(*actual))
+                        && previous != Type::ConstU64(*actual)
+                    {
+                        return creator(CreatorFailureKind::GenericArgumentConflict, site);
+                    }
+                }
+                _ => return creator(CreatorFailureKind::GenericArgumentConflict, site),
+            }
+            bind_type(expected, actual, substitutions, site)
+        }
         (
             Type::Function {
                 parameters: expected_parameters,
@@ -6050,7 +6826,21 @@ fn bind_type(
                 pool: actual_pool,
                 value: actual,
             },
-        ) if expected_pool == actual_pool => bind_type(expected, actual, substitutions, site),
+        ) => {
+            match (expected_pool, actual_pool) {
+                (PoolTerm::Concrete(expected), PoolTerm::Concrete(actual))
+                    if expected == actual => {}
+                (PoolTerm::Parameter { id, .. }, PoolTerm::Concrete(actual)) => {
+                    if let Some(previous) = substitutions.insert(*id, Type::PoolArgument(*actual))
+                        && previous != Type::PoolArgument(*actual)
+                    {
+                        return creator(CreatorFailureKind::GenericArgumentConflict, site);
+                    }
+                }
+                _ => return creator(CreatorFailureKind::GenericArgumentConflict, site),
+            }
+            bind_type(expected, actual, substitutions, site)
+        }
         (Type::Tuple(expected), Type::Tuple(actual)) if expected.len() == actual.len() => {
             for (expected, actual) in expected.iter().zip(actual.iter()) {
                 bind_type(expected, actual, substitutions, site)?;
@@ -6413,7 +7203,9 @@ fn verify_match_pattern_artifact(
         HirMatchPattern::FixedArray(patterns) => {
             let (element, length) = match expected {
                 Type::Array(element) => (element.as_ref(), patterns.len() as u64),
-                Type::FixedArray { element, length } => (element.as_ref(), *length),
+                Type::FixedArray { element, length } => {
+                    (element.as_ref(), length.value().unwrap_or(u64::MAX))
+                }
                 _ => return defect("lowered fixed-array pattern targets a non-array value"),
             };
             if patterns.len() as u64 != length {
@@ -6511,7 +7303,9 @@ fn artifact_pattern_irrefutable(
         HirMatchPattern::FixedArray(patterns) => {
             let (element, length) = match type_ {
                 Type::Array(element) => (element.as_ref(), patterns.len() as u64),
-                Type::FixedArray { element, length } => (element.as_ref(), *length),
+                Type::FixedArray { element, length } => {
+                    (element.as_ref(), length.value().unwrap_or(u64::MAX))
+                }
                 _ => return false,
             };
             patterns.len() as u64 == length
@@ -6662,7 +7456,16 @@ fn substitute(type_: &Type, substitutions: &BTreeMap<crate::model::TypeParameter
         Type::Array(element) => Type::Array(Arc::new(substitute(element, substitutions))),
         Type::FixedArray { element, length } => Type::FixedArray {
             element: Arc::new(substitute(element, substitutions)),
-            length: *length,
+            length: match length {
+                ArrayLength::Value(value) => ArrayLength::Value(*value),
+                ArrayLength::Parameter { id, .. } => substitutions
+                    .get(id)
+                    .and_then(|value| match value {
+                        Type::ConstU64(value) => Some(ArrayLength::Value(*value)),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| length.clone()),
+            },
         },
         Type::Tuple(members) => Type::Tuple(
             members
@@ -6688,7 +7491,16 @@ fn substitute(type_: &Type, substitutions: &BTreeMap<crate::model::TypeParameter
             return_type: Arc::new(substitute(return_type, substitutions)),
         },
         Type::Own { pool, value } => Type::Own {
-            pool: *pool,
+            pool: match pool {
+                PoolTerm::Concrete(pool) => PoolTerm::Concrete(*pool),
+                PoolTerm::Parameter { id, .. } => substitutions
+                    .get(id)
+                    .and_then(|value| match value {
+                        Type::PoolArgument(pool) => Some(PoolTerm::Concrete(*pool)),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| pool.clone()),
+            },
             value: Arc::new(substitute(value, substitutions)),
         },
         Type::Nominal {
@@ -6769,7 +7581,7 @@ fn binary_type(operator: BinaryOperator, left: &Type, right: &Type) -> Option<Ty
         return matches!(left, Type::Integer(_)).then(|| left.clone());
     }
     if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual) {
-        return Some(Type::Bool);
+        return comparison_shape_supported(left, false).then_some(Type::Bool);
     }
     if matches!(
         operator,
@@ -6778,13 +7590,38 @@ fn binary_type(operator: BinaryOperator, left: &Type, right: &Type) -> Option<Ty
             | BinaryOperator::Greater
             | BinaryOperator::GreaterEqual
     ) {
-        return matches!(
-            left,
-            Type::Integer(_) | Type::Float(_) | Type::Text | Type::Scalar | Type::Bytes
-        )
-        .then_some(Type::Bool);
+        return comparison_shape_supported(left, true).then_some(Type::Bool);
     }
     left.is_numeric().then(|| left.clone())
+}
+
+fn comparison_shape_supported(type_: &Type, ordered: bool) -> bool {
+    match type_ {
+        Type::Unit | Type::Bool => !ordered,
+        Type::Integer(_) | Type::Float(_) | Type::Text | Type::Scalar | Type::Bytes => true,
+        Type::Array(value) | Type::FixedArray { element: value, .. } | Type::Option(value) => {
+            comparison_shape_supported(value, ordered)
+        }
+        Type::Tuple(values) => values
+            .iter()
+            .all(|value| comparison_shape_supported(value, ordered)),
+        Type::Result { success, error } => {
+            comparison_shape_supported(success, ordered)
+                && error
+                    .as_ref()
+                    .is_none_or(|error| comparison_shape_supported(error, ordered))
+        }
+        // Nominal capability is validated against its declaration while lowering.
+        Type::Nominal { .. } => true,
+        Type::Function { .. }
+        | Type::Own { .. }
+        | Type::Any { .. }
+        | Type::Builtin(_)
+        | Type::ConstU64(_)
+        | Type::PoolArgument(_)
+        | Type::Parameter { .. }
+        | Type::Infer => false,
+    }
 }
 
 impl From<BinaryOperatorSyntax> for BinaryOperator {
@@ -6957,8 +7794,13 @@ fn append_function(bytes: &mut impl ByteSink, function: &HirFunction) {
             .unwrap_or(u64::MAX)
             .to_be_bytes(),
     );
-    for (local, type_, access) in &function.parameters {
+    for ((local, type_, access), definition) in function
+        .parameters
+        .iter()
+        .zip(function.parameter_definitions.iter())
+    {
         bytes.extend_from_slice(&local.0.to_be_bytes());
+        bytes.extend_from_slice(&definition.0.to_be_bytes());
         append_part(bytes, &type_.canonical_key());
         bytes.push(access.canonical_tag());
     }
@@ -7163,6 +8005,12 @@ fn append_place(bytes: &mut impl ByteSink, place: &Place) {
 fn append_expression(bytes: &mut impl ByteSink, expression: &Expression) {
     append_range(bytes, &expression.source);
     bytes.extend_from_slice(&expression.type_id.0.to_be_bytes());
+    if let Some(type_) = &expression.coerced_from {
+        bytes.push(1);
+        append_part(bytes, &type_.canonical_key());
+    } else {
+        bytes.push(0);
+    }
     bytes.push(match expression.access {
         AccessMode::Copy => 0,
         AccessMode::Read => 1,
@@ -7225,22 +8073,48 @@ fn append_expression(bytes: &mut impl ByteSink, expression: &Expression) {
                 CallTarget::TemplateFunction {
                     definition,
                     argument_order,
+                    argument_parameters,
                 } => {
                     bytes.push(0);
                     bytes.extend_from_slice(&definition.0.to_be_bytes());
                     append_argument_order(bytes, argument_order);
+                    for parameter in argument_parameters.iter() {
+                        bytes.extend_from_slice(&parameter.0.to_be_bytes());
+                    }
                 }
                 CallTarget::Function {
                     definition,
                     specialization,
                     argument_order,
+                    argument_parameters,
                 } => {
                     bytes.push(1);
                     bytes.extend_from_slice(&definition.0.to_be_bytes());
                     bytes.extend_from_slice(&specialization.0.to_be_bytes());
                     append_argument_order(bytes, argument_order);
+                    for parameter in argument_parameters.iter() {
+                        bytes.extend_from_slice(&parameter.0.to_be_bytes());
+                    }
                 }
-                CallTarget::Build(primitive) => {
+                CallTarget::Interface {
+                    interface,
+                    alternatives,
+                    argument_order,
+                    argument_parameters,
+                } => {
+                    bytes.push(8);
+                    bytes.extend_from_slice(&interface.0.to_be_bytes());
+                    for (nominal, definition, specialization) in alternatives.iter() {
+                        bytes.extend_from_slice(&nominal.0.to_be_bytes());
+                        bytes.extend_from_slice(&definition.0.to_be_bytes());
+                        bytes.extend_from_slice(&specialization.0.to_be_bytes());
+                    }
+                    append_argument_order(bytes, argument_order);
+                    for parameter in argument_parameters.iter() {
+                        bytes.extend_from_slice(&parameter.0.to_be_bytes());
+                    }
+                }
+                CallTarget::Build { primitive, labels } => {
                     bytes.push(2);
                     bytes.extend_from_slice(&primitive.identity.to_be_bytes());
                     bytes.push(primitive.kind.canonical_tag());
@@ -7252,30 +8126,47 @@ fn append_expression(bytes: &mut impl ByteSink, expression: &Expression) {
                         bytes.extend_from_slice(&definition.0.to_be_bytes());
                         bytes.extend_from_slice(&type_identity.0.to_be_bytes());
                     }
+                    for label in labels.iter() {
+                        append_part(bytes, label.as_bytes());
+                    }
                 }
                 CallTarget::BuiltinVariant(variant) => {
                     bytes.push(3);
                     bytes.push(variant.canonical_tag());
                 }
                 CallTarget::UserVariant {
-                    id, argument_order, ..
+                    id,
+                    argument_order,
+                    argument_parameters,
+                    ..
                 } => {
                     bytes.push(4);
                     bytes.extend_from_slice(&id.owner.0.to_be_bytes());
                     bytes.extend_from_slice(&id.variant.to_be_bytes());
                     append_argument_order(bytes, argument_order);
+                    for parameter in argument_parameters.iter() {
+                        bytes.extend_from_slice(&parameter.0.to_be_bytes());
+                    }
                 }
-                CallTarget::Test { id, argument_order } => {
+                CallTarget::Test {
+                    id,
+                    argument_order,
+                    argument_parameters,
+                } => {
                     bytes.push(5);
                     bytes.extend_from_slice(&id.suite.0.to_be_bytes());
                     bytes.extend_from_slice(&id.test.0.to_be_bytes());
                     bytes.extend_from_slice(&id.identity.to_be_bytes());
                     append_argument_order(bytes, argument_order);
+                    for parameter in argument_parameters.iter() {
+                        bytes.extend_from_slice(&parameter.0.to_be_bytes());
+                    }
                 }
                 CallTarget::Struct {
                     definition,
                     field_order,
                     argument_fields,
+                    argument_field_definitions,
                     ..
                 } => {
                     bytes.push(6);
@@ -7286,6 +8177,9 @@ fn append_expression(bytes: &mut impl ByteSink, expression: &Expression) {
                     bytes.push(0xff);
                     for field in &**argument_fields {
                         append_part(bytes, field.as_bytes());
+                    }
+                    for field in argument_field_definitions.iter() {
+                        bytes.extend_from_slice(&field.0.to_be_bytes());
                     }
                 }
             }
@@ -7486,6 +8380,7 @@ mod tests {
                 name: "broken".to_owned(),
                 modifier: crate::syntax::FunctionModifier::Ordinary,
                 type_parameters: Arc::from([]),
+                generic_constraints: Arc::from([]),
                 parameters: Vec::new(),
                 return_type: Type::Unit,
                 body: Vec::new(),
@@ -7513,6 +8408,7 @@ mod tests {
             kind: ExpressionKind::Literal(Literal::Bool(true)),
             type_id: bool_id,
             type_: Type::Bool,
+            coerced_from: None,
             access: AccessMode::Copy,
             source: range.clone(),
         };
@@ -7524,6 +8420,7 @@ mod tests {
             },
             type_id: bool_id,
             type_: Type::Bool,
+            coerced_from: None,
             access: AccessMode::Copy,
             source: range,
         };
@@ -7533,6 +8430,7 @@ mod tests {
         let specializations = BTreeMap::new();
         let variants = BTreeMap::new();
         let structs = BTreeMap::new();
+        let interfaces = BTreeMap::new();
         let catalog = ArtifactCatalog {
             templates: &templates,
             specialized: &specialized,
@@ -7541,6 +8439,7 @@ mod tests {
             identities: &identities,
             variants: &variants,
             structs: &structs,
+            interfaces: &interfaces,
         };
         assert!(matches!(
             verify_expression_artifact(
@@ -7584,6 +8483,7 @@ mod tests {
             }),
             type_id,
             type_: type_.clone(),
+            coerced_from: None,
             access: AccessMode::Copy,
             source: range.clone(),
         };
@@ -7591,6 +8491,7 @@ mod tests {
             kind: ExpressionKind::Negate(Box::new(operand)),
             type_id,
             type_: type_.clone(),
+            coerced_from: None,
             access: AccessMode::Copy,
             source: range.clone(),
         };
@@ -7600,6 +8501,7 @@ mod tests {
         let specializations = BTreeMap::new();
         let variants = BTreeMap::new();
         let structs = BTreeMap::new();
+        let interfaces = BTreeMap::new();
         let catalog = ArtifactCatalog {
             templates: &templates,
             specialized: &specialized,
@@ -7608,6 +8510,7 @@ mod tests {
             identities: &identities,
             variants: &variants,
             structs: &structs,
+            interfaces: &interfaces,
         };
 
         assert!(matches!(
@@ -7636,6 +8539,7 @@ mod tests {
                         kind: ExpressionKind::Literal(Literal::Bool(true)),
                         type_id: TypeId(0),
                         type_: Type::Bool,
+                        coerced_from: None,
                         access: AccessMode::Copy,
                         source: range.clone(),
                     },

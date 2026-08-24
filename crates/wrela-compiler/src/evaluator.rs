@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -15,9 +16,9 @@ use crate::typed_hir::{
     VerifiedProgram,
 };
 use crate::{
-    Cancellation, CanonicalValue, EvaluationLimitPolicy as LimitPolicy, EvaluationOutcome,
-    EvaluationPanicKind as PanicKind, EvaluationPolicy, EvaluationReceipt,
-    EvaluationRejectionKind as RejectKind, SourceRange,
+    Cancellation, CanonicalValue, EvaluationContributorObservation, EvaluationFrameObservation,
+    EvaluationLimitPolicy as LimitPolicy, EvaluationOutcome, EvaluationPanicKind as PanicKind,
+    EvaluationPolicy, EvaluationReceipt, EvaluationRejectionKind as RejectKind, SourceRange,
 };
 
 pub(crate) const FUEL_LIMIT: u64 = 100_000;
@@ -67,6 +68,7 @@ enum Value {
     },
     UserVariant {
         id: VariantId,
+        variant_order: u32,
         type_display: Arc<str>,
         variant_display: Arc<str>,
         payload: Arc<[Value]>,
@@ -309,18 +311,21 @@ pub(crate) struct Engine<'a> {
     compilation_memory: u64,
     constructions: Vec<Construction>,
     construction_keys: BTreeMap<u128, Arc<[u8]>>,
-    test_applications: Vec<TestId>,
+    construction_coordinates: BTreeMap<Arc<[u8]>, u64>,
+    test_applications: Vec<AppliedTest>,
     call_stack: Vec<(u128, String, SourceRange)>,
     evaluation_policy: EvaluationPolicy,
     evaluation_root: u128,
+    evaluation_provenance: Option<SourceRange>,
     root_dependencies: BTreeSet<u128>,
+    fuel_by_site: BTreeMap<SourceRange, u64>,
 }
 
 pub(crate) struct Run {
     pub(crate) outcome: EvaluationOutcome,
     pub(crate) receipt: EvaluationReceipt,
     pub(crate) constructions: Vec<Construction>,
-    pub(crate) test_applications: Vec<TestId>,
+    pub(crate) test_applications: Vec<AppliedTest>,
     pub(crate) root_handle: Option<(BuildKind, u128)>,
 }
 
@@ -330,6 +335,19 @@ pub(crate) struct Construction {
     pub(crate) kind: BuildKind,
     pub(crate) site: SourceRange,
     pub(crate) edges: Vec<u128>,
+    pub(crate) operands: Vec<ConstructionOperand>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ConstructionOperand {
+    pub(crate) label: Arc<str>,
+    pub(crate) value: CanonicalValue,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AppliedTest {
+    pub(crate) id: TestId,
+    pub(crate) payload: Vec<CanonicalValue>,
 }
 
 impl<'a> Engine<'a> {
@@ -346,11 +364,14 @@ impl<'a> Engine<'a> {
             compilation_memory: 0,
             constructions: Vec::new(),
             construction_keys: BTreeMap::new(),
+            construction_coordinates: BTreeMap::new(),
             test_applications: Vec::new(),
             call_stack: Vec::new(),
             evaluation_policy: EvaluationPolicy::Constant,
             evaluation_root: 0,
+            evaluation_provenance: None,
             root_dependencies: BTreeSet::new(),
+            fuel_by_site: BTreeMap::new(),
         }
     }
 
@@ -378,13 +399,54 @@ impl<'a> Engine<'a> {
         self.current_memory = 0;
         self.constructions.clear();
         self.construction_keys.clear();
+        self.construction_coordinates.clear();
         self.test_applications.clear();
         self.call_stack.clear();
         self.evaluating_constants.clear();
         self.root_dependencies.clear();
+        self.evaluation_provenance = None;
+        self.fuel_by_site.clear();
     }
 
     fn finish(&mut self, result: Result<Value, EvalFailure>) -> Run {
+        let failed = result.is_err();
+        let provenance = match &result {
+            Err(EvalFailure::Panic(_, site)) => Some(site.clone()),
+            Err(_) => self
+                .call_stack
+                .last()
+                .map(|(_, _, site)| site.clone())
+                .or_else(|| self.evaluation_provenance.clone()),
+            Ok(_) => None,
+        };
+        let relevant_identity = failed.then(|| {
+            self.call_stack
+                .last()
+                .map_or(self.evaluation_root, |(identity, _, _)| *identity)
+        });
+        let call_chain = if failed {
+            self.call_stack
+                .iter()
+                .take(32)
+                .map(|(identity, callable, site)| {
+                    EvaluationFrameObservation::new(*identity, callable.as_str(), site.clone())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut contributors = self
+            .fuel_by_site
+            .iter()
+            .map(|(site, fuel)| EvaluationContributorObservation::new(site.clone(), *fuel))
+            .collect::<Vec<_>>();
+        contributors.sort_by(|left, right| {
+            right
+                .fuel()
+                .cmp(&left.fuel())
+                .then(left.site().cmp(right.site()))
+        });
+        contributors.truncate(8);
         let root_handle = match &result {
             Ok(Value::SymbolicHandle { kind, identity }) => Some((*kind, *identity)),
             _ => None,
@@ -413,6 +475,12 @@ impl<'a> Engine<'a> {
                 self.program.fingerprint(),
                 self.fuel,
                 self.peak_memory,
+            )
+            .with_failure_evidence(
+                provenance,
+                relevant_identity,
+                call_chain,
+                if failed { contributors } else { Vec::new() },
             ),
             constructions: std::mem::take(&mut self.constructions),
             test_applications: std::mem::take(&mut self.test_applications),
@@ -425,6 +493,15 @@ impl<'a> Engine<'a> {
             return Err(EvalFailure::Cancelled);
         }
         self.fuel = self.fuel.saturating_add(amount);
+        if let Some(site) = self
+            .call_stack
+            .last()
+            .map(|(_, _, site)| site)
+            .or(self.evaluation_provenance.as_ref())
+        {
+            let fuel = self.fuel_by_site.entry(site.clone()).or_insert(0);
+            *fuel = fuel.saturating_add(amount);
+        }
         self.compilation_fuel = self.compilation_fuel.saturating_add(amount);
         if self.compilation_fuel > COMPILATION_FUEL_LIMIT {
             return Err(EvalFailure::Limit {
@@ -486,6 +563,10 @@ impl<'a> Engine<'a> {
             RootWork::Constant(id) => {
                 self.evaluation_policy = EvaluationPolicy::Constant;
                 self.evaluation_root = id.0;
+                self.evaluation_provenance = program
+                    .constants()
+                    .get(&id)
+                    .map(|value| value.source.clone());
                 self.retain(64)?;
                 frames.push(MachineFrame {
                     kind: FrameKind::Root,
@@ -502,6 +583,7 @@ impl<'a> Engine<'a> {
                 key.extend_from_slice(&expression.source.start().to_be_bytes());
                 key.extend_from_slice(&expression.source.end().to_be_bytes());
                 self.evaluation_root = xxh3_128(&key);
+                self.evaluation_provenance = Some(expression.source.clone());
                 self.retain(64)?;
                 frames.push(MachineFrame {
                     kind: FrameKind::Root,
@@ -525,6 +607,7 @@ impl<'a> Engine<'a> {
                     .get(&id)
                     .map(|function| &function.source)
                     .ok_or(EvalFailure::Creator(RejectKind::UnresolvedCall))?;
+                self.evaluation_provenance = Some(site.clone());
                 self.push_function_frame(&mut frames, function, Vec::new(), Vec::new(), site)?;
             }
         }
@@ -560,12 +643,24 @@ impl<'a> Engine<'a> {
                         }
                         ExpressionKind::Read(place) => {
                             if place.projections.is_empty() {
-                                let value = frames
-                                    .last()
-                                    .and_then(|frame| frame.locals.get(place.local.0 as usize))
-                                    .and_then(Option::as_ref)
-                                    .cloned()
-                                    .ok_or(EvalFailure::Creator(RejectKind::MissingLocal))?;
+                                let value = if expression.access
+                                    == crate::typed_hir::AccessMode::Move
+                                {
+                                    frames
+                                        .last_mut()
+                                        .and_then(|frame| {
+                                            frame.locals.get_mut(place.local.0 as usize)
+                                        })
+                                        .and_then(Option::take)
+                                        .ok_or(EvalFailure::Creator(RejectKind::MissingLocal))?
+                                } else {
+                                    frames
+                                        .last()
+                                        .and_then(|frame| frame.locals.get(place.local.0 as usize))
+                                        .and_then(Option::as_ref)
+                                        .cloned()
+                                        .ok_or(EvalFailure::Creator(RejectKind::MissingLocal))?
+                                };
                                 self.push_value(&mut frames, value)?;
                             } else {
                                 let indexes = place
@@ -1722,8 +1817,46 @@ impl<'a> Engine<'a> {
                                 site,
                             )?;
                         }
-                        CallTarget::Build(primitive) => {
-                            let value = self.construct(primitive.kind, &arguments, site)?;
+                        CallTarget::Interface {
+                            alternatives,
+                            argument_order,
+                            ..
+                        } => {
+                            let receiver = arguments.first().ok_or_else(|| {
+                                EvalFailure::Defect(Arc::from(
+                                    "verified interface call omitted its receiver",
+                                ))
+                            })?;
+                            let nominal = match receiver {
+                                Value::Struct { definition, .. } => *definition,
+                                Value::UserVariant { id, .. } => id.owner,
+                                _ => {
+                                    return Err(EvalFailure::Defect(Arc::from(
+                                        "existential receiver has no nominal representation",
+                                    )));
+                                }
+                            };
+                            let (_, _, specialization) = alternatives
+                                .iter()
+                                .find(|(candidate, _, _)| *candidate == nominal)
+                                .ok_or(EvalFailure::Creator(RejectKind::UnresolvedCall))?;
+                            let function = program
+                                .specialization_function(*specialization)
+                                .ok_or(EvalFailure::Creator(RejectKind::UnresolvedCall))?;
+                            self.push_function_frame(
+                                &mut frames,
+                                function,
+                                reorder_values(arguments, argument_order)?,
+                                function_writebacks(
+                                    function,
+                                    argument_expressions,
+                                    argument_order,
+                                )?,
+                                site,
+                            )?;
+                        }
+                        CallTarget::Build { primitive, labels } => {
+                            let value = self.construct(primitive.kind, &arguments, labels, site)?;
                             self.push_value(&mut frames, value)?;
                         }
                         CallTarget::BuiltinVariant(variant) => {
@@ -1737,14 +1870,17 @@ impl<'a> Engine<'a> {
                         }
                         CallTarget::UserVariant {
                             id,
+                            variant_order,
                             type_display,
                             variant_display,
                             argument_order,
+                            ..
                         } => {
                             self.push_value(
                                 &mut frames,
                                 Value::UserVariant {
                                     id: *id,
+                                    variant_order: *variant_order,
                                     type_display: type_display.clone(),
                                     variant_display: variant_display.clone(),
                                     payload: reorder_values(arguments, argument_order)?.into(),
@@ -1756,6 +1892,7 @@ impl<'a> Engine<'a> {
                             type_display,
                             field_order,
                             argument_fields,
+                            ..
                         } => {
                             let authored = argument_fields
                                 .iter()
@@ -1785,7 +1922,9 @@ impl<'a> Engine<'a> {
                                 },
                             )?;
                         }
-                        CallTarget::Test { id, argument_order } => {
+                        CallTarget::Test {
+                            id, argument_order, ..
+                        } => {
                             self.push_value(
                                 &mut frames,
                                 Value::TestApplication {
@@ -2073,6 +2212,7 @@ impl<'a> Engine<'a> {
         &mut self,
         kind: BuildKind,
         arguments: &[Value],
+        labels: &[Arc<str>],
         site: &SourceRange,
     ) -> Result<Value, EvalFailure> {
         self.charge(3)?;
@@ -2095,22 +2235,37 @@ impl<'a> Engine<'a> {
         key.extend_from_slice(site.path().as_bytes());
         key.extend_from_slice(&site.start().to_be_bytes());
         key.extend_from_slice(&site.end().to_be_bytes());
+        let coordinate: Arc<[u8]> = Arc::from(key.clone());
+        let ordinal = self.construction_coordinates.entry(coordinate).or_insert(0);
+        key.extend_from_slice(&ordinal.to_be_bytes());
+        *ordinal = ordinal.checked_add(1).ok_or_else(|| {
+            EvalFailure::Defect(Arc::from("construction coordinate ordinal overflow"))
+        })?;
         let identity = xxh3_128(&key);
         let key: Arc<[u8]> = key.into();
         if let Some(previous) = self.construction_keys.get(&identity) {
-            return Err(EvalFailure::Defect(if previous == &key {
-                Arc::from("duplicate semantic construction coordinate")
-            } else {
-                Arc::from("construction identity digest collision")
-            }));
+            let _ = previous;
+            return Err(EvalFailure::Defect(Arc::from(
+                "construction identity digest collision",
+            )));
         }
         self.construction_keys.insert(identity, key);
+        if labels.len() != arguments.len() {
+            return Err(EvalFailure::Defect(Arc::from(
+                "verified Build call label count disagrees with operands",
+            )));
+        }
         let mut edges = Vec::new();
-        for argument in arguments {
+        let mut operands = Vec::with_capacity(arguments.len());
+        for (label, argument) in labels.iter().zip(arguments) {
             collect_construction_edges(argument, &mut edges);
             if kind == BuildKind::Test {
                 collect_test_applications(argument, &mut self.test_applications);
             }
+            operands.push(ConstructionOperand {
+                label: Arc::clone(label),
+                value: canonical(argument.clone()),
+            });
         }
         let construction_memory = 64_u64.saturating_add(
             u64::try_from(edges.len())
@@ -2122,6 +2277,7 @@ impl<'a> Engine<'a> {
             kind,
             site: site.clone(),
             edges,
+            operands,
         });
         self.retain(construction_memory)?;
         Ok(Value::SymbolicHandle { kind, identity })
@@ -2274,10 +2430,13 @@ fn collect_construction_edges(value: &Value, edges: &mut Vec<u128>) {
     }
 }
 
-fn collect_test_applications(value: &Value, applications: &mut Vec<TestId>) {
+fn collect_test_applications(value: &Value, applications: &mut Vec<AppliedTest>) {
     match value {
         Value::TestApplication { id, payload } => {
-            applications.push(*id);
+            applications.push(AppliedTest {
+                id: *id,
+                payload: payload.iter().cloned().map(canonical).collect(),
+            });
             for value in &**payload {
                 collect_test_applications(value, applications);
             }
@@ -2418,7 +2577,7 @@ fn apply_binary(
         (Value::Bytes(left), Value::Bytes(right)) => apply_ordering(operator, &*left, &*right),
         (Value::Unit, Value::Unit) => apply_equality(operator, true),
         (Value::Array(left), Value::Array(right)) | (Value::Tuple(left), Value::Tuple(right)) => {
-            apply_equality(operator, left == right)
+            apply_structural_comparison(operator, &left, &right)
         }
         (
             Value::Float { kind, bits: left },
@@ -2434,11 +2593,152 @@ fn apply_binary(
             }
             apply_float(operator, kind, left, right)
         }
-        (left, right) if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual) => {
-            apply_equality(operator, left == right)
+        (left @ Value::UserVariant { .. }, right @ Value::UserVariant { .. })
+        | (left @ Value::Struct { .. }, right @ Value::Struct { .. })
+        | (left @ Value::BuiltinVariant { .. }, right @ Value::BuiltinVariant { .. }) => {
+            apply_value_comparison(operator, &left, &right)
         }
         _ => Err(EvalFailure::Creator(RejectKind::BinaryTypeMismatch)),
     }
+}
+
+fn apply_structural_comparison(
+    operator: BinaryOperator,
+    left: &[Value],
+    right: &[Value],
+) -> Result<Value, EvalFailure> {
+    let ordering = compare_sequences(left, right)?;
+    apply_comparison_order(operator, ordering)
+}
+
+fn apply_value_comparison(
+    operator: BinaryOperator,
+    left: &Value,
+    right: &Value,
+) -> Result<Value, EvalFailure> {
+    apply_comparison_order(operator, compare_values(left, right)?)
+}
+
+fn apply_comparison_order(
+    operator: BinaryOperator,
+    ordering: Option<Ordering>,
+) -> Result<Value, EvalFailure> {
+    let value = match operator {
+        BinaryOperator::Equal => ordering == Some(Ordering::Equal),
+        BinaryOperator::NotEqual => ordering != Some(Ordering::Equal),
+        BinaryOperator::Less => ordering == Some(Ordering::Less),
+        BinaryOperator::LessEqual => {
+            matches!(ordering, Some(Ordering::Less | Ordering::Equal))
+        }
+        BinaryOperator::Greater => ordering == Some(Ordering::Greater),
+        BinaryOperator::GreaterEqual => {
+            matches!(ordering, Some(Ordering::Greater | Ordering::Equal))
+        }
+        _ => return Err(EvalFailure::Creator(RejectKind::BinaryTypeMismatch)),
+    };
+    Ok(Value::Bool(value))
+}
+
+fn compare_sequences(left: &[Value], right: &[Value]) -> Result<Option<Ordering>, EvalFailure> {
+    for (left, right) in left.iter().zip(right) {
+        let ordering = compare_values(left, right)?;
+        if ordering != Some(Ordering::Equal) {
+            return Ok(ordering);
+        }
+    }
+    Ok(Some(left.len().cmp(&right.len())))
+}
+
+fn compare_values(left: &Value, right: &Value) -> Result<Option<Ordering>, EvalFailure> {
+    Ok(Some(match (left, right) {
+        (Value::Unit, Value::Unit) => Ordering::Equal,
+        (Value::Bool(left), Value::Bool(right)) => left.cmp(right),
+        (
+            Value::Integer { kind, value: left },
+            Value::Integer {
+                kind: right_kind,
+                value: right,
+            },
+        ) if kind == right_kind => left.cmp(right),
+        (
+            Value::Float { kind, bits: left },
+            Value::Float {
+                kind: right_kind,
+                bits: right,
+            },
+        ) if kind == right_kind => {
+            return Ok(decode_float(*kind, *left).partial_cmp(&decode_float(*kind, *right)));
+        }
+        (Value::Text(left), Value::Text(right)) => left.cmp(right),
+        (Value::Scalar(left), Value::Scalar(right)) => left.cmp(right),
+        (Value::Bytes(left), Value::Bytes(right)) => left.cmp(right),
+        (Value::Array(left), Value::Array(right)) | (Value::Tuple(left), Value::Tuple(right)) => {
+            return compare_sequences(left, right);
+        }
+        (
+            Value::UserVariant {
+                id: left_id,
+                variant_order: left_order,
+                payload: left,
+                ..
+            },
+            Value::UserVariant {
+                id: right_id,
+                variant_order: right_order,
+                payload: right,
+                ..
+            },
+        ) if left_id.owner == right_id.owner => {
+            let ordering = left_order.cmp(right_order);
+            if ordering == Ordering::Equal {
+                return compare_sequences(left, right);
+            } else {
+                ordering
+            }
+        }
+        (
+            Value::Struct {
+                definition: left_definition,
+                fields: left,
+                ..
+            },
+            Value::Struct {
+                definition: right_definition,
+                fields: right,
+                ..
+            },
+        ) if left_definition == right_definition => {
+            let left_values = left
+                .iter()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>();
+            let right_values = right
+                .iter()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>();
+            return compare_sequences(&left_values, &right_values);
+        }
+        (
+            Value::BuiltinVariant {
+                variant: left_variant,
+                payload: left,
+            },
+            Value::BuiltinVariant {
+                variant: right_variant,
+                payload: right,
+            },
+        ) => {
+            let ordering = left_variant
+                .canonical_tag()
+                .cmp(&right_variant.canonical_tag());
+            if ordering == Ordering::Equal {
+                return compare_sequences(left, right);
+            } else {
+                ordering
+            }
+        }
+        _ => return Err(EvalFailure::Creator(RejectKind::BinaryTypeMismatch)),
+    }))
 }
 
 fn pattern_bindings(value: &Value, pattern: &HirMatchPattern) -> Option<Vec<(LocalId, Value)>> {
@@ -2767,10 +3067,11 @@ fn value_matches(value: &Value, expected: &Type) -> bool {
         (Value::Integer { kind, .. }, Type::Integer(expected)) => kind == expected,
         (Value::Float { kind, .. }, Type::Float(expected)) => kind == expected,
         (Value::Function(_) | Value::Closure { .. }, Type::Function { .. }) => true,
+        (Value::Struct { .. } | Value::UserVariant { .. }, Type::Any { .. }) => true,
         (Value::Array(_), Type::Array(_)) => true,
-        (Value::Array(values), Type::FixedArray { length, .. }) => {
-            u64::try_from(values.len()).is_ok_and(|actual| actual == *length)
-        }
+        (Value::Array(values), Type::FixedArray { length, .. }) => length
+            .value()
+            .is_some_and(|length| u64::try_from(values.len()) == Ok(length)),
         (Value::Tuple(values), Type::Tuple(expected)) => {
             values.len() == expected.len()
                 && values

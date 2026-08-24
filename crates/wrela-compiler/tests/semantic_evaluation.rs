@@ -2530,6 +2530,45 @@ fn typed_hir_fingerprint_includes_literal_payloads_and_operations() {
 }
 
 #[test]
+fn evaluation_failures_expose_provenance_identity_call_chain_and_contributors() {
+    let source = br#"pure fn inner() -> i64:
+    panic "boom"
+
+pure fn outer() -> i64:
+    return inner()
+
+const BAD: i64 = outer()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("the evaluated Panic fixture must reject");
+    };
+    let evaluation = rejected
+        .inspection()
+        .evaluations()
+        .iter()
+        .find(|evaluation| evaluation.root() == "image.BAD")
+        .expect("failed constant evaluation remains inspectable");
+    assert!(matches!(
+        evaluation.outcome(),
+        EvaluationOutcome::Panicked { .. }
+    ));
+    let receipt = evaluation.receipt();
+    assert!(receipt.provenance().is_some());
+    assert!(receipt.relevant_identity().is_some());
+    assert!(
+        receipt
+            .call_chain()
+            .iter()
+            .any(|frame| frame.callable() == "inner")
+    );
+    assert!(!receipt.contributors().is_empty());
+}
+
+#[test]
 fn recursive_facts_propagate_panic_and_evaluator_ineligibility() {
     let source = br#"fn dangerous() -> i64:
     panic "boom"
@@ -3293,6 +3332,254 @@ fn build() -> Image:
 }
 
 #[test]
+fn generic_kinds_bounds_existentials_and_associated_constants_are_operational() {
+    let source = br#"interface Measured:
+    pure fn measure(read self) -> i64
+    const ZERO: i64
+
+struct Sample implements Measured:
+    value: i64
+    const ZERO: i64 = 0
+    pub const WIDTH: i64 = 3
+    pure fn measure(read self) -> i64:
+        return self.value
+
+struct Buffer[const N: u64]:
+    values: [i64; N]
+    pure fn first(read self) -> i64:
+        return self.values[0]
+
+pool storage
+
+resource struct OwnedSample[P: Pool]:
+    value: own[P] Sample
+
+fn release(take value: OwnedSample[storage]):
+    pass
+
+pure fn first[const N: u64](values: [i64; N]) -> i64:
+    return values[0]
+
+pure fn measured[T: Measured](value: T) -> i64:
+    return value.measure()
+
+pure fn erased(value: any Measured) -> i64:
+    return value.measure()
+
+pure fn buffer_first() -> i64:
+    buffer = Buffer(values=[5, 8])
+    return buffer.first()
+
+const BUFFER: Buffer[2] = Buffer(values=[5, 8])
+const TOTAL: i64 = first([5, 8]) + buffer_first() + measured(Sample(value=13)) + erased(Sample(value=16)) + Sample.WIDTH
+
+@image
+fn build() -> Image:
+    return Image.new(total=TOTAL)
+"#;
+
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!(
+            "Layer 1 generic kinds, interface bounds, existentials, and associated constants must compile: {outcome:#?}"
+        );
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.TOTAL"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 42
+            )
+    }));
+}
+
+#[test]
+fn resources_require_explicit_transfer_and_results_are_must_use() {
+    let implicit_transfer = br#"resource struct Ticket:
+    value: i64
+
+resource struct Envelope:
+    ticket: Ticket
+
+fn wrap(take ticket: Ticket) -> Envelope:
+    return Envelope(ticket=ticket)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(implicit_transfer) else {
+        panic!("copying a Resource into another Resource must reject");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.resource_requires_take")
+    );
+
+    let discarded_result = br#"struct Failure:
+    code: i64
+
+fn broken():
+    Result.Ok(1)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(discarded_result) else {
+        panic!("discarding a Result must reject");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.must_use_value")
+    );
+}
+
+#[test]
+fn plain_generic_data_cannot_silently_promote_to_resource() {
+    let source = br#"resource struct Ticket:
+    value: i64
+
+struct Box[T]:
+    value: T
+
+fn invalid(take value: Box[Ticket]):
+    pass
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("a plain generic Data aggregate cannot hide a Resource");
+    };
+    assert!(rejected.diagnostics().iter().any(|diagnostic| {
+        diagnostic.code() == "semantic.resource_argument_requires_resource_struct"
+    }));
+}
+
+#[test]
+fn public_nameability_and_result_error_contract_cover_every_signature_form() {
+    let private_exposure = br#"struct Hidden:
+    value: i64
+
+pub const EXPOSED: Hidden = Hidden(value=1)
+pub type PublicAlias = Hidden
+
+pub enum PublicChoice:
+    Item(value: Hidden)
+
+pub interface PublicInterface:
+    fn reveal() -> Hidden
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(private_exposure) else {
+        panic!("all public signature forms must enforce nameability");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code() == "semantic.private_type_in_public_signature")
+            .count()
+            >= 4
+    );
+
+    let invalid_results = br#"interface NotAnErrorValue:
+    fn marker()
+
+fn primitive_error() -> Result[i64, Text]:
+    return Result.Err("bad")
+
+fn interface_error() -> Result[i64, NotAnErrorValue]:
+    return Result.Ok(1)
+
+pub fn omitted_error() -> Result[i64]:
+    return Result.Ok(1)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(invalid_results) else {
+        panic!("Result errors must be concrete named Data or Resource types");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code() == "semantic.invalid_result_error_type")
+            .count()
+            >= 2
+    );
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.public_result_requires_error_type")
+    );
+}
+
+#[test]
+fn structural_comparison_requires_synthesized_capability() {
+    let comparable = br#"struct Point:
+    x: i64
+    y: i64
+
+enum Direction:
+    North
+    South
+
+const ORDERED: bool = Point(x=1, y=9) < Point(x=2, y=0) and Direction.North < Direction.South
+
+@image
+fn build() -> Image:
+    return Image.new(ordered=ORDERED)
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(comparable) else {
+        panic!("Data aggregates must receive structural Eq/Order semantics");
+    };
+    assert!(
+        accepted
+            .inspection()
+            .evaluations()
+            .iter()
+            .any(|evaluation| {
+                evaluation.root() == "image.ORDERED"
+                    && evaluation.outcome()
+                        == &EvaluationOutcome::Completed(CanonicalValue::Bool(true))
+            })
+    );
+
+    let resource = br#"resource struct Ticket:
+    value: i64
+
+fn invalid(read left: Ticket, read right: Ticket) -> bool:
+    return left == right
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(resource) else {
+        panic!("Resources must not acquire synthesized comparison");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.binary_type_mismatch")
+    );
+}
+
+#[test]
 fn named_arguments_may_reorder_without_changing_source_evaluation_order() {
     let source = br#"pure fn subtract(left: i64, right: i64) -> i64:
     return left - right
@@ -3611,6 +3898,25 @@ fn build() -> Image:
             .inspection()
             .constructions()
             .iter()
+            .map(|construction| construction.edges().len())
+            .sum::<usize>(),
+        2,
+        "the sealed graph retains both node-to-node and Image-to-node topology",
+    );
+    assert!(
+        accepted
+            .inspection()
+            .constructions()
+            .iter()
+            .flat_map(|construction| construction.operands())
+            .any(|operand| operand.label() == "children"
+                && matches!(operand.value(), CanonicalValue::Array(values) if !values.is_empty()))
+    );
+    assert_eq!(
+        accepted
+            .inspection()
+            .constructions()
+            .iter()
             .filter(|construction| matches!(construction.kind(), ConstructionKind::Node { .. }))
             .count(),
         2
@@ -3623,6 +3929,60 @@ fn build() -> Image:
             .filter(|construction| construction.kind() == ConstructionKind::Image)
             .count(),
         1
+    );
+}
+
+#[test]
+fn repeated_construction_at_one_loop_site_receives_stable_distinct_coordinates() {
+    let compiler = Compiler::open(CompilerInstallation::with_authenticated_modules(vec![
+        ProjectFile::new(
+            "src/runtime/topology.wr",
+            br#"pub struct Node:
+    pub pure fn new(children: [Node]) -> Node:
+        panic "sealed Node constructor"
+"#,
+        ),
+    ]))
+    .expect("authenticated topology declaration seals");
+    let source = br#"from runtime import topology
+
+@image
+fn build() -> Image:
+    mut root = topology.Node.new(children=[])
+    for index in 0..2:
+        root = topology.Node.new(children=[root])
+    return Image.new(node=root)
+"#;
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    );
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("repeated construction at one static loop site must compile: {outcome:#?}");
+    };
+    assert_eq!(accepted.inspection().constructions().len(), 4);
+    assert_eq!(
+        accepted
+            .inspection()
+            .constructions()
+            .iter()
+            .map(|construction| construction.identity())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        4,
+    );
+    assert_eq!(
+        accepted
+            .inspection()
+            .constructions()
+            .iter()
+            .map(|construction| construction.edges().len())
+            .sum::<usize>(),
+        3,
     );
 }
 

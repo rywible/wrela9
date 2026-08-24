@@ -277,6 +277,7 @@ pub(crate) struct NameSyntax {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TypeSyntax {
     Unit,
+    ConstU64(u64),
     Named(NameSyntax),
     Apply {
         base: NameSyntax,
@@ -286,7 +287,7 @@ pub(crate) enum TypeSyntax {
     Tuple(Vec<TypeSyntax>),
     FixedArray {
         element: Box<TypeSyntax>,
-        length: u64,
+        length: FixedArrayLengthSyntax,
     },
     Function {
         parameters: Vec<TypeSyntax>,
@@ -298,6 +299,25 @@ pub(crate) enum TypeSyntax {
     },
     Any(NameSyntax),
     Infer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FixedArrayLengthSyntax {
+    Literal(u64),
+    Parameter(String),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GenericParameterSyntax {
+    pub(crate) name: String,
+    pub(crate) kind: GenericParameterKindSyntax,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum GenericParameterKindSyntax {
+    Type { interface_bound: Option<NameSyntax> },
+    Const { type_syntax: TypeSyntax },
+    Pool,
 }
 
 #[derive(Clone, Debug)]
@@ -324,9 +344,11 @@ pub(crate) enum DeclarationSyntax {
 #[derive(Clone, Debug)]
 pub(crate) struct StructSyntax {
     pub(crate) type_parameters: Vec<String>,
+    pub(crate) generic_parameters: Vec<GenericParameterSyntax>,
     pub(crate) implements: Vec<NameSyntax>,
     pub(crate) fields: Vec<FieldSyntax>,
     pub(crate) functions: Vec<MemberFunctionSyntax>,
+    pub(crate) constants: Vec<MemberConstantSyntax>,
     pub(crate) comptime_selections: Vec<ComptimeMemberSelection>,
 }
 
@@ -335,6 +357,15 @@ pub(crate) struct MemberFunctionSyntax {
     pub(crate) name: String,
     pub(crate) public: bool,
     pub(crate) function: FunctionSyntax,
+    pub(crate) range: SourceRange,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MemberConstantSyntax {
+    pub(crate) name: String,
+    pub(crate) public: bool,
+    pub(crate) type_syntax: TypeSyntax,
+    pub(crate) value: Option<ExpressionSyntax>,
     pub(crate) range: SourceRange,
 }
 
@@ -350,6 +381,7 @@ pub(crate) struct FieldSyntax {
 #[derive(Clone, Debug)]
 pub(crate) struct InterfaceSyntax {
     pub(crate) requirements: Vec<FunctionRequirementSyntax>,
+    pub(crate) constants: Vec<MemberConstantSyntax>,
 }
 
 #[derive(Clone, Debug)]
@@ -364,8 +396,10 @@ pub(crate) struct FunctionRequirementSyntax {
 #[derive(Clone, Debug)]
 pub(crate) struct EnumSyntax {
     pub(crate) type_parameters: Vec<String>,
+    pub(crate) generic_parameters: Vec<GenericParameterSyntax>,
     pub(crate) variants: Vec<VariantSyntax>,
     pub(crate) functions: Vec<MemberFunctionSyntax>,
+    pub(crate) constants: Vec<MemberConstantSyntax>,
     pub(crate) comptime_selections: Vec<ComptimeMemberSelection>,
 }
 
@@ -381,6 +415,7 @@ pub(crate) struct ComptimeMemberBranch {
     pub(crate) fields: Vec<FieldSyntax>,
     pub(crate) variants: Vec<VariantSyntax>,
     pub(crate) functions: Vec<MemberFunctionSyntax>,
+    pub(crate) constants: Vec<MemberConstantSyntax>,
     pub(crate) range: SourceRange,
 }
 
@@ -395,6 +430,7 @@ pub(crate) struct VariantSyntax {
 pub(crate) struct FunctionSyntax {
     pub(crate) modifier: FunctionModifier,
     pub(crate) type_parameters: Vec<String>,
+    pub(crate) generic_parameters: Vec<GenericParameterSyntax>,
     pub(crate) parameters: Vec<ParameterSyntax>,
     pub(crate) return_type: TypeSyntax,
     pub(crate) body: Vec<StatementSyntax>,
@@ -2542,16 +2578,11 @@ fn parse_function_syntax(
 ) -> Option<DeclarationSyntax> {
     cursor.expect(TokenKind::Fn)?;
     cursor.expect_identifier()?;
-    let mut type_parameters = Vec::new();
-    if cursor.consume(TokenKind::LeftBracket) {
-        while !cursor.consume(TokenKind::RightBracket) {
-            type_parameters.push(cursor.expect_identifier()?.to_owned());
-            if !cursor.consume(TokenKind::Comma) {
-                cursor.expect(TokenKind::RightBracket)?;
-                break;
-            }
-        }
-    }
+    let generic_parameters = parse_generic_parameters(cursor)?;
+    let type_parameters = generic_parameters
+        .iter()
+        .map(|parameter| parameter.name.clone())
+        .collect();
     let parameters = parse_parameters(cursor)?;
     let return_type = if cursor.consume(TokenKind::Arrow) {
         cursor.parse_type()?
@@ -2574,6 +2605,7 @@ fn parse_function_syntax(
     Some(DeclarationSyntax::Function(FunctionSyntax {
         modifier,
         type_parameters,
+        generic_parameters,
         parameters,
         return_type,
         body,
@@ -2641,6 +2673,7 @@ fn parse_member_selection(
         let mut fields = Vec::new();
         let mut variants = Vec::new();
         let mut functions = Vec::new();
+        let mut constants = Vec::new();
         while let Some(line) = lines.get(*index) {
             if cancellation.is_cancelled() {
                 return None;
@@ -2660,9 +2693,29 @@ fn parse_member_selection(
             } else {
                 FunctionModifier::Ordinary
             };
+            if modifier == FunctionModifier::Ordinary && member.consume(TokenKind::Const) {
+                let name = member.expect_identifier()?.to_owned();
+                member.expect(TokenKind::Colon)?;
+                let type_syntax = member.parse_type()?;
+                member.expect(TokenKind::Equal)?;
+                let value = member.parse_complete_expression()?;
+                constants.push(MemberConstantSyntax {
+                    name,
+                    public,
+                    type_syntax,
+                    value: Some(value),
+                    range: line.range.clone(),
+                });
+                *index += 1;
+                continue;
+            }
             if member.consume(TokenKind::Fn) {
                 let name = member.expect_identifier()?.to_owned();
-                let type_parameters = parse_type_parameter_names(&mut member)?;
+                let generic_parameters = parse_generic_parameters(&mut member)?;
+                let type_parameters = generic_parameters
+                    .iter()
+                    .map(|parameter| parameter.name.clone())
+                    .collect();
                 let parameters = parse_parameters(&mut member)?;
                 let return_type = if member.consume(TokenKind::Arrow) {
                     member.parse_type()?
@@ -2691,6 +2744,7 @@ fn parse_member_selection(
                     function: FunctionSyntax {
                         modifier,
                         type_parameters,
+                        generic_parameters,
                         parameters,
                         return_type,
                         body: body.clone(),
@@ -2757,6 +2811,7 @@ fn parse_member_selection(
             fields,
             variants,
             functions,
+            constants,
             range: SourceRange::from_u64_shared(
                 header.range.path_arc(),
                 header.range.start(),
@@ -2793,7 +2848,11 @@ fn parse_struct_syntax(
     }
     cursor.expect(TokenKind::Struct)?;
     cursor.expect_identifier()?;
-    let type_parameters = parse_type_parameter_names(cursor)?;
+    let generic_parameters = parse_generic_parameters(cursor)?;
+    let type_parameters = generic_parameters
+        .iter()
+        .map(|parameter| parameter.name.clone())
+        .collect();
     let mut implements = Vec::new();
     if cursor.consume(TokenKind::Implements) {
         loop {
@@ -2809,6 +2868,7 @@ fn parse_struct_syntax(
     }
     let mut fields = Vec::new();
     let mut functions = Vec::new();
+    let mut constants = Vec::new();
     let mut comptime_selections = Vec::new();
     let mut line_index = 1;
     while let Some(line) = lines.get(line_index) {
@@ -2837,9 +2897,29 @@ fn parse_struct_syntax(
         } else {
             FunctionModifier::Ordinary
         };
+        if modifier == FunctionModifier::Ordinary && member.consume(TokenKind::Const) {
+            let name = member.expect_identifier()?.to_owned();
+            member.expect(TokenKind::Colon)?;
+            let type_syntax = member.parse_type()?;
+            member.expect(TokenKind::Equal)?;
+            let value = member.parse_complete_expression()?;
+            constants.push(MemberConstantSyntax {
+                name,
+                public,
+                type_syntax,
+                value: Some(value),
+                range: line.range.clone(),
+            });
+            line_index += 1;
+            continue;
+        }
         if member.consume(TokenKind::Fn) {
             let name = member.expect_identifier()?.to_owned();
-            let type_parameters = parse_type_parameter_names(&mut member)?;
+            let generic_parameters = parse_generic_parameters(&mut member)?;
+            let type_parameters = generic_parameters
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .collect();
             let parameters = parse_parameters(&mut member)?;
             let return_type = if member.consume(TokenKind::Arrow) {
                 member.parse_type()?
@@ -2873,6 +2953,7 @@ fn parse_struct_syntax(
                 function: FunctionSyntax {
                     modifier,
                     type_parameters,
+                    generic_parameters,
                     parameters,
                     return_type,
                     body,
@@ -2902,9 +2983,11 @@ fn parse_struct_syntax(
     }
     let syntax = StructSyntax {
         type_parameters,
+        generic_parameters,
         implements,
         fields,
         functions,
+        constants,
         comptime_selections,
     };
     Some(if resource {
@@ -2927,11 +3010,32 @@ fn parse_interface_syntax(
         return None;
     }
     let mut requirements = Vec::new();
+    let mut constants = Vec::new();
     for line in lines.iter().skip(1) {
         if cancellation.is_cancelled() || line.indent != 4 {
             return None;
         }
         let mut requirement = SyntaxCursor::new(file, &line.tokens, cancellation);
+        let public = requirement.consume(TokenKind::Pub);
+        if requirement.consume(TokenKind::Const) {
+            let name = requirement.expect_identifier()?.to_owned();
+            requirement.expect(TokenKind::Colon)?;
+            let type_syntax = requirement.parse_type()?;
+            if !requirement.at_end() {
+                return None;
+            }
+            constants.push(MemberConstantSyntax {
+                name,
+                public,
+                type_syntax,
+                value: None,
+                range: line.range.clone(),
+            });
+            continue;
+        }
+        if public {
+            return None;
+        }
         let modifier = if requirement.consume(TokenKind::Pure) {
             FunctionModifier::Pure
         } else if requirement.consume(TokenKind::Async) {
@@ -2960,6 +3064,7 @@ fn parse_interface_syntax(
     }
     Some(DeclarationSyntax::Interface(InterfaceSyntax {
         requirements,
+        constants,
     }))
 }
 
@@ -3066,22 +3171,18 @@ fn parse_enum_syntax(
 ) -> Option<DeclarationSyntax> {
     cursor.expect(TokenKind::Enum)?;
     cursor.expect_identifier()?;
-    let mut type_parameters = Vec::new();
-    if cursor.consume(TokenKind::LeftBracket) {
-        while !cursor.consume(TokenKind::RightBracket) {
-            type_parameters.push(cursor.expect_identifier()?.to_owned());
-            if !cursor.consume(TokenKind::Comma) {
-                cursor.expect(TokenKind::RightBracket)?;
-                break;
-            }
-        }
-    }
+    let generic_parameters = parse_generic_parameters(cursor)?;
+    let type_parameters = generic_parameters
+        .iter()
+        .map(|parameter| parameter.name.clone())
+        .collect();
     cursor.expect(TokenKind::Colon)?;
     if !cursor.at_end() {
         return None;
     }
     let mut variants = Vec::new();
     let mut functions = Vec::new();
+    let mut constants = Vec::new();
     let mut comptime_selections = Vec::new();
     let mut names = BTreeSet::new();
     let mut line_index = 1;
@@ -3111,9 +3212,29 @@ fn parse_enum_syntax(
         } else {
             FunctionModifier::Ordinary
         };
+        if modifier == FunctionModifier::Ordinary && member.consume(TokenKind::Const) {
+            let name = member.expect_identifier()?.to_owned();
+            member.expect(TokenKind::Colon)?;
+            let type_syntax = member.parse_type()?;
+            member.expect(TokenKind::Equal)?;
+            let value = member.parse_complete_expression()?;
+            constants.push(MemberConstantSyntax {
+                name,
+                public,
+                type_syntax,
+                value: Some(value),
+                range: line.range.clone(),
+            });
+            line_index += 1;
+            continue;
+        }
         if member.consume(TokenKind::Fn) {
             let name = member.expect_identifier()?.to_owned();
-            let member_type_parameters = parse_type_parameter_names(&mut member)?;
+            let member_generic_parameters = parse_generic_parameters(&mut member)?;
+            let member_type_parameters = member_generic_parameters
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .collect();
             let parameters = parse_parameters(&mut member)?;
             let return_type = if member.consume(TokenKind::Arrow) {
                 member.parse_type()?
@@ -3142,6 +3263,7 @@ fn parse_enum_syntax(
                 function: FunctionSyntax {
                     modifier,
                     type_parameters: member_type_parameters,
+                    generic_parameters: member_generic_parameters,
                     parameters,
                     return_type,
                     body: body.clone(),
@@ -3185,8 +3307,10 @@ fn parse_enum_syntax(
     }
     Some(DeclarationSyntax::Enum(EnumSyntax {
         type_parameters,
+        generic_parameters,
         variants,
         functions,
+        constants,
         comptime_selections,
     }))
 }
@@ -3238,11 +3362,50 @@ fn parse_parameters(cursor: &mut SyntaxCursor<'_, '_>) -> Option<Vec<ParameterSy
     Some(parameters)
 }
 
-fn parse_type_parameter_names(cursor: &mut SyntaxCursor<'_, '_>) -> Option<Vec<String>> {
+fn parse_generic_parameters(
+    cursor: &mut SyntaxCursor<'_, '_>,
+) -> Option<Vec<GenericParameterSyntax>> {
     let mut parameters = Vec::new();
     if cursor.consume(TokenKind::LeftBracket) {
         while !cursor.consume(TokenKind::RightBracket) {
-            parameters.push(cursor.expect_identifier()?.to_owned());
+            let parameter = if cursor.consume(TokenKind::Const) {
+                let name = cursor.expect_identifier()?.to_owned();
+                cursor.expect(TokenKind::Colon)?;
+                GenericParameterSyntax {
+                    name,
+                    kind: GenericParameterKindSyntax::Const {
+                        type_syntax: cursor.parse_type()?,
+                    },
+                }
+            } else {
+                let name = cursor.expect_identifier()?.to_owned();
+                let kind = if cursor.consume(TokenKind::Colon) {
+                    let pool_bound = cursor.consume(TokenKind::Pool)
+                        || (cursor.peek_kind() == Some(TokenKind::Identifier)
+                            && cursor
+                                .tokens
+                                .get(cursor.index)
+                                .and_then(|token| token_text(cursor.file, token))
+                                == Some("Pool")
+                            && {
+                                cursor.advance();
+                                true
+                            });
+                    if pool_bound {
+                        GenericParameterKindSyntax::Pool
+                    } else {
+                        GenericParameterKindSyntax::Type {
+                            interface_bound: Some(cursor.parse_name()?),
+                        }
+                    }
+                } else {
+                    GenericParameterKindSyntax::Type {
+                        interface_bound: None,
+                    }
+                };
+                GenericParameterSyntax { name, kind }
+            };
+            parameters.push(parameter);
             if !cursor.consume(TokenKind::Comma) {
                 cursor.expect(TokenKind::RightBracket)?;
                 break;
@@ -4223,7 +4386,11 @@ impl<'a, 'tokens> SyntaxCursor<'a, 'tokens> {
         if self.consume(TokenKind::LeftBracket) {
             let element = self.parse_type_at(depth + 1)?;
             if self.consume(TokenKind::Semicolon) {
-                let length = self.expect_integer_literal()?.parse().ok()?;
+                let length = if self.peek_kind() == Some(TokenKind::IntegerLiteral) {
+                    FixedArrayLengthSyntax::Literal(self.expect_integer_literal()?.parse().ok()?)
+                } else {
+                    FixedArrayLengthSyntax::Parameter(self.expect_identifier()?.to_owned())
+                };
                 self.expect(TokenKind::RightBracket)?;
                 return Some(TypeSyntax::FixedArray {
                     element: Box::new(element),
@@ -4237,7 +4404,11 @@ impl<'a, 'tokens> SyntaxCursor<'a, 'tokens> {
         if self.consume(TokenKind::LeftBracket) {
             let mut arguments = Vec::new();
             while !self.consume(TokenKind::RightBracket) {
-                if self.peek_kind() == Some(TokenKind::Identifier)
+                if self.peek_kind() == Some(TokenKind::IntegerLiteral) {
+                    arguments.push(TypeSyntax::ConstU64(
+                        self.expect_integer_literal()?.parse().ok()?,
+                    ));
+                } else if self.peek_kind() == Some(TokenKind::Identifier)
                     && self
                         .tokens
                         .get(self.index)

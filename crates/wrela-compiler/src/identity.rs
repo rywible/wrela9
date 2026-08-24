@@ -32,6 +32,8 @@ pub(crate) struct IdentityCatalog {
     modules: BTreeMap<String, ModuleId>,
     definitions: BTreeMap<(String, DeclarationKind, String), DefinitionId>,
     associated_functions: BTreeMap<(DefinitionId, String), DefinitionId>,
+    associated_constants: BTreeMap<(DefinitionId, String), DefinitionId>,
+    nested_definitions: BTreeMap<(DefinitionId, String, String), DefinitionId>,
     tests: BTreeMap<(String, String, String), TestId>,
     types: BTreeMap<DefinitionId, TypeId>,
     pools: BTreeMap<DefinitionId, PoolId>,
@@ -62,6 +64,8 @@ impl IdentityCatalog {
             modules: BTreeMap::new(),
             definitions: BTreeMap::new(),
             associated_functions: BTreeMap::new(),
+            associated_constants: BTreeMap::new(),
+            nested_definitions: BTreeMap::new(),
             tests: BTreeMap::new(),
             types: BTreeMap::new(),
             pools: BTreeMap::new(),
@@ -164,6 +168,27 @@ impl IdentityCatalog {
             .copied()
     }
 
+    pub(crate) fn associated_constant(
+        &self,
+        owner: DefinitionId,
+        name: &str,
+    ) -> Option<DefinitionId> {
+        self.associated_constants
+            .get(&(owner, name.to_owned()))
+            .copied()
+    }
+
+    pub(crate) fn nested_definition(
+        &self,
+        owner: DefinitionId,
+        role: &str,
+        name: &str,
+    ) -> Option<DefinitionId> {
+        self.nested_definitions
+            .get(&(owner, role.to_owned(), name.to_owned()))
+            .copied()
+    }
+
     pub(crate) fn type_for_definition(&self, definition: DefinitionId) -> Option<TypeId> {
         self.types.get(&definition).copied()
     }
@@ -208,6 +233,8 @@ impl IdentityCatalog {
             | Type::Text
             | Type::Scalar
             | Type::Bytes
+            | Type::ConstU64(_)
+            | Type::PoolArgument(_)
             | Type::Builtin(_)
             | Type::Any { .. }
             | Type::Parameter { .. }
@@ -338,6 +365,8 @@ where
     let mut modules = BTreeMap::new();
     let mut definitions = BTreeMap::new();
     let mut associated_functions = BTreeMap::new();
+    let mut associated_constants = BTreeMap::new();
+    let mut nested_definitions = BTreeMap::new();
     let mut tests = BTreeMap::new();
     let mut types = BTreeMap::new();
     let mut pools = BTreeMap::new();
@@ -450,6 +479,66 @@ where
                 }
                 records.push(observation);
             }
+            let (type_parameters, parameters, fields): (
+                &[String],
+                &[crate::syntax::ParameterSyntax],
+                &[crate::syntax::FieldSyntax],
+            ) = match declaration.syntax.as_ref() {
+                Some(DeclarationSyntax::Function(function)) => {
+                    (&function.type_parameters, &function.parameters, &[])
+                }
+                Some(DeclarationSyntax::Struct(struct_))
+                | Some(DeclarationSyntax::ResourceStruct(struct_)) => {
+                    (&struct_.type_parameters, &[], &struct_.fields)
+                }
+                Some(DeclarationSyntax::Enum(enum_)) => (&enum_.type_parameters, &[], &[]),
+                _ => (&[], &[], &[]),
+            };
+            for parameter in type_parameters {
+                intern_nested_definition(
+                    definition_id,
+                    "generic_parameter",
+                    parameter,
+                    format!("{}.{}", declaration.name, parameter),
+                    origin,
+                    bytes,
+                    &hasher,
+                    &mut digests,
+                    &mut records,
+                    &mut nested_definitions,
+                )
+                .map_err(IdentityFailure::Collision)?;
+            }
+            for parameter in parameters {
+                intern_nested_definition(
+                    definition_id,
+                    "parameter",
+                    &parameter.name,
+                    format!("{}.{}", declaration.name, parameter.name),
+                    origin,
+                    bytes,
+                    &hasher,
+                    &mut digests,
+                    &mut records,
+                    &mut nested_definitions,
+                )
+                .map_err(IdentityFailure::Collision)?;
+            }
+            for field in fields {
+                intern_nested_definition(
+                    definition_id,
+                    "field",
+                    &field.name,
+                    format!("{}.{}", declaration.name, field.name),
+                    origin,
+                    bytes,
+                    &hasher,
+                    &mut digests,
+                    &mut records,
+                    &mut nested_definitions,
+                )
+                .map_err(IdentityFailure::Collision)?;
+            }
             if let Some(DeclarationSyntax::Suite(suite)) = &declaration.syntax {
                 for test in &suite.tests {
                     let test_bytes = usize::try_from(test.range.start())
@@ -477,6 +566,21 @@ where
                     .map_err(IdentityFailure::Collision)?;
                     let test_definition_id = DefinitionId(nested_definition.digest());
                     records.push(nested_definition);
+                    for parameter in &test.parameters {
+                        intern_nested_definition(
+                            test_definition_id,
+                            "parameter",
+                            &parameter.name,
+                            format!("{}.{}.{}", declaration.name, test.name, parameter.name),
+                            origin,
+                            test_bytes,
+                            &hasher,
+                            &mut digests,
+                            &mut records,
+                            &mut nested_definitions,
+                        )
+                        .map_err(IdentityFailure::Collision)?;
+                    }
                     let observation = intern(
                         IdentityDomain::Test,
                         origin,
@@ -532,6 +636,21 @@ where
                     .map_err(IdentityFailure::Collision)?;
                     let variant_definition = DefinitionId(nested_definition.digest());
                     records.push(nested_definition);
+                    for parameter in &variant.parameters {
+                        intern_nested_definition(
+                            variant_definition,
+                            "parameter",
+                            &parameter.name,
+                            format!("{}.{}.{}", declaration.name, variant.name, parameter.name),
+                            origin,
+                            variant_bytes,
+                            &hasher,
+                            &mut digests,
+                            &mut records,
+                            &mut nested_definitions,
+                        )
+                        .map_err(IdentityFailure::Collision)?;
+                    }
                     let observation = intern(
                         IdentityDomain::Generated,
                         origin,
@@ -555,6 +674,41 @@ where
                         },
                     );
                     records.push(observation);
+                }
+            }
+            if let Some(DeclarationSyntax::Interface(interface)) = &declaration.syntax {
+                for requirement in &interface.requirements {
+                    let requirement_definition = intern_nested_definition(
+                        definition_id,
+                        "interface_requirement",
+                        &requirement.name,
+                        format!("{}.{}", declaration.name, requirement.name),
+                        origin,
+                        bytes,
+                        &hasher,
+                        &mut digests,
+                        &mut records,
+                        &mut nested_definitions,
+                    )
+                    .map_err(IdentityFailure::Collision)?;
+                    for parameter in &requirement.parameters {
+                        intern_nested_definition(
+                            requirement_definition,
+                            "parameter",
+                            &parameter.name,
+                            format!(
+                                "{}.{}.{}",
+                                declaration.name, requirement.name, parameter.name
+                            ),
+                            origin,
+                            bytes,
+                            &hasher,
+                            &mut digests,
+                            &mut records,
+                            &mut nested_definitions,
+                        )
+                        .map_err(IdentityFailure::Collision)?;
+                    }
                 }
             }
             let member_functions: &[crate::syntax::MemberFunctionSyntax] = match &declaration.syntax
@@ -591,7 +745,77 @@ where
                     &mut digests,
                 )
                 .map_err(IdentityFailure::Collision)?;
-                associated_functions.insert(
+                let member_definition = DefinitionId(observation.digest());
+                associated_functions
+                    .insert((definition_id, member.name.clone()), member_definition);
+                records.push(observation);
+                for parameter in &member.function.type_parameters {
+                    intern_nested_definition(
+                        member_definition,
+                        "generic_parameter",
+                        parameter,
+                        format!("{}.{}.{}", declaration.name, member.name, parameter),
+                        origin,
+                        member_bytes,
+                        &hasher,
+                        &mut digests,
+                        &mut records,
+                        &mut nested_definitions,
+                    )
+                    .map_err(IdentityFailure::Collision)?;
+                }
+                for parameter in &member.function.parameters {
+                    intern_nested_definition(
+                        member_definition,
+                        "parameter",
+                        &parameter.name,
+                        format!("{}.{}.{}", declaration.name, member.name, parameter.name),
+                        origin,
+                        member_bytes,
+                        &hasher,
+                        &mut digests,
+                        &mut records,
+                        &mut nested_definitions,
+                    )
+                    .map_err(IdentityFailure::Collision)?;
+                }
+            }
+            let member_constants: &[crate::syntax::MemberConstantSyntax] = match &declaration.syntax
+            {
+                Some(
+                    DeclarationSyntax::Struct(struct_) | DeclarationSyntax::ResourceStruct(struct_),
+                ) => &struct_.constants,
+                Some(DeclarationSyntax::Enum(enum_)) => &enum_.constants,
+                Some(DeclarationSyntax::Interface(interface)) => &interface.constants,
+                _ => &[],
+            };
+            for member in member_constants {
+                let canonical_key = key(
+                    IdentityDomain::Definition,
+                    origin,
+                    &[
+                        &definition_id.0.to_be_bytes(),
+                        b"associated_constant",
+                        member.name.as_bytes(),
+                    ],
+                );
+                let start = usize::try_from(member.range.start()).ok();
+                let end = usize::try_from(member.range.end()).ok();
+                let member_bytes = start
+                    .zip(end)
+                    .and_then(|(start, end)| files[path.as_str()].bytes().get(start..end))
+                    .unwrap_or_default();
+                let observation = intern(
+                    IdentityDomain::Definition,
+                    origin,
+                    format!("{}.{}", declaration.name, member.name),
+                    canonical_key,
+                    fingerprint(member_bytes),
+                    &hasher,
+                    &mut digests,
+                )
+                .map_err(IdentityFailure::Collision)?;
+                associated_constants.insert(
                     (definition_id, member.name.clone()),
                     DefinitionId(observation.digest()),
                 );
@@ -611,6 +835,8 @@ where
         modules,
         definitions,
         associated_functions,
+        associated_constants,
+        nested_definitions,
         tests,
         types,
         pools,
@@ -662,6 +888,41 @@ where
         observation: IdentityObservation::new(domain, origin, name, digest, fingerprint),
         canonical_key,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn intern_nested_definition<F>(
+    owner: DefinitionId,
+    role: &str,
+    name: &str,
+    display: String,
+    origin: IdentityOrigin,
+    source_bytes: &[u8],
+    hasher: &F,
+    digests: &mut BTreeMap<u128, Arc<[u8]>>,
+    records: &mut Vec<IdentityRecord>,
+    nested: &mut BTreeMap<(DefinitionId, String, String), DefinitionId>,
+) -> Result<DefinitionId, IdentityCollision>
+where
+    F: Fn(&[u8]) -> u128,
+{
+    let observation = intern(
+        IdentityDomain::Definition,
+        origin,
+        display,
+        key(
+            IdentityDomain::Definition,
+            origin,
+            &[&owner.0.to_be_bytes(), role.as_bytes(), name.as_bytes()],
+        ),
+        fingerprint(source_bytes),
+        hasher,
+        digests,
+    )?;
+    let id = DefinitionId(observation.digest());
+    nested.insert((owner, role.to_owned(), name.to_owned()), id);
+    records.push(observation);
+    Ok(id)
 }
 
 fn fingerprint(bytes: &[u8]) -> u128 {

@@ -33,6 +33,44 @@ pub(crate) struct VariantId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TypeParameterId(pub(crate) u16);
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ArrayLength {
+    Value(u64),
+    Parameter {
+        owner: DefinitionId,
+        id: TypeParameterId,
+        display: Arc<str>,
+    },
+}
+
+impl ArrayLength {
+    pub(crate) const fn value(&self) -> Option<u64> {
+        match self {
+            Self::Value(value) => Some(*value),
+            Self::Parameter { .. } => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ArrayLength {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Value(value) => value.fmt(formatter),
+            Self::Parameter { display, .. } => display.fmt(formatter),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PoolTerm {
+    Concrete(PoolId),
+    Parameter {
+        owner: DefinitionId,
+        id: TypeParameterId,
+        display: Arc<str>,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SpecializationId(pub(crate) u128);
 
@@ -100,10 +138,12 @@ pub(crate) enum Type {
     Text,
     Scalar,
     Bytes,
+    ConstU64(u64),
+    PoolArgument(PoolId),
     Array(Arc<Type>),
     FixedArray {
         element: Arc<Type>,
-        length: u64,
+        length: ArrayLength,
     },
     Tuple(Arc<[Type]>),
     Function {
@@ -111,7 +151,7 @@ pub(crate) enum Type {
         return_type: Arc<Type>,
     },
     Own {
-        pool: PoolId,
+        pool: PoolTerm,
         value: Arc<Type>,
     },
     Any {
@@ -244,6 +284,8 @@ impl Type {
             Self::Text => "Text".to_owned(),
             Self::Scalar => "Scalar".to_owned(),
             Self::Bytes => "Bytes".to_owned(),
+            Self::ConstU64(value) => value.to_string(),
+            Self::PoolArgument(pool) => format!("pool[{:032x}]", pool.0),
             Self::Array(element) => format!("[{}]", element.display()),
             Self::FixedArray { element, length } => format!("[{}; {length}]", element.display()),
             Self::Tuple(members) => {
@@ -270,7 +312,12 @@ impl Type {
                     .join(", "),
                 return_type.display()
             ),
-            Self::Own { pool, value } => format!("own[{:032x}] {}", pool.0, value.display()),
+            Self::Own { pool, value } => match pool {
+                PoolTerm::Concrete(pool) => format!("own[{:032x}] {}", pool.0, value.display()),
+                PoolTerm::Parameter { display, .. } => {
+                    format!("own[{display}] {}", value.display())
+                }
+            },
             Self::Any { display, .. } => format!("any {display}"),
             Self::Result { success, error } => error.as_ref().map_or_else(
                 || format!("Result[{}]", success.display()),
@@ -325,6 +372,14 @@ impl Type {
             Self::Text => bytes.push(4),
             Self::Scalar => bytes.push(5),
             Self::Bytes => bytes.push(6),
+            Self::ConstU64(value) => {
+                bytes.push(19);
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            Self::PoolArgument(pool) => {
+                bytes.push(20);
+                bytes.extend_from_slice(&pool.0.to_be_bytes());
+            }
             Self::Array(element) => {
                 bytes.push(7);
                 element.append_canonical_key(bytes);
@@ -332,7 +387,17 @@ impl Type {
             Self::FixedArray { element, length } => {
                 bytes.push(15);
                 element.append_canonical_key(bytes);
-                bytes.extend_from_slice(&length.to_be_bytes());
+                match length {
+                    ArrayLength::Value(length) => {
+                        bytes.push(0);
+                        bytes.extend_from_slice(&length.to_be_bytes());
+                    }
+                    ArrayLength::Parameter { owner, id, .. } => {
+                        bytes.push(1);
+                        bytes.extend_from_slice(&owner.0.to_be_bytes());
+                        bytes.extend_from_slice(&id.0.to_be_bytes());
+                    }
+                }
             }
             Self::Tuple(members) => {
                 bytes.push(8);
@@ -402,7 +467,17 @@ impl Type {
             }
             Self::Own { pool, value } => {
                 bytes.push(17);
-                bytes.extend_from_slice(&pool.0.to_be_bytes());
+                match pool {
+                    PoolTerm::Concrete(pool) => {
+                        bytes.push(0);
+                        bytes.extend_from_slice(&pool.0.to_be_bytes());
+                    }
+                    PoolTerm::Parameter { owner, id, .. } => {
+                        bytes.push(1);
+                        bytes.extend_from_slice(&owner.0.to_be_bytes());
+                        bytes.extend_from_slice(&id.0.to_be_bytes());
+                    }
+                }
                 value.append_canonical_key(bytes);
             }
             Self::Any { interface, .. } => {

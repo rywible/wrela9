@@ -1,6 +1,6 @@
 use wrela_compiler::{
-    Cancellation, CompilationOutcome, CompilationRequest, Compiler, CompilerInstallation,
-    InspectSelection, OpenError, ProjectFile, ProjectSnapshot, Root,
+    Cancellation, CanonicalValue, CompilationOutcome, CompilationRequest, Compiler,
+    CompilerInstallation, InspectSelection, OpenError, ProjectFile, ProjectSnapshot, Root,
 };
 
 fn compile(files: Vec<ProjectFile>, root: Root) -> CompilationOutcome {
@@ -517,6 +517,10 @@ fn build() -> Image:
     assert_eq!(binding.name(), "value");
     assert_eq!(binding.type_name(), "i64");
     assert_eq!(binding.ownership(), wrela_compiler::OwnershipMode::Take);
+    assert!(matches!(
+        binding.value(),
+        CanonicalValue::Integer { value, .. } if *value == 1
+    ));
     assert!(accepted.inspection().ownership().iter().any(|ownership| {
         ownership.name() == "value" && ownership.mode() == wrela_compiler::OwnershipMode::Take
     }));

@@ -10,12 +10,12 @@ use crate::compiler::{
     RecoveryAction, Root, SourceRange, SpecializationObservation, TestApplicationObservation,
     TestBindingObservation, TypeObservation, TypeRole,
 };
-use crate::evaluator::Engine;
+use crate::evaluator::{AppliedTest, Engine};
 use crate::identity::{IdentityCatalog, IdentityFailure};
 use crate::image_evaluation::{self, GraphSealFailure, ImageEvaluationStatus};
 use crate::model::{
-    BuildKind, BuiltinType, DefinitionId, ModuleId, SpecializationId, TestId, Type,
-    TypeParameterId, resolve_builtin_type,
+    ArrayLength, BuildKind, BuiltinType, DefinitionId, ModuleId, PoolTerm, SpecializationId,
+    TestId, Type, TypeParameterId, resolve_builtin_type,
 };
 use crate::syntax::{
     AttributeSyntax, ComptimeMemberBranch, ComptimeStatementBranch, Declaration, DeclarationKind,
@@ -26,8 +26,8 @@ use crate::type_semantics::{can_unify, contains_resource};
 use crate::typed_hir::{
     self, AuthorityContext, BuildAuthority, CallTarget, Expression, ExpressionKind,
     NamespaceCatalog, PoolAuthority, ProgramInput, ResolvedConstant, ResolvedField,
-    ResolvedFunction, ResolvedName, ResolvedParameter, ResolvedStruct, ResolvedTest,
-    ResolvedVariant, Statement, VerifiedProgram,
+    ResolvedFunction, ResolvedInterface, ResolvedInterfaceRequirement, ResolvedName,
+    ResolvedParameter, ResolvedStruct, ResolvedTest, ResolvedVariant, Statement, VerifiedProgram,
 };
 
 pub(crate) struct Analysis {
@@ -260,10 +260,14 @@ fn replace_member_selection(
                 if let Some(selected) = selected {
                     struct_.fields.extend(selected.fields);
                     struct_.functions.extend(selected.functions);
+                    struct_.constants.extend(selected.constants);
                     struct_.fields.sort_by_key(|field| field.range.start());
                     struct_
                         .functions
                         .sort_by_key(|function| function.range.start());
+                    struct_
+                        .constants
+                        .sort_by_key(|constant| constant.range.start());
                 }
                 return true;
             }
@@ -279,10 +283,14 @@ fn replace_member_selection(
                 if let Some(selected) = selected {
                     enum_.variants.extend(selected.variants);
                     enum_.functions.extend(selected.functions);
+                    enum_.constants.extend(selected.constants);
                     enum_.variants.sort_by_key(|variant| variant.range.start());
                     enum_
                         .functions
                         .sort_by_key(|function| function.range.start());
+                    enum_
+                        .constants
+                        .sort_by_key(|constant| constant.range.start());
                 }
                 return true;
             }
@@ -595,6 +603,7 @@ struct DefinitionRecord {
     name: String,
     kind: DeclarationKind,
     public: bool,
+    pool: Option<crate::model::PoolId>,
     declaration: Declaration,
 }
 
@@ -730,6 +739,7 @@ fn analyze_with_probe(
                     name: declaration.name.clone(),
                     kind: declaration.kind,
                     public: declaration.public,
+                    pool: identity_catalog.pool_for_definition(id),
                     declaration: declaration.clone(),
                 },
             );
@@ -764,12 +774,13 @@ fn analyze_with_probe(
         }
     }
     for definition in definitions.values() {
-        let functions = match definition.declaration.syntax.as_ref() {
+        let (functions, constants): (&[_], &[_]) = match definition.declaration.syntax.as_ref() {
             Some(
                 DeclarationSyntax::Struct(struct_) | DeclarationSyntax::ResourceStruct(struct_),
-            ) => &struct_.functions,
-            Some(DeclarationSyntax::Enum(enum_)) => &enum_.functions,
-            _ => continue,
+            ) => (&struct_.functions, &struct_.constants),
+            Some(DeclarationSyntax::Enum(enum_)) => (&enum_.functions, &enum_.constants),
+            Some(DeclarationSyntax::Interface(interface)) => (&[], &interface.constants),
+            _ => (&[], &[]),
         };
         for member in functions {
             let id = identity_catalog
@@ -786,6 +797,24 @@ fn analyze_with_probe(
                 definition.module,
                 member.name.clone(),
                 ResolvedName::Function(id),
+                definition.public && member.public,
+            );
+        }
+        for member in constants {
+            let id = identity_catalog
+                .associated_constant(definition.id, &member.name)
+                .expect("structured associated constant was catalogued");
+            namespace.declare(
+                definition.module,
+                Arc::from([definition.name.clone(), member.name.clone()]),
+                ResolvedName::Constant(id),
+                definition.public && member.public,
+            );
+            namespace.declare_member(
+                definition.id,
+                definition.module,
+                member.name.clone(),
+                ResolvedName::Constant(id),
                 definition.public && member.public,
             );
         }
@@ -928,6 +957,7 @@ fn analyze_with_probe(
         );
     }
     let mut interfaces = BTreeMap::<DefinitionId, Vec<InterfaceRequirement>>::new();
+    let mut interface_constants = BTreeMap::<DefinitionId, Vec<(String, Type, SourceRange)>>::new();
     for definition in definitions
         .values()
         .filter(|definition| definition.kind == DeclarationKind::Interface)
@@ -951,13 +981,18 @@ fn analyze_with_probe(
                 );
                 continue;
             }
+            let requirement_id = identity_catalog
+                .nested_definition(definition.id, "interface_requirement", &requirement.name)
+                .expect("interface requirement identity exists");
             let Some(parameters) = resolve_parameters(
                 &requirement.parameters,
+                requirement_id,
                 definition.module,
                 &input.namespace,
                 &input.nominal_displays,
                 &alias_types,
                 &self_parameters,
+                identity_catalog,
                 &mut diagnostics,
             ) else {
                 continue;
@@ -977,6 +1012,29 @@ fn analyze_with_probe(
                 ));
                 continue;
             };
+            if definition.public
+                && (exposes_private_type(&return_type, &definitions)
+                    || parameters
+                        .iter()
+                        .any(|parameter| exposes_private_type(&parameter.type_, &definitions)))
+            {
+                diagnostics.push(Diagnostic::new(
+                    "semantic.private_type_in_public_signature",
+                    requirement.range.clone(),
+                    RecoveryAction::None,
+                ));
+            }
+            if !result_type_well_formed(&return_type, false, &definitions)
+                || parameters.iter().any(|parameter| {
+                    !result_type_well_formed(&parameter.type_, false, &definitions)
+                })
+            {
+                diagnostics.push(Diagnostic::new(
+                    "semantic.invalid_result_error_type",
+                    requirement.range.clone(),
+                    RecoveryAction::None,
+                ));
+            }
             requirements.push(InterfaceRequirement {
                 name: requirement.name.clone(),
                 modifier: requirement.modifier,
@@ -986,7 +1044,53 @@ fn analyze_with_probe(
             });
         }
         interfaces.insert(definition.id, requirements);
+        let constants = interface
+            .constants
+            .iter()
+            .filter_map(|constant| {
+                let type_ = resolve_type(
+                    &constant.type_syntax,
+                    definition.module,
+                    &input.namespace,
+                    &input.nominal_displays,
+                    &alias_types,
+                    &BTreeMap::new(),
+                );
+                if type_.is_none() {
+                    diagnostics.push(Diagnostic::new(
+                        "semantic.unresolved_type",
+                        constant.range.clone(),
+                        RecoveryAction::None,
+                    ));
+                }
+                type_.map(|type_| (constant.name.clone(), type_, constant.range.clone()))
+            })
+            .collect();
+        interface_constants.insert(definition.id, constants);
     }
+    input.interfaces = interfaces
+        .iter()
+        .map(|(id, requirements)| {
+            (
+                *id,
+                ResolvedInterface {
+                    requirements: requirements
+                        .iter()
+                        .map(|requirement| {
+                            (
+                                requirement.name.clone(),
+                                ResolvedInterfaceRequirement {
+                                    parameters: requirement.parameters.clone(),
+                                    return_type: requirement.return_type.clone(),
+                                },
+                            )
+                        })
+                        .collect(),
+                    implementations: BTreeMap::new(),
+                },
+            )
+        })
+        .collect();
     let mut tests_in_source_order = Vec::new();
     let mut image_functions = Vec::new();
     for definition in definitions.values() {
@@ -1017,11 +1121,13 @@ fn analyze_with_probe(
                     .collect::<BTreeMap<_, _>>();
                 let parameters = match resolve_parameters(
                     &function.parameters,
+                    definition.id,
                     definition.module,
                     &input.namespace,
                     &input.nominal_displays,
                     &alias_types,
                     &type_parameters,
+                    identity_catalog,
                     &mut diagnostics,
                 ) {
                     Some(parameters) => parameters,
@@ -1075,6 +1181,17 @@ fn analyze_with_probe(
                         RecoveryAction::None,
                     ));
                 }
+                if !result_type_well_formed(&return_type, !definition.public, &definitions)
+                    || parameters.iter().any(|parameter| {
+                        !result_type_well_formed(&parameter.type_, false, &definitions)
+                    })
+                {
+                    diagnostics.push(Diagnostic::new(
+                        "semantic.invalid_result_error_type",
+                        definition.declaration.range.clone(),
+                        RecoveryAction::None,
+                    ));
+                }
                 if definition
                     .declaration
                     .attributes
@@ -1104,6 +1221,17 @@ fn analyze_with_probe(
                         type_parameters: (0..function.type_parameters.len())
                             .map(|index| TypeParameterId(u16::try_from(index).unwrap_or(u16::MAX)))
                             .collect(),
+                        generic_constraints: resolve_generic_constraints(
+                            &function.generic_parameters,
+                            definition.module,
+                            &input.namespace,
+                            &input.nominal_displays,
+                            &alias_types,
+                            &type_parameters,
+                            &definitions,
+                            &definition.declaration.range,
+                            &mut diagnostics,
+                        ),
                         parameters,
                         return_type,
                         body: function.body.clone(),
@@ -1131,6 +1259,20 @@ fn analyze_with_probe(
                     ));
                     continue;
                 };
+                if definition.public && exposes_private_type(&type_, &definitions) {
+                    diagnostics.push(Diagnostic::new(
+                        "semantic.private_type_in_public_signature",
+                        definition.declaration.range.clone(),
+                        RecoveryAction::None,
+                    ));
+                }
+                if !result_type_well_formed(&type_, false, &definitions) {
+                    diagnostics.push(Diagnostic::new(
+                        "semantic.invalid_result_error_type",
+                        definition.declaration.range.clone(),
+                        RecoveryAction::None,
+                    ));
+                }
                 input.constants.insert(
                     definition.id,
                     ResolvedConstant {
@@ -1170,11 +1312,13 @@ fn analyze_with_probe(
                     }
                     let Some(parameters) = resolve_parameters(
                         &test.parameters,
+                        id.test,
                         definition.module,
                         &input.namespace,
                         &input.nominal_displays,
                         &alias_types,
                         &BTreeMap::new(),
+                        identity_catalog,
                         &mut diagnostics,
                     ) else {
                         continue;
@@ -1220,6 +1364,64 @@ fn analyze_with_probe(
                     })
                     .collect::<BTreeMap<_, _>>();
                 let mut field_names = BTreeSet::new();
+                for constant in &struct_.constants {
+                    if !field_names.insert(&constant.name) {
+                        diagnostics.push(
+                            Diagnostic::new(
+                                "semantic.duplicate_member",
+                                constant.range.clone(),
+                                RecoveryAction::None,
+                            )
+                            .with_parameter("name", constant.name.clone()),
+                        );
+                        continue;
+                    }
+                    let Some(type_) = resolve_type(
+                        &constant.type_syntax,
+                        definition.module,
+                        &input.namespace,
+                        &input.nominal_displays,
+                        &alias_types,
+                        &type_parameters,
+                    ) else {
+                        diagnostics.push(Diagnostic::new(
+                            "semantic.unresolved_type",
+                            constant.range.clone(),
+                            RecoveryAction::None,
+                        ));
+                        continue;
+                    };
+                    if definition.public
+                        && constant.public
+                        && exposes_private_type(&type_, &definitions)
+                    {
+                        diagnostics.push(Diagnostic::new(
+                            "semantic.private_type_in_public_signature",
+                            constant.range.clone(),
+                            RecoveryAction::None,
+                        ));
+                    }
+                    let Some(value) = constant.value.clone() else {
+                        return defect(
+                            "associated constant resolution",
+                            Arc::from("concrete associated constant has no value"),
+                        );
+                    };
+                    let id = identity_catalog
+                        .associated_constant(definition.id, &constant.name)
+                        .expect("associated constant identity exists");
+                    input.constants.insert(
+                        id,
+                        ResolvedConstant {
+                            id,
+                            module: definition.module,
+                            name: format!("{}.{}", definition.name, constant.name),
+                            type_,
+                            value,
+                            source: constant.range.clone(),
+                        },
+                    );
+                }
                 let mut resolved_fields = Vec::new();
                 for field in &struct_.fields {
                     if !field_names.insert(&field.name) {
@@ -1265,7 +1467,17 @@ fn analyze_with_probe(
                             RecoveryAction::None,
                         ));
                     }
+                    if !result_type_well_formed(&type_, false, &definitions) {
+                        diagnostics.push(Diagnostic::new(
+                            "semantic.invalid_result_error_type",
+                            field.range.clone(),
+                            RecoveryAction::None,
+                        ));
+                    }
                     resolved_fields.push(ResolvedField {
+                        definition: identity_catalog
+                            .nested_definition(definition.id, "field", &field.name)
+                            .expect("field identity exists"),
                         name: field.name.clone(),
                         public: field.public,
                         mutable: field.mutable,
@@ -1282,6 +1494,17 @@ fn analyze_with_probe(
                         type_parameters: (0..struct_.type_parameters.len())
                             .map(|index| TypeParameterId(u16::try_from(index).unwrap_or(u16::MAX)))
                             .collect(),
+                        generic_constraints: resolve_generic_constraints(
+                            &struct_.generic_parameters,
+                            definition.module,
+                            &input.namespace,
+                            &input.nominal_displays,
+                            &alias_types,
+                            &type_parameters,
+                            &definitions,
+                            &definition.declaration.range,
+                            &mut diagnostics,
+                        ),
                         fields: resolved_fields,
                     },
                 );
@@ -1372,6 +1595,45 @@ fn analyze_with_probe(
                                 .with_label(requirement.range.clone(), DiagnosticLabelRole::Related)
                                 .with_parameter("member", requirement.name.clone()),
                             );
+                        } else if let Some(interface) = input.interfaces.get_mut(&interface_id) {
+                            interface
+                                .implementations
+                                .entry(definition.id)
+                                .or_default()
+                                .insert(requirement.name.clone(), implementation.id);
+                        }
+                    }
+                    for (name, expected, requirement_range) in
+                        interface_constants.get(&interface_id).into_iter().flatten()
+                    {
+                        let implementation =
+                            struct_.constants.iter().find(|value| value.name == *name);
+                        let actual = implementation.and_then(|constant| {
+                            resolve_type(
+                                &constant.type_syntax,
+                                definition.module,
+                                &input.namespace,
+                                &input.nominal_displays,
+                                &alias_types,
+                                &type_parameters,
+                            )
+                        });
+                        if actual
+                            .as_ref()
+                            .is_none_or(|actual| !can_unify(actual, expected))
+                        {
+                            diagnostics.push(
+                                Diagnostic::new(
+                                    "semantic.interface_constant_mismatch",
+                                    implementation.map_or_else(
+                                        || definition.declaration.range.clone(),
+                                        |constant| constant.range.clone(),
+                                    ),
+                                    RecoveryAction::None,
+                                )
+                                .with_label(requirement_range.clone(), DiagnosticLabelRole::Related)
+                                .with_parameter("member", name.clone()),
+                            );
                         }
                     }
                 }
@@ -1393,18 +1655,100 @@ fn analyze_with_probe(
                         )
                     })
                     .collect::<BTreeMap<_, _>>();
-                for variant in &enum_.variants {
-                    let Some(parameters) = resolve_parameters(
-                        &variant.parameters,
+                for constant in &enum_.constants {
+                    let Some(type_) = resolve_type(
+                        &constant.type_syntax,
                         definition.module,
                         &input.namespace,
                         &input.nominal_displays,
                         &alias_types,
                         &type_parameters,
+                    ) else {
+                        diagnostics.push(Diagnostic::new(
+                            "semantic.unresolved_type",
+                            constant.range.clone(),
+                            RecoveryAction::None,
+                        ));
+                        continue;
+                    };
+                    if definition.public
+                        && constant.public
+                        && exposes_private_type(&type_, &definitions)
+                    {
+                        diagnostics.push(Diagnostic::new(
+                            "semantic.private_type_in_public_signature",
+                            constant.range.clone(),
+                            RecoveryAction::None,
+                        ));
+                    }
+                    let Some(value) = constant.value.clone() else {
+                        return defect(
+                            "associated constant resolution",
+                            Arc::from("concrete associated constant has no value"),
+                        );
+                    };
+                    let id = identity_catalog
+                        .associated_constant(definition.id, &constant.name)
+                        .expect("associated constant identity exists");
+                    input.constants.insert(
+                        id,
+                        ResolvedConstant {
+                            id,
+                            module: definition.module,
+                            name: format!("{}.{}", definition.name, constant.name),
+                            type_,
+                            value,
+                            source: constant.range.clone(),
+                        },
+                    );
+                }
+                for (variant_order, variant) in enum_.variants.iter().enumerate() {
+                    let variant_id = identity_catalog
+                        .variant(definition.id, &variant.name)
+                        .expect("structured enum variant was catalogued");
+                    let Some(parameters) = resolve_parameters(
+                        &variant.parameters,
+                        variant_id.definition,
+                        definition.module,
+                        &input.namespace,
+                        &input.nominal_displays,
+                        &alias_types,
+                        &type_parameters,
+                        identity_catalog,
                         &mut diagnostics,
                     ) else {
                         continue;
                     };
+                    if definition.public
+                        && parameters
+                            .iter()
+                            .any(|parameter| exposes_private_type(&parameter.type_, &definitions))
+                    {
+                        diagnostics.push(Diagnostic::new(
+                            "semantic.private_type_in_public_signature",
+                            variant.range.clone(),
+                            RecoveryAction::None,
+                        ));
+                    }
+                    if parameters.iter().any(|parameter| {
+                        !result_type_well_formed(&parameter.type_, false, &definitions)
+                    }) {
+                        diagnostics.push(Diagnostic::new(
+                            "semantic.invalid_result_error_type",
+                            variant.range.clone(),
+                            RecoveryAction::None,
+                        ));
+                    }
+                    if parameters
+                        .iter()
+                        .any(|parameter| is_resource_type(&parameter.type_, &definitions))
+                    {
+                        diagnostics.push(Diagnostic::new(
+                            "semantic.resource_payload_requires_resource_type",
+                            variant.range.clone(),
+                            RecoveryAction::None,
+                        ));
+                    }
                     if variant
                         .parameters
                         .iter()
@@ -1416,17 +1760,27 @@ fn analyze_with_probe(
                             RecoveryAction::None,
                         ));
                     }
-                    let id = identity_catalog
-                        .variant(definition.id, &variant.name)
-                        .expect("structured enum variant was catalogued");
+                    let id = variant_id;
                     input.variants.insert(
                         id,
                         ResolvedVariant {
+                            order: u32::try_from(variant_order).unwrap_or(u32::MAX),
                             type_parameters: (0..enum_.type_parameters.len())
                                 .map(|index| {
                                     TypeParameterId(u16::try_from(index).unwrap_or(u16::MAX))
                                 })
                                 .collect(),
+                            generic_constraints: resolve_generic_constraints(
+                                &enum_.generic_parameters,
+                                definition.module,
+                                &input.namespace,
+                                &input.nominal_displays,
+                                &alias_types,
+                                &type_parameters,
+                                &definitions,
+                                &definition.declaration.range,
+                                &mut diagnostics,
+                            ),
                             parameters,
                         },
                     );
@@ -1445,6 +1799,23 @@ fn analyze_with_probe(
                 }
             }
             DeclarationSyntax::TypeAlias(_) | DeclarationSyntax::Pool => {}
+        }
+    }
+
+    for (id, type_) in &alias_types {
+        if definitions[id].public && exposes_private_type(type_, &definitions) {
+            diagnostics.push(Diagnostic::new(
+                "semantic.private_type_in_public_signature",
+                definitions[id].declaration.range.clone(),
+                RecoveryAction::None,
+            ));
+        }
+        if !result_type_well_formed(type_, false, &definitions) {
+            diagnostics.push(Diagnostic::new(
+                "semantic.invalid_result_error_type",
+                definitions[id].declaration.range.clone(),
+                RecoveryAction::None,
+            ));
         }
     }
 
@@ -1485,6 +1856,14 @@ fn analyze_with_probe(
                 Arc::from("inferred function is absent from the semantic catalog"),
             );
         };
+        if !matches!(error, Type::Nominal { .. }) {
+            diagnostics.push(Diagnostic::new(
+                "semantic.invalid_result_error_type",
+                function.source.clone(),
+                RecoveryAction::None,
+            ));
+            continue;
+        }
         let Type::Result {
             success,
             error: inferred_error,
@@ -1528,6 +1907,64 @@ fn analyze_with_probe(
             image_functions[0].1.clone(),
             RecoveryAction::None,
         ));
+    }
+
+    for function in input.functions.values() {
+        if invalid_resource_argument_in_data_nominal(&function.return_type, &definitions)
+            || function.parameters.iter().any(|parameter| {
+                invalid_resource_argument_in_data_nominal(&parameter.type_, &definitions)
+            })
+        {
+            diagnostics.push(Diagnostic::new(
+                "semantic.resource_argument_requires_resource_struct",
+                function.source.clone(),
+                RecoveryAction::None,
+            ));
+        }
+    }
+    for constant in input.constants.values() {
+        if invalid_resource_argument_in_data_nominal(&constant.type_, &definitions) {
+            diagnostics.push(Diagnostic::new(
+                "semantic.resource_argument_requires_resource_struct",
+                constant.source.clone(),
+                RecoveryAction::None,
+            ));
+        }
+    }
+    for test in input.tests.values() {
+        if test.parameters.iter().any(|parameter| {
+            invalid_resource_argument_in_data_nominal(&parameter.type_, &definitions)
+        }) {
+            diagnostics.push(Diagnostic::new(
+                "semantic.resource_argument_requires_resource_struct",
+                test.source.clone(),
+                RecoveryAction::None,
+            ));
+        }
+    }
+    for struct_ in input.structs.values() {
+        if struct_
+            .fields
+            .iter()
+            .any(|field| invalid_resource_argument_in_data_nominal(&field.type_, &definitions))
+        {
+            diagnostics.push(Diagnostic::new(
+                "semantic.resource_argument_requires_resource_struct",
+                definitions[&struct_.definition].declaration.range.clone(),
+                RecoveryAction::None,
+            ));
+        }
+    }
+    for (variant, resolved) in &input.variants {
+        if resolved.parameters.iter().any(|parameter| {
+            invalid_resource_argument_in_data_nominal(&parameter.type_, &definitions)
+        }) {
+            diagnostics.push(Diagnostic::new(
+                "semantic.resource_argument_requires_resource_struct",
+                definitions[&variant.owner].declaration.range.clone(),
+                RecoveryAction::None,
+            ));
+        }
     }
 
     let mut type_observations = Vec::new();
@@ -1836,9 +2273,8 @@ fn analyze_with_probe(
                 {
                     return defect("constant evaluation", evidence);
                 }
-                let record = definitions.get(&constant.id).expect("constant definition");
                 evaluations.push(EvaluationObservation::new(
-                    format!("{}.{}", record.module_display, record.name),
+                    format!("{}.{}", module_displays[&constant.module], constant.name),
                     run.outcome,
                     run.receipt,
                 ));
@@ -2098,10 +2534,40 @@ fn resolve_associated_functions(
     identity_catalog: &IdentityCatalog,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<ResolvedFunction> {
+    let enclosing_parameter_names: &[String] = match definition.declaration.syntax.as_ref() {
+        Some(DeclarationSyntax::Struct(struct_))
+        | Some(DeclarationSyntax::ResourceStruct(struct_)) => &struct_.type_parameters,
+        Some(DeclarationSyntax::Enum(enum_)) => &enum_.type_parameters,
+        _ => &[],
+    };
+    let enclosing_generic_parameters: &[crate::syntax::GenericParameterSyntax] =
+        match definition.declaration.syntax.as_ref() {
+            Some(DeclarationSyntax::Struct(struct_))
+            | Some(DeclarationSyntax::ResourceStruct(struct_)) => &struct_.generic_parameters,
+            Some(DeclarationSyntax::Enum(enum_)) => &enum_.generic_parameters,
+            _ => &[],
+        };
+    let enclosing_parameters = enclosing_parameter_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            (
+                name.clone(),
+                Type::Parameter {
+                    owner: definition.id,
+                    id: TypeParameterId(u16::try_from(index).unwrap_or(u16::MAX)),
+                    display: Arc::from(name.as_str()),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let self_type = Type::Nominal {
         definition: definition.id,
         display: displays[&definition.id].clone(),
-        arguments: Arc::from([]),
+        arguments: enclosing_parameter_names
+            .iter()
+            .map(|name| enclosing_parameters[name].clone())
+            .collect(),
     };
     let mut member_names = BTreeSet::new();
     let mut resolved = Vec::new();
@@ -2120,14 +2586,16 @@ fn resolve_associated_functions(
         let id = identity_catalog
             .associated_function(definition.id, &member.name)
             .expect("associated function identity exists");
-        let mut type_parameters = BTreeMap::from([("Self".to_owned(), self_type.clone())]);
+        let mut type_parameters = enclosing_parameters.clone();
+        type_parameters.insert("Self".to_owned(), self_type.clone());
         for (index, name) in member.function.type_parameters.iter().enumerate() {
+            let parameter_index = enclosing_parameter_names.len().saturating_add(index);
             if type_parameters
                 .insert(
                     name.clone(),
                     Type::Parameter {
                         owner: id,
-                        id: TypeParameterId(u16::try_from(index).unwrap_or(u16::MAX)),
+                        id: TypeParameterId(u16::try_from(parameter_index).unwrap_or(u16::MAX)),
                         display: Arc::from(name.as_str()),
                     },
                 )
@@ -2145,11 +2613,13 @@ fn resolve_associated_functions(
         }
         let Some(parameters) = resolve_parameters(
             &member.function.parameters,
+            id,
             definition.module,
             namespace,
             displays,
             aliases,
             &type_parameters,
+            identity_catalog,
             diagnostics,
         ) else {
             continue;
@@ -2210,15 +2680,56 @@ fn resolve_associated_functions(
                 RecoveryAction::None,
             ));
         }
+        if definition.public
+            && member.public
+            && matches!(return_type, Type::Result { error: None, .. })
+        {
+            diagnostics.push(Diagnostic::new(
+                "semantic.public_result_requires_error_type",
+                member.range.clone(),
+                RecoveryAction::None,
+            ));
+        }
+        if !result_type_well_formed(
+            &return_type,
+            !(definition.public && member.public),
+            definitions,
+        ) || parameters
+            .iter()
+            .any(|parameter| !result_type_well_formed(&parameter.type_, false, definitions))
+        {
+            diagnostics.push(Diagnostic::new(
+                "semantic.invalid_result_error_type",
+                member.range.clone(),
+                RecoveryAction::None,
+            ));
+        }
         resolved.push(ResolvedFunction {
             id,
             module: definition.module,
             module_display: definition.module_display.clone(),
             name: format!("{}.{}", definition.name, member.name),
             modifier: member.function.modifier,
-            type_parameters: (0..member.function.type_parameters.len())
+            type_parameters: (0..enclosing_parameter_names
+                .len()
+                .saturating_add(member.function.type_parameters.len()))
                 .map(|index| TypeParameterId(u16::try_from(index).unwrap_or(u16::MAX)))
                 .collect(),
+            generic_constraints: {
+                let mut constraints = enclosing_generic_parameters.to_vec();
+                constraints.extend(member.function.generic_parameters.clone());
+                resolve_generic_constraints(
+                    &constraints,
+                    definition.module,
+                    namespace,
+                    displays,
+                    aliases,
+                    &type_parameters,
+                    definitions,
+                    &member.range,
+                    diagnostics,
+                )
+            },
             parameters,
             return_type,
             body: member.function.body.clone(),
@@ -2228,13 +2739,16 @@ fn resolve_associated_functions(
     resolved
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_parameters(
     parameters: &[ParameterSyntax],
+    owner: DefinitionId,
     module: ModuleId,
     namespace: &NamespaceCatalog,
     displays: &BTreeMap<DefinitionId, Arc<str>>,
     aliases: &BTreeMap<DefinitionId, Type>,
     type_parameters: &BTreeMap<String, Type>,
+    identity_catalog: &IdentityCatalog,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<Vec<ResolvedParameter>> {
     parameters
@@ -2256,10 +2770,99 @@ fn resolve_parameters(
                 ));
             }
             type_.map(|type_| ResolvedParameter {
+                definition: identity_catalog
+                    .nested_definition(owner, "parameter", &parameter.name)
+                    .expect("parameter identity exists"),
                 name: parameter.name.clone(),
                 ownership: parameter.ownership,
                 type_,
             })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_generic_constraints(
+    parameters: &[crate::syntax::GenericParameterSyntax],
+    module: ModuleId,
+    namespace: &NamespaceCatalog,
+    displays: &BTreeMap<DefinitionId, Arc<str>>,
+    aliases: &BTreeMap<DefinitionId, Type>,
+    type_parameters: &BTreeMap<String, Type>,
+    definitions: &BTreeMap<DefinitionId, DefinitionRecord>,
+    range: &SourceRange,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Arc<[typed_hir::GenericConstraint]> {
+    parameters
+        .iter()
+        .map(|parameter| match &parameter.kind {
+            crate::syntax::GenericParameterKindSyntax::Type { interface_bound } => {
+                let interface = interface_bound.as_ref().and_then(|bound| {
+                    let Some(ResolvedName::Nominal(id)) =
+                        namespace.resolve(module, &bound.segments)
+                    else {
+                        diagnostics.push(Diagnostic::new(
+                            "semantic.unresolved_interface",
+                            range.clone(),
+                            RecoveryAction::None,
+                        ));
+                        return None;
+                    };
+                    if definitions
+                        .get(&id)
+                        .is_none_or(|definition| definition.kind != DeclarationKind::Interface)
+                    {
+                        diagnostics.push(Diagnostic::new(
+                            "semantic.generic_bound_requires_interface",
+                            range.clone(),
+                            RecoveryAction::None,
+                        ));
+                        None
+                    } else {
+                        Some(id)
+                    }
+                });
+                typed_hir::GenericConstraint::Type { interface }
+            }
+            crate::syntax::GenericParameterKindSyntax::Const { type_syntax } => {
+                let type_ = resolve_type(
+                    type_syntax,
+                    module,
+                    namespace,
+                    displays,
+                    aliases,
+                    type_parameters,
+                )
+                .unwrap_or_else(|| {
+                    diagnostics.push(Diagnostic::new(
+                        "semantic.unresolved_type",
+                        range.clone(),
+                        RecoveryAction::None,
+                    ));
+                    Type::Infer
+                });
+                if is_resource_type(&type_, definitions)
+                    || !matches!(
+                        type_,
+                        Type::Bool
+                            | Type::Integer(_)
+                            | Type::Text
+                            | Type::Scalar
+                            | Type::Bytes
+                            | Type::Nominal { .. }
+                            | Type::Tuple(_)
+                            | Type::FixedArray { .. }
+                    )
+                {
+                    diagnostics.push(Diagnostic::new(
+                        "semantic.const_generic_requires_canonical_data",
+                        range.clone(),
+                        RecoveryAction::None,
+                    ));
+                }
+                typed_hir::GenericConstraint::Const { type_ }
+            }
+            crate::syntax::GenericParameterKindSyntax::Pool => typed_hir::GenericConstraint::Pool,
         })
         .collect()
 }
@@ -2300,6 +2903,7 @@ fn resolve_type(
 ) -> Option<Type> {
     match syntax {
         TypeSyntax::Unit => Some(Type::Unit),
+        TypeSyntax::ConstU64(value) => Some(Type::ConstU64(*value)),
         TypeSyntax::Infer => Some(Type::Infer),
         TypeSyntax::Array(element) => Some(Type::Array(Arc::new(resolve_type(
             element,
@@ -2334,7 +2938,19 @@ fn resolve_type(
                 aliases,
                 type_parameters,
             )?),
-            length: *length,
+            length: match length {
+                crate::syntax::FixedArrayLengthSyntax::Literal(value) => ArrayLength::Value(*value),
+                crate::syntax::FixedArrayLengthSyntax::Parameter(name) => {
+                    let Type::Parameter { owner, id, display } = type_parameters.get(name)? else {
+                        return None;
+                    };
+                    ArrayLength::Parameter {
+                        owner: *owner,
+                        id: *id,
+                        display: Arc::clone(display),
+                    }
+                }
+            },
         }),
         TypeSyntax::Function {
             parameters,
@@ -2364,8 +2980,21 @@ fn resolve_type(
             )?),
         }),
         TypeSyntax::Own { pool, value } => {
-            let ResolvedName::Pool(pool) = namespace.resolve(module, &pool.segments)? else {
-                return None;
+            let pool = match namespace.resolve(module, &pool.segments) {
+                Some(ResolvedName::Pool(pool)) => PoolTerm::Concrete(pool),
+                None if pool.segments.len() == 1 => {
+                    let Type::Parameter { owner, id, display } =
+                        type_parameters.get(&pool.segments[0])?
+                    else {
+                        return None;
+                    };
+                    PoolTerm::Parameter {
+                        owner: *owner,
+                        id: *id,
+                        display: Arc::clone(display),
+                    }
+                }
+                _ => return None,
             };
             Some(Type::Own {
                 pool,
@@ -2400,6 +3029,7 @@ fn resolve_type(
                 return Some(builtin);
             }
             match namespace.resolve(module, &name.segments)? {
+                ResolvedName::Pool(pool) => Some(Type::PoolArgument(pool)),
                 ResolvedName::Nominal(id) if namespace.nominal_arity(id) == Some(0) => {
                     Some(Type::Nominal {
                         definition: id,
@@ -2469,7 +3099,7 @@ fn unresolved_alias_dependencies(
         missing: &mut bool,
     ) {
         match syntax {
-            TypeSyntax::Unit | TypeSyntax::Infer => {}
+            TypeSyntax::Unit | TypeSyntax::ConstU64(_) | TypeSyntax::Infer => {}
             TypeSyntax::Array(value) => visit(value, module, namespace, dependencies, missing),
             TypeSyntax::FixedArray { element, .. } => {
                 visit(element, module, namespace, dependencies, missing);
@@ -2550,10 +3180,20 @@ fn exposes_private_type(
                     .iter()
                     .any(|argument| exposes_private_type(argument, definitions))
         }
-        Type::Array(value)
-        | Type::FixedArray { element: value, .. }
-        | Type::Own { value, .. }
-        | Type::Option(value) => exposes_private_type(value, definitions),
+        Type::Array(value) | Type::FixedArray { element: value, .. } | Type::Option(value) => {
+            exposes_private_type(value, definitions)
+        }
+        Type::Own { pool, value } => {
+            matches!(
+                pool,
+                PoolTerm::Concrete(pool) if definitions.values().any(|definition| {
+                    definition.pool == Some(*pool) && !definition.public
+                })
+            ) || exposes_private_type(value, definitions)
+        }
+        Type::PoolArgument(pool) => definitions
+            .values()
+            .any(|definition| definition.pool == Some(*pool) && !definition.public),
         Type::Function {
             parameters,
             return_type,
@@ -2579,12 +3219,125 @@ fn exposes_private_type(
     }
 }
 
+fn result_type_well_formed(
+    type_: &Type,
+    allow_omitted_root_error: bool,
+    definitions: &BTreeMap<DefinitionId, DefinitionRecord>,
+) -> bool {
+    fn check(
+        type_: &Type,
+        allow_omitted_error: bool,
+        definitions: &BTreeMap<DefinitionId, DefinitionRecord>,
+    ) -> bool {
+        match type_ {
+            Type::Result { success, error } => {
+                check(success, false, definitions)
+                    && match error.as_deref() {
+                        Some(error @ Type::Nominal { definition, .. })
+                            if definitions.get(definition).is_some_and(|definition| {
+                                matches!(
+                                    definition.kind,
+                                    DeclarationKind::Struct
+                                        | DeclarationKind::ResourceStruct
+                                        | DeclarationKind::Enum
+                                )
+                            }) =>
+                        {
+                            check(error, false, definitions)
+                        }
+                        Some(Type::Parameter { .. }) => true,
+                        Some(_) => false,
+                        None => allow_omitted_error,
+                    }
+            }
+            Type::Array(value)
+            | Type::FixedArray { element: value, .. }
+            | Type::Own { value, .. }
+            | Type::Option(value) => check(value, false, definitions),
+            Type::Tuple(values) => values.iter().all(|value| check(value, false, definitions)),
+            Type::Function {
+                parameters,
+                return_type,
+            } => {
+                parameters
+                    .iter()
+                    .all(|value| check(value, false, definitions))
+                    && check(return_type, false, definitions)
+            }
+            Type::Nominal { arguments, .. } => arguments
+                .iter()
+                .all(|argument| check(argument, false, definitions)),
+            _ => true,
+        }
+    }
+    check(type_, allow_omitted_root_error, definitions)
+}
+
 fn is_resource_type(type_: &Type, definitions: &BTreeMap<DefinitionId, DefinitionRecord>) -> bool {
     contains_resource(type_, &|definition| {
         definitions
             .get(&definition)
             .is_some_and(|definition| definition.kind == DeclarationKind::ResourceStruct)
     })
+}
+
+fn invalid_resource_argument_in_data_nominal(
+    type_: &Type,
+    definitions: &BTreeMap<DefinitionId, DefinitionRecord>,
+) -> bool {
+    match type_ {
+        Type::Nominal {
+            definition,
+            arguments,
+            ..
+        } => {
+            let resource_nominal = definitions
+                .get(definition)
+                .is_some_and(|definition| definition.kind == DeclarationKind::ResourceStruct);
+            (!resource_nominal
+                && arguments
+                    .iter()
+                    .any(|argument| is_resource_type(argument, definitions)))
+                || arguments.iter().any(|argument| {
+                    invalid_resource_argument_in_data_nominal(argument, definitions)
+                })
+        }
+        Type::Array(value) | Type::FixedArray { element: value, .. } | Type::Option(value) => {
+            invalid_resource_argument_in_data_nominal(value, definitions)
+        }
+        Type::Tuple(values) => values
+            .iter()
+            .any(|value| invalid_resource_argument_in_data_nominal(value, definitions)),
+        Type::Function {
+            parameters,
+            return_type,
+        } => {
+            parameters
+                .iter()
+                .any(|value| invalid_resource_argument_in_data_nominal(value, definitions))
+                || invalid_resource_argument_in_data_nominal(return_type, definitions)
+        }
+        Type::Own { value, .. } => invalid_resource_argument_in_data_nominal(value, definitions),
+        Type::Result { success, error } => {
+            invalid_resource_argument_in_data_nominal(success, definitions)
+                || error.as_ref().is_some_and(|error| {
+                    invalid_resource_argument_in_data_nominal(error, definitions)
+                })
+        }
+        Type::Unit
+        | Type::Bool
+        | Type::Integer(_)
+        | Type::Float(_)
+        | Type::Text
+        | Type::Scalar
+        | Type::Bytes
+        | Type::ConstU64(_)
+        | Type::PoolArgument(_)
+        | Type::Any { .. }
+        | Type::Builtin(_)
+        | Type::Parameter { .. }
+        | Type::Infer => false,
+    }
 }
 
 fn solve_function_facts(
@@ -2845,7 +3598,7 @@ fn visit_expression(expression: &Expression, facts: &mut FunctionFacts) {
                         .entry(*specialization)
                         .or_default() += 1;
                 }
-                CallTarget::Build(primitive) => {
+                CallTarget::Build { primitive, .. } => {
                     facts.constructs.insert(primitive.kind);
                 }
                 _ => {}
@@ -2916,7 +3669,7 @@ fn visit_expression(expression: &Expression, facts: &mut FunctionFacts) {
 fn expression_constructs(expression: &Expression) -> bool {
     match &expression.kind {
         ExpressionKind::Call { target, arguments } => {
-            matches!(target, CallTarget::Build(_))
+            matches!(target, CallTarget::Build { .. })
                 || matches!(target, CallTarget::Callable { value } if expression_constructs(value))
                 || arguments.iter().any(expression_constructs)
         }
@@ -3033,6 +3786,7 @@ fn recursive_calls_decrease(
                 | CallTarget::TemplateFunction {
                     definition,
                     argument_order,
+                    ..
                 } if members.contains(definition) => Some((*definition, argument_order)),
                 _ => None,
             };
@@ -3128,13 +3882,13 @@ fn recursive_calls_decrease(
 fn plan_tests(
     program: &VerifiedProgram,
     tests: &[TestRecord],
-    applications: &[TestId],
+    applications: &[AppliedTest],
     range: &SourceRange,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<TestApplicationObservation> {
     let mut counts = BTreeMap::new();
-    for id in applications {
-        *counts.entry(*id).or_insert(0_u32) += 1;
+    for application in applications {
+        *counts.entry(application.id).or_insert(0_u32) += 1;
     }
     let known = tests.iter().map(|test| test.id).collect::<BTreeSet<_>>();
     diagnose_unknown_test_applications(&known, applications, range, diagnostics);
@@ -3165,11 +3919,20 @@ fn plan_tests(
         }
     }
     let mut plan = Vec::new();
-    for (order, id) in applications.iter().enumerate() {
+    for (order, application) in applications.iter().enumerate() {
+        let id = &application.id;
         if counts.get(id) != Some(&1) || !known.contains(id) {
             continue;
         }
         let resolved = program.test(*id).expect("applied Test identity resolves");
+        if resolved.parameters.len() != application.payload.len() {
+            diagnostics.push(Diagnostic::new(
+                "test.binding_arity_mismatch",
+                range.clone(),
+                RecoveryAction::None,
+            ));
+            continue;
+        }
         plan.push(TestApplicationObservation::new(
             resolved.suite.clone(),
             resolved.test.clone(),
@@ -3178,7 +3941,8 @@ fn plan_tests(
             resolved
                 .parameters
                 .iter()
-                .map(|parameter| {
+                .zip(&application.payload)
+                .map(|(parameter, value)| {
                     TestBindingObservation::new(
                         parameter.name.clone(),
                         parameter.type_.display(),
@@ -3188,6 +3952,7 @@ fn plan_tests(
                             OwnershipSyntax::Mut => OwnershipMode::Mut,
                             OwnershipSyntax::Take => OwnershipMode::Take,
                         },
+                        value.clone(),
                     )
                 })
                 .collect(),
@@ -3198,12 +3963,12 @@ fn plan_tests(
 
 fn diagnose_unknown_test_applications(
     known: &BTreeSet<TestId>,
-    applications: &[TestId],
+    applications: &[AppliedTest],
     range: &SourceRange,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    for id in applications {
-        if !known.contains(id) {
+    for application in applications {
+        if !known.contains(&application.id) {
             diagnostics.push(Diagnostic::new(
                 "test.unknown_application",
                 range.clone(),
@@ -3356,7 +4121,10 @@ mod tests {
         let mut diagnostics = Vec::new();
         diagnose_unknown_test_applications(
             &BTreeSet::from([known]),
-            &[unknown],
+            &[AppliedTest {
+                id: unknown,
+                payload: Vec::new(),
+            }],
             &SourceRange::new("src/test.wr", 0, 1),
             &mut diagnostics,
         );

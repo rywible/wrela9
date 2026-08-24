@@ -1,9 +1,12 @@
 #![forbid(unsafe_code)]
 
 mod compiler;
+mod distribution;
+mod error_flow;
 mod evaluator;
 mod graph;
 mod identity;
+mod image_evaluation;
 mod model;
 mod semantic;
 mod syntax;
@@ -18,8 +21,8 @@ pub use compiler::{
     EvaluationReceipt, EvaluationRejectionKind, FunctionFactsObservation, HostFailure,
     IdentityDomain, IdentityObservation, IdentityOrigin, InferredErrorObservation,
     InspectSelection, Inspection, OpenError, OwnershipMode, OwnershipObservation, ProjectFile,
-    ProjectSnapshot, RecoveryAction, RejectedCompilation, Root, SourceRange,
-    SpecializationObservation, SyntaxElement, SyntaxElementKind, SyntaxErrorKind,
+    ProjectSnapshot, RecoveryAction, RejectedCompilation, Root, SnapshotDigestMismatch,
+    SourceRange, SpecializationObservation, SyntaxElement, SyntaxElementKind, SyntaxErrorKind,
     SyntaxInvalidKind, SyntaxLayoutKind, SyntaxMissingKind, SyntaxNodeKind, SyntaxNodeObservation,
     SyntaxObservation, SyntaxTokenKind, SyntaxTriviaKind, TestApplicationObservation,
     TestBindingObservation, TypeObservation, TypeRole,

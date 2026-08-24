@@ -5,25 +5,26 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use xxhash_rust::xxh3::Xxh3;
+
 use crate::syntax;
+use crate::typed_hir::AuthorityContext;
 use crate::{
+    distribution::CompilerDistribution,
     identity,
     identity::{IdentityCollision, IdentityFailure},
     semantic,
-    typed_hir::BuildAuthority,
 };
 
 #[derive(Clone, Debug)]
 pub struct CompilerInstallation {
-    authenticated_modules: Arc<[ProjectFile]>,
-    build_authority: BuildAuthority,
+    pub(crate) authenticated_modules: Arc<[ProjectFile]>,
 }
 
 impl Default for CompilerInstallation {
     fn default() -> Self {
         Self {
             authenticated_modules: Arc::from([]),
-            build_authority: BuildAuthority::compiler_distribution(),
         }
     }
 }
@@ -35,12 +36,44 @@ impl CompilerInstallation {
     }
 
     #[must_use]
-    pub fn with_authenticated_modules(modules: Vec<ProjectFile>) -> Self {
+    pub fn with_authenticated_modules(mut modules: Vec<ProjectFile>) -> Self {
+        modules.push(layer1_build_module());
+        modules.push(layer1_pool_module());
         Self {
             authenticated_modules: modules.into(),
-            build_authority: BuildAuthority::compiler_distribution(),
         }
     }
+
+    #[must_use]
+    pub fn layer1() -> Self {
+        Self::with_authenticated_modules(Vec::new())
+    }
+}
+
+fn layer1_build_module() -> ProjectFile {
+    ProjectFile::new(
+        "src/core/build.wr",
+        br#"pub struct Image:
+    pub pure fn new() -> Image:
+        panic "sealed Image constructor"
+
+pub struct Test:
+    pub pure fn new(cases: [TestApplication]) -> Test:
+        panic "sealed Test constructor"
+"#,
+    )
+}
+
+fn layer1_pool_module() -> ProjectFile {
+    ProjectFile::new(
+        "src/core/pool.wr",
+        br#"pub resource struct Scope:
+    capacity: u64
+
+pub pure fn scoped(capacity: u64) -> Scope:
+    return Scope(capacity=capacity)
+"#,
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,17 +106,82 @@ impl ProjectFile {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectSnapshot {
     files: Arc<[ProjectFile]>,
+    revision: Arc<str>,
+    digest: u128,
 }
 
 impl ProjectSnapshot {
     #[must_use]
     pub fn new(files: Vec<ProjectFile>) -> Self {
+        let digest = project_snapshot_digest(&files);
         Self {
             files: files.into(),
+            revision: format!("snapshot-{digest:032x}").into(),
+            digest,
         }
+    }
+
+    #[must_use]
+    pub fn with_revision(files: Vec<ProjectFile>, revision: impl Into<Arc<str>>) -> Self {
+        let digest = project_snapshot_digest(&files);
+        Self {
+            files: files.into(),
+            revision: revision.into(),
+            digest,
+        }
+    }
+
+    pub fn verified(
+        files: Vec<ProjectFile>,
+        revision: impl Into<Arc<str>>,
+        expected_digest: u128,
+    ) -> Result<Self, SnapshotDigestMismatch> {
+        let snapshot = Self::with_revision(files, revision);
+        if snapshot.digest == expected_digest {
+            Ok(snapshot)
+        } else {
+            Err(SnapshotDigestMismatch {
+                expected: expected_digest,
+                actual: snapshot.digest,
+            })
+        }
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    #[must_use]
+    pub const fn digest(&self) -> u128 {
+        self.digest
+    }
+}
+
+impl Default for ProjectSnapshot {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotDigestMismatch {
+    expected: u128,
+    actual: u128,
+}
+
+impl SnapshotDigestMismatch {
+    #[must_use]
+    pub const fn expected(&self) -> u128 {
+        self.expected
+    }
+
+    #[must_use]
+    pub const fn actual(&self) -> u128 {
+        self.actual
     }
 }
 
@@ -393,12 +491,21 @@ pub enum SyntaxTokenKind {
     IntegerLiteral,
     FloatLiteral,
     TextLiteral,
+    ScalarLiteral,
+    BytesLiteral,
     Fn,
     Pub,
     Pure,
     Async,
+    Any,
     Return,
+    Break,
+    Case,
+    Continue,
+    Defer,
+    For,
     If,
+    Elif,
     Else,
     Const,
     Struct,
@@ -414,7 +521,14 @@ pub enum SyntaxTokenKind {
     As,
     Comptime,
     Assert,
+    In,
+    Is,
+    Match,
+    And,
+    Or,
+    Not,
     Await,
+    Own,
     Panic,
     Pass,
     Take,
@@ -423,6 +537,10 @@ pub enum SyntaxTokenKind {
     SelfValue,
     Implements,
     Expect,
+    Send,
+    TrySend,
+    While,
+    With,
     True,
     False,
     LeftParen,
@@ -446,6 +564,15 @@ pub enum SyntaxTokenKind {
     Star,
     Slash,
     Percent,
+    Ampersand,
+    Pipe,
+    Caret,
+    Tilde,
+    ShiftLeft,
+    ShiftRight,
+    Range,
+    RangeInclusive,
+    Semicolon,
     Question,
     Invalid,
 }
@@ -559,12 +686,21 @@ impl SyntaxTokenKind {
             Self::IntegerLiteral => "integer_literal",
             Self::FloatLiteral => "float_literal",
             Self::TextLiteral => "text_literal",
+            Self::ScalarLiteral => "scalar_literal",
+            Self::BytesLiteral => "bytes_literal",
             Self::Fn => "fn",
             Self::Pub => "pub",
             Self::Pure => "pure",
             Self::Async => "async",
+            Self::Any => "any",
             Self::Return => "return",
+            Self::Break => "break",
+            Self::Case => "case",
+            Self::Continue => "continue",
+            Self::Defer => "defer",
+            Self::For => "for",
             Self::If => "if",
+            Self::Elif => "elif",
             Self::Else => "else",
             Self::Const => "const",
             Self::Struct => "struct",
@@ -580,7 +716,14 @@ impl SyntaxTokenKind {
             Self::As => "as",
             Self::Comptime => "comptime",
             Self::Assert => "assert",
+            Self::In => "in",
+            Self::Is => "is",
+            Self::Match => "match",
+            Self::And => "and",
+            Self::Or => "or",
+            Self::Not => "not",
             Self::Await => "await",
+            Self::Own => "own",
             Self::Panic => "panic",
             Self::Pass => "pass",
             Self::Take => "take",
@@ -589,6 +732,10 @@ impl SyntaxTokenKind {
             Self::SelfValue => "self",
             Self::Implements => "implements",
             Self::Expect => "expect",
+            Self::Send => "send",
+            Self::TrySend => "try_send",
+            Self::While => "while",
+            Self::With => "with",
             Self::True => "true",
             Self::False => "false",
             Self::LeftParen => "left_paren",
@@ -612,6 +759,15 @@ impl SyntaxTokenKind {
             Self::Star => "star",
             Self::Slash => "slash",
             Self::Percent => "percent",
+            Self::Ampersand => "ampersand",
+            Self::Pipe => "pipe",
+            Self::Caret => "caret",
+            Self::Tilde => "tilde",
+            Self::ShiftLeft => "shift_left",
+            Self::ShiftRight => "shift_right",
+            Self::Range => "range",
+            Self::RangeInclusive => "range_inclusive",
+            Self::Semicolon => "semicolon",
             Self::Question => "question",
             Self::Invalid => "invalid",
         }
@@ -693,23 +849,52 @@ pub enum SyntaxNodeKind {
     FunctionRequirement,
     ReturnStatement,
     PanicStatement,
+    AssertStatement,
     ExpectStatement,
     InitializeStatement,
     ExpressionStatement,
     IfStatement,
+    ComptimeSelection,
+    ComptimeBranch,
+    MatchStatement,
+    MatchCase,
+    ForStatement,
+    WhileStatement,
+    BreakStatement,
+    ContinueStatement,
+    DeferStatement,
+    WithStatement,
+    TakeStatement,
+    SendStatement,
+    TrySendStatement,
     PassStatement,
     IntegerExpression,
     FloatExpression,
     TextExpression,
+    ScalarExpression,
+    BytesExpression,
     BoolExpression,
     NameExpression,
     CallExpression,
     ArrayExpression,
+    TupleExpression,
+    IndexExpression,
     UnitExpression,
+    PositiveExpression,
     NegateExpression,
+    BitNotExpression,
+    NotExpression,
     AwaitExpression,
+    MutExpression,
     PropagateExpression,
     BinaryExpression,
+    RangeExpression,
+    IsExpression,
+    ClosureExpression,
+    RepeatedArrayExpression,
+    TakeExpression,
+    SendExpression,
+    TrySendExpression,
 }
 
 impl SyntaxNodeObservation {
@@ -735,6 +920,11 @@ impl SyntaxNodeObservation {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Inspection {
+    distribution_version: Arc<str>,
+    distribution_digest: u128,
+    project_revision: Arc<str>,
+    snapshot_digest: u128,
+    semantic_closure_digest: Option<u128>,
     syntax: Arc<[SyntaxObservation]>,
     closure: Arc<[Arc<str>]>,
     identities: Arc<[IdentityObservation]>,
@@ -749,6 +939,31 @@ pub struct Inspection {
 }
 
 impl Inspection {
+    #[must_use]
+    pub fn distribution_version(&self) -> &str {
+        &self.distribution_version
+    }
+
+    #[must_use]
+    pub const fn distribution_digest(&self) -> u128 {
+        self.distribution_digest
+    }
+
+    #[must_use]
+    pub fn project_revision(&self) -> &str {
+        &self.project_revision
+    }
+
+    #[must_use]
+    pub const fn snapshot_digest(&self) -> u128 {
+        self.snapshot_digest
+    }
+
+    #[must_use]
+    pub const fn semantic_closure_digest(&self) -> Option<u128> {
+        self.semantic_closure_digest
+    }
+
     #[must_use]
     pub fn syntax(&self) -> Option<&[SyntaxObservation]> {
         (!self.syntax.is_empty()).then_some(&self.syntax)
@@ -903,6 +1118,15 @@ pub enum CanonicalValue {
         bits: u64,
     },
     Text(Arc<str>),
+    Scalar(char),
+    Bytes(Arc<[u8]>),
+    Function {
+        identity: u128,
+    },
+    Closure {
+        identity: u128,
+        captures: Arc<[CanonicalValue]>,
+    },
     Tuple(Arc<[CanonicalValue]>),
     Array(Arc<[CanonicalValue]>),
     Variant {
@@ -982,8 +1206,10 @@ impl EvaluationRejectionKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvaluationPanicKind {
     Explicit,
+    AssertionFailed,
     IntegerOverflow,
     DivisionByZero,
+    IndexOutOfBounds,
 }
 
 impl EvaluationPanicKind {
@@ -991,8 +1217,10 @@ impl EvaluationPanicKind {
     pub const fn code(self) -> &'static str {
         match self {
             Self::Explicit => "explicit",
+            Self::AssertionFailed => "assertion_failed",
             Self::IntegerOverflow => "integer_overflow",
             Self::DivisionByZero => "division_by_zero",
+            Self::IndexOutOfBounds => "index_out_of_bounds",
         }
     }
 }
@@ -1431,6 +1659,7 @@ impl ConstructionObservation {
 pub enum ConstructionKind {
     Image,
     Test,
+    Node { type_identity: u128 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1458,7 +1687,6 @@ pub struct IdentityObservation {
     domain: IdentityDomain,
     origin: IdentityOrigin,
     name: Arc<str>,
-    canonical_key: Arc<[u8]>,
     digest: u128,
     fingerprint: u128,
 }
@@ -1468,7 +1696,6 @@ impl IdentityObservation {
         domain: IdentityDomain,
         origin: IdentityOrigin,
         name: impl Into<Arc<str>>,
-        canonical_key: Arc<[u8]>,
         digest: u128,
         fingerprint: u128,
     ) -> Self {
@@ -1476,7 +1703,6 @@ impl IdentityObservation {
             domain,
             origin,
             name: name.into(),
-            canonical_key,
             digest,
             fingerprint,
         }
@@ -1495,10 +1721,6 @@ impl IdentityObservation {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    pub(crate) fn canonical_key_bytes(&self) -> &[u8] {
-        &self.canonical_key
     }
 
     #[must_use]
@@ -1600,33 +1822,47 @@ pub enum CompilationOutcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpenError {
-    DuplicateAuthenticatedModule { path: Arc<str> },
-    InvalidAuthenticatedModulePath { path: Arc<str> },
+    DuplicateAuthenticatedModule {
+        path: Arc<str>,
+    },
+    InvalidAuthenticatedModulePath {
+        path: Arc<str>,
+    },
+    MalformedAuthenticatedModule {
+        path: Arc<str>,
+        code: Arc<str>,
+    },
+    InvalidAuthenticatedModule {
+        path: Arc<str>,
+        code: Arc<str>,
+    },
+    AuthenticatedIdentityCollision {
+        digest: u128,
+    },
+    AuthenticatedModuleDefect {
+        phase: Arc<str>,
+        evidence: Arc<str>,
+    },
+    MissingAuthenticatedDependency {
+        path: Arc<str>,
+        dependency: Arc<str>,
+    },
+    AuthenticatedImportCycle {
+        path: Arc<str>,
+    },
 }
 
 #[derive(Debug)]
 pub struct Compiler {
-    installation: Arc<CompilerInstallation>,
+    distribution: Arc<CompilerDistribution>,
     poisoned: AtomicBool,
 }
 
 impl Compiler {
     pub fn open(installation: CompilerInstallation) -> Result<Self, OpenError> {
-        let mut paths = BTreeSet::new();
-        for module in &*installation.authenticated_modules {
-            if !valid_module_path(module.path(), false) {
-                return Err(OpenError::InvalidAuthenticatedModulePath {
-                    path: Arc::clone(&module.path),
-                });
-            }
-            if !paths.insert(Arc::clone(&module.path)) {
-                return Err(OpenError::DuplicateAuthenticatedModule {
-                    path: Arc::clone(&module.path),
-                });
-            }
-        }
+        let distribution = CompilerDistribution::seal(installation)?;
         Ok(Self {
-            installation: Arc::new(installation),
+            distribution: Arc::new(distribution),
             poisoned: AtomicBool::new(false),
         })
     }
@@ -1667,7 +1903,6 @@ impl Compiler {
         request: &CompilationRequest,
         cancellation: &Cancellation,
     ) -> CompilationOutcome {
-        let _sealed_distribution = &self.installation;
         let mut files = BTreeMap::new();
         let mut diagnostics = Vec::new();
         let mut project_files = request.project.files.iter().collect::<Vec<_>>();
@@ -1698,7 +1933,7 @@ impl Compiler {
             }
         }
         let mut authenticated_paths = BTreeSet::new();
-        for module in &*self.installation.authenticated_modules {
+        for module in self.distribution.modules() {
             if files.contains_key(module.path()) {
                 diagnostics.push(Diagnostic::new(
                     "project.authenticated_module_shadow",
@@ -1717,9 +1952,29 @@ impl Compiler {
                 SourceRange::new(request.root.path(), 0, 0),
                 RecoveryAction::None,
             ));
+            let syntax = if request.inspection.syntax {
+                let Some(syntax) = parse_unreachable_project_syntax(
+                    &request.project,
+                    &BTreeMap::new(),
+                    &files,
+                    cancellation,
+                ) else {
+                    return CompilationOutcome::Cancelled;
+                };
+                syntax.into()
+            } else {
+                Arc::from([])
+            };
             return CompilationOutcome::Rejected(RejectedCompilation {
                 diagnostics: diagnostics.into(),
-                inspection: Inspection::default(),
+                inspection: Inspection {
+                    distribution_version: Arc::from(self.distribution.version()),
+                    distribution_digest: self.distribution.digest(),
+                    project_revision: Arc::clone(&request.project.revision),
+                    snapshot_digest: request.project.digest,
+                    syntax,
+                    ..Inspection::default()
+                },
             });
         };
 
@@ -1743,12 +1998,6 @@ impl Compiler {
                 {
                     diagnostics.push(Diagnostic::new(
                         "project.authenticated_imports_project_module",
-                        import.range.clone(),
-                        RecoveryAction::None,
-                    ));
-                } else if matches!(import.target_path.as_str(), "src/image.wr" | "src/test.wr") {
-                    diagnostics.push(Diagnostic::new(
-                        "project.root_not_importable",
                         import.range.clone(),
                         RecoveryAction::None,
                     ));
@@ -1782,6 +2031,34 @@ impl Compiler {
                 .then(left.primary.start.cmp(&right.primary.start))
                 .then(left.code.cmp(&right.code))
         });
+        if diagnostics.is_empty() {
+            match semantic::select_comptime_declarations(
+                &mut parsed_sources,
+                &files,
+                &authenticated_paths,
+                request.root,
+                cancellation,
+                self.distribution.build_authority(),
+                self.distribution.pool_authority(),
+            ) {
+                Ok(()) => {}
+                Err(semantic::SelectionFailure::Diagnostic(diagnostic)) => {
+                    diagnostics.push(diagnostic);
+                }
+                Err(semantic::SelectionFailure::Defect(defect)) => {
+                    return CompilationOutcome::Defect(defect);
+                }
+                Err(semantic::SelectionFailure::Cancelled) => {
+                    return CompilationOutcome::Cancelled;
+                }
+            }
+        }
+        let semantic_closure_digest = closure_digest(
+            &parsed_sources,
+            &files,
+            &authenticated_paths,
+            self.distribution.digest(),
+        );
 
         let mut identity_catalog = match identity::catalog(
             &parsed_sources,
@@ -1813,7 +2090,10 @@ impl Compiler {
             request.root,
             cancellation,
             front_end_clean,
-            &self.installation.build_authority,
+            AuthorityContext::new(
+                self.distribution.build_authority(),
+                self.distribution.pool_authority(),
+            ),
         );
         if analysis.cancelled {
             return CompilationOutcome::Cancelled;
@@ -1830,9 +2110,28 @@ impl Compiler {
                 .then(left.code.cmp(&right.code))
         });
 
+        let unreachable_project_syntax = if request.inspection.syntax {
+            let Some(syntax) = parse_unreachable_project_syntax(
+                &request.project,
+                &parsed_sources,
+                &files,
+                cancellation,
+            ) else {
+                return CompilationOutcome::Cancelled;
+            };
+            syntax
+        } else {
+            Vec::new()
+        };
+
         let inspection = Inspection {
+            distribution_version: Arc::from(self.distribution.version()),
+            distribution_digest: self.distribution.digest(),
+            project_revision: Arc::clone(&request.project.revision),
+            snapshot_digest: request.project.digest,
+            semantic_closure_digest: Some(semantic_closure_digest),
             syntax: if request.inspection.syntax {
-                parsed_sources
+                let mut syntax = parsed_sources
                     .iter()
                     .map(|(path, parsed)| {
                         SyntaxObservation::new(
@@ -1841,8 +2140,14 @@ impl Compiler {
                             parsed.node_observations(),
                         )
                     })
-                    .collect::<Vec<_>>()
-                    .into()
+                    .chain(unreachable_project_syntax)
+                    .collect::<Vec<_>>();
+                syntax.sort_by(|left, right| {
+                    left.path()
+                        .cmp(right.path())
+                        .then(left.source_bytes().cmp(right.source_bytes()))
+                });
+                syntax.into()
             } else {
                 Arc::from([])
             },
@@ -1856,7 +2161,7 @@ impl Compiler {
                 Arc::from([])
             },
             identities: if request.inspection.identities {
-                identity_catalog.observations().to_vec().into()
+                identity_catalog.project_observations().into()
             } else {
                 Arc::from([])
             },
@@ -1916,6 +2221,38 @@ impl Compiler {
     }
 }
 
+fn parse_unreachable_project_syntax(
+    project: &ProjectSnapshot,
+    parsed_sources: &BTreeMap<String, syntax::ParsedSource>,
+    selected_files: &BTreeMap<&str, &ProjectFile>,
+    cancellation: &Cancellation,
+) -> Option<Vec<SyntaxObservation>> {
+    let mut project_files = project.files.iter().collect::<Vec<_>>();
+    project_files.sort_by(|left, right| {
+        left.path()
+            .cmp(right.path())
+            .then(left.bytes().cmp(right.bytes()))
+    });
+
+    let mut observations = Vec::new();
+    for file in project_files {
+        let is_reachable_file = parsed_sources.contains_key(file.path())
+            && selected_files
+                .get(file.path())
+                .is_some_and(|selected| std::ptr::eq(*selected, file));
+        if is_reachable_file {
+            continue;
+        }
+        let parsed = syntax::parse(file, cancellation);
+        if parsed.cancelled {
+            return None;
+        }
+        let nodes = parsed.node_observations();
+        observations.push(SyntaxObservation::new(file, parsed.elements, nodes));
+    }
+    Some(observations)
+}
+
 fn import_cycle(parsed_sources: &BTreeMap<String, syntax::ParsedSource>) -> Option<SourceRange> {
     let paths = parsed_sources.keys().cloned().collect::<Vec<_>>();
     let indexes = paths
@@ -1961,7 +2298,7 @@ fn import_cycle(parsed_sources: &BTreeMap<String, syntax::ParsedSource>) -> Opti
     })
 }
 
-fn valid_module_path(path: &str, project: bool) -> bool {
+pub(crate) fn valid_module_path(path: &str, project: bool) -> bool {
     let Some(relative) = path.strip_prefix("src/") else {
         return false;
     };
@@ -1983,6 +2320,44 @@ fn valid_module_path(path: &str, project: bool) -> bool {
     [first].into_iter().chain(rest).all(valid_path_segment)
 }
 
+fn project_snapshot_digest(files: &[ProjectFile]) -> u128 {
+    let mut files = files.iter().collect::<Vec<_>>();
+    files.sort_by(|left, right| {
+        left.path()
+            .cmp(right.path())
+            .then(left.bytes().cmp(right.bytes()))
+    });
+    let mut hasher = Xxh3::new();
+    hasher.update(b"wrela.project-snapshot\0\x01");
+    for file in files {
+        hash_digest_part(&mut hasher, file.path().as_bytes());
+        hash_digest_part(&mut hasher, file.bytes());
+    }
+    hasher.digest128()
+}
+
+fn closure_digest<'a>(
+    parsed_sources: &BTreeMap<String, syntax::ParsedSource>,
+    files: &BTreeMap<&'a str, &'a ProjectFile>,
+    authenticated_paths: &BTreeSet<&str>,
+    distribution_digest: u128,
+) -> u128 {
+    let mut hasher = Xxh3::new();
+    hasher.update(b"wrela.semantic-closure\0\x01");
+    hasher.update(&distribution_digest.to_be_bytes());
+    for path in parsed_sources.keys() {
+        hasher.update(&[u8::from(authenticated_paths.contains(path.as_str()))]);
+        hash_digest_part(&mut hasher, path.as_bytes());
+        hash_digest_part(&mut hasher, files[path.as_str()].bytes());
+    }
+    hasher.digest128()
+}
+
+fn hash_digest_part(hasher: &mut Xxh3, bytes: &[u8]) {
+    hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(bytes);
+}
+
 fn valid_path_segment(segment: &str) -> bool {
     let mut bytes = segment.bytes();
     matches!(bytes.next(), Some(b'a'..=b'z'))
@@ -1995,7 +2370,7 @@ mod tests {
 
     #[test]
     fn unexpected_panics_poison_the_compiler_instance() {
-        let compiler = Compiler::open(CompilerInstallation::empty()).expect("installation opens");
+        let compiler = Compiler::open(CompilerInstallation::layer1()).expect("installation opens");
         assert!(matches!(
             compiler.contain(|| panic!("injected private invariant failure")),
             CompilationOutcome::Defect(_)

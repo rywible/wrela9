@@ -9,7 +9,7 @@ if ! cargo test --workspace --all-targets --all-features --no-run >/dev/null; th
     echo "Failed: the Regression Case build failed during Check setup."
     exit 1
 fi
-if ! cargo clippy --workspace --all-targets --all-features -- -A warnings >/dev/null; then
+if ! cargo clippy --workspace --all-targets --all-features -- -D warnings >/dev/null; then
     echo "Failed: the static-validation build failed during Check setup."
     exit 1
 fi

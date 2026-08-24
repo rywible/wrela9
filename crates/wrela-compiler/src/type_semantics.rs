@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use crate::model::Type;
+use crate::model::{DefinitionId, Type};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LabelMode {
@@ -103,6 +103,83 @@ pub(crate) fn can_unify(actual: &Type, expected: &Type) -> bool {
         }
         (Type::Array(actual), Type::Array(expected))
         | (Type::Option(actual), Type::Option(expected)) => can_unify(actual, expected),
+        (
+            Type::FixedArray {
+                element: actual, ..
+            },
+            Type::Array(expected),
+        )
+        | (
+            Type::Array(actual),
+            Type::FixedArray {
+                element: expected, ..
+            },
+        ) => can_unify(actual, expected),
+        (
+            Type::FixedArray {
+                element: actual,
+                length: actual_length,
+            },
+            Type::FixedArray {
+                element: expected,
+                length: expected_length,
+            },
+        ) => actual_length == expected_length && can_unify(actual, expected),
+        (
+            Type::Function {
+                parameters: actual_parameters,
+                return_type: actual_return,
+            },
+            Type::Function {
+                parameters: expected_parameters,
+                return_type: expected_return,
+            },
+        ) => {
+            actual_parameters.len() == expected_parameters.len()
+                && actual_parameters
+                    .iter()
+                    .zip(expected_parameters.iter())
+                    .all(|(actual, expected)| can_unify(actual, expected))
+                && can_unify(actual_return, expected_return)
+        }
+        (
+            Type::Own {
+                pool: actual_pool,
+                value: actual,
+            },
+            Type::Own {
+                pool: expected_pool,
+                value: expected,
+            },
+        ) => actual_pool == expected_pool && can_unify(actual, expected),
+        (
+            Type::Any {
+                interface: actual, ..
+            },
+            Type::Any {
+                interface: expected,
+                ..
+            },
+        ) => actual == expected,
+        (
+            Type::Nominal {
+                definition: actual_definition,
+                arguments: actual_arguments,
+                ..
+            },
+            Type::Nominal {
+                definition: expected_definition,
+                arguments: expected_arguments,
+                ..
+            },
+        ) => {
+            actual_definition == expected_definition
+                && actual_arguments.len() == expected_arguments.len()
+                && actual_arguments
+                    .iter()
+                    .zip(expected_arguments.iter())
+                    .all(|(actual, expected)| can_unify(actual, expected))
+        }
         (Type::Tuple(actual), Type::Tuple(expected)) => {
             actual.len() == expected.len()
                 && actual
@@ -130,4 +207,49 @@ pub(crate) fn can_pass(actual: &Type, expected: &Type) -> bool {
 pub(crate) fn can_return(actual: &Type, expected: &Type) -> bool {
     can_unify(actual, expected)
         || matches!(expected, Type::Result { success, .. } if can_unify(actual, success))
+}
+
+/// Whether a value of this type transitively owns a Resource. Nominal
+/// classification remains catalog-owned; structural recursion has one meaning.
+pub(crate) fn contains_resource(
+    type_: &Type,
+    nominal_is_resource: &impl Fn(DefinitionId) -> bool,
+) -> bool {
+    match type_ {
+        Type::Own { .. } => true,
+        Type::Nominal {
+            definition,
+            arguments,
+            ..
+        } => {
+            nominal_is_resource(*definition)
+                || arguments
+                    .iter()
+                    .any(|argument| contains_resource(argument, nominal_is_resource))
+        }
+        Type::Array(value) | Type::FixedArray { element: value, .. } | Type::Option(value) => {
+            contains_resource(value, nominal_is_resource)
+        }
+        Type::Tuple(values) => values
+            .iter()
+            .any(|value| contains_resource(value, nominal_is_resource)),
+        Type::Result { success, error } => {
+            contains_resource(success, nominal_is_resource)
+                || error
+                    .as_ref()
+                    .is_some_and(|error| contains_resource(error, nominal_is_resource))
+        }
+        Type::Function { .. }
+        | Type::Any { .. }
+        | Type::Unit
+        | Type::Bool
+        | Type::Integer(_)
+        | Type::Float(_)
+        | Type::Text
+        | Type::Scalar
+        | Type::Bytes
+        | Type::Builtin(_)
+        | Type::Parameter { .. }
+        | Type::Infer => false,
+    }
 }

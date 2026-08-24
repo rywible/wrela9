@@ -26,7 +26,8 @@ pub(crate) enum IdentityFailure {
 
 #[derive(Clone, Debug)]
 pub(crate) struct IdentityCatalog {
-    observations: Vec<IdentityObservation>,
+    records: Vec<IdentityRecord>,
+    specialization_records: BTreeMap<SpecializationId, usize>,
     observation_keys: BTreeSet<Arc<[u8]>>,
     modules: BTreeMap<String, ModuleId>,
     definitions: BTreeMap<(String, DeclarationKind, String), DefinitionId>,
@@ -39,11 +40,24 @@ pub(crate) struct IdentityCatalog {
     full_keys: BTreeMap<u128, Arc<[u8]>>,
 }
 
+#[derive(Clone, Debug)]
+struct IdentityRecord {
+    observation: IdentityObservation,
+    canonical_key: Arc<[u8]>,
+}
+
+impl IdentityRecord {
+    fn digest(&self) -> u128 {
+        self.observation.digest()
+    }
+}
+
 impl IdentityCatalog {
     #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self {
-            observations: Vec::new(),
+            records: Vec::new(),
+            specialization_records: BTreeMap::new(),
             observation_keys: BTreeSet::new(),
             modules: BTreeMap::new(),
             definitions: BTreeMap::new(),
@@ -57,23 +71,27 @@ impl IdentityCatalog {
         }
     }
 
-    pub(crate) fn observations(&self) -> &[IdentityObservation] {
-        &self.observations
+    pub(crate) fn project_observations(&self) -> Vec<IdentityObservation> {
+        self.records
+            .iter()
+            .map(|record| record.observation.clone())
+            .collect()
     }
 
     pub(crate) fn revision_fingerprint(&self) -> u128 {
         let mut hasher = Xxh3::new();
         hasher.update(b"wrela.identity-catalog-revision\0\x01");
-        for observation in &self.observations {
-            hash_part(&mut hasher, observation.canonical_key_bytes());
-            hasher.update(&observation.fingerprint().to_be_bytes());
+        for record in &self.records {
+            hash_part(&mut hasher, &record.canonical_key);
+            hasher.update(&record.observation.fingerprint().to_be_bytes());
         }
         hasher.digest128()
     }
 
     pub(crate) fn finalize(&mut self) {
-        self.observations
-            .sort_by(|left, right| left.canonical_key_bytes().cmp(right.canonical_key_bytes()));
+        self.records
+            .sort_by(|left, right| left.canonical_key.cmp(&right.canonical_key));
+        self.rebuild_specialization_index();
     }
 
     pub(crate) fn set_specialization_fingerprint(
@@ -81,20 +99,38 @@ impl IdentityCatalog {
         id: SpecializationId,
         fingerprint: u128,
     ) -> bool {
-        let Some(observation) = self.observations.iter_mut().find(|observation| {
-            observation.domain() == IdentityDomain::Specialization && observation.digest() == id.0
-        }) else {
+        let Some(index) = self.specialization_records.get(&id).copied() else {
             return false;
         };
-        observation.replace_fingerprint(fingerprint);
+        let record = &mut self.records[index];
+        record.observation.replace_fingerprint(fingerprint);
         true
     }
 
-    fn push_observation(&mut self, observation: IdentityObservation) {
-        let key = Arc::<[u8]>::from(observation.canonical_key_bytes());
-        if self.observation_keys.insert(key) {
-            self.observations.push(observation);
+    fn push_record(&mut self, record: IdentityRecord) {
+        if self
+            .observation_keys
+            .insert(Arc::clone(&record.canonical_key))
+        {
+            if record.observation.domain() == IdentityDomain::Specialization {
+                self.specialization_records.insert(
+                    SpecializationId(record.observation.digest()),
+                    self.records.len(),
+                );
+            }
+            self.records.push(record);
         }
+    }
+
+    fn rebuild_specialization_index(&mut self) {
+        self.specialization_records.clear();
+        self.specialization_records.extend(
+            self.records
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| record.observation.domain() == IdentityDomain::Specialization)
+                .map(|(index, record)| (SpecializationId(record.observation.digest()), index)),
+        );
     }
 
     pub(crate) fn module(&self, path: &str) -> Option<ModuleId> {
@@ -134,7 +170,10 @@ impl IdentityCatalog {
 
     pub(crate) fn intern_type(&mut self, type_: &Type) -> Result<TypeId, IdentityCollision> {
         match type_ {
-            Type::Array(element) | Type::Option(element) => {
+            Type::Array(element)
+            | Type::FixedArray { element, .. }
+            | Type::Own { value: element, .. }
+            | Type::Option(element) => {
                 self.intern_type(element)?;
             }
             Type::Tuple(members) => {
@@ -148,14 +187,29 @@ impl IdentityCatalog {
                     self.intern_type(error)?;
                 }
             }
+            Type::Function {
+                parameters,
+                return_type,
+            } => {
+                for parameter in &**parameters {
+                    self.intern_type(parameter)?;
+                }
+                self.intern_type(return_type)?;
+            }
+            Type::Nominal { arguments, .. } => {
+                for argument in &**arguments {
+                    self.intern_type(argument)?;
+                }
+            }
             Type::Unit
             | Type::Bool
             | Type::Integer(_)
             | Type::Float(_)
             | Type::Text
+            | Type::Scalar
             | Type::Bytes
             | Type::Builtin(_)
-            | Type::Nominal { .. }
+            | Type::Any { .. }
             | Type::Parameter { .. }
             | Type::Infer => {}
         }
@@ -163,7 +217,13 @@ impl IdentityCatalog {
         if let Some(id) = self.interned_types.get(&type_key) {
             return Ok(*id);
         }
-        if let Type::Nominal { definition, .. } = type_ {
+        if let Type::Nominal {
+            definition,
+            arguments,
+            ..
+        } = type_
+            && arguments.is_empty()
+        {
             let id = self
                 .types
                 .get(definition)
@@ -192,7 +252,7 @@ impl IdentityCatalog {
         )?;
         let id = TypeId(observation.digest());
         self.interned_types.insert(type_key, id);
-        self.push_observation(observation);
+        self.push_record(observation);
         Ok(id)
     }
 
@@ -244,7 +304,7 @@ impl IdentityCatalog {
             &mut self.full_keys,
         )?;
         let id = SpecializationId(observation.digest());
-        self.push_observation(observation);
+        self.push_record(observation);
         Ok(id)
     }
 }
@@ -274,7 +334,7 @@ fn catalog_with_hasher<'a, F>(
 where
     F: Fn(&[u8]) -> u128,
 {
-    let mut observations = Vec::new();
+    let mut records = Vec::new();
     let mut modules = BTreeMap::new();
     let mut definitions = BTreeMap::new();
     let mut associated_functions = BTreeMap::new();
@@ -305,7 +365,7 @@ where
         .map_err(IdentityFailure::Collision)?;
         let module_id = ModuleId(module_observation.digest());
         modules.insert(path.clone(), module_id);
-        observations.push(module_observation);
+        records.push(module_observation);
 
         for declaration in &parsed.declarations {
             if cancellation.is_cancelled() {
@@ -339,8 +399,8 @@ where
                 (path.clone(), declaration.kind, declaration.name.clone()),
                 definition_id,
             );
-            observations.push(definition_observation);
-            observations.push(
+            records.push(definition_observation);
+            records.push(
                 intern(
                     IdentityDomain::SourceSite,
                     origin,
@@ -388,7 +448,7 @@ where
                     }
                     _ => unreachable!("declaration extra identity domain is closed"),
                 }
-                observations.push(observation);
+                records.push(observation);
             }
             if let Some(DeclarationSyntax::Suite(suite)) = &declaration.syntax {
                 for test in &suite.tests {
@@ -416,7 +476,7 @@ where
                     )
                     .map_err(IdentityFailure::Collision)?;
                     let test_definition_id = DefinitionId(nested_definition.digest());
-                    observations.push(nested_definition);
+                    records.push(nested_definition);
                     let observation = intern(
                         IdentityDomain::Test,
                         origin,
@@ -442,7 +502,7 @@ where
                             identity: observation.digest(),
                         },
                     );
-                    observations.push(observation);
+                    records.push(observation);
                 }
             }
             if let Some(DeclarationSyntax::Enum(enum_)) = &declaration.syntax {
@@ -471,7 +531,7 @@ where
                     )
                     .map_err(IdentityFailure::Collision)?;
                     let variant_definition = DefinitionId(nested_definition.digest());
-                    observations.push(nested_definition);
+                    records.push(nested_definition);
                     let observation = intern(
                         IdentityDomain::Generated,
                         origin,
@@ -494,7 +554,7 @@ where
                             variant: observation.digest(),
                         },
                     );
-                    observations.push(observation);
+                    records.push(observation);
                 }
             }
             let member_functions: &[crate::syntax::MemberFunctionSyntax] = match &declaration.syntax
@@ -535,18 +595,19 @@ where
                     (definition_id, member.name.clone()),
                     DefinitionId(observation.digest()),
                 );
-                observations.push(observation);
+                records.push(observation);
             }
         }
     }
-    observations.sort_by(|left, right| left.canonical_key_bytes().cmp(right.canonical_key_bytes()));
-    observations.dedup_by(|left, right| left.canonical_key_bytes() == right.canonical_key_bytes());
+    records.sort_by(|left, right| left.canonical_key.cmp(&right.canonical_key));
+    records.dedup_by(|left, right| left.canonical_key == right.canonical_key);
     Ok(IdentityCatalog {
-        observation_keys: observations
+        observation_keys: records
             .iter()
-            .map(|observation| Arc::<[u8]>::from(observation.canonical_key_bytes()))
+            .map(|record| Arc::clone(&record.canonical_key))
             .collect(),
-        observations,
+        records,
+        specialization_records: BTreeMap::new(),
         modules,
         definitions,
         associated_functions,
@@ -582,7 +643,7 @@ fn intern<F>(
     fingerprint: u128,
     hasher: &F,
     digests: &mut BTreeMap<u128, Arc<[u8]>>,
-) -> Result<IdentityObservation, IdentityCollision>
+) -> Result<IdentityRecord, IdentityCollision>
 where
     F: Fn(&[u8]) -> u128,
 {
@@ -597,14 +658,10 @@ where
         });
     }
     digests.insert(digest, Arc::clone(&canonical_key));
-    Ok(IdentityObservation::new(
-        domain,
-        origin,
-        name,
+    Ok(IdentityRecord {
+        observation: IdentityObservation::new(domain, origin, name, digest, fingerprint),
         canonical_key,
-        digest,
-        fingerprint,
-    ))
+    })
 }
 
 fn fingerprint(bytes: &[u8]) -> u128 {

@@ -85,6 +85,10 @@ impl BuiltinVariant {
 pub(crate) enum BuildKind {
     Image,
     Test,
+    Node {
+        definition: DefinitionId,
+        type_identity: TypeId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -94,9 +98,26 @@ pub(crate) enum Type {
     Integer(IntegerType),
     Float(FloatType),
     Text,
+    Scalar,
     Bytes,
     Array(Arc<Type>),
+    FixedArray {
+        element: Arc<Type>,
+        length: u64,
+    },
     Tuple(Arc<[Type]>),
+    Function {
+        parameters: Arc<[Type]>,
+        return_type: Arc<Type>,
+    },
+    Own {
+        pool: PoolId,
+        value: Arc<Type>,
+    },
+    Any {
+        interface: DefinitionId,
+        display: Arc<str>,
+    },
     Result {
         success: Arc<Type>,
         error: Option<Arc<Type>>,
@@ -106,6 +127,7 @@ pub(crate) enum Type {
     Nominal {
         definition: DefinitionId,
         display: Arc<str>,
+        arguments: Arc<[Type]>,
     },
     Parameter {
         owner: DefinitionId,
@@ -130,6 +152,15 @@ impl IntegerType {
     }
     pub(crate) const fn is_signed(self) -> bool {
         matches!(self, Self::I8 | Self::I16 | Self::I32 | Self::I64)
+    }
+
+    pub(crate) const fn bits(self) -> u32 {
+        match self {
+            Self::U8 | Self::I8 => 8,
+            Self::U16 | Self::I16 => 16,
+            Self::U32 | Self::I32 => 32,
+            Self::U64 | Self::I64 => 64,
+        }
     }
 
     pub(crate) const fn name(self) -> &'static str {
@@ -194,10 +225,11 @@ impl BuiltinType {
 }
 
 impl BuildKind {
-    pub(crate) const fn name(self) -> &'static str {
+    pub(crate) const fn canonical_tag(self) -> u8 {
         match self {
-            Self::Image => "Image",
-            Self::Test => "Test",
+            Self::Image => 1,
+            Self::Test => 2,
+            Self::Node { .. } => 3,
         }
     }
 }
@@ -210,23 +242,60 @@ impl Type {
             Self::Integer(kind) => kind.name().to_owned(),
             Self::Float(kind) => kind.name().to_owned(),
             Self::Text => "Text".to_owned(),
+            Self::Scalar => "Scalar".to_owned(),
             Self::Bytes => "Bytes".to_owned(),
             Self::Array(element) => format!("[{}]", element.display()),
-            Self::Tuple(members) => format!(
-                "({})",
-                members
+            Self::FixedArray { element, length } => format!("[{}; {length}]", element.display()),
+            Self::Tuple(members) => {
+                let contents = members
                     .iter()
                     .map(Type::display)
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", ");
+                if members.len() == 1 {
+                    format!("({contents},)")
+                } else {
+                    format!("({contents})")
+                }
+            }
+            Self::Function {
+                parameters,
+                return_type,
+            } => format!(
+                "fn({}) -> {}",
+                parameters
+                    .iter()
+                    .map(Type::display)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                return_type.display()
             ),
+            Self::Own { pool, value } => format!("own[{:032x}] {}", pool.0, value.display()),
+            Self::Any { display, .. } => format!("any {display}"),
             Self::Result { success, error } => error.as_ref().map_or_else(
                 || format!("Result[{}]", success.display()),
                 |error| format!("Result[{}, {}]", success.display(), error.display()),
             ),
             Self::Option(value) => format!("Option[{}]", value.display()),
             Self::Builtin(kind) => kind.name().to_owned(),
-            Self::Nominal { display, .. } | Self::Parameter { display, .. } => display.to_string(),
+            Self::Nominal {
+                display, arguments, ..
+            } => {
+                if arguments.is_empty() {
+                    display.to_string()
+                } else {
+                    format!(
+                        "{}[{}]",
+                        display,
+                        arguments
+                            .iter()
+                            .map(Type::display)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            }
+            Self::Parameter { display, .. } => display.to_string(),
             Self::Infer => "_".to_owned(),
         }
     }
@@ -254,13 +323,19 @@ impl Type {
                 bytes.push(kind.canonical_tag());
             }
             Self::Text => bytes.push(4),
-            Self::Bytes => bytes.push(5),
+            Self::Scalar => bytes.push(5),
+            Self::Bytes => bytes.push(6),
             Self::Array(element) => {
-                bytes.push(6);
+                bytes.push(7);
                 element.append_canonical_key(bytes);
             }
+            Self::FixedArray { element, length } => {
+                bytes.push(15);
+                element.append_canonical_key(bytes);
+                bytes.extend_from_slice(&length.to_be_bytes());
+            }
             Self::Tuple(members) => {
-                bytes.push(7);
+                bytes.push(8);
                 bytes.extend_from_slice(
                     &u64::try_from(members.len())
                         .unwrap_or(u64::MAX)
@@ -271,7 +346,7 @@ impl Type {
                 }
             }
             Self::Result { success, error } => {
-                bytes.push(8);
+                bytes.push(9);
                 success.append_canonical_key(bytes);
                 if let Some(error) = error {
                     bytes.push(1);
@@ -281,23 +356,59 @@ impl Type {
                 }
             }
             Self::Option(value) => {
-                bytes.push(9);
+                bytes.push(10);
                 value.append_canonical_key(bytes);
             }
             Self::Builtin(kind) => {
-                bytes.push(10);
+                bytes.push(11);
                 bytes.push(kind.canonical_tag());
             }
-            Self::Nominal { definition, .. } => {
-                bytes.push(11);
+            Self::Nominal {
+                definition,
+                arguments,
+                ..
+            } => {
+                bytes.push(12);
                 bytes.extend_from_slice(&definition.0.to_be_bytes());
+                bytes.extend_from_slice(
+                    &u64::try_from(arguments.len())
+                        .unwrap_or(u64::MAX)
+                        .to_be_bytes(),
+                );
+                for argument in &**arguments {
+                    argument.append_canonical_key(bytes);
+                }
             }
             Self::Parameter { owner, id, .. } => {
-                bytes.push(12);
+                bytes.push(13);
                 bytes.extend_from_slice(&owner.0.to_be_bytes());
                 bytes.extend_from_slice(&id.0.to_be_bytes());
             }
-            Self::Infer => bytes.push(13),
+            Self::Infer => bytes.push(14),
+            Self::Function {
+                parameters,
+                return_type,
+            } => {
+                bytes.push(16);
+                bytes.extend_from_slice(
+                    &u64::try_from(parameters.len())
+                        .unwrap_or(u64::MAX)
+                        .to_be_bytes(),
+                );
+                for parameter in &**parameters {
+                    parameter.append_canonical_key(bytes);
+                }
+                return_type.append_canonical_key(bytes);
+            }
+            Self::Own { pool, value } => {
+                bytes.push(17);
+                bytes.extend_from_slice(&pool.0.to_be_bytes());
+                value.append_canonical_key(bytes);
+            }
+            Self::Any { interface, .. } => {
+                bytes.push(18);
+                bytes.extend_from_slice(&interface.0.to_be_bytes());
+            }
         }
     }
 }
@@ -320,6 +431,7 @@ pub(crate) fn resolve_builtin_type(name: &NameSyntax) -> Option<Type> {
         "f32" => Type::Float(FloatType::F32),
         "f64" => Type::Float(FloatType::F64),
         "Text" => Type::Text,
+        "Scalar" => Type::Scalar,
         "Bytes" => Type::Bytes,
         "Image" => Type::Builtin(BuiltinType::Image),
         "Test" => Type::Builtin(BuiltinType::Test),

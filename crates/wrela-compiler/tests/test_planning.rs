@@ -1,10 +1,10 @@
 use wrela_compiler::{
     Cancellation, CompilationOutcome, CompilationRequest, Compiler, CompilerInstallation,
-    DiagnosticValue, InspectSelection, ProjectFile, ProjectSnapshot, Root,
+    InspectSelection, OpenError, ProjectFile, ProjectSnapshot, Root,
 };
 
 fn compile(files: Vec<ProjectFile>, root: Root) -> CompilationOutcome {
-    Compiler::open(CompilerInstallation::empty())
+    Compiler::open(CompilerInstallation::layer1())
         .expect("distribution opens")
         .compile(
             CompilationRequest::new(ProjectSnapshot::new(files), root)
@@ -62,6 +62,51 @@ fn build() -> Image:
             .map(|application| (application.suite(), application.test(), application.order()))
             .collect::<Vec<_>>(),
         [("arithmetic", "adds", 0), ("arithmetic", "subtracts", 1)]
+    );
+}
+
+#[test]
+fn nested_comptime_statements_select_test_bodies_before_test_semantics() {
+    let source = br#"const ENABLED: bool = false
+
+pub suite behavior:
+    test selected():
+        comptime if ENABLED:
+            expect missing()
+        else:
+            expect true
+
+@image
+fn build() -> Image:
+    tests = Test.new(cases=[behavior.selected()])
+    return Image.new(tests=tests)
+"#;
+    let outcome = compile(vec![ProjectFile::new("src/test.wr", source)], Root::Test);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("only the selected nested Test branch is semantic: {outcome:#?}");
+    };
+    assert_eq!(accepted.inspection().test_plan().len(), 1);
+}
+
+#[test]
+fn suite_rejects_a_non_test_member_without_stalling() {
+    let source = br#"pub suite behavior:
+    fn helper():
+        pass
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(vec![ProjectFile::new("src/test.wr", source)], Root::Test);
+    let CompilationOutcome::Rejected(rejected) = outcome else {
+        panic!("a Suite owns only nested Tests: {outcome:#?}");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "syntax.malformed_declaration")
     );
 }
 
@@ -193,14 +238,12 @@ fn build() -> Image:
     else {
         panic!("a Test Application belongs inside Test.new cases");
     };
-    assert!(rejected.diagnostics().iter().any(|diagnostic| {
-        diagnostic.code() == "semantic.invalid_typed_hir"
-            && diagnostic.typed_parameters().iter().any(|(name, value)| {
-                name.as_ref() == "kind"
-                    && matches!(value, DiagnosticValue::Text(value)
-                                if value.as_ref() == "test_application_outside_cases")
-            })
-    }));
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| { diagnostic.code() == "semantic.test_application_outside_cases" })
+    );
 }
 
 #[test]
@@ -219,14 +262,12 @@ fn build() -> Image:
     else {
         panic!("a Test Application outside cases must reject");
     };
-    assert!(rejected.diagnostics().iter().any(|diagnostic| {
-        diagnostic.code() == "semantic.invalid_typed_hir"
-            && diagnostic.typed_parameters().iter().any(|(name, value)| {
-                name.as_ref() == "kind"
-                    && matches!(value, DiagnosticValue::Text(value)
-                        if value.as_ref() == "test_application_outside_cases")
-            })
-    }));
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| { diagnostic.code() == "semantic.test_application_outside_cases" })
+    );
 }
 
 #[test]
@@ -258,12 +299,10 @@ fn build() -> Image:
         else {
             panic!("invalid Test callable application must reject");
         };
-        assert!(
-            rejected
-                .diagnostics()
-                .iter()
-                .any(|diagnostic| diagnostic.code() == "semantic.invalid_typed_hir")
-        );
+        assert!(rejected.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic.code(),
+            "semantic.argument_count" | "semantic.argument_label_mismatch"
+        )));
     }
 }
 
@@ -271,7 +310,7 @@ fn build() -> Image:
 fn cancelled_request_publishes_no_partial_result() {
     let cancellation = Cancellation::new();
     cancellation.cancel();
-    let outcome = Compiler::open(CompilerInstallation::empty())
+    let outcome = Compiler::open(CompilerInstallation::layer1())
         .expect("distribution opens")
         .compile(
             CompilationRequest::new(
@@ -284,6 +323,33 @@ fn cancelled_request_publishes_no_partial_result() {
             &cancellation,
         );
     assert_eq!(outcome, CompilationOutcome::Cancelled);
+}
+
+#[test]
+fn a_cancelled_request_does_not_change_the_next_request() {
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let project = || {
+        ProjectSnapshot::new(vec![ProjectFile::new(
+            "src/image.wr",
+            b"@image\nfn build() -> Image:\n    return Image.new()\n",
+        )])
+    };
+    let cancellation = Cancellation::new();
+    cancellation.cancel();
+    assert_eq!(
+        compiler.compile(
+            CompilationRequest::new(project(), Root::Image),
+            &cancellation,
+        ),
+        CompilationOutcome::Cancelled
+    );
+    assert!(matches!(
+        compiler.compile(
+            CompilationRequest::new(project(), Root::Image),
+            &Cancellation::new(),
+        ),
+        CompilationOutcome::Accepted(_)
+    ));
 }
 
 #[test]
@@ -305,7 +371,7 @@ fn imported_private_declarations_do_not_enter_the_module_namespace() {
         rejected
             .diagnostics()
             .iter()
-            .any(|diagnostic| diagnostic.code() == "semantic.invalid_typed_hir")
+            .any(|diagnostic| diagnostic.code() == "semantic.unresolved_call")
     );
 }
 
@@ -324,13 +390,12 @@ fn imports_never_leak_bare_members_into_local_scope() {
     let CompilationOutcome::Rejected(rejected) = compile(files, Root::Image) else {
         panic!("an imported public member requires its Module alias");
     };
-    assert!(rejected.diagnostics().iter().any(|diagnostic| {
-        diagnostic.code() == "semantic.invalid_typed_hir"
-            && diagnostic.typed_parameters().iter().any(|(name, value)| {
-                name.as_ref() == "kind"
-                    && matches!(value, DiagnosticValue::Text(value) if value.as_ref() == "unresolved_call")
-            })
-    }));
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.unresolved_call")
+    );
 }
 
 #[test]
@@ -510,35 +575,16 @@ fn authenticated_modules_resolve_from_the_sealed_distribution_and_cannot_be_shad
 
 #[test]
 fn authenticated_modules_cannot_import_project_modules() {
-    let compiler = Compiler::open(CompilerInstallation::with_authenticated_modules(vec![
+    let outcome = Compiler::open(CompilerInstallation::with_authenticated_modules(vec![
         ProjectFile::new(
             "src/core/images.wr",
             b"from game import helper\n\npub fn blank() -> Image:\n    return helper.make()\n",
         ),
-    ]))
-    .expect("distribution opens");
-    let outcome = compiler.compile(
-        CompilationRequest::new(
-            ProjectSnapshot::new(vec![
-                ProjectFile::new(
-                    "src/image.wr",
-                    b"from core import images\n\n@image\nfn build() -> Image:\n    return images.blank()\n",
-                ),
-                ProjectFile::new(
-                    "src/game/helper.wr",
-                    b"pub fn make() -> Image:\n    return Image.new()\n",
-                ),
-            ]),
-            Root::Image,
-        ),
-        &Cancellation::new(),
-    );
-    let CompilationOutcome::Rejected(rejected) = outcome else {
-        panic!("authenticated authority cannot depend on Creator source");
-    };
-    assert!(
-        rejected.diagnostics().iter().any(|diagnostic| {
-            diagnostic.code() == "project.authenticated_imports_project_module"
-        })
-    );
+    ]));
+    assert!(matches!(
+        outcome,
+        Err(OpenError::MissingAuthenticatedDependency { path, dependency })
+            if path.as_ref() == "src/core/images.wr"
+                && dependency.as_ref() == "src/game/helper.wr"
+    ));
 }

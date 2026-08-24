@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use wrela_compiler::{
     Cancellation, CanonicalValue, CompilationOutcome, CompilationRequest, Compiler,
     CompilerInstallation, ConstructionKind, Diagnostic, DiagnosticValue, EvaluationOutcome,
     EvaluationPolicy, IdentityDomain, InspectSelection, ProjectFile, ProjectSnapshot, Root,
+    SyntaxNodeKind,
 };
 
 fn has_text_parameter(diagnostic: &Diagnostic, name: &str, expected: &str) -> bool {
@@ -15,7 +18,7 @@ fn has_text_parameter(diagnostic: &Diagnostic, name: &str, expected: &str) -> bo
 }
 
 fn compile(source: &[u8]) -> CompilationOutcome {
-    let compiler = Compiler::open(CompilerInstallation::empty()).expect("distribution opens");
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
     compiler.compile(
         CompilationRequest::new(
             ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
@@ -24,6 +27,1053 @@ fn compile(source: &[u8]) -> CompilationOutcome {
         .with_inspection(InspectSelection::all()),
         &Cancellation::new(),
     )
+}
+
+#[test]
+fn comptime_if_selects_declarations_before_name_resolution_and_evaluation() {
+    let source = br#"const DEBUG: bool = false
+
+comptime if DEBUG:
+    const VALUE: i64 = missing_in_unselected_branch
+else:
+    const VALUE: i64 = 42
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("only the selected compile-time declaration branch must enter semantics");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 42
+            )
+    }));
+}
+
+#[test]
+fn comptime_elif_uses_the_bounded_evaluator_and_is_declaration_order_independent() {
+    let source = br#"comptime if not enabled():
+    const VALUE: i64 = 1
+elif enabled():
+    const VALUE: i64 = 2
+else:
+    const VALUE: i64 = 3
+
+pure fn enabled() -> bool:
+    return true
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("compile-time branches may call later pure declarations");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 2
+            )
+    }));
+}
+
+#[test]
+fn accepted_layer_one_structural_types_resolve_through_the_compiler_seam() {
+    let source = br#"pool storage
+
+resource struct Ticket:
+    value: i64
+
+interface Shape:
+    fn area() -> i64
+
+fn typed(
+    callback: fn(i64) -> i64,
+    take owned: own[storage] Ticket,
+    erased: any Shape,
+    fixed: [i64; 4],
+):
+    pass
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "every accepted Layer 1 structural type must resolve: {outcome:#?}"
+    );
+}
+
+#[test]
+fn bounded_for_and_repeated_arrays_are_evaluated_as_initial_layer_one_wrela() {
+    let source = br#"pure fn total() -> i64:
+    mut sum = 0
+    for value in [2; 4]:
+        sum += value
+    return sum
+
+const VALUE: i64 = total()
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("a finite collection iteration must compile and evaluate");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 8
+            )
+    }));
+}
+
+#[test]
+fn bounded_integer_ranges_are_evaluated_in_source_order() {
+    let source = br#"pure fn total() -> i64:
+    mut sum = 0
+    for value in 1..=4:
+        sum = sum + value
+    return sum
+
+const VALUE: i64 = total()
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("a finite integer range must compile and evaluate");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 10
+            )
+    }));
+}
+
+#[test]
+fn nearest_loop_exits_apply_to_bounded_for_without_unrolling_control_storage() {
+    let source = br#"pure fn total() -> i64:
+    mut sum = 0
+    for value in 1..=6:
+        if value == 2:
+            continue
+        if value == 5:
+            break
+        sum += value
+    return sum
+
+const VALUE: i64 = total()
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("nearest-loop exits must work for bounded collection iteration: {outcome:#?}");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 8
+            )
+    }));
+}
+
+#[test]
+fn source_ordered_exhaustive_match_is_verified_and_evaluated() {
+    let source = br#"pure fn choose(value: i64) -> i64:
+    match value:
+        case 1:
+            return 10
+        case _:
+            return 20
+
+const VALUE: i64 = choose(1)
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("an exhaustive source-ordered match must compile and evaluate");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 10
+            )
+    }));
+    let syntax = accepted.inspection().syntax().expect("syntax requested");
+    assert_eq!(
+        syntax[0]
+            .nodes()
+            .iter()
+            .filter(|node| node.kind() == SyntaxNodeKind::MatchCase)
+            .count(),
+        2,
+        "match patterns and their case headers remain structurally observable"
+    );
+}
+
+#[test]
+fn match_bindings_and_guards_are_scoped_and_evaluated_in_source_order() {
+    let source = br#"pure fn choose(value: i64) -> i64:
+    match value:
+        case matched if matched > 10:
+            return matched
+        case matched:
+            return matched + 1
+
+const VALUE: i64 = choose(4)
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("a binding is visible in its guard and selected case body: {outcome:#?}");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 5
+            )
+    }));
+}
+
+#[test]
+fn enum_payload_patterns_bind_nested_values_and_prove_exhaustiveness() {
+    let source = br#"enum Lookup:
+    Found(value: i64)
+    Absent
+
+pure fn choose(value: Lookup) -> i64:
+    match value:
+        case Lookup.Found(found):
+            return found
+        case Lookup.Absent:
+            return 0
+
+const VALUE: i64 = choose(Lookup.Found(7))
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("enum payload patterns must bind and evaluate: {outcome:#?}");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 7
+            )
+    }));
+}
+
+#[test]
+fn tuple_fixed_array_and_or_patterns_destructure_closed_values() {
+    let source = br#"enum Choice:
+    Left(value: (i64, [i64; 2]))
+    Right(value: (i64, [i64; 2]))
+
+pure fn choose(value: Choice) -> i64:
+    match value:
+        case Choice.Left((head, [middle, tail])) or Choice.Right((head, [middle, tail])):
+            return head + middle + tail
+
+const VALUE: i64 = choose(Choice.Right((2, [3, 4])))
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("nested product and binding-consistent or patterns must evaluate: {outcome:#?}");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 9
+            )
+    }));
+}
+
+#[test]
+fn struct_patterns_destructure_named_fields() {
+    let source = br#"struct Point:
+    x: i64
+    y: i64
+
+pure fn total(value: Point) -> i64:
+    match value:
+        case Point(x=left, y=right):
+            return left + right
+
+const VALUE: i64 = total(Point(x=5, y=8))
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("named struct patterns must bind their fields: {outcome:#?}");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 13
+            )
+    }));
+}
+
+#[test]
+fn take_binding_patterns_make_resource_consumption_explicit() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket) -> i64:
+    return ticket.id
+
+fn choose(take value: Ticket) -> i64:
+    match value:
+        case take ticket:
+            return consume(take ticket)
+
+fn compute() -> i64:
+    ticket = Ticket(id=21)
+    return choose(take ticket)
+
+const VALUE: i64 = compute()
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("resource pattern moves must be explicitly authored: {outcome:#?}");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 21
+            )
+    }));
+}
+
+#[test]
+fn take_binding_patterns_leave_the_matched_resource_unreadable() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket) -> i64:
+    return ticket.id
+
+fn broken(take value: Ticket) -> i64:
+    mut result: i64 = 0
+    match value:
+        case take ticket:
+            result = consume(take ticket)
+    return result + value.id
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Rejected(rejected) = outcome else {
+        panic!("a resource moved by a pattern must remain moved: {outcome:#?}");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.read_after_move")
+    );
+}
+
+#[test]
+fn mutable_field_and_index_places_update_the_nested_value() {
+    let source = br#"struct State:
+    mut values: [i64; 2]
+
+pure fn compute() -> i64:
+    mut state = State(values=[2, 3])
+    state.values[1] += 4
+    return state.values[0] + state.values[1]
+
+const VALUE: i64 = compute()
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("mutable field/index places must update through the public seam: {outcome:#?}");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 9
+            )
+    }));
+}
+
+#[test]
+fn for_patterns_destructure_every_bounded_element() {
+    let source = br#"pure fn total(values: [(i64, i64); 2]) -> i64:
+    mut result = 0
+    for (left, right) in values:
+        result += left + right
+    return result
+
+const VALUE: i64 = total([(1, 2), (3, 4)])
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("an irrefutable product pattern must bind each for element: {outcome:#?}");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 10
+            )
+    }));
+}
+
+#[test]
+fn for_rejects_a_pattern_that_cannot_match_every_element() {
+    let source = br#"enum Choice:
+    Left(value: i64)
+    Right(value: i64)
+
+pure fn total(values: [Choice; 1]) -> i64:
+    mut result = 0
+    for Choice.Left(value) in values:
+        result += value
+    return result
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("a refutable for pattern must be rejected");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.invalid_match_pattern"),
+        "{rejected:#?}"
+    );
+}
+
+#[test]
+fn mutable_resource_arguments_require_and_honor_an_explicit_call_site_marker() {
+    let source = br#"resource struct Counter:
+    mut value: i64
+
+fn increment(mut counter: Counter):
+    counter.value += 1
+
+fn observe(read counter: Counter) -> i64:
+    return counter.value
+
+fn compute() -> i64:
+    mut counter = Counter(value=4)
+    increment(mut counter)
+    return observe(counter)
+
+const VALUE: i64 = compute()
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("an authored mut marker must grant call-scoped mutation: {outcome:#?}");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 5
+            )
+    }));
+}
+
+#[test]
+fn mutable_and_consuming_parameters_reject_unmarked_arguments() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn borrow_mut(mut ticket: Ticket):
+    pass
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn broken(take ticket: Ticket):
+    borrow_mut(ticket)
+    consume(ticket)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Rejected(rejected) = outcome else {
+        panic!("mut/take parameters must not infer authority from their signatures: {outcome:#?}");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| { diagnostic.code() == "semantic.argument_ownership_mismatch" })
+    );
+}
+
+#[test]
+fn explicit_take_tracks_sibling_resource_field_places_independently() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+resource struct Envelope:
+    left: Ticket
+    right: Ticket
+
+fn consume(take ticket: Ticket) -> i64:
+    return ticket.id
+
+fn total(take envelope: Envelope) -> i64:
+    return consume(take envelope.left) + consume(take envelope.right)
+
+fn compute() -> i64:
+    envelope = Envelope(left=Ticket(id=6), right=Ticket(id=7))
+    return total(take envelope)
+
+const VALUE: i64 = compute()
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("moving one Resource field must leave its sibling place readable: {outcome:#?}");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 13
+            )
+    }));
+}
+
+#[test]
+fn for_patterns_bind_nested_elements_for_each_iteration() {
+    let source = br#"pure fn total(values: [(i64, i64); 2]) -> i64:
+    mut result: i64 = 0
+    for (left, right) in values:
+        result += left + right
+    return result
+
+const VALUE: i64 = total([(1, 2), (3, 4)])
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("for must accept the same nested binding patterns as match: {outcome:#?}");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 10
+            )
+    }));
+}
+
+#[test]
+fn compiler_bounded_while_and_nearest_loop_exits_evaluate_deterministically() {
+    let source = br#"type Count = i64
+
+pure fn total() -> i64:
+    mut index: i64 = 0
+    mut sum: Count = 0
+    while index < 6:
+        index = index + 1
+        if index == 2:
+            continue
+        if index == 5:
+            break
+        sum = sum + index
+    return sum
+
+const VALUE: i64 = total()
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("a compiler-bounded while with nearest-loop exits must compile: {outcome:#?}");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 8
+            )
+    }));
+}
+
+#[test]
+fn while_without_a_compiler_derived_bound_is_rejected() {
+    let source = br#"pure fn spin(flag: bool):
+    while flag:
+        pass
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("an unbounded while must be rejected");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.unbounded_while")
+    );
+}
+
+#[test]
+fn while_bounds_do_not_reuse_branch_specific_integer_facts() {
+    let source = br#"pure fn branch_bound(flag: bool):
+    mut index = 0
+    if flag:
+        index = -100
+    else:
+        index = 0
+    while index < 3:
+        index += 1
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("a path-specific initial value must not prove a whole-loop bound");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.unbounded_while")
+    );
+}
+
+#[test]
+fn explicit_take_moves_resource_arguments() {
+    let source = br#"resource struct Token:
+    value: i64
+
+pure fn consume(take token: Token) -> i64:
+    return token.value
+
+pure fn use_token() -> i64:
+    token = Token(value=7)
+    return consume(take token)
+
+const VALUE: i64 = use_token()
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("an explicitly moved Resource argument must compile");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 7
+            )
+    }));
+}
+
+#[test]
+fn named_function_values_keep_their_exact_callable_type_and_evaluate() {
+    let source = br#"pure fn increment(value: i64) -> i64:
+    return value + 1
+
+pure fn apply(callback: fn(i64) -> i64, value: i64) -> i64:
+    return callback(value)
+
+const VALUE: i64 = apply(increment, 4)
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("a closed named function value must compile and evaluate");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 5
+            )
+    }));
+}
+
+#[test]
+fn inline_closures_capture_bounded_data_and_evaluate_through_the_callable_seam() {
+    let source = br#"pure fn calculate(offset: i64) -> i64:
+    add = |value: i64| value + offset
+    return add(4)
+
+const VALUE: i64 = calculate(3)
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("a Data-capturing inline closure must compile and evaluate");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 7
+            )
+    }));
+}
+
+#[test]
+fn closure_values_are_constant_callable_data_but_cannot_capture_resources() {
+    let constant = br#"const ADD: fn(i64) -> i64 = |value| value + 2
+const VALUE: i64 = ADD(5)
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(constant) else {
+        panic!("a closed closure must be a constant callable value");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 7
+            )
+    }));
+
+    let resource = br#"resource struct Token:
+    value: i64
+
+pure fn invalid(take token: Token) -> fn(i64) -> i64:
+    return |value: i64| value + token.value
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(resource) else {
+        panic!("runtime closures must not hide Resource captures");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| { diagnostic.code() == "semantic.closure_capture_requires_data" })
+    );
+}
+
+#[test]
+fn generic_nominal_construction_preserves_concrete_field_types() {
+    let source = br#"struct Box[T]:
+    value: T
+
+pure fn unwrap(boxed: Box[i64]) -> i64:
+    return boxed.value
+
+const VALUE: i64 = unwrap(Box(value=9))
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!(
+            "a generic nominal must infer and preserve its concrete type arguments: {outcome:#?}"
+        );
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 9
+            )
+    }));
+}
+
+#[test]
+fn closed_boolean_matches_prove_exhaustiveness_without_a_wildcard() {
+    let source = br#"pure fn choose(value: bool) -> i64:
+    match value:
+        case true:
+            return 1
+        case false:
+            return 2
+
+const VALUE: i64 = choose(false)
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("all alternatives of a closed Bool match must prove exhaustiveness");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 2
+            )
+    }));
+
+    let duplicate = br#"pure fn choose(value: bool) -> i64:
+    match value:
+        case true:
+            return 1
+        case true:
+            return 2
+        case false:
+            return 3
+
+@image
+fn build() -> Image:
+    return Image.new(value=choose(false))
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(duplicate) else {
+        panic!("a duplicate literal case must be unreachable");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| { diagnostic.code() == "semantic.unreachable_match_case" })
+    );
+}
+
+#[test]
+fn closed_enum_matches_are_proven_exhaustive_and_evaluated() {
+    let source = br#"enum Direction:
+    North
+    South
+
+pure fn code(direction: Direction) -> i64:
+    match direction:
+        case Direction.North:
+            return 10
+        case Direction.South:
+            return 20
+
+const VALUE: i64 = code(Direction.South())
+
+@image
+fn build() -> Image:
+    return Image.new(value=VALUE)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("all variants of a closed enum must prove match exhaustiveness: {outcome:#?}");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.VALUE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 20
+            )
+    }));
+}
+
+#[test]
+fn is_tests_a_single_literal_or_closed_variant_without_reflection() {
+    let source = br#"enum Direction:
+    North
+    South
+
+pure fn is_south(direction: Direction) -> bool:
+    return direction is Direction.South
+
+const ENUM_VALUE: bool = is_south(Direction.South())
+const LITERAL_VALUE: bool = 4 is 4 and true
+
+@image
+fn build() -> Image:
+    return Image.new(enum_value=ENUM_VALUE, literal_value=LITERAL_VALUE)
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("single-case is patterns must compile and evaluate");
+    };
+    for root in ["image.ENUM_VALUE", "image.LITERAL_VALUE"] {
+        assert!(
+            accepted
+                .inspection()
+                .evaluations()
+                .iter()
+                .any(|evaluation| {
+                    evaluation.root() == root
+                        && matches!(
+                            evaluation.outcome(),
+                            EvaluationOutcome::Completed(CanonicalValue::Bool(true))
+                        )
+                })
+        );
+    }
+}
+
+#[test]
+fn is_patterns_bind_payloads_only_in_the_successful_branch() {
+    let source = br#"enum Lookup:
+    Found(value: i64)
+    Absent
+
+pure fn choose(value: Lookup) -> i64:
+    if value is Lookup.Found(found):
+        return found
+    return 0
+
+const FOUND: i64 = choose(Lookup.Found(7))
+const ABSENT: i64 = choose(Lookup.Absent)
+
+@image
+fn build() -> Image:
+    return Image.new(found=FOUND, absent=ABSENT)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("a successful is pattern must expose its payload binding: {outcome:#?}");
+    };
+    for (root, expected) in [("image.FOUND", 7), ("image.ABSENT", 0)] {
+        assert!(
+            accepted
+                .inspection()
+                .evaluations()
+                .iter()
+                .any(|evaluation| {
+                    evaluation.root() == root
+                        && matches!(
+                            evaluation.outcome(),
+                            EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. })
+                                if *value == expected
+                        )
+                })
+        );
+    }
+}
+
+#[test]
+fn is_pattern_bindings_cannot_escape_or_be_introduced_through_negation() {
+    let escaped = br#"enum Lookup:
+    Found(value: i64)
+    Absent
+
+pure fn choose(value: Lookup) -> i64:
+    if value is Lookup.Found(found):
+        pass
+    return found
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(escaped) else {
+        panic!("an is-pattern binding must not escape its successful branch");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.unresolved_name")
+    );
+
+    let negated = br#"enum Lookup:
+    Found(value: i64)
+    Absent
+
+pure fn choose(value: Lookup) -> i64:
+    if not (value is Lookup.Found(found)):
+        return 0
+    return found
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(negated) else {
+        panic!("a binding is-pattern must be the direct condition of its branch");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.invalid_match_pattern")
+    );
 }
 
 #[test]
@@ -77,6 +1127,166 @@ fn image_constructor_contract_rejects_parameters_generics_and_suspension() {
 }
 
 #[test]
+fn image_constructor_failures_never_reach_graph_sealing() {
+    for (source, expected_code) in [
+        (
+            b"@image\nfn build() -> Image:\n    panic \"boom\"\n".as_slice(),
+            "evaluation.panicked",
+        ),
+        (
+            b"@image\nfn build() -> Image:\n    value = 127i8 + 1i8\n    return Image.new(value=value)\n"
+                .as_slice(),
+            "evaluation.panicked",
+        ),
+    ] {
+        let CompilationOutcome::Rejected(rejected) = compile(source) else {
+            panic!("Image evaluation failure must remain a Creator rejection");
+        };
+        assert!(
+            rejected
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code() == expected_code)
+        );
+    }
+
+    let mut source = String::new();
+    for index in 0..32 {
+        if index == 31 {
+            source.push_str("pure fn helper31() -> i64:\n    return 1\n\n");
+        } else {
+            source.push_str(&format!(
+                "pure fn helper{index}() -> i64:\n    return helper{}()\n\n",
+                index + 1
+            ));
+        }
+    }
+    source.push_str("@image\nfn build() -> Image:\n    return Image.new(value=helper0())\n");
+    let CompilationOutcome::Rejected(rejected) = compile(source.as_bytes()) else {
+        panic!("Image evaluator containment must be a structured Creator rejection");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "evaluation.limit_exceeded")
+    );
+}
+
+#[test]
+fn nested_comptime_statements_select_before_function_semantics() {
+    let source = br#"const ENABLED: bool = false
+
+pure fn answer() -> i64:
+    comptime if ENABLED:
+        return missing()
+    elif not ENABLED:
+        return 42
+    else:
+        return also_missing()
+
+@image
+fn build() -> Image:
+    return Image.new(value=answer())
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("only the selected nested statement branch is semantic: {outcome:#?}");
+    };
+    assert!(matches!(
+        accepted.inspection().evaluations()[1].outcome(),
+        EvaluationOutcome::Completed(CanonicalValue::SymbolicHandle {
+            kind: ConstructionKind::Image,
+            ..
+        })
+    ));
+    let syntax = accepted.inspection().syntax().expect("syntax");
+    assert_eq!(syntax[0].source_bytes(), source);
+}
+
+#[test]
+fn nested_comptime_member_blocks_select_struct_resource_and_enum_members() {
+    let source = br#"const ENABLED: bool = false
+
+struct Card:
+    comptime if ENABLED:
+        broken: Missing
+        pure fn score(self) -> i64:
+            return missing()
+    else:
+        value: i64
+        pure fn score(self) -> i64:
+            return self.value
+
+resource struct Ticket:
+    comptime if ENABLED:
+        broken: Missing
+    else:
+        bytes: Bytes
+
+enum State:
+    comptime if ENABLED:
+        Broken(value: Missing)
+    else:
+        Ready
+
+@image
+fn build() -> Image:
+    card = Card(value=42)
+    ticket = Ticket(bytes=b"ok")
+    return Image.new(score=card.score(), ticket=ticket, state=State.Ready)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("only selected container members are semantic: {outcome:#?}");
+    };
+    let syntax = &accepted.inspection().syntax().expect("syntax")[0];
+    assert_eq!(syntax.source_bytes(), source);
+    let count = |kind| {
+        syntax
+            .nodes()
+            .iter()
+            .filter(|node| node.kind() == kind)
+            .count()
+    };
+    assert_eq!(count(SyntaxNodeKind::ComptimeSelection), 3);
+    assert_eq!(count(SyntaxNodeKind::ComptimeBranch), 6);
+    assert_eq!(count(SyntaxNodeKind::Field), 4);
+    assert_eq!(count(SyntaxNodeKind::MemberFunction), 2);
+    assert_eq!(count(SyntaxNodeKind::Variant), 2);
+}
+
+#[test]
+fn unselected_nested_comptime_branches_still_require_valid_syntax() {
+    let source = br#"const ENABLED: bool = false
+
+pure fn answer() -> i64:
+    comptime if ENABLED:
+        if:
+            pass
+    else:
+        return 42
+
+@image
+fn build() -> Image:
+    return Image.new(value=answer())
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("compile-time selection never hides malformed syntax");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "syntax.malformed_declaration")
+    );
+    assert_eq!(
+        rejected.inspection().syntax().expect("syntax")[0].source_bytes(),
+        source
+    );
+}
+
+#[test]
 fn pure_constants_and_image_construction_share_the_verified_evaluator() {
     let source = br#"const ANSWER: i64 = add(40, 2)
 
@@ -121,6 +1331,159 @@ fn build() -> Image:
     assert!(accepted.inspection().identities().iter().any(|identity| {
         identity.domain() == IdentityDomain::Specialization && identity.digest() == add.identity()
     }));
+}
+
+#[test]
+fn text_escapes_decode_and_unknown_escapes_are_rejected() {
+    let source = br#"const VALUE: Text = "line\n\u{41}"
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("valid Text escapes must compile");
+    };
+    assert!(
+        accepted
+            .inspection()
+            .evaluations()
+            .iter()
+            .any(|evaluation| {
+                evaluation.root() == "image.VALUE"
+                    && evaluation.outcome()
+                        == &EvaluationOutcome::Completed(CanonicalValue::Text("line\nA".into()))
+            })
+    );
+
+    let malformed = br#"const VALUE: Text = "bad\q"
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(malformed) else {
+        panic!("an unknown Text escape must be preserved and rejected");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "syntax.invalid_literal")
+    );
+}
+
+#[test]
+fn numeric_separators_and_prefixes_follow_the_source_contract() {
+    for literal in ["1__2", "1_", "0b_1", "0Xff", "0B10", "0O7"] {
+        let source = format!(
+            "const VALUE: i64 = {literal}\n\n@image\nfn build() -> Image:\n    return Image.new()\n"
+        );
+        let CompilationOutcome::Rejected(rejected) = compile(source.as_bytes()) else {
+            panic!("malformed numeric literal {literal} must reject");
+        };
+        assert!(
+            rejected
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code() == "syntax.invalid_literal"),
+            "{literal} must be rejected at the lossless syntax seam"
+        );
+    }
+
+    let valid = br#"const VALUE: i64 = 1_024
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    assert!(matches!(compile(valid), CompilationOutcome::Accepted(_)));
+}
+
+#[test]
+fn ordinary_assert_is_checked_by_the_verified_evaluator() {
+    let passing = br#"pure fn checked() -> i64:
+    assert true
+    return 7
+
+const VALUE: i64 = checked()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(passing) else {
+        panic!("a passing ordinary assertion must evaluate");
+    };
+    assert!(
+        accepted
+            .inspection()
+            .evaluations()
+            .iter()
+            .any(|evaluation| {
+                evaluation.root() == "image.VALUE"
+                    && evaluation.outcome()
+                        == &EvaluationOutcome::Completed(CanonicalValue::Integer {
+                            type_name: "i64".into(),
+                            value: 7,
+                        })
+            })
+    );
+
+    let failing = br#"pure fn checked() -> i64:
+    assert false
+    return 7
+
+const VALUE: i64 = checked()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(failing) else {
+        panic!("a failed ordinary assertion must reject evaluation");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "evaluation.panicked")
+    );
+}
+
+#[test]
+fn boolean_operators_short_circuit_in_source_order() {
+    let source = br#"pure fn unsafe_value() -> bool:
+    return 1i64 / 0i64 == 0i64
+
+const AND_VALUE: bool = false and unsafe_value()
+const OR_VALUE: bool = true or unsafe_value()
+const NOT_VALUE: bool = not false
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("Boolean operators must type-check and short-circuit");
+    };
+    for (root, value) in [
+        ("image.AND_VALUE", false),
+        ("image.OR_VALUE", true),
+        ("image.NOT_VALUE", true),
+    ] {
+        assert!(
+            accepted
+                .inspection()
+                .evaluations()
+                .iter()
+                .any(|evaluation| {
+                    evaluation.root() == root
+                        && evaluation.outcome()
+                            == &EvaluationOutcome::Completed(CanonicalValue::Bool(value))
+                })
+        );
+    }
 }
 
 #[test]
@@ -268,6 +1631,49 @@ fn build() -> Image:
 }
 
 #[test]
+fn inferred_result_signatures_are_concrete_before_callers_are_checked() {
+    let source = br#"enum ReadError:
+    Missing
+
+fn fetch() -> Result[i64]:
+    return Result.Err(ReadError.Missing)
+
+const FETCHED: Result[i64, ReadError] = fetch()
+
+@image
+fn build() -> Image:
+    return Image.new(value=FETCHED)
+"#;
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "an inferred private signature must be concrete at its caller: {outcome:#?}"
+    );
+}
+
+#[test]
+fn expected_types_concretize_nested_result_variants() {
+    let source = br#"struct Trouble:
+    code: i64
+
+fn swallow(value: Result[i64, Trouble]) -> i64:
+    return 7
+
+fn f() -> Result[i64]:
+    return Result.Ok(swallow(Result.Err(Trouble(code=1))))
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "context must eliminate every Result placeholder before HIR sealing: {outcome:#?}"
+    );
+}
+
+#[test]
 fn creator_variants_must_be_declared_by_their_enum() {
     let source = br#"enum ReadError:
     Missing
@@ -283,10 +1689,10 @@ fn build() -> Image:
         panic!("an undeclared creator variant must reject");
     };
     assert!(
-        rejected.diagnostics().iter().any(|diagnostic| {
-            diagnostic.code() == "semantic.invalid_typed_hir"
-                && has_text_parameter(diagnostic, "kind", "unresolved_call")
-        }),
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.unresolved_call"),
         "{:#?}",
         rejected.diagnostics()
     );
@@ -303,10 +1709,12 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = compile(builtin) else {
         panic!("a built-in variant must reject extra payload values");
     };
-    assert!(rejected.diagnostics().iter().any(|diagnostic| {
-        diagnostic.code() == "semantic.invalid_typed_hir"
-            && has_text_parameter(diagnostic, "kind", "argument_count")
-    }));
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.argument_count")
+    );
 
     let creator = br#"enum ReadError:
     Missing
@@ -335,10 +1743,12 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = compile(source) else {
         panic!("a misspelled argument label cannot bind positionally");
     };
-    assert!(rejected.diagnostics().iter().any(|diagnostic| {
-        diagnostic.code() == "semantic.invalid_typed_hir"
-            && has_text_parameter(diagnostic, "kind", "argument_label_mismatch")
-    }));
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.argument_label_mismatch")
+    );
 }
 
 #[test]
@@ -395,10 +1805,13 @@ fn build() -> Image:
         let CompilationOutcome::Rejected(rejected) = compile(source) else {
             panic!("invalid callable application must reject");
         };
-        assert!(rejected.diagnostics().iter().any(|diagnostic| {
-            diagnostic.code() == "semantic.invalid_typed_hir"
-                && has_text_parameter(diagnostic, "kind", expected)
-        }));
+        let expected = format!("semantic.{expected}");
+        assert!(
+            rejected
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code() == expected)
+        );
     }
 }
 
@@ -491,6 +1904,121 @@ fn build() -> Image:
 }
 
 #[test]
+fn private_error_inference_follows_a_directly_returned_result() {
+    let source = br#"enum ReadError:
+    Missing
+
+fn outer() -> Result[i64]:
+    return inner()
+
+fn inner() -> Result[i64]:
+    return Result.Err(ReadError.Missing)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("a directly returned Result carries its Nominal Error");
+    };
+    assert_eq!(
+        accepted
+            .inspection()
+            .inferred_errors()
+            .iter()
+            .map(|error| (error.function(), error.error_type()))
+            .collect::<Vec<_>>(),
+        [("inner", "ReadError"), ("outer", "ReadError")]
+    );
+}
+
+#[test]
+fn private_error_inference_follows_a_result_returned_through_a_local() {
+    let source = br#"enum ReadError:
+    Missing
+
+fn outer() -> Result[i64]:
+    result = inner()
+    return result
+
+fn inner() -> Result[i64, ReadError]:
+    return Result.Err(ReadError.Missing)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("a local cannot erase the returned Result's Nominal Error: {outcome:#?}");
+    };
+    let inferred = accepted
+        .inspection()
+        .inferred_errors()
+        .iter()
+        .find(|error| error.function() == "outer")
+        .expect("outer inferred error");
+    assert_eq!(inferred.error_type(), "ReadError");
+}
+
+#[test]
+fn private_error_inference_follows_an_inferred_result_through_a_local() {
+    let source = br#"enum ReadError:
+    Missing
+
+fn outer() -> Result[i64]:
+    result = inner()
+    return result
+
+fn inner() -> Result[i64]:
+    return Result.Err(ReadError.Missing)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("local Result flow must participate in the private error fixpoint: {outcome:#?}");
+    };
+    assert_eq!(
+        accepted
+            .inspection()
+            .inferred_errors()
+            .iter()
+            .map(|error| (error.function(), error.error_type()))
+            .collect::<Vec<_>>(),
+        [("inner", "ReadError"), ("outer", "ReadError")]
+    );
+}
+
+#[test]
+fn private_error_inference_follows_a_propagated_local() {
+    let source = br#"enum ReadError:
+    Missing
+
+fn outer(input: Result[i64, ReadError]) -> Result[i64]:
+    result = input
+    return result?
+
+@image
+fn build() -> Image:
+    return Image.new(value=outer(Result.Err(ReadError.Missing)))
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("a propagated local must contribute its exact error: {outcome:#?}");
+    };
+    let inferred = accepted
+        .inspection()
+        .inferred_errors()
+        .iter()
+        .find(|error| error.function() == "outer")
+        .expect("outer inferred error");
+    assert_eq!(inferred.error_type(), "ReadError");
+}
+
+#[test]
 fn result_propagation_rewraps_success_and_preserves_the_exact_error() {
     let source = br#"enum ReadError:
     Missing
@@ -555,6 +2083,119 @@ fn build() -> Image:
 }
 
 #[test]
+fn option_propagation_returns_the_compatible_absent_alternative() {
+    let source = br#"fn succeeds() -> Option[i64]:
+    return Option.Some(7)
+
+fn fails() -> Option[i64]:
+    return Option.None
+
+fn success_outer() -> Option[i64]:
+    value = succeeds()?
+    return Option.Some(value)
+
+fn none_outer() -> Option[i64]:
+    value = fails()?
+    return Option.Some(value)
+
+const SOME: Option[i64] = success_outer()
+const NONE: Option[i64] = none_outer()
+
+@image
+fn build() -> Image:
+    return Image.new(some=SOME, none=NONE)
+"#;
+
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("Option propagation must return the compatible absent alternative: {outcome:#?}");
+    };
+    let evaluation = |name: &str| {
+        accepted
+            .inspection()
+            .evaluations()
+            .iter()
+            .find(|evaluation| evaluation.root() == name)
+            .expect("constant evaluation")
+            .outcome()
+    };
+    assert_eq!(
+        evaluation("image.SOME"),
+        &EvaluationOutcome::Completed(CanonicalValue::Variant {
+            type_name: "Option".into(),
+            variant: "Some".into(),
+            payload: vec![CanonicalValue::Integer {
+                type_name: "i64".into(),
+                value: 7,
+            }]
+            .into(),
+        })
+    );
+    assert_eq!(
+        evaluation("image.NONE"),
+        &EvaluationOutcome::Completed(CanonicalValue::Variant {
+            type_name: "Option".into(),
+            variant: "None".into(),
+            payload: Vec::new().into(),
+        })
+    );
+}
+
+#[test]
+fn option_propagation_cannot_escape_a_result_returning_function() {
+    let source = br#"enum ReadError:
+    Missing
+
+fn inner() -> Option[i64]:
+    return Option.None
+
+fn outer() -> Result[i64, ReadError]:
+    return Result.Ok(inner()?)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("Option.None cannot become a Result early return");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.propagation_return_mismatch")
+    );
+}
+
+#[test]
+fn result_propagation_cannot_escape_an_option_returning_function() {
+    let source = br#"enum ReadError:
+    Missing
+
+fn inner() -> Result[i64, ReadError]:
+    return Result.Err(ReadError.Missing)
+
+fn outer() -> Option[i64]:
+    return Option.Some(inner()?)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("Result.Err cannot become an Option early return");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.propagation_return_mismatch")
+    );
+}
+
+#[test]
 fn verified_control_flow_preserves_branch_evaluation() {
     let source = br#"fn choose(flag: bool) -> i64:
     if flag:
@@ -584,6 +2225,270 @@ fn build() -> Image:
                             value: 42,
                         })
             })
+    );
+}
+
+#[test]
+fn deferred_expressions_run_in_reverse_order_on_normal_scope_exit() {
+    let source = br#"fn fail(which: i64):
+    if which == 1:
+        panic "first deferred expression"
+    else:
+        panic "second deferred expression"
+
+fn run():
+    defer fail(1)
+    defer fail(2)
+
+const VALUE: () = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("the last registered deferred expression must Panic first");
+    };
+    let diagnostic = rejected
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.code() == "evaluation.panicked")
+        .expect("deferred Panic diagnostic");
+    let expected = source
+        .windows(b"        panic \"second deferred expression\"".len())
+        .position(|window| window == b"        panic \"second deferred expression\"")
+        .expect("second Panic site");
+    assert_eq!(diagnostic.primary().start(), expected as u64);
+}
+
+#[test]
+fn deferred_expression_runs_on_return() {
+    let source = br#"fn fail():
+    panic "deferred return cleanup"
+
+fn run() -> i64:
+    defer fail()
+    return 7
+
+const VALUE: i64 = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("return must run deferred expressions");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "evaluation.panicked")
+    );
+}
+
+#[test]
+fn deferred_expression_runs_on_propagation() {
+    let source = br#"enum Failure:
+    Failed
+
+fn fail() -> Result[i64, Failure]:
+    return Result.Err(Failure.Failed)
+
+fn cleanup():
+    panic "deferred propagation cleanup"
+
+fn run() -> Result[i64, Failure]:
+    defer cleanup()
+    return fail()?
+
+const VALUE: Result[i64, Failure] = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("propagation must run deferred expressions");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "evaluation.panicked")
+    );
+}
+
+#[test]
+fn deferred_expression_runs_on_break() {
+    let source = br#"fn cleanup():
+    panic "deferred break cleanup"
+
+fn run():
+    for value in [1]:
+        defer cleanup()
+        break
+
+const VALUE: () = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("break must run deferred expressions in the loop body scope");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "evaluation.panicked")
+    );
+}
+
+#[test]
+fn deferred_expression_runs_on_continue() {
+    let source = br#"fn cleanup():
+    panic "deferred continue cleanup"
+
+fn run():
+    for value in [1]:
+        defer cleanup()
+        continue
+
+const VALUE: () = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("continue must run deferred expressions in the loop body scope");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "evaluation.panicked")
+    );
+}
+
+#[test]
+fn panic_does_not_run_deferred_cleanup() {
+    let source = br#"fn cleanup():
+    panic "deferred cleanup must not run"
+
+fn run():
+    defer cleanup()
+    panic "body panic"
+
+const VALUE: () = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("the body Panic must reject evaluation");
+    };
+    let diagnostic = rejected
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.code() == "evaluation.panicked")
+        .expect("body Panic diagnostic");
+    let expected = source
+        .windows(b"    panic \"body panic\"".len())
+        .position(|window| window == b"    panic \"body panic\"")
+        .expect("body Panic site");
+    assert_eq!(diagnostic.primary().start(), expected as u64);
+}
+
+#[test]
+fn deferred_expression_cannot_return_a_recoverable_error() {
+    let source = br#"enum Failure:
+    Failed
+
+fn recoverable() -> Result[i64, Failure]:
+    return Result.Err(Failure.Failed)
+
+fn run():
+    defer recoverable()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("a deferred Result must be resolved before scope exit");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.defer_returns_recoverable_error")
+    );
+}
+
+#[test]
+fn deferred_expression_cannot_propagate_a_recoverable_error() {
+    let source = br#"enum Failure:
+    Failed
+
+fn recoverable() -> Result[i64, Failure]:
+    return Result.Err(Failure.Failed)
+
+fn run() -> Result[i64, Failure]:
+    defer recoverable()?
+    return Result.Ok(1)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("deferred propagation cannot replace or hide the original exit");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.defer_returns_recoverable_error")
+    );
+}
+
+#[test]
+fn defer_registration_is_lexical_and_execution_dependent() {
+    let source = |condition: &str| {
+        format!(
+            "fn cleanup():\n    panic \"lexical cleanup\"\n\nfn run() -> i64:\n    if {condition}:\n        defer cleanup()\n    return 7\n\nconst VALUE: i64 = run()\n\n@image\nfn build() -> Image:\n    return Image.new()\n"
+        )
+    };
+
+    let CompilationOutcome::Accepted(accepted) = compile(source("false").as_bytes()) else {
+        panic!("an unexecuted defer statement must not register cleanup");
+    };
+    assert!(
+        accepted
+            .inspection()
+            .evaluations()
+            .iter()
+            .any(|evaluation| {
+                evaluation.root() == "image.VALUE"
+                    && matches!(
+                        evaluation.outcome(),
+                        EvaluationOutcome::Completed(CanonicalValue::Integer { value: 7, .. })
+                    )
+            })
+    );
+
+    let CompilationOutcome::Rejected(rejected) = compile(source("true").as_bytes()) else {
+        panic!("a nested lexical scope must run its registered cleanup when it exits");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "evaluation.panicked")
     );
 }
 
@@ -754,6 +2659,36 @@ fn build() -> Image:
 }
 
 #[test]
+fn exact_propagation_rejects_local_mediated_error_conversion() {
+    let source = br#"enum ReadError:
+    Missing
+
+enum AppError:
+    Failed
+
+fn fetch() -> Result[i64, ReadError]:
+    return Result.Err(ReadError.Missing)
+
+fn load() -> Result[i64, AppError]:
+    result = fetch()
+    return Result.Ok(result?)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("a local cannot hide an implicit error conversion");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.propagation_error_mismatch")
+    );
+}
+
+#[test]
 fn fixed_width_numeric_literals_include_f16_and_checked_integer_overflow() {
     let valid = br#"const BYTE: u8 = 255u8
 const HALF: f16 = 1.5f16
@@ -807,10 +2742,12 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = compile(mixed_float) else {
         panic!("mixed float formats require an explicit conversion");
     };
-    assert!(rejected.diagnostics().iter().any(|diagnostic| {
-        diagnostic.code() == "semantic.invalid_typed_hir"
-            && has_text_parameter(diagnostic, "kind", "binary_type_mismatch")
-    }));
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.binary_type_mismatch")
+    );
 
     let mixed_integer = br#"const BAD: u16 = 1u8 + 2u16
 
@@ -870,10 +2807,12 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = compile(unsigned) else {
         panic!("an unsigned integer cannot be negated");
     };
-    assert!(rejected.diagnostics().iter().any(|diagnostic| {
-        diagnostic.code() == "semantic.invalid_typed_hir"
-            && has_text_parameter(diagnostic, "kind", "invalid_unary_operand")
-    }));
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.invalid_unary_operand")
+    );
 
     let signed_minimum = br#"const MINIMUM: i8 = -128i8
 
@@ -920,13 +2859,36 @@ fn every_signed_minimum_is_a_valid_checked_unary_expression() {
 }
 
 #[test]
+fn negating_an_evaluated_signed_minimum_panics_on_fixed_width_overflow() {
+    let source = br#"const MINIMUM: i8 = -128i8
+const NEGATED: i8 = -MINIMUM
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("negating an evaluated i8 minimum must overflow");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "evaluation.panicked")
+    );
+}
+
+#[test]
 fn source_read_after_move_is_a_creator_rejection_not_a_compiler_defect() {
-    let source = br#"fn consume(take value: i64):
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take value: Ticket):
     pass
 
-fn broken(take value: i64) -> i64:
-    consume(value)
-    return value
+fn broken(take value: Ticket) -> i64:
+    consume(take value)
+    return value.id
 
 @image
 fn build() -> Image:
@@ -935,6 +2897,37 @@ fn build() -> Image:
     let outcome = compile(source);
     let CompilationOutcome::Rejected(rejected) = outcome else {
         panic!("ordinary source ownership misuse must be rejected: {outcome:#?}");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.read_after_move")
+    );
+}
+
+#[test]
+fn moving_a_resource_field_moves_its_containing_place() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+resource struct Envelope:
+    ticket: Ticket
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn broken(take envelope: Envelope):
+    consume(take envelope.ticket)
+    consume(take envelope.ticket)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Rejected(rejected) = outcome else {
+        panic!("a Resource field cannot be moved twice: {outcome:#?}");
     };
     assert!(
         rejected
@@ -954,7 +2947,7 @@ fn consume(take ticket: Ticket):
 
 fn choose(flag: bool, take ticket: Ticket) -> Ticket:
     if flag:
-        consume(ticket)
+        consume(take ticket)
         return Ticket(id=0)
     return ticket
 
@@ -976,7 +2969,7 @@ fn consume(take ticket: Ticket):
 
 fn broken(flag: bool, take ticket: Ticket) -> Ticket:
     if flag:
-        consume(ticket)
+        consume(take ticket)
     return ticket
 
 @image
@@ -1137,6 +3130,40 @@ fn build() -> Image:
             .diagnostics()
             .iter()
             .any(|diagnostic| diagnostic.code() == "semantic.recursive_type_alias")
+    );
+}
+
+#[test]
+fn expected_types_concretize_zero_payload_generic_nominals() {
+    let source = br#"enum Maybe[T]:
+    Nothing
+    Some(value: T)
+
+const NOTHING: Maybe[i64] = Maybe.Nothing()
+
+@image
+fn build() -> Image:
+    return Image.new(nothing=NOTHING)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!(
+            "an expected generic nominal type must supply otherwise-unconstrained arguments: {outcome:#?}"
+        );
+    };
+    assert!(
+        accepted
+            .inspection()
+            .evaluations()
+            .iter()
+            .any(|evaluation| {
+                evaluation.root() == "image.NOTHING"
+                    && matches!(
+                        evaluation.outcome(),
+                        EvaluationOutcome::Completed(CanonicalValue::Variant { variant, .. })
+                            if variant.as_ref() == "Nothing"
+                    )
+            })
     );
 }
 
@@ -1418,6 +3445,26 @@ fn build() -> Image:
 }
 
 #[test]
+fn one_element_tuple_types_keep_their_required_trailing_comma() {
+    let source = br#"const ONE: (i64,) = (1,)
+
+@image
+fn build() -> Image:
+    return Image.new(value=ONE)
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("a one-element tuple type and value must compile");
+    };
+    assert!(
+        accepted
+            .inspection()
+            .types()
+            .iter()
+            .any(|type_| { type_.name() == "ONE" && type_.type_name() == "(i64,)" })
+    );
+}
+
+#[test]
 fn unbounded_recursion_is_rejected_before_evaluation() {
     let source = br#"fn recurse() -> i64:
     return recurse()
@@ -1440,6 +3487,58 @@ fn build() -> Image:
 }
 
 #[test]
+fn visibly_decreasing_bounded_integer_recursion_is_admitted() {
+    let source = br#"pure fn countdown(remaining: u8) -> u8:
+    if remaining == 0u8:
+        return 0u8
+    return countdown(remaining - 1u8)
+
+const ZERO: u8 = countdown(4u8)
+
+@image
+fn build() -> Image:
+    return Image.new(value=ZERO)
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("a visibly decreasing fixed-width measure is finite: {outcome:#?}");
+    };
+    assert!(
+        accepted
+            .inspection()
+            .function_facts()
+            .iter()
+            .find(|facts| facts.name() == "countdown")
+            .is_some_and(|facts| facts.is_bounded())
+    );
+}
+
+#[test]
+fn every_edge_in_a_decreasing_recursive_group_uses_the_group_measure() {
+    let source = br#"pure fn even(remaining: u8) -> bool:
+    if remaining == 0u8:
+        return true
+    return odd(remaining - 1u8)
+
+pure fn odd(remaining: u8) -> bool:
+    if remaining == 0u8:
+        return false
+    return even(remaining - 1u8)
+
+const ANSWER: bool = even(4u8)
+
+@image
+fn build() -> Image:
+    return Image.new(value=ANSWER)
+"#;
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "a mutually recursive SCC is finite when every internal edge decreases: {outcome:#?}"
+    );
+}
+
+#[test]
 fn build_constructors_have_no_authority_outside_the_image_call_chain() {
     let source = br#"const FORGED: Image = Image.new()
 
@@ -1455,6 +3554,157 @@ fn build() -> Image:
             .diagnostics()
             .iter()
             .any(|diagnostic| diagnostic.code() == "semantic.build_constructor_outside_image")
+    );
+}
+
+#[test]
+fn authenticated_constructor_signatures_create_typed_non_root_symbolic_nodes() {
+    let compiler = Compiler::open(CompilerInstallation::with_authenticated_modules(vec![
+        ProjectFile::new(
+            "src/runtime/topology.wr",
+            br#"pub struct Node:
+    pub pure fn new(children: [Node]) -> Node:
+        panic "sealed Node constructor"
+"#,
+        ),
+    ]))
+    .expect("authenticated topology declaration seals");
+    let source = br#"from runtime import topology
+
+@image
+fn build() -> Image:
+    leaf = topology.Node.new(children=[])
+    root = topology.Node.new(children=[leaf])
+    return Image.new(node=root)
+"#;
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    );
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("an authenticated signature must expose a sealed constructor: {outcome:#?}");
+    };
+    assert_eq!(accepted.inspection().constructions().len(), 3);
+    let node_types = accepted
+        .inspection()
+        .identities()
+        .iter()
+        .filter(|identity| identity.domain() == IdentityDomain::Type && identity.name() == "Node")
+        .map(|identity| identity.digest())
+        .collect::<std::collections::BTreeSet<_>>();
+    let constructed_node_types = accepted
+        .inspection()
+        .constructions()
+        .iter()
+        .filter_map(|construction| match construction.kind() {
+            ConstructionKind::Node { type_identity } => Some(type_identity),
+            ConstructionKind::Image | ConstructionKind::Test => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(constructed_node_types, node_types);
+    assert_eq!(
+        accepted
+            .inspection()
+            .constructions()
+            .iter()
+            .filter(|construction| matches!(construction.kind(), ConstructionKind::Node { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        accepted
+            .inspection()
+            .constructions()
+            .iter()
+            .filter(|construction| construction.kind() == ConstructionKind::Image)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn sealed_constructor_registry_requires_both_an_authenticated_signature_and_namespace_access() {
+    let installation = || {
+        CompilerInstallation::with_authenticated_modules(vec![ProjectFile::new(
+            "src/runtime/topology.wr",
+            br#"pub struct Node:
+    pub pure fn new(children: [Node]) -> Node:
+        panic "sealed Node constructor"
+"#,
+        )])
+    };
+    let compile_with = |source: &[u8]| {
+        Compiler::open(installation())
+            .expect("authenticated topology declaration seals")
+            .compile(
+                CompilationRequest::new(
+                    ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+                    Root::Image,
+                ),
+                &Cancellation::new(),
+            )
+    };
+
+    let wrong_type = compile_with(
+        br#"from runtime import topology
+
+@image
+fn build() -> Image:
+    node = topology.Node.new(children=1)
+    return Image.new(node=node)
+"#,
+    );
+    let CompilationOutcome::Rejected(wrong_type) = wrong_type else {
+        panic!("the authenticated constructor signature must check operands");
+    };
+    assert!(
+        wrong_type
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| { diagnostic.code() == "semantic.argument_type_mismatch" })
+    );
+
+    let ambient = compile_with(
+        br#"@image
+fn build() -> Image:
+    node = Node.new(children=[])
+    return Image.new(node=node)
+"#,
+    );
+    let CompilationOutcome::Rejected(ambient) = ambient else {
+        panic!("an unimported authenticated constructor must not become ambient authority");
+    };
+    assert!(
+        ambient
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.unresolved_nominal_type"),
+        "{ambient:#?}"
+    );
+}
+
+#[test]
+fn project_authored_constructor_signatures_remain_ordinary_wrela() {
+    let source = br#"struct Node:
+    pure fn new(label: Text) -> Node:
+        return Node()
+
+@image
+fn build() -> Image:
+    node = Node.new(label="ordinary")
+    return Image.new(node=node)
+"#;
+    let CompilationOutcome::Accepted(accepted) = compile(source) else {
+        panic!("a project-associated function remains ordinary Wrela");
+    };
+    assert_eq!(accepted.inspection().constructions().len(), 1);
+    assert_eq!(
+        accepted.inspection().constructions()[0].kind(),
+        ConstructionKind::Image
     );
 }
 
@@ -1498,4 +3748,234 @@ fn build() -> Image:
     assert_eq!(leaf.len(), 2, "i64 and bool have distinct concrete facts");
     assert_ne!(leaf[0].identity(), leaf[1].identity());
     assert!(leaf.iter().all(|facts| facts.logical_cost() > 0));
+}
+
+#[test]
+fn tuples_field_reads_and_elif_cross_the_complete_compiler_seam() {
+    let source = br#"struct Pair:
+    left: i64
+    right: i64
+
+pure fn choose(value: i64) -> i64:
+    if value < 0:
+        return 1
+    elif value == 0:
+        return 2
+    else:
+        return 3
+
+pure fn read_left() -> i64:
+    pair = Pair(left=7, right=9)
+    return pair.left
+
+const TUPLE: (i64, bool) = (choose(0), true)
+const FIELD: i64 = read_left()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("accepted Layer 1 expression and branch forms must compile: {outcome:#?}");
+    };
+    let evaluation = |name: &str| {
+        accepted
+            .inspection()
+            .evaluations()
+            .iter()
+            .find(|evaluation| evaluation.root() == name)
+            .expect("constant evaluation")
+            .outcome()
+    };
+    assert_eq!(
+        evaluation("image.TUPLE"),
+        &EvaluationOutcome::Completed(CanonicalValue::Tuple(
+            vec![
+                CanonicalValue::Integer {
+                    type_name: "i64".into(),
+                    value: 2,
+                },
+                CanonicalValue::Bool(true),
+            ]
+            .into()
+        ))
+    );
+    assert_eq!(
+        evaluation("image.FIELD"),
+        &EvaluationOutcome::Completed(CanonicalValue::Integer {
+            type_name: "i64".into(),
+            value: 7,
+        })
+    );
+}
+
+#[test]
+fn scalar_bytes_and_multiline_text_literals_are_canonical_values() {
+    let source = br#"const SCALAR: Scalar = '\u{1f642}'
+const BYTES_VALUE: Bytes = b"A\x00\n"
+const MULTILINE: Text = """
+    first
+    second
+    """
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("accepted literal forms must compile: {outcome:#?}");
+    };
+    let evaluation = |name: &str| {
+        accepted
+            .inspection()
+            .evaluations()
+            .iter()
+            .find(|evaluation| evaluation.root() == name)
+            .expect("constant evaluation")
+            .outcome()
+    };
+    assert_eq!(
+        evaluation("image.SCALAR"),
+        &EvaluationOutcome::Completed(CanonicalValue::Scalar('🙂'))
+    );
+    assert_eq!(
+        evaluation("image.BYTES_VALUE"),
+        &EvaluationOutcome::Completed(CanonicalValue::Bytes(Arc::from(*b"A\0\n")))
+    );
+    assert_eq!(
+        evaluation("image.MULTILINE"),
+        &EvaluationOutcome::Completed(CanonicalValue::Text("first\nsecond\n".into()))
+    );
+
+    for malformed in [
+        b"const VALUE: Scalar = 'ab'\n".as_slice(),
+        b"const VALUE: Bytes = b\"non-ascii \xff\"\n".as_slice(),
+        b"const VALUE: Bytes = b\"\\u{41}\"\n".as_slice(),
+    ] {
+        let CompilationOutcome::Rejected(rejected) = compile(malformed) else {
+            panic!("malformed literal must reject");
+        };
+        assert!(
+            rejected
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code() == "syntax.invalid_literal")
+        );
+    }
+}
+
+#[test]
+fn fixed_operators_and_checked_indexing_cross_verified_hir() {
+    let source = br#"const BITS: u8 = ((0b1100u8 & 0b1010u8) | 0b0001u8) ^ 0b0010u8
+const SHIFTED: u16 = 1u16 << 8u16
+const INVERTED: u8 = ~0u8
+const INDEXED: i64 = [4, 5, 6][1]
+const POSITIVE: i64 = +2
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("fixed operator vocabulary must compile: {outcome:#?}");
+    };
+    let integer = |name: &str| {
+        let EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) = accepted
+            .inspection()
+            .evaluations()
+            .iter()
+            .find(|evaluation| evaluation.root() == name)
+            .expect("constant evaluation")
+            .outcome()
+        else {
+            panic!("integer constant outcome");
+        };
+        *value
+    };
+    assert_eq!(integer("image.BITS"), 11);
+    assert_eq!(integer("image.SHIFTED"), 256);
+    assert_eq!(integer("image.INVERTED"), 255);
+    assert_eq!(integer("image.INDEXED"), 5);
+    assert_eq!(integer("image.POSITIVE"), 2);
+
+    let out_of_bounds = br#"const BAD: i64 = [1][2]
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(out_of_bounds) else {
+        panic!("checked indexing must panic during constant evaluation");
+    };
+    assert!(rejected.diagnostics().iter().any(|diagnostic| {
+        diagnostic.code() == "evaluation.panicked"
+            && has_text_parameter(diagnostic, "kind", "index_out_of_bounds")
+    }));
+}
+
+#[test]
+fn data_comparisons_have_one_typed_hir_and_evaluator_meaning() {
+    let source = br#"struct Point:
+    x: i64
+
+enum Choice:
+    None
+    Some(value: i64)
+
+const TEXT_EQUAL: bool = "same" == "same"
+const SCALAR_ORDER: bool = 'a' < 'b'
+const BYTES_ORDER: bool = b"ab" < b"ac"
+const ARRAY_EQUAL: bool = [1, 2] == [1, 2]
+const TUPLE_DIFFERENT: bool = (1, false) != (1, true)
+const STRUCT_EQUAL: bool = Point(x=1) == Point(x=1)
+const ENUM_DIFFERENT: bool = Choice.Some(value=1) != Choice.None
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("comparable Data must evaluate after Typed HIR accepts it: {outcome:#?}");
+    };
+    for name in [
+        "image.TEXT_EQUAL",
+        "image.SCALAR_ORDER",
+        "image.BYTES_ORDER",
+        "image.ARRAY_EQUAL",
+        "image.TUPLE_DIFFERENT",
+        "image.STRUCT_EQUAL",
+        "image.ENUM_DIFFERENT",
+    ] {
+        assert_eq!(
+            accepted
+                .inspection()
+                .evaluations()
+                .iter()
+                .find(|evaluation| evaluation.root() == name)
+                .expect("constant evaluation")
+                .outcome(),
+            &EvaluationOutcome::Completed(CanonicalValue::Bool(true)),
+            "{name}"
+        );
+    }
+
+    let invalid = br#"const BAD: bool = false < true
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(invalid) else {
+        panic!("Boolean values are equatable but not ordered");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.binary_type_mismatch")
+    );
 }

@@ -6,11 +6,13 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_128;
 
 use crate::model::{
-    BuildKind, BuiltinVariant, DefinitionId, FloatType, IntegerType, TestId, Type, VariantId,
+    BuildKind, BuiltinVariant, DefinitionId, FloatType, IntegerType, SpecializationId, TestId,
+    Type, VariantId,
 };
 use crate::typed_hir::{
-    BinaryOperator, CallTarget, Expression, ExpressionKind, HirFunction, Literal, LocalId,
-    Statement, VerifiedProgram,
+    BinaryOperator, CallTarget, ClosureId, Expression, ExpressionKind, HirClosure, HirFunction,
+    HirMatchCase, HirMatchPattern, Literal, LocalId, Place, PlaceProjection, Statement,
+    VerifiedProgram,
 };
 use crate::{
     Cancellation, CanonicalValue, EvaluationLimitPolicy as LimitPolicy, EvaluationOutcome,
@@ -50,7 +52,15 @@ enum Value {
         bits: u64,
     },
     Text(Arc<str>),
+    Scalar(char),
+    Bytes(Arc<[u8]>),
+    Function(SpecializationId),
+    Closure {
+        id: ClosureId,
+        captures: Arc<[(LocalId, Value)]>,
+    },
     Array(Arc<[Value]>),
+    Tuple(Arc<[Value]>),
     BuiltinVariant {
         variant: BuiltinVariant,
         payload: Arc<[Value]>,
@@ -93,6 +103,7 @@ enum RootWork<'hir> {
 enum FrameKind<'hir> {
     Root,
     Function(&'hir HirFunction),
+    Closure(&'hir HirClosure),
     Constant {
         id: DefinitionId,
         type_: &'hir Type,
@@ -107,6 +118,7 @@ struct MachineFrame<'hir> {
     controls: Vec<Control<'hir>>,
     values: Vec<Value>,
     locals: Vec<Option<Value>>,
+    writebacks: Vec<(LocalId, Place)>,
 }
 
 enum Control<'hir> {
@@ -115,10 +127,16 @@ enum Control<'hir> {
     FinishRoot,
     FinishConstant,
     FunctionFallthrough,
+    FinishClosure {
+        return_type: &'hir Type,
+    },
     Block {
         function: &'hir HirFunction,
         statements: &'hir [Statement],
         index: usize,
+    },
+    EndScope {
+        deferred: Vec<&'hir Expression>,
     },
     Statement {
         function: &'hir HirFunction,
@@ -127,7 +145,11 @@ enum Control<'hir> {
     FinishReturn {
         return_type: &'hir Type,
     },
+    FinishUnitReturn,
     FinishPanic {
+        site: &'hir SourceRange,
+    },
+    FinishAssert {
         site: &'hir SourceRange,
     },
     Discard,
@@ -135,27 +157,144 @@ enum Control<'hir> {
         local: LocalId,
         initialize: bool,
     },
+    StorePlace {
+        place: &'hir Place,
+        index_count: usize,
+    },
+    FinishReadPlace {
+        place: &'hir Place,
+        index_count: usize,
+    },
     SelectBranch {
         function: &'hir HirFunction,
         then_branch: &'hir [Statement],
         else_branch: &'hir [Statement],
     },
+    SelectPatternBranch {
+        function: &'hir HirFunction,
+        pattern: &'hir HirMatchPattern,
+        then_branch: &'hir [Statement],
+        else_branch: &'hir [Statement],
+    },
+    FinishFor {
+        function: &'hir HirFunction,
+        pattern: &'hir HirMatchPattern,
+        body: &'hir [Statement],
+    },
+    FinishMatch {
+        function: &'hir HirFunction,
+        cases: &'hir [HirMatchCase],
+    },
+    TryMatch {
+        function: &'hir HirFunction,
+        cases: &'hir [HirMatchCase],
+        value: Value,
+        index: usize,
+    },
+    FinishMatchGuard {
+        function: &'hir HirFunction,
+        cases: &'hir [HirMatchCase],
+        value: Value,
+        next_index: usize,
+        body: &'hir [Statement],
+        bindings: Vec<LocalId>,
+    },
+    ClearLocals(Vec<LocalId>),
+    ForNext {
+        function: &'hir HirFunction,
+        pattern: &'hir HirMatchPattern,
+        body: &'hir [Statement],
+        values: Arc<[Value]>,
+        index: usize,
+    },
+    WhileNext {
+        function: &'hir HirFunction,
+        condition: &'hir Expression,
+        body: &'hir [Statement],
+        remaining: u64,
+    },
+    FinishWhileCondition {
+        function: &'hir HirFunction,
+        condition: &'hir Expression,
+        body: &'hir [Statement],
+        remaining: u64,
+    },
     FinishArray {
         count: usize,
+    },
+    FinishRepeatedArray {
+        count: u64,
+    },
+    FinishTuple {
+        count: usize,
+    },
+    FinishIndex {
+        site: &'hir SourceRange,
     },
     FinishNegate {
         site: &'hir SourceRange,
     },
+    FinishBitNot,
+    FinishNot,
+    FinishShortCircuit {
+        operator: BinaryOperator,
+        right: &'hir Expression,
+    },
     FinishPropagate,
+    FinishIs {
+        pattern: &'hir HirMatchPattern,
+    },
     FinishBinary {
         operator: BinaryOperator,
         site: &'hir SourceRange,
     },
     FinishCall {
         target: &'hir CallTarget,
-        argument_count: usize,
+        arguments: &'hir [Expression],
         site: &'hir SourceRange,
     },
+}
+
+impl Control<'_> {
+    fn is_loop_marker(&self) -> bool {
+        matches!(self, Self::ForNext { .. } | Self::WhileNext { .. })
+    }
+}
+
+fn deferred_expressions<'hir>(controls: &[Control<'hir>], start: usize) -> Vec<&'hir Expression> {
+    controls[start..]
+        .iter()
+        .rev()
+        .filter_map(|control| match control {
+            Control::EndScope { deferred } => Some(deferred.iter().rev()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect()
+}
+
+fn exited_locals(controls: &[Control<'_>], start: usize) -> Vec<LocalId> {
+    controls[start..]
+        .iter()
+        .rev()
+        .filter_map(|control| match control {
+            Control::ClearLocals(locals) => Some(locals.iter()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect()
+}
+
+fn push_deferred_controls<'hir>(
+    controls: &mut Vec<Control<'hir>>,
+    deferred: Vec<&'hir Expression>,
+) {
+    for expression in deferred.into_iter().rev() {
+        controls.push(Control::Discard);
+        controls.push(Control::Expression(expression));
+    }
 }
 
 pub(crate) struct Engine<'a> {
@@ -171,7 +310,7 @@ pub(crate) struct Engine<'a> {
     constructions: Vec<Construction>,
     construction_keys: BTreeMap<u128, Arc<[u8]>>,
     test_applications: Vec<TestId>,
-    call_stack: Vec<(DefinitionId, String, SourceRange)>,
+    call_stack: Vec<(u128, String, SourceRange)>,
     evaluation_policy: EvaluationPolicy,
     evaluation_root: u128,
     root_dependencies: BTreeSet<u128>,
@@ -353,6 +492,7 @@ impl<'a> Engine<'a> {
                     controls: vec![Control::FinishRoot, Control::Constant(id)],
                     values: Vec::new(),
                     locals: Vec::new(),
+                    writebacks: Vec::new(),
                 });
             }
             RootWork::Expression(expression) => {
@@ -368,6 +508,7 @@ impl<'a> Engine<'a> {
                     controls: vec![Control::FinishRoot, Control::Expression(expression)],
                     values: Vec::new(),
                     locals: Vec::new(),
+                    writebacks: Vec::new(),
                 });
             }
             RootWork::Function(id) => {
@@ -384,7 +525,7 @@ impl<'a> Engine<'a> {
                     .get(&id)
                     .map(|function| &function.source)
                     .ok_or(EvalFailure::Creator(RejectKind::UnresolvedCall))?;
-                self.push_function_frame(&mut frames, function, Vec::new(), site)?;
+                self.push_function_frame(&mut frames, function, Vec::new(), Vec::new(), site)?;
             }
         }
 
@@ -412,23 +553,81 @@ impl<'a> Engine<'a> {
                                     bits: *bits,
                                 },
                                 Literal::Text(value) => Value::Text(value.clone()),
+                                Literal::Scalar(value) => Value::Scalar(*value),
+                                Literal::Bytes(value) => Value::Bytes(value.clone()),
                             };
                             self.push_value(&mut frames, value)?;
                         }
                         ExpressionKind::Read(place) => {
-                            let value = frames
-                                .last()
-                                .and_then(|frame| frame.locals.get(place.local.0 as usize))
-                                .and_then(Option::as_ref)
-                                .cloned()
-                                .ok_or(EvalFailure::Creator(RejectKind::MissingLocal))?;
-                            self.push_value(&mut frames, value)?;
+                            if place.projections.is_empty() {
+                                let value = frames
+                                    .last()
+                                    .and_then(|frame| frame.locals.get(place.local.0 as usize))
+                                    .and_then(Option::as_ref)
+                                    .cloned()
+                                    .ok_or(EvalFailure::Creator(RejectKind::MissingLocal))?;
+                                self.push_value(&mut frames, value)?;
+                            } else {
+                                let indexes = place
+                                    .projections
+                                    .iter()
+                                    .filter_map(|projection| match projection {
+                                        PlaceProjection::Index { index, .. } => {
+                                            Some(index.as_ref())
+                                        }
+                                        PlaceProjection::Field { .. } => None,
+                                    })
+                                    .collect::<Vec<_>>();
+                                let controls = &mut frames
+                                    .last_mut()
+                                    .expect("machine has current frame")
+                                    .controls;
+                                controls.push(Control::FinishReadPlace {
+                                    place,
+                                    index_count: indexes.len(),
+                                });
+                                controls.extend(indexes.into_iter().rev().map(Control::Expression));
+                            }
                         }
                         ExpressionKind::Constant(id) => frames
                             .last_mut()
                             .expect("machine has current frame")
                             .controls
                             .push(Control::Constant(*id)),
+                        ExpressionKind::FunctionValue { specialization, .. } => {
+                            let specialization = specialization.ok_or_else(|| {
+                                EvalFailure::Defect(Arc::from(
+                                    "template function value reached the concrete evaluator",
+                                ))
+                            })?;
+                            self.push_value(&mut frames, Value::Function(specialization))?;
+                        }
+                        ExpressionKind::Closure(closure) => {
+                            let captures = closure
+                                .captures
+                                .iter()
+                                .map(|(local, _)| {
+                                    frames
+                                        .last()
+                                        .and_then(|frame| {
+                                            frame
+                                                .locals
+                                                .get(local.0 as usize)
+                                                .and_then(Option::as_ref)
+                                        })
+                                        .cloned()
+                                        .map(|value| (*local, value))
+                                        .ok_or(EvalFailure::Creator(RejectKind::MissingLocal))
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            self.push_value(
+                                &mut frames,
+                                Value::Closure {
+                                    id: closure.id,
+                                    captures: captures.into(),
+                                },
+                            )?;
+                        }
                         ExpressionKind::Array(values) => {
                             let controls = &mut frames
                                 .last_mut()
@@ -439,6 +638,40 @@ impl<'a> Engine<'a> {
                             });
                             controls.extend(values.iter().rev().map(Control::Expression));
                         }
+                        ExpressionKind::RepeatedArray { value, length } => {
+                            let controls = &mut frames
+                                .last_mut()
+                                .expect("machine has current frame")
+                                .controls;
+                            controls.push(Control::FinishRepeatedArray { count: *length });
+                            controls.push(Control::Expression(value));
+                        }
+                        ExpressionKind::Tuple(values) => {
+                            let controls = &mut frames
+                                .last_mut()
+                                .expect("machine has current frame")
+                                .controls;
+                            controls.push(Control::FinishTuple {
+                                count: values.len(),
+                            });
+                            controls.extend(values.iter().rev().map(Control::Expression));
+                        }
+                        ExpressionKind::Index { value, index } => {
+                            let controls = &mut frames
+                                .last_mut()
+                                .expect("machine has current frame")
+                                .controls;
+                            controls.push(Control::FinishIndex {
+                                site: &expression.source,
+                            });
+                            controls.push(Control::Expression(index));
+                            controls.push(Control::Expression(value));
+                        }
+                        ExpressionKind::Positive(value) => frames
+                            .last_mut()
+                            .expect("machine has current frame")
+                            .controls
+                            .push(Control::Expression(value)),
                         ExpressionKind::Negate(value) => {
                             let controls = &mut frames
                                 .last_mut()
@@ -447,6 +680,22 @@ impl<'a> Engine<'a> {
                             controls.push(Control::FinishNegate {
                                 site: &expression.source,
                             });
+                            controls.push(Control::Expression(value));
+                        }
+                        ExpressionKind::BitNot(value) => {
+                            let controls = &mut frames
+                                .last_mut()
+                                .expect("machine has current frame")
+                                .controls;
+                            controls.push(Control::FinishBitNot);
+                            controls.push(Control::Expression(value));
+                        }
+                        ExpressionKind::Not(value) => {
+                            let controls = &mut frames
+                                .last_mut()
+                                .expect("machine has current frame")
+                                .controls;
+                            controls.push(Control::FinishNot);
                             controls.push(Control::Expression(value));
                         }
                         ExpressionKind::Await(_) => {
@@ -462,6 +711,14 @@ impl<'a> Engine<'a> {
                             controls.push(Control::FinishPropagate);
                             controls.push(Control::Expression(value));
                         }
+                        ExpressionKind::Is { value, pattern } => {
+                            let controls = &mut frames
+                                .last_mut()
+                                .expect("machine has current frame")
+                                .controls;
+                            controls.push(Control::FinishIs { pattern });
+                            controls.push(Control::Expression(value));
+                        }
                         ExpressionKind::Binary {
                             operator,
                             left,
@@ -471,11 +728,18 @@ impl<'a> Engine<'a> {
                                 .last_mut()
                                 .expect("machine has current frame")
                                 .controls;
-                            controls.push(Control::FinishBinary {
-                                operator: *operator,
-                                site: &expression.source,
-                            });
-                            controls.push(Control::Expression(right));
+                            if matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
+                                controls.push(Control::FinishShortCircuit {
+                                    operator: *operator,
+                                    right,
+                                });
+                            } else {
+                                controls.push(Control::FinishBinary {
+                                    operator: *operator,
+                                    site: &expression.source,
+                                });
+                                controls.push(Control::Expression(right));
+                            }
                             controls.push(Control::Expression(left));
                         }
                         ExpressionKind::Call { target, arguments } => {
@@ -485,10 +749,13 @@ impl<'a> Engine<'a> {
                                 .controls;
                             controls.push(Control::FinishCall {
                                 target,
-                                argument_count: arguments.len(),
+                                arguments,
                                 site: &expression.source,
                             });
                             controls.extend(arguments.iter().rev().map(Control::Expression));
+                            if let CallTarget::Callable { value } = target {
+                                controls.push(Control::Expression(value));
+                            }
                         }
                     }
                 }
@@ -526,6 +793,7 @@ impl<'a> Engine<'a> {
                         ],
                         values: Vec::new(),
                         locals: Vec::new(),
+                        writebacks: Vec::new(),
                     });
                 }
                 Control::FinishRoot | Control::FinishConstant => {
@@ -552,11 +820,28 @@ impl<'a> Engine<'a> {
                         return Ok(result);
                     }
                 }
+                Control::FinishClosure { return_type } => {
+                    let value = self.pop_value(&mut frames)?;
+                    let value = coerce(value, return_type)
+                        .ok_or(EvalFailure::Creator(RejectKind::ReturnTypeMismatch))?;
+                    if let Some(result) = self.complete_frame(&mut frames, value)? {
+                        return Ok(result);
+                    }
+                }
                 Control::Block {
                     function,
                     statements,
                     index,
                 } => {
+                    if index == 0 {
+                        frames
+                            .last_mut()
+                            .expect("machine has current frame")
+                            .controls
+                            .push(Control::EndScope {
+                                deferred: Vec::new(),
+                            });
+                    }
                     if let Some(statement) = statements.get(index) {
                         let controls = &mut frames
                             .last_mut()
@@ -586,21 +871,27 @@ impl<'a> Engine<'a> {
                         Statement::Return {
                             value: Some(value), ..
                         } => {
+                            let deferred = deferred_expressions(controls, 0);
                             controls.clear();
                             controls.push(Control::FinishReturn {
                                 return_type: &function.return_type,
                             });
+                            push_deferred_controls(controls, deferred);
                             controls.push(Control::Expression(value));
                         }
                         Statement::Return { value: None, .. } => {
+                            let deferred = deferred_expressions(controls, 0);
                             controls.clear();
-                            if let Some(result) = self.complete_frame(&mut frames, Value::Unit)? {
-                                return Ok(result);
-                            }
+                            controls.push(Control::FinishUnitReturn);
+                            push_deferred_controls(controls, deferred);
                         }
                         Statement::Panic { value, source } => {
                             controls.push(Control::FinishPanic { site: source });
                             controls.push(Control::Expression(value));
+                        }
+                        Statement::Assert { condition, source } => {
+                            controls.push(Control::FinishAssert { site: source });
+                            controls.push(Control::Expression(condition));
                         }
                         Statement::Expect { condition, .. } => {
                             controls.push(Control::Discard);
@@ -614,11 +905,30 @@ impl<'a> Engine<'a> {
                             controls.push(Control::Expression(value));
                         }
                         Statement::Assign { place, value, .. } => {
-                            controls.push(Control::Store {
-                                local: place.local,
-                                initialize: false,
-                            });
-                            controls.push(Control::Expression(value));
+                            if place.projections.is_empty() {
+                                controls.push(Control::Store {
+                                    local: place.local,
+                                    initialize: false,
+                                });
+                                controls.push(Control::Expression(value));
+                            } else {
+                                let indexes = place
+                                    .projections
+                                    .iter()
+                                    .filter_map(|projection| match projection {
+                                        PlaceProjection::Index { index, .. } => {
+                                            Some(index.as_ref())
+                                        }
+                                        PlaceProjection::Field { .. } => None,
+                                    })
+                                    .collect::<Vec<_>>();
+                                controls.push(Control::StorePlace {
+                                    place,
+                                    index_count: indexes.len(),
+                                });
+                                controls.push(Control::Expression(value));
+                                controls.extend(indexes.into_iter().rev().map(Control::Expression));
+                            }
                         }
                         Statement::Evaluate(expression) => {
                             controls.push(Control::Discard);
@@ -637,7 +947,116 @@ impl<'a> Engine<'a> {
                             });
                             controls.push(Control::Expression(condition));
                         }
+                        Statement::IfPattern {
+                            value,
+                            pattern,
+                            then_branch,
+                            else_branch,
+                            ..
+                        } => {
+                            controls.push(Control::SelectPatternBranch {
+                                function,
+                                pattern,
+                                then_branch,
+                                else_branch,
+                            });
+                            controls.push(Control::Expression(value));
+                        }
+                        Statement::For {
+                            pattern,
+                            iterable,
+                            body,
+                            ..
+                        } => {
+                            controls.push(Control::FinishFor {
+                                function,
+                                pattern,
+                                body,
+                            });
+                            controls.push(Control::Expression(iterable));
+                        }
+                        Statement::While {
+                            condition,
+                            body,
+                            max_iterations,
+                            ..
+                        } => controls.push(Control::WhileNext {
+                            function,
+                            condition,
+                            body,
+                            remaining: *max_iterations,
+                        }),
+                        Statement::Break(_) => {
+                            let Some(index) = controls.iter().rposition(Control::is_loop_marker)
+                            else {
+                                return Err(EvalFailure::Defect(Arc::from(
+                                    "verified break appeared outside a loop",
+                                )));
+                            };
+                            let deferred = deferred_expressions(controls, index + 1);
+                            let locals = exited_locals(controls, index + 1);
+                            controls.truncate(index);
+                            controls.push(Control::ClearLocals(locals));
+                            push_deferred_controls(controls, deferred);
+                        }
+                        Statement::Continue(_) => {
+                            let Some(index) = controls.iter().rposition(Control::is_loop_marker)
+                            else {
+                                return Err(EvalFailure::Defect(Arc::from(
+                                    "verified continue appeared outside a loop",
+                                )));
+                            };
+                            let deferred = deferred_expressions(controls, index + 1);
+                            let locals = exited_locals(controls, index + 1);
+                            controls.truncate(index + 1);
+                            controls.push(Control::ClearLocals(locals));
+                            push_deferred_controls(controls, deferred);
+                        }
+                        Statement::Match { value, cases, .. } => {
+                            controls.push(Control::FinishMatch { function, cases });
+                            controls.push(Control::Expression(value));
+                        }
+                        Statement::Defer { expression, .. } => {
+                            let Some(Control::EndScope { deferred }) = controls
+                                .iter_mut()
+                                .rev()
+                                .find(|control| matches!(control, Control::EndScope { .. }))
+                            else {
+                                return Err(EvalFailure::Defect(Arc::from(
+                                    "verified defer appeared outside a lexical scope",
+                                )));
+                            };
+                            deferred.push(expression);
+                        }
+                        Statement::WithPool {
+                            binding,
+                            scope,
+                            body,
+                            ..
+                        } => {
+                            controls.push(Control::ClearLocals(vec![binding.local]));
+                            controls.push(Control::Block {
+                                function,
+                                statements: body,
+                                index: 0,
+                            });
+                            controls.push(Control::Store {
+                                local: binding.local,
+                                initialize: true,
+                            });
+                            controls.push(Control::Expression(scope));
+                        }
                         Statement::Pass(_) => {}
+                    }
+                }
+                Control::EndScope { deferred } => {
+                    let controls = &mut frames
+                        .last_mut()
+                        .expect("machine has current frame")
+                        .controls;
+                    for expression in deferred {
+                        controls.push(Control::Discard);
+                        controls.push(Control::Expression(expression));
                     }
                 }
                 Control::FinishReturn { return_type } => {
@@ -648,10 +1067,26 @@ impl<'a> Engine<'a> {
                         return Ok(result);
                     }
                 }
+                Control::FinishUnitReturn => {
+                    if let Some(result) = self.complete_frame(&mut frames, Value::Unit)? {
+                        return Ok(result);
+                    }
+                }
                 Control::FinishPanic { site } => {
                     let _ = self.pop_value(&mut frames)?;
                     return Err(EvalFailure::Panic(PanicKind::Explicit, site.clone()));
                 }
+                Control::FinishAssert { site } => match self.pop_value(&mut frames)? {
+                    Value::Bool(true) => {}
+                    Value::Bool(false) => {
+                        return Err(EvalFailure::Panic(PanicKind::AssertionFailed, site.clone()));
+                    }
+                    _ => {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "verified assertion condition is not Bool",
+                        )));
+                    }
+                },
                 Control::Discard => {
                     let _ = self.pop_value(&mut frames)?;
                 }
@@ -681,6 +1116,32 @@ impl<'a> Engine<'a> {
                     self.retain(value_size(&value))?;
                     frames.last_mut().expect("machine has frame").locals[index] = Some(value);
                 }
+                Control::FinishReadPlace { place, index_count } => {
+                    let indexes = self.pop_values(&mut frames, index_count)?;
+                    let root = frames
+                        .last()
+                        .and_then(|frame| frame.locals.get(place.local.0 as usize))
+                        .and_then(Option::as_ref)
+                        .ok_or(EvalFailure::Creator(RejectKind::MissingLocal))?;
+                    let value = read_projected_value(root, &place.projections, &indexes)?;
+                    self.push_value(&mut frames, value)?;
+                }
+                Control::StorePlace { place, index_count } => {
+                    let value = self.pop_value(&mut frames)?;
+                    let indexes = self.pop_values(&mut frames, index_count)?;
+                    let slot = place.local.0 as usize;
+                    let mut root = frames
+                        .last_mut()
+                        .and_then(|frame| frame.locals.get_mut(slot))
+                        .and_then(Option::take)
+                        .ok_or(EvalFailure::Creator(RejectKind::MissingLocal))?;
+                    let previous_size = value_size(&root);
+                    store_projected_value(&mut root, &place.projections, &indexes, value)?;
+                    let next_size = value_size(&root);
+                    self.release(previous_size)?;
+                    self.retain(next_size)?;
+                    frames.last_mut().expect("machine has frame").locals[slot] = Some(root);
+                }
                 Control::SelectBranch {
                     function,
                     then_branch,
@@ -706,18 +1167,348 @@ impl<'a> Engine<'a> {
                             index: 0,
                         });
                 }
+                Control::SelectPatternBranch {
+                    function,
+                    pattern,
+                    then_branch,
+                    else_branch,
+                } => {
+                    let value = self.pop_value(&mut frames)?;
+                    let Some(bindings) = pattern_bindings(&value, pattern) else {
+                        frames
+                            .last_mut()
+                            .expect("machine has current frame")
+                            .controls
+                            .push(Control::Block {
+                                function,
+                                statements: else_branch,
+                                index: 0,
+                            });
+                        continue;
+                    };
+                    let binding_locals =
+                        bindings.iter().map(|(local, _)| *local).collect::<Vec<_>>();
+                    for (local, binding) in bindings {
+                        let slot = local.0 as usize;
+                        self.retain(value_size(&binding))?;
+                        let frame = frames.last_mut().expect("machine has current frame");
+                        if frame.locals.len() <= slot {
+                            frame.locals.resize(slot + 1, None);
+                        }
+                        if frame.locals[slot].replace(binding).is_some() {
+                            return Err(EvalFailure::Defect(Arc::from(
+                                "verified is pattern reused a live LocalId",
+                            )));
+                        }
+                    }
+                    let controls = &mut frames
+                        .last_mut()
+                        .expect("machine has current frame")
+                        .controls;
+                    controls.push(Control::ClearLocals(binding_locals));
+                    controls.push(Control::Block {
+                        function,
+                        statements: then_branch,
+                        index: 0,
+                    });
+                }
+                Control::FinishFor {
+                    function,
+                    pattern,
+                    body,
+                } => {
+                    let Value::Array(values) = self.pop_value(&mut frames)? else {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "verified for iterable is not an array",
+                        )));
+                    };
+                    frames
+                        .last_mut()
+                        .expect("machine has current frame")
+                        .controls
+                        .push(Control::ForNext {
+                            function,
+                            pattern,
+                            body,
+                            values,
+                            index: 0,
+                        });
+                }
+                Control::ForNext {
+                    function,
+                    pattern,
+                    body,
+                    values,
+                    index,
+                } => {
+                    let Some(value) = values.get(index).cloned() else {
+                        continue;
+                    };
+                    let bindings = pattern_bindings(&value, pattern).ok_or_else(|| {
+                        EvalFailure::Defect(Arc::from(
+                            "verified irrefutable for pattern did not match",
+                        ))
+                    })?;
+                    let binding_locals =
+                        bindings.iter().map(|(local, _)| *local).collect::<Vec<_>>();
+                    for (local, binding) in bindings {
+                        let slot = local.0 as usize;
+                        self.retain(value_size(&binding))?;
+                        let frame = frames.last_mut().expect("machine has current frame");
+                        if frame.locals.len() <= slot {
+                            frame.locals.resize(slot + 1, None);
+                        }
+                        if frame.locals[slot].replace(binding).is_some() {
+                            return Err(EvalFailure::Defect(Arc::from(
+                                "verified for pattern reused a live LocalId",
+                            )));
+                        }
+                    }
+                    let controls = &mut frames
+                        .last_mut()
+                        .expect("machine has current frame")
+                        .controls;
+                    controls.push(Control::ForNext {
+                        function,
+                        pattern,
+                        body,
+                        values,
+                        index: index + 1,
+                    });
+                    controls.push(Control::ClearLocals(binding_locals));
+                    controls.push(Control::Block {
+                        function,
+                        statements: body,
+                        index: 0,
+                    });
+                }
+                Control::WhileNext {
+                    function,
+                    condition,
+                    body,
+                    remaining,
+                } => {
+                    let controls = &mut frames
+                        .last_mut()
+                        .expect("machine has current frame")
+                        .controls;
+                    controls.push(Control::FinishWhileCondition {
+                        function,
+                        condition,
+                        body,
+                        remaining,
+                    });
+                    controls.push(Control::Expression(condition));
+                }
+                Control::FinishWhileCondition {
+                    function,
+                    condition,
+                    body,
+                    remaining,
+                } => match self.pop_value(&mut frames)? {
+                    Value::Bool(false) => {}
+                    Value::Bool(true) if remaining == 0 => {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "verified while exceeded its compiler-derived bound",
+                        )));
+                    }
+                    Value::Bool(true) => {
+                        let controls = &mut frames
+                            .last_mut()
+                            .expect("machine has current frame")
+                            .controls;
+                        controls.push(Control::WhileNext {
+                            function,
+                            condition,
+                            body,
+                            remaining: remaining - 1,
+                        });
+                        controls.push(Control::Block {
+                            function,
+                            statements: body,
+                            index: 0,
+                        });
+                    }
+                    _ => {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "verified while condition is not Bool",
+                        )));
+                    }
+                },
+                Control::FinishMatch { function, cases } => {
+                    let value = self.pop_value(&mut frames)?;
+                    frames
+                        .last_mut()
+                        .expect("machine has current frame")
+                        .controls
+                        .push(Control::TryMatch {
+                            function,
+                            cases,
+                            value,
+                            index: 0,
+                        });
+                }
+                Control::TryMatch {
+                    function,
+                    cases,
+                    value,
+                    index,
+                } => {
+                    let Some(case) = cases.get(index) else {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "verified exhaustive match selected no case",
+                        )));
+                    };
+                    let Some(bindings) = case.pattern.as_ref().map_or_else(
+                        || Some(Vec::new()),
+                        |pattern| pattern_bindings(&value, pattern),
+                    ) else {
+                        frames
+                            .last_mut()
+                            .expect("machine has current frame")
+                            .controls
+                            .push(Control::TryMatch {
+                                function,
+                                cases,
+                                value,
+                                index: index + 1,
+                            });
+                        continue;
+                    };
+                    let binding_locals =
+                        bindings.iter().map(|(local, _)| *local).collect::<Vec<_>>();
+                    for (local, binding) in bindings {
+                        let slot = local.0 as usize;
+                        self.retain(value_size(&binding))?;
+                        let frame = frames.last_mut().expect("machine has current frame");
+                        if frame.locals.len() <= slot {
+                            frame.locals.resize(slot + 1, None);
+                        }
+                        if frame.locals[slot].replace(binding).is_some() {
+                            return Err(EvalFailure::Defect(Arc::from(
+                                "verified pattern binding reused a live LocalId",
+                            )));
+                        }
+                    }
+                    let controls = &mut frames
+                        .last_mut()
+                        .expect("machine has current frame")
+                        .controls;
+                    if let Some(guard) = &case.guard {
+                        controls.push(Control::FinishMatchGuard {
+                            function,
+                            cases,
+                            value,
+                            next_index: index + 1,
+                            body: &case.body,
+                            bindings: binding_locals,
+                        });
+                        controls.push(Control::Expression(guard));
+                    } else {
+                        controls.push(Control::ClearLocals(binding_locals));
+                        controls.push(Control::Block {
+                            function,
+                            statements: &case.body,
+                            index: 0,
+                        });
+                    }
+                }
+                Control::FinishMatchGuard {
+                    function,
+                    cases,
+                    value,
+                    next_index,
+                    body,
+                    bindings,
+                } => match self.pop_value(&mut frames)? {
+                    Value::Bool(true) => {
+                        let controls = &mut frames
+                            .last_mut()
+                            .expect("machine has current frame")
+                            .controls;
+                        controls.push(Control::ClearLocals(bindings));
+                        controls.push(Control::Block {
+                            function,
+                            statements: body,
+                            index: 0,
+                        });
+                    }
+                    Value::Bool(false) => {
+                        self.clear_locals(&mut frames, &bindings)?;
+                        frames
+                            .last_mut()
+                            .expect("machine has current frame")
+                            .controls
+                            .push(Control::TryMatch {
+                                function,
+                                cases,
+                                value,
+                                index: next_index,
+                            });
+                    }
+                    _ => {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "verified match guard is not Bool",
+                        )));
+                    }
+                },
+                Control::ClearLocals(locals) => self.clear_locals(&mut frames, &locals)?,
                 Control::FinishArray { count } => {
                     let values = self.pop_values(&mut frames, count)?;
                     self.push_value(&mut frames, Value::Array(values.into()))?;
                 }
+                Control::FinishRepeatedArray { count } => {
+                    let value = self.pop_value(&mut frames)?;
+                    let retained = value_size(&value)
+                        .checked_mul(count)
+                        .and_then(|values| values.checked_add(16))
+                        .unwrap_or(u64::MAX);
+                    self.observe_temporary(retained)?;
+                    let count = usize::try_from(count).map_err(|_| EvalFailure::Limit {
+                        policy: LimitPolicy::RootMemory,
+                        ceiling: MEMORY_LIMIT,
+                        used: u64::MAX,
+                    })?;
+                    self.push_value(&mut frames, Value::Array(vec![value; count].into()))?;
+                }
+                Control::FinishTuple { count } => {
+                    let values = self.pop_values(&mut frames, count)?;
+                    self.push_value(&mut frames, Value::Tuple(values.into()))?;
+                }
+                Control::FinishIndex { site } => {
+                    let Value::Integer { value: index, .. } = self.pop_value(&mut frames)? else {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "verified array index is not an integer",
+                        )));
+                    };
+                    let Value::Array(values) = self.pop_value(&mut frames)? else {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "verified indexed value is not an array",
+                        )));
+                    };
+                    let value = usize::try_from(index)
+                        .ok()
+                        .and_then(|index| values.get(index))
+                        .cloned()
+                        .ok_or_else(|| {
+                            EvalFailure::Panic(PanicKind::IndexOutOfBounds, site.clone())
+                        })?;
+                    self.push_value(&mut frames, value)?;
+                }
                 Control::FinishNegate { site } => {
                     let value = match self.pop_value(&mut frames)? {
-                        Value::Integer { kind, value } => Value::Integer {
-                            kind,
-                            value: value.checked_neg().ok_or_else(|| {
+                        Value::Integer { kind, value } => {
+                            let value = value.checked_neg().ok_or_else(|| {
                                 EvalFailure::Panic(PanicKind::IntegerOverflow, site.clone())
-                            })?,
-                        },
+                            })?;
+                            if !kind.fits(value) {
+                                return Err(EvalFailure::Panic(
+                                    PanicKind::IntegerOverflow,
+                                    site.clone(),
+                                ));
+                            }
+                            Value::Integer { kind, value }
+                        }
                         Value::Float { kind, bits } => Value::Float {
                             kind,
                             bits: encode_float(kind, -decode_float(kind, bits)),
@@ -728,11 +1519,59 @@ impl<'a> Engine<'a> {
                     };
                     self.push_value(&mut frames, value)?;
                 }
+                Control::FinishBitNot => {
+                    let Value::Integer { kind, value } = self.pop_value(&mut frames)? else {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "verified bitwise-not operand is not an integer",
+                        )));
+                    };
+                    let value = if kind.is_signed() {
+                        !value
+                    } else {
+                        let mask = (1_i128 << kind.bits()) - 1;
+                        mask ^ value
+                    };
+                    self.push_value(&mut frames, Value::Integer { kind, value })?;
+                }
+                Control::FinishNot => {
+                    let Value::Bool(value) = self.pop_value(&mut frames)? else {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "verified not operand is not Bool",
+                        )));
+                    };
+                    self.push_value(&mut frames, Value::Bool(!value))?;
+                }
+                Control::FinishShortCircuit { operator, right } => {
+                    let Value::Bool(left) = self.pop_value(&mut frames)? else {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "verified short-circuit operand is not Bool",
+                        )));
+                    };
+                    let result = match (operator, left) {
+                        (BinaryOperator::And, false) => Some(false),
+                        (BinaryOperator::Or, true) => Some(true),
+                        (BinaryOperator::And, true) | (BinaryOperator::Or, false) => None,
+                        _ => {
+                            return Err(EvalFailure::Defect(Arc::from(
+                                "non-boolean operator reached short-circuit control",
+                            )));
+                        }
+                    };
+                    if let Some(result) = result {
+                        self.push_value(&mut frames, Value::Bool(result))?;
+                    } else {
+                        frames
+                            .last_mut()
+                            .expect("machine has current frame")
+                            .controls
+                            .push(Control::Expression(right));
+                    }
+                }
                 Control::FinishPropagate => {
                     let value = self.pop_value(&mut frames)?;
                     match value {
                         Value::BuiltinVariant {
-                            variant: BuiltinVariant::ResultOk,
+                            variant: BuiltinVariant::ResultOk | BuiltinVariant::OptionSome,
                             payload,
                         } => {
                             let value = payload
@@ -741,27 +1580,57 @@ impl<'a> Engine<'a> {
                                 .ok_or(EvalFailure::Creator(RejectKind::ResultOkMissingPayload))?;
                             self.push_value(&mut frames, value)?;
                         }
-                        error @ Value::BuiltinVariant {
-                            variant: BuiltinVariant::ResultErr,
+                        alternative @ Value::BuiltinVariant {
+                            variant: BuiltinVariant::ResultErr | BuiltinVariant::OptionNone,
                             ..
                         } => {
-                            if !matches!(
-                                frames.last().map(|frame| &frame.kind),
-                                Some(FrameKind::Function(function))
-                                    if matches!(function.return_type, Type::Result { .. })
-                            ) {
+                            let return_type = match frames.last().map(|frame| &frame.kind) {
+                                Some(FrameKind::Function(function)) => &function.return_type,
+                                Some(FrameKind::Closure(closure)) => &closure.return_type,
+                                _ => {
+                                    return Err(EvalFailure::Defect(Arc::from(
+                                        "verified propagation escaped a callable frame",
+                                    )));
+                                }
+                            };
+                            let compatible = matches!(
+                                (&alternative, return_type),
+                                (
+                                    Value::BuiltinVariant {
+                                        variant: BuiltinVariant::ResultErr,
+                                        ..
+                                    },
+                                    Type::Result { .. }
+                                ) | (
+                                    Value::BuiltinVariant {
+                                        variant: BuiltinVariant::OptionNone,
+                                        ..
+                                    },
+                                    Type::Option(_)
+                                )
+                            );
+                            if !compatible {
                                 return Err(EvalFailure::Defect(Arc::from(
-                                    "verified propagation escaped a non-Result function",
+                                    "verified propagation alternative does not match callable return",
                                 )));
                             }
-                            frames
-                                .last_mut()
+                            let return_already_scheduled = frames
+                                .last()
                                 .expect("machine has current frame")
                                 .controls
-                                .clear();
-                            if let Some(result) = self.complete_frame(&mut frames, error)? {
-                                return Ok(result);
+                                .iter()
+                                .any(|control| matches!(control, Control::FinishReturn { .. }));
+                            if !return_already_scheduled {
+                                let controls = &mut frames
+                                    .last_mut()
+                                    .expect("machine has current frame")
+                                    .controls;
+                                let deferred = deferred_expressions(controls, 0);
+                                controls.clear();
+                                controls.push(Control::FinishReturn { return_type });
+                                push_deferred_controls(controls, deferred);
                             }
+                            self.push_value(&mut frames, alternative)?;
                         }
                         _ => {
                             return Err(EvalFailure::Creator(
@@ -769,6 +1638,13 @@ impl<'a> Engine<'a> {
                             ));
                         }
                     }
+                }
+                Control::FinishIs { pattern } => {
+                    let value = self.pop_value(&mut frames)?;
+                    self.push_value(
+                        &mut frames,
+                        Value::Bool(pattern_bindings(&value, pattern).is_some()),
+                    )?;
                 }
                 Control::FinishBinary { operator, site } => {
                     let right = self.pop_value(&mut frames)?;
@@ -778,11 +1654,49 @@ impl<'a> Engine<'a> {
                 }
                 Control::FinishCall {
                     target,
-                    argument_count,
+                    arguments: argument_expressions,
                     site,
                 } => {
-                    let arguments = self.pop_values(&mut frames, argument_count)?;
+                    let arguments = self.pop_values(&mut frames, argument_expressions.len())?;
                     match target {
+                        CallTarget::Callable { .. } => match self.pop_value(&mut frames)? {
+                            Value::Function(specialization) => {
+                                let function = program
+                                    .specialization_function(specialization)
+                                    .ok_or(EvalFailure::Creator(RejectKind::UnresolvedCall))?;
+                                let writebacks = function_writebacks(
+                                    function,
+                                    argument_expressions,
+                                    &(0..function.parameters.len())
+                                        .map(|index| index as u16)
+                                        .collect::<Vec<_>>(),
+                                )?;
+                                self.push_function_frame(
+                                    &mut frames,
+                                    function,
+                                    arguments,
+                                    writebacks,
+                                    site,
+                                )?;
+                            }
+                            Value::Closure { id, captures } => {
+                                let closure = program
+                                    .closure(id)
+                                    .ok_or(EvalFailure::Creator(RejectKind::UnresolvedCall))?;
+                                self.push_closure_frame(
+                                    &mut frames,
+                                    closure,
+                                    &captures,
+                                    arguments,
+                                    site,
+                                )?;
+                            }
+                            _ => {
+                                return Err(EvalFailure::Defect(Arc::from(
+                                    "verified callable target is not a function value",
+                                )));
+                            }
+                        },
                         CallTarget::TemplateFunction { .. } => {
                             return Err(EvalFailure::Defect(Arc::from(
                                 "template call reached the concrete evaluator",
@@ -800,6 +1714,11 @@ impl<'a> Engine<'a> {
                                 &mut frames,
                                 function,
                                 reorder_values(arguments, argument_order)?,
+                                function_writebacks(
+                                    function,
+                                    argument_expressions,
+                                    argument_order,
+                                )?,
                                 site,
                             )?;
                         }
@@ -886,6 +1805,7 @@ impl<'a> Engine<'a> {
         frames: &mut Vec<MachineFrame<'hir>>,
         function: &'hir HirFunction,
         arguments: Vec<Value>,
+        writebacks: Vec<(LocalId, Place)>,
         call_site: &SourceRange,
     ) -> Result<(), EvalFailure> {
         self.charge(5)?;
@@ -914,7 +1834,7 @@ impl<'a> Engine<'a> {
             locals[local.0 as usize] = Some(value);
         }
         self.call_stack
-            .push((function.id, function.name.clone(), call_site.clone()));
+            .push((function.id.0, function.name.clone(), call_site.clone()));
         frames.push(MachineFrame {
             kind: FrameKind::Function(function),
             controls: vec![
@@ -927,6 +1847,71 @@ impl<'a> Engine<'a> {
             ],
             values: Vec::new(),
             locals,
+            writebacks,
+        });
+        Ok(())
+    }
+
+    fn push_closure_frame<'hir>(
+        &mut self,
+        frames: &mut Vec<MachineFrame<'hir>>,
+        closure: &'hir HirClosure,
+        captures: &[(LocalId, Value)],
+        arguments: Vec<Value>,
+        call_site: &SourceRange,
+    ) -> Result<(), EvalFailure> {
+        self.charge(5)?;
+        if self.call_stack.len() == CALL_DEPTH_LIMIT {
+            return Err(EvalFailure::Limit {
+                policy: LimitPolicy::CallDepth,
+                ceiling: CALL_DEPTH_LIMIT as u64,
+                used: (CALL_DEPTH_LIMIT + 1) as u64,
+            });
+        }
+        if closure.parameters.len() != arguments.len() || closure.captures.len() != captures.len() {
+            return Err(EvalFailure::Creator(RejectKind::ArgumentCount));
+        }
+        let local_count = closure
+            .parameters
+            .iter()
+            .chain(closure.captures.iter())
+            .map(|(local, _)| local.0 as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut locals = vec![None; local_count];
+        self.retain(64)?;
+        for ((expected_local, type_), (actual_local, value)) in
+            closure.captures.iter().zip(captures)
+        {
+            if expected_local != actual_local {
+                return Err(EvalFailure::Defect(Arc::from(
+                    "closure capture layout disagrees with its value",
+                )));
+            }
+            let value = coerce(value.clone(), type_)
+                .ok_or(EvalFailure::Creator(RejectKind::ArgumentTypeMismatch))?;
+            self.retain(value_size(&value))?;
+            locals[expected_local.0 as usize] = Some(value);
+        }
+        for ((local, type_), value) in closure.parameters.iter().zip(arguments) {
+            let value = coerce(value, type_)
+                .ok_or(EvalFailure::Creator(RejectKind::ArgumentTypeMismatch))?;
+            self.retain(value_size(&value))?;
+            locals[local.0 as usize] = Some(value);
+        }
+        self.call_stack
+            .push((closure.id.0, "<closure>".to_owned(), call_site.clone()));
+        frames.push(MachineFrame {
+            kind: FrameKind::Closure(closure),
+            controls: vec![
+                Control::FinishClosure {
+                    return_type: &closure.return_type,
+                },
+                Control::Expression(&closure.body),
+            ],
+            values: Vec::new(),
+            locals,
+            writebacks: Vec::new(),
         });
         Ok(())
     }
@@ -966,6 +1951,26 @@ impl<'a> Engine<'a> {
         Ok(values)
     }
 
+    fn clear_locals<'hir>(
+        &mut self,
+        frames: &mut [MachineFrame<'hir>],
+        locals: &[LocalId],
+    ) -> Result<(), EvalFailure> {
+        let frame = frames
+            .last_mut()
+            .ok_or_else(|| EvalFailure::Defect(Arc::from("local cleanup without a frame")))?;
+        for local in locals {
+            if let Some(value) = frame
+                .locals
+                .get_mut(local.0 as usize)
+                .and_then(Option::take)
+            {
+                self.release(value_size(&value))?;
+            }
+        }
+        Ok(())
+    }
+
     fn complete_frame<'hir>(
         &mut self,
         frames: &mut Vec<MachineFrame<'hir>>,
@@ -974,15 +1979,32 @@ impl<'a> Engine<'a> {
         let frame = frames
             .pop()
             .ok_or_else(|| EvalFailure::Defect(Arc::from("completed missing evaluator frame")))?;
+        let writebacks = frame
+            .writebacks
+            .iter()
+            .map(|(local, place)| {
+                frame
+                    .locals
+                    .get(local.0 as usize)
+                    .and_then(Option::as_ref)
+                    .cloned()
+                    .map(|value| (place.clone(), value))
+                    .ok_or_else(|| {
+                        EvalFailure::Defect(Arc::from(
+                            "mutable parameter writeback references a missing local",
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let frame_memory = 64_u64
             .saturating_add(frame.locals.iter().flatten().map(value_size).sum::<u64>())
             .saturating_add(frame.values.iter().map(value_size).sum::<u64>());
         self.release(frame_memory)?;
         let value = match frame.kind {
             FrameKind::Root => value,
-            FrameKind::Function(_) => {
+            FrameKind::Function(_) | FrameKind::Closure(_) => {
                 self.call_stack.pop().ok_or_else(|| {
-                    EvalFailure::Defect(Arc::from("function frame had no call-stack entry"))
+                    EvalFailure::Defect(Arc::from("call frame had no call-stack entry"))
                 })?;
                 value
             }
@@ -1025,6 +2047,20 @@ impl<'a> Engine<'a> {
                 value
             }
         };
+        for (place, value) in writebacks {
+            let slot = place.local.0 as usize;
+            let mut root = frames
+                .last_mut()
+                .and_then(|frame| frame.locals.get_mut(slot))
+                .and_then(Option::take)
+                .ok_or(EvalFailure::Creator(RejectKind::MissingLocal))?;
+            let previous_size = value_size(&root);
+            store_projected_value(&mut root, &place.projections, &[], value)?;
+            let next_size = value_size(&root);
+            self.release(previous_size)?;
+            self.retain(next_size)?;
+            frames.last_mut().expect("caller frame").locals[slot] = Some(root);
+        }
         if frames.is_empty() {
             Ok(Some(value))
         } else {
@@ -1042,15 +2078,20 @@ impl<'a> Engine<'a> {
         self.charge(3)?;
         let mut key = b"wrela.construction\0\x02".to_vec();
         for (id, _, call_site) in &self.call_stack {
-            key.extend_from_slice(&id.0.to_be_bytes());
+            key.extend_from_slice(&id.to_be_bytes());
             key.extend_from_slice(call_site.path().as_bytes());
             key.extend_from_slice(&call_site.start().to_be_bytes());
             key.extend_from_slice(&call_site.end().to_be_bytes());
         }
-        key.push(match kind {
-            BuildKind::Image => 1,
-            BuildKind::Test => 2,
-        });
+        key.push(kind.canonical_tag());
+        if let BuildKind::Node {
+            definition,
+            type_identity,
+        } = kind
+        {
+            key.extend_from_slice(&definition.0.to_be_bytes());
+            key.extend_from_slice(&type_identity.0.to_be_bytes());
+        }
         key.extend_from_slice(site.path().as_bytes());
         key.extend_from_slice(&site.start().to_be_bytes());
         key.extend_from_slice(&site.end().to_be_bytes());
@@ -1121,13 +2162,61 @@ fn reorder_values(
         .collect()
 }
 
+fn function_writebacks(
+    function: &HirFunction,
+    arguments: &[Expression],
+    argument_order: &[u16],
+) -> Result<Vec<(LocalId, Place)>, EvalFailure> {
+    let mut writebacks = Vec::new();
+    for (source_index, argument) in arguments.iter().enumerate() {
+        if argument.access != crate::typed_hir::AccessMode::Mut {
+            continue;
+        }
+        let parameter_index = usize::from(*argument_order.get(source_index).ok_or_else(|| {
+            EvalFailure::Defect(Arc::from("mutable call argument order is incomplete"))
+        })?);
+        let local = function
+            .parameters
+            .get(parameter_index)
+            .map(|(local, _, _)| *local)
+            .ok_or_else(|| {
+                EvalFailure::Defect(Arc::from("mutable call argument targets no parameter"))
+            })?;
+        let ExpressionKind::Read(place) = &argument.kind else {
+            return Err(EvalFailure::Defect(Arc::from(
+                "verified mutable call argument is not a typed place",
+            )));
+        };
+        if place
+            .projections
+            .iter()
+            .any(|projection| matches!(projection, PlaceProjection::Index { .. }))
+        {
+            return Err(EvalFailure::Defect(Arc::from(
+                "verified mutable indexed writeback lacks captured indexes",
+            )));
+        }
+        writebacks.push((local, place.clone()));
+    }
+    Ok(writebacks)
+}
+
 fn value_size(value: &Value) -> u64 {
     match value {
         Value::Unit => 0,
         Value::Bool(_) => 1,
-        Value::Integer { .. } | Value::Float { .. } | Value::SymbolicHandle { .. } => 16,
+        Value::Integer { .. }
+        | Value::Float { .. }
+        | Value::Function(_)
+        | Value::SymbolicHandle { .. } => 16,
+        Value::Closure { captures, .. } => captures.iter().fold(16_u64, |size, (_, value)| {
+            size.saturating_add(value_size(value))
+        }),
         Value::Text(value) => 16_u64.saturating_add(value.len() as u64),
+        Value::Scalar(_) => 4,
+        Value::Bytes(value) => 16_u64.saturating_add(value.len() as u64),
         Value::Array(values)
+        | Value::Tuple(values)
         | Value::BuiltinVariant {
             payload: values, ..
         }
@@ -1150,6 +2239,7 @@ fn collect_construction_edges(value: &Value, edges: &mut Vec<u128>) {
     match value {
         Value::SymbolicHandle { identity, .. } => edges.push(*identity),
         Value::Array(values)
+        | Value::Tuple(values)
         | Value::BuiltinVariant {
             payload: values, ..
         }
@@ -1172,7 +2262,15 @@ fn collect_construction_edges(value: &Value, edges: &mut Vec<u128>) {
         | Value::Bool(_)
         | Value::Integer { .. }
         | Value::Float { .. }
-        | Value::Text(_) => {}
+        | Value::Function(_)
+        | Value::Text(_)
+        | Value::Scalar(_)
+        | Value::Bytes(_) => {}
+        Value::Closure { captures, .. } => {
+            for (_, value) in &**captures {
+                collect_construction_edges(value, edges);
+            }
+        }
     }
 }
 
@@ -1185,6 +2283,7 @@ fn collect_test_applications(value: &Value, applications: &mut Vec<TestId>) {
             }
         }
         Value::Array(values)
+        | Value::Tuple(values)
         | Value::BuiltinVariant {
             payload: values, ..
         }
@@ -1204,8 +2303,16 @@ fn collect_test_applications(value: &Value, applications: &mut Vec<TestId>) {
         | Value::Bool(_)
         | Value::Integer { .. }
         | Value::Float { .. }
+        | Value::Function(_)
         | Value::Text(_)
+        | Value::Scalar(_)
+        | Value::Bytes(_)
         | Value::SymbolicHandle { .. } => {}
+        Value::Closure { captures, .. } => {
+            for (_, value) in &**captures {
+                collect_test_applications(value, applications);
+            }
+        }
     }
 }
 
@@ -1229,6 +2336,36 @@ fn apply_binary(
                 )));
             }
             match operator {
+                BinaryOperator::Range | BinaryOperator::RangeInclusive => {
+                    let inclusive = operator == BinaryOperator::RangeInclusive;
+                    let count = if right < left {
+                        0
+                    } else {
+                        let distance = right.checked_sub(left).ok_or_else(|| {
+                            EvalFailure::Panic(PanicKind::IntegerOverflow, site.clone())
+                        })?;
+                        distance.checked_add(i128::from(inclusive)).ok_or_else(|| {
+                            EvalFailure::Panic(PanicKind::IntegerOverflow, site.clone())
+                        })?
+                    };
+                    let count = u64::try_from(count).unwrap_or(u64::MAX);
+                    let maximum = MEMORY_LIMIT / 16;
+                    if count > maximum {
+                        return Err(EvalFailure::Limit {
+                            policy: LimitPolicy::RootMemory,
+                            ceiling: MEMORY_LIMIT,
+                            used: count.saturating_mul(16),
+                        });
+                    }
+                    let mut values = Vec::with_capacity(count as usize);
+                    for offset in 0..count {
+                        values.push(Value::Integer {
+                            kind,
+                            value: left + i128::from(offset),
+                        });
+                    }
+                    Ok(Value::Array(values.into()))
+                }
                 BinaryOperator::Add => checked_integer(kind, left.checked_add(right), site),
                 BinaryOperator::Subtract => checked_integer(kind, left.checked_sub(right), site),
                 BinaryOperator::Multiply => checked_integer(kind, left.checked_mul(right), site),
@@ -1237,19 +2374,52 @@ fn apply_binary(
                 }
                 BinaryOperator::Divide => checked_integer(kind, left.checked_div(right), site),
                 BinaryOperator::Remainder => checked_integer(kind, left.checked_rem(right), site),
+                BinaryOperator::BitAnd => Ok(Value::Integer {
+                    kind,
+                    value: left & right,
+                }),
+                BinaryOperator::BitOr => Ok(Value::Integer {
+                    kind,
+                    value: left | right,
+                }),
+                BinaryOperator::BitXor => Ok(Value::Integer {
+                    kind,
+                    value: left ^ right,
+                }),
+                BinaryOperator::ShiftLeft => {
+                    let shift = u32::try_from(right).ok();
+                    checked_integer(kind, shift.and_then(|shift| left.checked_shl(shift)), site)
+                }
+                BinaryOperator::ShiftRight => {
+                    let shift = u32::try_from(right).ok();
+                    checked_integer(kind, shift.and_then(|shift| left.checked_shr(shift)), site)
+                }
                 BinaryOperator::Equal => Ok(Value::Bool(left == right)),
                 BinaryOperator::NotEqual => Ok(Value::Bool(left != right)),
                 BinaryOperator::Less => Ok(Value::Bool(left < right)),
                 BinaryOperator::LessEqual => Ok(Value::Bool(left <= right)),
                 BinaryOperator::Greater => Ok(Value::Bool(left > right)),
                 BinaryOperator::GreaterEqual => Ok(Value::Bool(left >= right)),
+                BinaryOperator::And | BinaryOperator::Or => Err(EvalFailure::Defect(Arc::from(
+                    "short-circuit boolean operator reached integer evaluation",
+                ))),
             }
         }
         (Value::Bool(left), Value::Bool(right)) => match operator {
             BinaryOperator::Equal => Ok(Value::Bool(left == right)),
             BinaryOperator::NotEqual => Ok(Value::Bool(left != right)),
+            BinaryOperator::And | BinaryOperator::Or => Err(EvalFailure::Defect(Arc::from(
+                "short-circuit boolean operator reached eager evaluation",
+            ))),
             _ => Err(EvalFailure::Creator(RejectKind::InvalidBooleanOperator)),
         },
+        (Value::Text(left), Value::Text(right)) => apply_ordering(operator, &*left, &*right),
+        (Value::Scalar(left), Value::Scalar(right)) => apply_ordering(operator, &left, &right),
+        (Value::Bytes(left), Value::Bytes(right)) => apply_ordering(operator, &*left, &*right),
+        (Value::Unit, Value::Unit) => apply_equality(operator, true),
+        (Value::Array(left), Value::Array(right)) | (Value::Tuple(left), Value::Tuple(right)) => {
+            apply_equality(operator, left == right)
+        }
         (
             Value::Float { kind, bits: left },
             Value::Float {
@@ -1264,8 +2434,256 @@ fn apply_binary(
             }
             apply_float(operator, kind, left, right)
         }
+        (left, right) if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual) => {
+            apply_equality(operator, left == right)
+        }
         _ => Err(EvalFailure::Creator(RejectKind::BinaryTypeMismatch)),
     }
+}
+
+fn pattern_bindings(value: &Value, pattern: &HirMatchPattern) -> Option<Vec<(LocalId, Value)>> {
+    match pattern {
+        HirMatchPattern::Variant {
+            id: expected,
+            payload: expected_payload,
+        } => {
+            let Value::UserVariant { id, payload, .. } = value else {
+                return None;
+            };
+            if id != expected || payload.len() != expected_payload.len() {
+                return None;
+            }
+            let mut bindings = Vec::new();
+            for (value, pattern) in payload.iter().zip(expected_payload.iter()) {
+                bindings.extend(pattern_bindings(value, pattern)?);
+            }
+            Some(bindings)
+        }
+        HirMatchPattern::Struct {
+            definition: expected,
+            fields: expected_fields,
+        } => {
+            let Value::Struct {
+                definition, fields, ..
+            } = value
+            else {
+                return None;
+            };
+            if definition != expected || fields.len() != expected_fields.len() {
+                return None;
+            }
+            let mut bindings = Vec::new();
+            for ((_, value), pattern) in fields.iter().zip(expected_fields.iter()) {
+                bindings.extend(pattern_bindings(value, pattern)?);
+            }
+            Some(bindings)
+        }
+        HirMatchPattern::Tuple(expected) => {
+            let Value::Tuple(values) = value else {
+                return None;
+            };
+            sequence_pattern_bindings(values, expected)
+        }
+        HirMatchPattern::FixedArray(expected) => {
+            let Value::Array(values) = value else {
+                return None;
+            };
+            sequence_pattern_bindings(values, expected)
+        }
+        HirMatchPattern::Or(alternatives) => alternatives
+            .iter()
+            .find_map(|alternative| pattern_bindings(value, alternative)),
+        HirMatchPattern::Literal(literal) => literal_matches(value, literal).then(Vec::new),
+        HirMatchPattern::Binding { local, .. } => Some(vec![(*local, value.clone())]),
+        HirMatchPattern::Wildcard => Some(Vec::new()),
+    }
+}
+
+fn read_projected_value(
+    root: &Value,
+    projections: &[PlaceProjection],
+    indexes: &[Value],
+) -> Result<Value, EvalFailure> {
+    let mut value = root;
+    let mut index_offset = 0;
+    for projection in projections {
+        match projection {
+            PlaceProjection::Field { name, .. } => {
+                let Value::Struct { fields, .. } = value else {
+                    return Err(EvalFailure::Defect(Arc::from(
+                        "verified place field projects a non-struct value",
+                    )));
+                };
+                value = fields
+                    .iter()
+                    .find(|(field, _)| field == name)
+                    .map(|(_, value)| value)
+                    .ok_or_else(|| {
+                        EvalFailure::Defect(Arc::from(
+                            "verified place field names an absent runtime field",
+                        ))
+                    })?;
+            }
+            PlaceProjection::Index { index, .. } => {
+                let Some(Value::Integer {
+                    value: authored, ..
+                }) = indexes.get(index_offset)
+                else {
+                    return Err(EvalFailure::Defect(Arc::from(
+                        "verified place index is not an integer",
+                    )));
+                };
+                index_offset += 1;
+                let Value::Array(values) = value else {
+                    return Err(EvalFailure::Defect(Arc::from(
+                        "verified place index projects a non-array value",
+                    )));
+                };
+                value = usize::try_from(*authored)
+                    .ok()
+                    .and_then(|offset| values.get(offset))
+                    .ok_or_else(|| {
+                        EvalFailure::Panic(PanicKind::IndexOutOfBounds, index.source.clone())
+                    })?;
+            }
+        }
+    }
+    Ok(value.clone())
+}
+
+fn store_projected_value(
+    root: &mut Value,
+    projections: &[PlaceProjection],
+    indexes: &[Value],
+    value: Value,
+) -> Result<(), EvalFailure> {
+    fn store(
+        current: &mut Value,
+        projections: &[PlaceProjection],
+        indexes: &[Value],
+        index_offset: &mut usize,
+        value: Value,
+    ) -> Result<(), EvalFailure> {
+        let Some((projection, remaining)) = projections.split_first() else {
+            *current = value;
+            return Ok(());
+        };
+        match projection {
+            PlaceProjection::Field { name, .. } => {
+                let Value::Struct { fields, .. } = current else {
+                    return Err(EvalFailure::Defect(Arc::from(
+                        "verified place field stores through a non-struct value",
+                    )));
+                };
+                let field = Arc::make_mut(fields)
+                    .iter_mut()
+                    .find(|(field, _)| field == name)
+                    .map(|(_, value)| value)
+                    .ok_or_else(|| {
+                        EvalFailure::Defect(Arc::from(
+                            "verified place field names an absent runtime field",
+                        ))
+                    })?;
+                store(field, remaining, indexes, index_offset, value)
+            }
+            PlaceProjection::Index { index, .. } => {
+                let Some(Value::Integer {
+                    value: authored, ..
+                }) = indexes.get(*index_offset)
+                else {
+                    return Err(EvalFailure::Defect(Arc::from(
+                        "verified place index is not an integer",
+                    )));
+                };
+                *index_offset += 1;
+                let Value::Array(values) = current else {
+                    return Err(EvalFailure::Defect(Arc::from(
+                        "verified place index stores through a non-array value",
+                    )));
+                };
+                let element = usize::try_from(*authored)
+                    .ok()
+                    .and_then(|offset| Arc::make_mut(values).get_mut(offset))
+                    .ok_or_else(|| {
+                        EvalFailure::Panic(PanicKind::IndexOutOfBounds, index.source.clone())
+                    })?;
+                store(element, remaining, indexes, index_offset, value)
+            }
+        }
+    }
+
+    store(root, projections, indexes, &mut 0, value)
+}
+
+fn sequence_pattern_bindings(
+    values: &[Value],
+    patterns: &[HirMatchPattern],
+) -> Option<Vec<(LocalId, Value)>> {
+    if values.len() != patterns.len() {
+        return None;
+    }
+    let mut bindings = Vec::new();
+    for (value, pattern) in values.iter().zip(patterns) {
+        bindings.extend(pattern_bindings(value, pattern)?);
+    }
+    Some(bindings)
+}
+
+fn literal_matches(value: &Value, literal: &Literal) -> bool {
+    match (value, literal) {
+        (Value::Unit, Literal::Unit) => true,
+        (Value::Bool(actual), Literal::Bool(expected)) => actual == expected,
+        (
+            Value::Integer {
+                kind: actual_kind,
+                value: actual,
+            },
+            Literal::Integer {
+                kind: expected_kind,
+                value: expected,
+            },
+        ) => actual_kind == expected_kind && actual == expected,
+        (
+            Value::Float {
+                kind: actual_kind,
+                bits: actual,
+            },
+            Literal::Float {
+                kind: expected_kind,
+                bits: expected,
+            },
+        ) => actual_kind == expected_kind && actual == expected,
+        (Value::Text(actual), Literal::Text(expected)) => actual == expected,
+        (Value::Scalar(actual), Literal::Scalar(expected)) => actual == expected,
+        (Value::Bytes(actual), Literal::Bytes(expected)) => actual == expected,
+        _ => false,
+    }
+}
+
+fn apply_equality(operator: BinaryOperator, equal: bool) -> Result<Value, EvalFailure> {
+    match operator {
+        BinaryOperator::Equal => Ok(Value::Bool(equal)),
+        BinaryOperator::NotEqual => Ok(Value::Bool(!equal)),
+        _ => Err(EvalFailure::Defect(Arc::from(
+            "ordered comparison reached an equality-only value",
+        ))),
+    }
+}
+
+fn apply_ordering<T: Ord + ?Sized>(
+    operator: BinaryOperator,
+    left: &T,
+    right: &T,
+) -> Result<Value, EvalFailure> {
+    Ok(Value::Bool(match operator {
+        BinaryOperator::Equal => left == right,
+        BinaryOperator::NotEqual => left != right,
+        BinaryOperator::Less => left < right,
+        BinaryOperator::LessEqual => left <= right,
+        BinaryOperator::Greater => left > right,
+        BinaryOperator::GreaterEqual => left >= right,
+        _ => return Err(EvalFailure::Creator(RejectKind::BinaryTypeMismatch)),
+    }))
 }
 
 fn checked_integer(
@@ -1295,12 +2713,28 @@ fn apply_float(
         BinaryOperator::Multiply => left * right,
         BinaryOperator::Divide => left / right,
         BinaryOperator::Remainder => left % right,
+        BinaryOperator::Range
+        | BinaryOperator::RangeInclusive
+        | BinaryOperator::BitAnd
+        | BinaryOperator::BitOr
+        | BinaryOperator::BitXor
+        | BinaryOperator::ShiftLeft
+        | BinaryOperator::ShiftRight => {
+            return Err(EvalFailure::Defect(Arc::from(
+                "integer-only operator reached float evaluation",
+            )));
+        }
         BinaryOperator::Equal => return Ok(Value::Bool(left == right)),
         BinaryOperator::NotEqual => return Ok(Value::Bool(left != right)),
         BinaryOperator::Less => return Ok(Value::Bool(left < right)),
         BinaryOperator::LessEqual => return Ok(Value::Bool(left <= right)),
         BinaryOperator::Greater => return Ok(Value::Bool(left > right)),
         BinaryOperator::GreaterEqual => return Ok(Value::Bool(left >= right)),
+        BinaryOperator::And | BinaryOperator::Or => {
+            return Err(EvalFailure::Defect(Arc::from(
+                "short-circuit boolean operator reached float evaluation",
+            )));
+        }
     };
     Ok(Value::Float {
         kind,
@@ -1329,9 +2763,21 @@ fn value_matches(value: &Value, expected: &Type) -> bool {
         (Value::Unit, Type::Unit) | (Value::Bool(_), Type::Bool) | (Value::Text(_), Type::Text) => {
             true
         }
+        (Value::Scalar(_), Type::Scalar) | (Value::Bytes(_), Type::Bytes) => true,
         (Value::Integer { kind, .. }, Type::Integer(expected)) => kind == expected,
         (Value::Float { kind, .. }, Type::Float(expected)) => kind == expected,
+        (Value::Function(_) | Value::Closure { .. }, Type::Function { .. }) => true,
         (Value::Array(_), Type::Array(_)) => true,
+        (Value::Array(values), Type::FixedArray { length, .. }) => {
+            u64::try_from(values.len()).is_ok_and(|actual| actual == *length)
+        }
+        (Value::Tuple(values), Type::Tuple(expected)) => {
+            values.len() == expected.len()
+                && values
+                    .iter()
+                    .zip(expected.iter())
+                    .all(|(value, expected)| value_matches(value, expected))
+        }
         (
             Value::BuiltinVariant {
                 variant: BuiltinVariant::ResultOk | BuiltinVariant::ResultErr,
@@ -1375,6 +2821,18 @@ fn value_matches(value: &Value, expected: &Type) -> bool {
             Type::Builtin(crate::model::BuiltinType::Test),
         ) => true,
         (
+            Value::SymbolicHandle {
+                kind: BuildKind::Node {
+                    definition: actual, ..
+                },
+                ..
+            },
+            Type::Nominal {
+                definition: expected,
+                ..
+            },
+        ) => actual == expected,
+        (
             Value::TestApplication { .. },
             Type::Builtin(crate::model::BuiltinType::TestApplication),
         ) => true,
@@ -1396,8 +2854,23 @@ fn canonical(value: Value) -> CanonicalValue {
             bits,
         },
         Value::Text(value) => CanonicalValue::Text(value),
+        Value::Scalar(value) => CanonicalValue::Scalar(value),
+        Value::Bytes(value) => CanonicalValue::Bytes(value),
+        Value::Function(identity) => CanonicalValue::Function {
+            identity: identity.0,
+        },
+        Value::Closure { id, captures } => CanonicalValue::Closure {
+            identity: id.0,
+            captures: captures
+                .iter()
+                .map(|(_, value)| canonical(value.clone()))
+                .collect(),
+        },
         Value::Array(values) => {
             CanonicalValue::Array(values.iter().cloned().map(canonical).collect())
+        }
+        Value::Tuple(values) => {
+            CanonicalValue::Tuple(values.iter().cloned().map(canonical).collect())
         }
         Value::BuiltinVariant { variant, payload } => {
             let (type_name, variant) = match variant {
@@ -1443,6 +2916,9 @@ fn canonical(value: Value) -> CanonicalValue {
             kind: match kind {
                 BuildKind::Image => crate::ConstructionKind::Image,
                 BuildKind::Test => crate::ConstructionKind::Test,
+                BuildKind::Node { type_identity, .. } => crate::ConstructionKind::Node {
+                    type_identity: type_identity.0,
+                },
             },
             identity,
         },
@@ -1474,14 +2950,15 @@ fn decode_float(kind: FloatType, bits: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::typed_hir::{self, BuildAuthority, ProgramInput};
+    use crate::typed_hir::{self, BuildAuthority, PoolAuthority, ProgramInput};
 
     #[test]
     fn logical_fuel_exhaustion_is_exact_and_host_time_independent() {
         let mut identities = crate::identity::IdentityCatalog::empty();
         let program = typed_hir::verify(
             ProgramInput::default(),
-            &BuildAuthority::compiler_distribution(),
+            &BuildAuthority::test_compiler_distribution(),
+            &PoolAuthority::from_authenticated_scoped_factory(None),
             &mut identities,
             &Cancellation::new(),
         )
@@ -1504,7 +2981,8 @@ mod tests {
         let mut identities = crate::identity::IdentityCatalog::empty();
         let program = typed_hir::verify(
             ProgramInput::default(),
-            &BuildAuthority::compiler_distribution(),
+            &BuildAuthority::test_compiler_distribution(),
+            &PoolAuthority::from_authenticated_scoped_factory(None),
             &mut identities,
             &Cancellation::new(),
         )
@@ -1520,7 +2998,8 @@ mod tests {
         let mut identities = crate::identity::IdentityCatalog::empty();
         let program = typed_hir::verify(
             ProgramInput::default(),
-            &BuildAuthority::compiler_distribution(),
+            &BuildAuthority::test_compiler_distribution(),
+            &PoolAuthority::from_authenticated_scoped_factory(None),
             &mut identities,
             &Cancellation::new(),
         )

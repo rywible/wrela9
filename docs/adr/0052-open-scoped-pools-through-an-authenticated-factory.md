@@ -1,0 +1,5 @@
+# Open scoped Pools through an authenticated factory
+
+Scoped Pools use the ordinary `with expression as name:` form with the sealed `core.pool.scoped` factory. The compiler recognizes that authenticated definition identity, opens its existential Pool identity, and binds the authored name as both the fresh lexical Pool identity and its mutable scoped handle; Project-authored lookalikes gain no authority. This preserves the uniform `with` grammar and the authenticated-module seam without introducing a dedicated `with pool` dialect or exposing dependent Pool types outside their scope.
+
+Scoped capacity is a target-independent maximum live-allocation count. Layer 1 seals and verifies the factory, binder lifetime, and non-forgeability boundary; it deliberately does not implement allocation. Layer 2 adds fallible `try_allocate`, copy-only `lookup`, and consuming `reclaim`; `PoolFull[T]` returns the rejected value so Resource ownership is never lost. Proof-dependent `allocate` and `reserve` wait for whole-Image capacity analysis to admit them without changing source-visible types.

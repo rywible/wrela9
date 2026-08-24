@@ -70,6 +70,17 @@ pub(crate) enum BuiltinVariant {
     OptionNone,
 }
 
+impl BuiltinVariant {
+    pub(crate) const fn canonical_tag(self) -> u8 {
+        match self {
+            Self::ResultOk => 0x01,
+            Self::ResultErr => 0x02,
+            Self::OptionSome => 0x11,
+            Self::OptionNone => 0x12,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum BuildKind {
     Image,
@@ -105,6 +116,22 @@ pub(crate) enum Type {
 }
 
 impl IntegerType {
+    pub(crate) const fn canonical_tag(self) -> u8 {
+        match self {
+            Self::U8 => 0x01,
+            Self::U16 => 0x02,
+            Self::U32 => 0x03,
+            Self::U64 => 0x04,
+            Self::I8 => 0x11,
+            Self::I16 => 0x12,
+            Self::I32 => 0x13,
+            Self::I64 => 0x14,
+        }
+    }
+    pub(crate) const fn is_signed(self) -> bool {
+        matches!(self, Self::I8 | Self::I16 | Self::I32 | Self::I64)
+    }
+
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::U8 => "u8",
@@ -133,6 +160,13 @@ impl IntegerType {
 }
 
 impl FloatType {
+    pub(crate) const fn canonical_tag(self) -> u8 {
+        match self {
+            Self::F16 => 0x21,
+            Self::F32 => 0x22,
+            Self::F64 => 0x23,
+        }
+    }
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::F16 => "f16",
@@ -143,6 +177,13 @@ impl FloatType {
 }
 
 impl BuiltinType {
+    pub(crate) const fn canonical_tag(self) -> u8 {
+        match self {
+            Self::Image => 0x01,
+            Self::Test => 0x02,
+            Self::TestApplication => 0x03,
+        }
+    }
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Image => "Image",
@@ -194,36 +235,6 @@ impl Type {
         matches!(self, Self::Integer(_) | Self::Float(_))
     }
 
-    pub(crate) fn compatible_with(&self, expected: &Self) -> bool {
-        self == expected
-            || matches!(self, Self::Infer | Self::Parameter { .. })
-            || matches!(expected, Self::Infer | Self::Parameter { .. })
-            || matches!((self, expected), (Self::Integer(_), Self::Integer(_)))
-            || matches!((self, expected), (Self::Float(_), Self::Float(_)))
-            || match (self, expected) {
-                (
-                    Self::Result {
-                        success: actual_success,
-                        error: actual_error,
-                    },
-                    Self::Result {
-                        success: expected_success,
-                        error: expected_error,
-                    },
-                ) => {
-                    actual_success.compatible_with(expected_success)
-                        && match (actual_error, expected_error) {
-                            (_, None) => true,
-                            (Some(actual), Some(expected)) => actual.compatible_with(expected),
-                            (None, Some(_)) => false,
-                        }
-                }
-                (actual, Self::Result { success, .. }) => actual.compatible_with(success),
-                (Self::Array(actual), Self::Array(expected)) => actual.compatible_with(expected),
-                _ => false,
-            }
-    }
-
     pub(crate) fn canonical_key(&self) -> Arc<[u8]> {
         let mut bytes = Vec::new();
         self.append_canonical_key(&mut bytes);
@@ -236,11 +247,11 @@ impl Type {
             Self::Bool => bytes.push(1),
             Self::Integer(kind) => {
                 bytes.push(2);
-                bytes.push(*kind as u8);
+                bytes.push(kind.canonical_tag());
             }
             Self::Float(kind) => {
                 bytes.push(3);
-                bytes.push(*kind as u8);
+                bytes.push(kind.canonical_tag());
             }
             Self::Text => bytes.push(4),
             Self::Bytes => bytes.push(5),
@@ -275,7 +286,7 @@ impl Type {
             }
             Self::Builtin(kind) => {
                 bytes.push(10);
-                bytes.push(*kind as u8);
+                bytes.push(kind.canonical_tag());
             }
             Self::Nominal { definition, .. } => {
                 bytes.push(11);
@@ -329,20 +340,6 @@ pub(crate) fn resolve_builtin_variant(name: &NameSyntax) -> Option<BuiltinVarian
         ["Result", "Err"] => Some(BuiltinVariant::ResultErr),
         ["Option", "Some"] => Some(BuiltinVariant::OptionSome),
         ["Option", "None"] => Some(BuiltinVariant::OptionNone),
-        _ => None,
-    }
-}
-
-pub(crate) fn resolve_build_kind(name: &NameSyntax) -> Option<BuildKind> {
-    match name
-        .segments
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        ["Image", "new"] => Some(BuildKind::Image),
-        ["Test", "new"] => Some(BuildKind::Test),
         _ => None,
     }
 }

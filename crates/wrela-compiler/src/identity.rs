@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use xxhash_rust::xxh3::xxh3_128;
+use xxhash_rust::xxh3::{Xxh3, xxh3_128};
 
 use crate::compiler::{
     Cancellation, IdentityDomain, IdentityObservation, IdentityOrigin, ProjectFile,
@@ -27,8 +27,10 @@ pub(crate) enum IdentityFailure {
 #[derive(Clone, Debug)]
 pub(crate) struct IdentityCatalog {
     observations: Vec<IdentityObservation>,
+    observation_keys: BTreeSet<Arc<[u8]>>,
     modules: BTreeMap<String, ModuleId>,
     definitions: BTreeMap<(String, DeclarationKind, String), DefinitionId>,
+    associated_functions: BTreeMap<(DefinitionId, String), DefinitionId>,
     tests: BTreeMap<(String, String, String), TestId>,
     types: BTreeMap<DefinitionId, TypeId>,
     pools: BTreeMap<DefinitionId, PoolId>,
@@ -42,8 +44,10 @@ impl IdentityCatalog {
     pub(crate) fn empty() -> Self {
         Self {
             observations: Vec::new(),
+            observation_keys: BTreeSet::new(),
             modules: BTreeMap::new(),
             definitions: BTreeMap::new(),
+            associated_functions: BTreeMap::new(),
             tests: BTreeMap::new(),
             types: BTreeMap::new(),
             pools: BTreeMap::new(),
@@ -58,12 +62,39 @@ impl IdentityCatalog {
     }
 
     pub(crate) fn revision_fingerprint(&self) -> u128 {
-        let mut bytes = b"wrela.identity-catalog-revision\0\x01".to_vec();
+        let mut hasher = Xxh3::new();
+        hasher.update(b"wrela.identity-catalog-revision\0\x01");
         for observation in &self.observations {
-            push_part(&mut bytes, observation.canonical_key_bytes());
-            bytes.extend_from_slice(&observation.fingerprint().to_be_bytes());
+            hash_part(&mut hasher, observation.canonical_key_bytes());
+            hasher.update(&observation.fingerprint().to_be_bytes());
         }
-        xxh3_128(&bytes)
+        hasher.digest128()
+    }
+
+    pub(crate) fn finalize(&mut self) {
+        self.observations
+            .sort_by(|left, right| left.canonical_key_bytes().cmp(right.canonical_key_bytes()));
+    }
+
+    pub(crate) fn set_specialization_fingerprint(
+        &mut self,
+        id: SpecializationId,
+        fingerprint: u128,
+    ) -> bool {
+        let Some(observation) = self.observations.iter_mut().find(|observation| {
+            observation.domain() == IdentityDomain::Specialization && observation.digest() == id.0
+        }) else {
+            return false;
+        };
+        observation.replace_fingerprint(fingerprint);
+        true
+    }
+
+    fn push_observation(&mut self, observation: IdentityObservation) {
+        let key = Arc::<[u8]>::from(observation.canonical_key_bytes());
+        if self.observation_keys.insert(key) {
+            self.observations.push(observation);
+        }
     }
 
     pub(crate) fn module(&self, path: &str) -> Option<ModuleId> {
@@ -84,6 +115,16 @@ impl IdentityCatalog {
     pub(crate) fn test(&self, path: &str, suite: &str, test: &str) -> Option<TestId> {
         self.tests
             .get(&(path.to_owned(), suite.to_owned(), test.to_owned()))
+            .copied()
+    }
+
+    pub(crate) fn associated_function(
+        &self,
+        owner: DefinitionId,
+        name: &str,
+    ) -> Option<DefinitionId> {
+        self.associated_functions
+            .get(&(owner, name.to_owned()))
             .copied()
     }
 
@@ -151,15 +192,7 @@ impl IdentityCatalog {
         )?;
         let id = TypeId(observation.digest());
         self.interned_types.insert(type_key, id);
-        if !self
-            .observations
-            .iter()
-            .any(|existing| existing.canonical_key_bytes() == observation.canonical_key_bytes())
-        {
-            self.observations.push(observation);
-            self.observations
-                .sort_by(|left, right| left.canonical_key_bytes().cmp(right.canonical_key_bytes()));
-        }
+        self.push_observation(observation);
         Ok(id)
     }
 
@@ -211,15 +244,7 @@ impl IdentityCatalog {
             &mut self.full_keys,
         )?;
         let id = SpecializationId(observation.digest());
-        if !self
-            .observations
-            .iter()
-            .any(|existing| existing.canonical_key_bytes() == observation.canonical_key_bytes())
-        {
-            self.observations.push(observation);
-            self.observations
-                .sort_by(|left, right| left.canonical_key_bytes().cmp(right.canonical_key_bytes()));
-        }
+        self.push_observation(observation);
         Ok(id)
     }
 }
@@ -252,6 +277,7 @@ where
     let mut observations = Vec::new();
     let mut modules = BTreeMap::new();
     let mut definitions = BTreeMap::new();
+    let mut associated_functions = BTreeMap::new();
     let mut tests = BTreeMap::new();
     let mut types = BTreeMap::new();
     let mut pools = BTreeMap::new();
@@ -338,8 +364,7 @@ where
                 DeclarationKind::Struct
                 | DeclarationKind::ResourceStruct
                 | DeclarationKind::Enum
-                | DeclarationKind::Interface
-                | DeclarationKind::TypeAlias => Some(IdentityDomain::Type),
+                | DeclarationKind::Interface => Some(IdentityDomain::Type),
                 DeclarationKind::Pool => Some(IdentityDomain::Pool),
                 _ => None,
             };
@@ -367,6 +392,11 @@ where
             }
             if let Some(DeclarationSyntax::Suite(suite)) = &declaration.syntax {
                 for test in &suite.tests {
+                    let test_bytes = usize::try_from(test.range.start())
+                        .ok()
+                        .zip(usize::try_from(test.range.end()).ok())
+                        .and_then(|(start, end)| files[path.as_str()].bytes().get(start..end))
+                        .unwrap_or_default();
                     let nested_definition = intern(
                         IdentityDomain::Definition,
                         origin,
@@ -380,7 +410,7 @@ where
                                 test.name.as_bytes(),
                             ],
                         ),
-                        fingerprint(test.name.as_bytes()),
+                        fingerprint(test_bytes),
                         &hasher,
                         &mut digests,
                     )
@@ -399,7 +429,7 @@ where
                                 &test_definition_id.0.to_be_bytes(),
                             ],
                         ),
-                        fingerprint(test.name.as_bytes()),
+                        fingerprint(test_bytes),
                         &hasher,
                         &mut digests,
                     )
@@ -417,6 +447,11 @@ where
             }
             if let Some(DeclarationSyntax::Enum(enum_)) = &declaration.syntax {
                 for variant in &enum_.variants {
+                    let variant_bytes = usize::try_from(variant.range.start())
+                        .ok()
+                        .zip(usize::try_from(variant.range.end()).ok())
+                        .and_then(|(start, end)| files[path.as_str()].bytes().get(start..end))
+                        .unwrap_or_default();
                     let nested_definition = intern(
                         IdentityDomain::Definition,
                         origin,
@@ -430,7 +465,7 @@ where
                                 variant.name.as_bytes(),
                             ],
                         ),
-                        fingerprint(variant.name.as_bytes()),
+                        fingerprint(variant_bytes),
                         &hasher,
                         &mut digests,
                     )
@@ -446,7 +481,7 @@ where
                             origin,
                             &[&variant_definition.0.to_be_bytes()],
                         ),
-                        fingerprint(variant.name.as_bytes()),
+                        fingerprint(variant_bytes),
                         &hasher,
                         &mut digests,
                     )
@@ -462,14 +497,59 @@ where
                     observations.push(observation);
                 }
             }
+            let member_functions: &[crate::syntax::MemberFunctionSyntax] = match &declaration.syntax
+            {
+                Some(
+                    DeclarationSyntax::Struct(struct_) | DeclarationSyntax::ResourceStruct(struct_),
+                ) => &struct_.functions,
+                Some(DeclarationSyntax::Enum(enum_)) => &enum_.functions,
+                _ => &[],
+            };
+            for member in member_functions {
+                let canonical_key = key(
+                    IdentityDomain::Definition,
+                    origin,
+                    &[
+                        &definition_id.0.to_be_bytes(),
+                        b"associated_function",
+                        member.name.as_bytes(),
+                    ],
+                );
+                let start = usize::try_from(member.range.start()).ok();
+                let end = usize::try_from(member.range.end()).ok();
+                let member_bytes = start
+                    .zip(end)
+                    .and_then(|(start, end)| files[path.as_str()].bytes().get(start..end))
+                    .unwrap_or_default();
+                let observation = intern(
+                    IdentityDomain::Definition,
+                    origin,
+                    format!("{}.{}", declaration.name, member.name),
+                    canonical_key,
+                    fingerprint(member_bytes),
+                    &hasher,
+                    &mut digests,
+                )
+                .map_err(IdentityFailure::Collision)?;
+                associated_functions.insert(
+                    (definition_id, member.name.clone()),
+                    DefinitionId(observation.digest()),
+                );
+                observations.push(observation);
+            }
         }
     }
     observations.sort_by(|left, right| left.canonical_key_bytes().cmp(right.canonical_key_bytes()));
     observations.dedup_by(|left, right| left.canonical_key_bytes() == right.canonical_key_bytes());
     Ok(IdentityCatalog {
+        observation_keys: observations
+            .iter()
+            .map(|observation| Arc::<[u8]>::from(observation.canonical_key_bytes()))
+            .collect(),
         observations,
         modules,
         definitions,
+        associated_functions,
         tests,
         types,
         pools,
@@ -528,9 +608,15 @@ where
 }
 
 fn fingerprint(bytes: &[u8]) -> u128 {
-    let mut canonical = b"wrela.fingerprint\0\x01".to_vec();
-    push_part(&mut canonical, bytes);
-    xxh3_128(&canonical)
+    let mut hasher = Xxh3::new();
+    hasher.update(b"wrela.fingerprint\0\x01");
+    hash_part(&mut hasher, bytes);
+    hasher.digest128()
+}
+
+fn hash_part(hasher: &mut Xxh3, part: &[u8]) {
+    hasher.update(&u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(part);
 }
 
 fn module_name(path: &str) -> String {

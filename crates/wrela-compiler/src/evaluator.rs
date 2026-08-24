@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use xxhash_rust::xxh3::xxh3_128;
@@ -12,84 +12,17 @@ use crate::typed_hir::{
     BinaryOperator, CallTarget, Expression, ExpressionKind, HirFunction, Literal, LocalId,
     Statement, VerifiedProgram,
 };
-use crate::{Cancellation, CanonicalValue, EvaluationOutcome, EvaluationReceipt, SourceRange};
+use crate::{
+    Cancellation, CanonicalValue, EvaluationLimitPolicy as LimitPolicy, EvaluationOutcome,
+    EvaluationPanicKind as PanicKind, EvaluationPolicy, EvaluationReceipt,
+    EvaluationRejectionKind as RejectKind, SourceRange,
+};
 
 pub(crate) const FUEL_LIMIT: u64 = 100_000;
 const MEMORY_LIMIT: u64 = 1_048_576;
+const COMPILATION_FUEL_LIMIT: u64 = 10_000_000;
+const COMPILATION_MEMORY_LIMIT: u64 = 8_388_608;
 const CALL_DEPTH_LIMIT: usize = 32;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RejectKind {
-    ConstantDependencyCycle,
-    UnresolvedConstant,
-    UnresolvedCall,
-    ArgumentCount,
-    ArgumentTypeMismatch,
-    ReturnTypeMismatch,
-    MissingLocal,
-    InvalidUnaryOperand,
-    PropagationRequiresResult,
-    PropagatedError,
-    ResultOkMissingPayload,
-    InvalidBooleanOperator,
-    BinaryTypeMismatch,
-    AwaitNotEvaluatorEligible,
-}
-
-impl RejectKind {
-    const fn code(self) -> &'static str {
-        match self {
-            Self::ConstantDependencyCycle => "constant_dependency_cycle",
-            Self::UnresolvedConstant => "unresolved_constant",
-            Self::UnresolvedCall => "unresolved_call",
-            Self::ArgumentCount => "argument_count",
-            Self::ArgumentTypeMismatch => "argument_type_mismatch",
-            Self::ReturnTypeMismatch => "return_type_mismatch",
-            Self::MissingLocal => "missing_local",
-            Self::InvalidUnaryOperand => "invalid_unary_operand",
-            Self::PropagationRequiresResult => "propagation_requires_result",
-            Self::PropagatedError => "propagated_error",
-            Self::ResultOkMissingPayload => "result_ok_missing_payload",
-            Self::InvalidBooleanOperator => "invalid_boolean_operator",
-            Self::BinaryTypeMismatch => "binary_type_mismatch",
-            Self::AwaitNotEvaluatorEligible => "await_not_evaluator_eligible",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PanicKind {
-    Explicit,
-    IntegerOverflow,
-    DivisionByZero,
-}
-
-impl PanicKind {
-    const fn code(self) -> &'static str {
-        match self {
-            Self::Explicit => "explicit",
-            Self::IntegerOverflow => "integer_overflow",
-            Self::DivisionByZero => "division_by_zero",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LimitPolicy {
-    RootFuel,
-    RootMemory,
-    CallDepth,
-}
-
-impl LimitPolicy {
-    const fn code(self) -> &'static str {
-        match self {
-            Self::RootFuel => "root_fuel",
-            Self::RootMemory => "root_memory",
-            Self::CallDepth => "call_depth",
-        }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum EvalFailure {
@@ -104,7 +37,7 @@ enum EvalFailure {
     Defect(Arc<str>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Value {
     Unit,
     Bool(bool),
@@ -128,6 +61,11 @@ enum Value {
         variant_display: Arc<str>,
         payload: Arc<[Value]>,
     },
+    Struct {
+        definition: DefinitionId,
+        type_display: Arc<str>,
+        fields: Arc<[(Arc<str>, Value)]>,
+    },
     TestApplication {
         id: TestId,
         payload: Arc<[Value]>,
@@ -138,16 +76,105 @@ enum Value {
     },
 }
 
+#[derive(Clone)]
+struct CachedConstant {
+    value: Value,
+    fuel: u64,
+    peak_memory: u64,
+    dependencies: Arc<[u128]>,
+}
+
+enum RootWork<'hir> {
+    Constant(DefinitionId),
+    Function(DefinitionId),
+    Expression(&'hir Expression),
+}
+
+enum FrameKind<'hir> {
+    Root,
+    Function(&'hir HirFunction),
+    Constant {
+        id: DefinitionId,
+        type_: &'hir Type,
+        fuel_before: u64,
+        peak_before: u64,
+        dependencies_before: BTreeSet<u128>,
+    },
+}
+
+struct MachineFrame<'hir> {
+    kind: FrameKind<'hir>,
+    controls: Vec<Control<'hir>>,
+    values: Vec<Value>,
+    locals: Vec<Option<Value>>,
+}
+
+enum Control<'hir> {
+    Expression(&'hir Expression),
+    Constant(DefinitionId),
+    FinishRoot,
+    FinishConstant,
+    FunctionFallthrough,
+    Block {
+        function: &'hir HirFunction,
+        statements: &'hir [Statement],
+        index: usize,
+    },
+    Statement {
+        function: &'hir HirFunction,
+        statement: &'hir Statement,
+    },
+    FinishReturn {
+        return_type: &'hir Type,
+    },
+    FinishPanic {
+        site: &'hir SourceRange,
+    },
+    Discard,
+    Store {
+        local: LocalId,
+        initialize: bool,
+    },
+    SelectBranch {
+        function: &'hir HirFunction,
+        then_branch: &'hir [Statement],
+        else_branch: &'hir [Statement],
+    },
+    FinishArray {
+        count: usize,
+    },
+    FinishNegate {
+        site: &'hir SourceRange,
+    },
+    FinishPropagate,
+    FinishBinary {
+        operator: BinaryOperator,
+        site: &'hir SourceRange,
+    },
+    FinishCall {
+        target: &'hir CallTarget,
+        argument_count: usize,
+        site: &'hir SourceRange,
+    },
+}
+
 pub(crate) struct Engine<'a> {
     program: &'a VerifiedProgram,
     cancellation: &'a Cancellation,
-    constant_values: BTreeMap<DefinitionId, Value>,
+    constant_values: BTreeMap<DefinitionId, CachedConstant>,
     evaluating_constants: Vec<DefinitionId>,
     fuel: u64,
     peak_memory: u64,
+    current_memory: u64,
+    compilation_fuel: u64,
+    compilation_memory: u64,
     constructions: Vec<Construction>,
+    construction_keys: BTreeMap<u128, Arc<[u8]>>,
     test_applications: Vec<TestId>,
     call_stack: Vec<(DefinitionId, String, SourceRange)>,
+    evaluation_policy: EvaluationPolicy,
+    evaluation_root: u128,
+    root_dependencies: BTreeSet<u128>,
 }
 
 pub(crate) struct Run {
@@ -175,25 +202,47 @@ impl<'a> Engine<'a> {
             evaluating_constants: Vec::new(),
             fuel: 0,
             peak_memory: 0,
+            current_memory: 0,
+            compilation_fuel: 0,
+            compilation_memory: 0,
             constructions: Vec::new(),
+            construction_keys: BTreeMap::new(),
             test_applications: Vec::new(),
             call_stack: Vec::new(),
+            evaluation_policy: EvaluationPolicy::Constant,
+            evaluation_root: 0,
+            root_dependencies: BTreeSet::new(),
         }
     }
 
     pub(crate) fn evaluate_constant(&mut self, id: DefinitionId) -> Run {
-        let result = self.constant(id);
+        self.start_root();
+        let result = self.run_machine(RootWork::Constant(id));
         self.finish(result)
     }
 
     pub(crate) fn evaluate_function(&mut self, id: DefinitionId) -> Run {
-        let result = self.call_function(id, Vec::new());
+        self.start_root();
+        let result = self.run_machine(RootWork::Function(id));
         self.finish(result)
     }
 
     pub(crate) fn evaluate_expression(&mut self, expression: &Expression) -> Run {
-        let result = self.expression(expression, &BTreeMap::new());
+        self.start_root();
+        let result = self.run_machine(RootWork::Expression(expression));
         self.finish(result)
+    }
+
+    fn start_root(&mut self) {
+        self.fuel = 0;
+        self.peak_memory = 0;
+        self.current_memory = 0;
+        self.constructions.clear();
+        self.construction_keys.clear();
+        self.test_applications.clear();
+        self.call_stack.clear();
+        self.evaluating_constants.clear();
+        self.root_dependencies.clear();
     }
 
     fn finish(&mut self, result: Result<Value, EvalFailure>) -> Run {
@@ -204,19 +253,14 @@ impl<'a> Engine<'a> {
         Run {
             outcome: match result {
                 Ok(value) => EvaluationOutcome::Completed(canonical(value)),
-                Err(EvalFailure::Creator(kind)) => EvaluationOutcome::CreatorRejected {
-                    kind: Arc::from(kind.code()),
-                },
-                Err(EvalFailure::Panic(kind, site)) => EvaluationOutcome::Panicked {
-                    kind: Arc::from(kind.code()),
-                    site,
-                },
+                Err(EvalFailure::Creator(kind)) => EvaluationOutcome::CreatorRejected { kind },
+                Err(EvalFailure::Panic(kind, site)) => EvaluationOutcome::Panicked { kind, site },
                 Err(EvalFailure::Limit {
                     policy,
                     ceiling,
                     used,
                 }) => EvaluationOutcome::LimitExceeded {
-                    policy: Arc::from(policy.code()),
+                    policy,
                     ceiling,
                     used,
                 },
@@ -224,6 +268,9 @@ impl<'a> Engine<'a> {
                 Err(EvalFailure::Defect(evidence)) => EvaluationOutcome::Defect { evidence },
             },
             receipt: EvaluationReceipt::new(
+                self.evaluation_policy,
+                self.evaluation_root,
+                self.root_dependencies.iter().copied().collect(),
                 self.program.fingerprint(),
                 self.fuel,
                 self.peak_memory,
@@ -239,6 +286,14 @@ impl<'a> Engine<'a> {
             return Err(EvalFailure::Cancelled);
         }
         self.fuel = self.fuel.saturating_add(amount);
+        self.compilation_fuel = self.compilation_fuel.saturating_add(amount);
+        if self.compilation_fuel > COMPILATION_FUEL_LIMIT {
+            return Err(EvalFailure::Limit {
+                policy: LimitPolicy::CompilationFuel,
+                ceiling: COMPILATION_FUEL_LIMIT,
+                used: self.compilation_fuel,
+            });
+        }
         if self.fuel > FUEL_LIMIT {
             return Err(EvalFailure::Limit {
                 policy: LimitPolicy::RootFuel,
@@ -250,7 +305,8 @@ impl<'a> Engine<'a> {
     }
 
     fn retain(&mut self, amount: u64) -> Result<(), EvalFailure> {
-        self.peak_memory = self.peak_memory.max(amount);
+        self.current_memory = self.current_memory.saturating_add(amount);
+        self.peak_memory = self.peak_memory.max(self.current_memory);
         if self.peak_memory > MEMORY_LIMIT {
             return Err(EvalFailure::Limit {
                 policy: LimitPolicy::RootMemory,
@@ -261,51 +317,578 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    fn constant(&mut self, id: DefinitionId) -> Result<Value, EvalFailure> {
-        if let Some(value) = self.constant_values.get(&id) {
-            return Ok(value.clone());
-        }
-        if self.evaluating_constants.contains(&id) {
-            return Err(EvalFailure::Creator(RejectKind::ConstantDependencyCycle));
-        }
-        let constant = self
-            .program
-            .constants()
-            .get(&id)
-            .cloned()
-            .ok_or(EvalFailure::Creator(RejectKind::UnresolvedConstant))?;
-        self.evaluating_constants.push(id);
-        let result = self.expression(&constant.expression, &BTreeMap::new());
-        self.evaluating_constants.pop();
-        let value = coerce(result?, &constant.type_)
-            .ok_or(EvalFailure::Creator(RejectKind::ArgumentTypeMismatch))?;
-        self.constant_values.insert(id, value.clone());
-        Ok(value)
+    fn release(&mut self, amount: u64) -> Result<(), EvalFailure> {
+        self.current_memory = self.current_memory.checked_sub(amount).ok_or_else(|| {
+            EvalFailure::Defect(Arc::from("evaluator retained-memory accounting underflow"))
+        })?;
+        Ok(())
     }
 
-    fn call_function(
-        &mut self,
-        id: DefinitionId,
-        arguments: Vec<Value>,
-    ) -> Result<Value, EvalFailure> {
-        let specialization = self
-            .program
-            .default_specialization(id)
-            .ok_or(EvalFailure::Creator(RejectKind::UnresolvedCall))?;
-        self.call_specialization(specialization, arguments)
+    fn observe_temporary(&mut self, amount: u64) -> Result<(), EvalFailure> {
+        let observed = self.current_memory.saturating_add(amount);
+        self.peak_memory = self.peak_memory.max(observed);
+        if observed > MEMORY_LIMIT {
+            return Err(EvalFailure::Limit {
+                policy: LimitPolicy::RootMemory,
+                ceiling: MEMORY_LIMIT,
+                used: observed,
+            });
+        }
+        Ok(())
     }
 
-    fn call_specialization(
+    fn run_machine<'hir>(&mut self, work: RootWork<'hir>) -> Result<Value, EvalFailure>
+    where
+        'a: 'hir,
+    {
+        let program = self.program;
+        let mut frames = Vec::<MachineFrame<'hir>>::new();
+        match work {
+            RootWork::Constant(id) => {
+                self.evaluation_policy = EvaluationPolicy::Constant;
+                self.evaluation_root = id.0;
+                self.retain(64)?;
+                frames.push(MachineFrame {
+                    kind: FrameKind::Root,
+                    controls: vec![Control::FinishRoot, Control::Constant(id)],
+                    values: Vec::new(),
+                    locals: Vec::new(),
+                });
+            }
+            RootWork::Expression(expression) => {
+                self.evaluation_policy = EvaluationPolicy::ComptimeAssertion;
+                let mut key = b"wrela.comptime-root\0\x01".to_vec();
+                key.extend_from_slice(expression.source.path().as_bytes());
+                key.extend_from_slice(&expression.source.start().to_be_bytes());
+                key.extend_from_slice(&expression.source.end().to_be_bytes());
+                self.evaluation_root = xxh3_128(&key);
+                self.retain(64)?;
+                frames.push(MachineFrame {
+                    kind: FrameKind::Root,
+                    controls: vec![Control::FinishRoot, Control::Expression(expression)],
+                    values: Vec::new(),
+                    locals: Vec::new(),
+                });
+            }
+            RootWork::Function(id) => {
+                let specialization = program
+                    .default_specialization(id)
+                    .ok_or(EvalFailure::Creator(RejectKind::UnresolvedCall))?;
+                let function = program
+                    .specialization_function(specialization)
+                    .ok_or(EvalFailure::Creator(RejectKind::UnresolvedCall))?;
+                self.evaluation_policy = EvaluationPolicy::ImageConstructor;
+                self.evaluation_root = specialization.0;
+                let site = program
+                    .functions()
+                    .get(&id)
+                    .map(|function| &function.source)
+                    .ok_or(EvalFailure::Creator(RejectKind::UnresolvedCall))?;
+                self.push_function_frame(&mut frames, function, Vec::new(), site)?;
+            }
+        }
+
+        loop {
+            let control = frames
+                .last_mut()
+                .and_then(|frame| frame.controls.pop())
+                .ok_or_else(|| {
+                    EvalFailure::Defect(Arc::from("evaluator frame exhausted without a result"))
+                })?;
+            match control {
+                Control::Expression(expression) => {
+                    self.charge(1)?;
+                    match &expression.kind {
+                        ExpressionKind::Literal(literal) => {
+                            let value = match literal {
+                                Literal::Unit => Value::Unit,
+                                Literal::Bool(value) => Value::Bool(*value),
+                                Literal::Integer { kind, value } => Value::Integer {
+                                    kind: *kind,
+                                    value: *value,
+                                },
+                                Literal::Float { kind, bits } => Value::Float {
+                                    kind: *kind,
+                                    bits: *bits,
+                                },
+                                Literal::Text(value) => Value::Text(value.clone()),
+                            };
+                            self.push_value(&mut frames, value)?;
+                        }
+                        ExpressionKind::Read(place) => {
+                            let value = frames
+                                .last()
+                                .and_then(|frame| frame.locals.get(place.local.0 as usize))
+                                .and_then(Option::as_ref)
+                                .cloned()
+                                .ok_or(EvalFailure::Creator(RejectKind::MissingLocal))?;
+                            self.push_value(&mut frames, value)?;
+                        }
+                        ExpressionKind::Constant(id) => frames
+                            .last_mut()
+                            .expect("machine has current frame")
+                            .controls
+                            .push(Control::Constant(*id)),
+                        ExpressionKind::Array(values) => {
+                            let controls = &mut frames
+                                .last_mut()
+                                .expect("machine has current frame")
+                                .controls;
+                            controls.push(Control::FinishArray {
+                                count: values.len(),
+                            });
+                            controls.extend(values.iter().rev().map(Control::Expression));
+                        }
+                        ExpressionKind::Negate(value) => {
+                            let controls = &mut frames
+                                .last_mut()
+                                .expect("machine has current frame")
+                                .controls;
+                            controls.push(Control::FinishNegate {
+                                site: &expression.source,
+                            });
+                            controls.push(Control::Expression(value));
+                        }
+                        ExpressionKind::Await(_) => {
+                            return Err(EvalFailure::Creator(
+                                RejectKind::AwaitNotEvaluatorEligible,
+                            ));
+                        }
+                        ExpressionKind::Propagate(value) => {
+                            let controls = &mut frames
+                                .last_mut()
+                                .expect("machine has current frame")
+                                .controls;
+                            controls.push(Control::FinishPropagate);
+                            controls.push(Control::Expression(value));
+                        }
+                        ExpressionKind::Binary {
+                            operator,
+                            left,
+                            right,
+                        } => {
+                            let controls = &mut frames
+                                .last_mut()
+                                .expect("machine has current frame")
+                                .controls;
+                            controls.push(Control::FinishBinary {
+                                operator: *operator,
+                                site: &expression.source,
+                            });
+                            controls.push(Control::Expression(right));
+                            controls.push(Control::Expression(left));
+                        }
+                        ExpressionKind::Call { target, arguments } => {
+                            let controls = &mut frames
+                                .last_mut()
+                                .expect("machine has current frame")
+                                .controls;
+                            controls.push(Control::FinishCall {
+                                target,
+                                argument_count: arguments.len(),
+                                site: &expression.source,
+                            });
+                            controls.extend(arguments.iter().rev().map(Control::Expression));
+                        }
+                    }
+                }
+                Control::Constant(id) => {
+                    let dependencies_before = self.root_dependencies.clone();
+                    self.root_dependencies.insert(id.0);
+                    if let Some(cached) = self.constant_values.get(&id).cloned() {
+                        self.root_dependencies
+                            .extend(cached.dependencies.iter().copied());
+                        self.charge(cached.fuel)?;
+                        self.observe_temporary(cached.peak_memory)?;
+                        self.push_value(&mut frames, cached.value)?;
+                        continue;
+                    }
+                    if self.evaluating_constants.contains(&id) {
+                        return Err(EvalFailure::Creator(RejectKind::ConstantDependencyCycle));
+                    }
+                    let constant = program
+                        .constants()
+                        .get(&id)
+                        .ok_or(EvalFailure::Creator(RejectKind::UnresolvedConstant))?;
+                    self.evaluating_constants.push(id);
+                    self.retain(64)?;
+                    frames.push(MachineFrame {
+                        kind: FrameKind::Constant {
+                            id,
+                            type_: &constant.type_,
+                            fuel_before: self.fuel,
+                            peak_before: self.peak_memory,
+                            dependencies_before,
+                        },
+                        controls: vec![
+                            Control::FinishConstant,
+                            Control::Expression(&constant.expression),
+                        ],
+                        values: Vec::new(),
+                        locals: Vec::new(),
+                    });
+                }
+                Control::FinishRoot | Control::FinishConstant => {
+                    let value = self.pop_value(&mut frames)?;
+                    if let Some(result) = self.complete_frame(&mut frames, value)? {
+                        return Ok(result);
+                    }
+                }
+                Control::FunctionFallthrough => {
+                    let function = match &frames.last().expect("machine has frame").kind {
+                        FrameKind::Function(function) => *function,
+                        _ => {
+                            return Err(EvalFailure::Defect(Arc::from(
+                                "function fallthrough appeared outside a function frame",
+                            )));
+                        }
+                    };
+                    if function.return_type != Type::Unit {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "verified non-Unit function fell through",
+                        )));
+                    }
+                    if let Some(result) = self.complete_frame(&mut frames, Value::Unit)? {
+                        return Ok(result);
+                    }
+                }
+                Control::Block {
+                    function,
+                    statements,
+                    index,
+                } => {
+                    if let Some(statement) = statements.get(index) {
+                        let controls = &mut frames
+                            .last_mut()
+                            .expect("machine has current frame")
+                            .controls;
+                        controls.push(Control::Block {
+                            function,
+                            statements,
+                            index: index + 1,
+                        });
+                        controls.push(Control::Statement {
+                            function,
+                            statement,
+                        });
+                    }
+                }
+                Control::Statement {
+                    function,
+                    statement,
+                } => {
+                    self.charge(1)?;
+                    let controls = &mut frames
+                        .last_mut()
+                        .expect("machine has current frame")
+                        .controls;
+                    match statement {
+                        Statement::Return {
+                            value: Some(value), ..
+                        } => {
+                            controls.clear();
+                            controls.push(Control::FinishReturn {
+                                return_type: &function.return_type,
+                            });
+                            controls.push(Control::Expression(value));
+                        }
+                        Statement::Return { value: None, .. } => {
+                            controls.clear();
+                            if let Some(result) = self.complete_frame(&mut frames, Value::Unit)? {
+                                return Ok(result);
+                            }
+                        }
+                        Statement::Panic { value, source } => {
+                            controls.push(Control::FinishPanic { site: source });
+                            controls.push(Control::Expression(value));
+                        }
+                        Statement::Expect { condition, .. } => {
+                            controls.push(Control::Discard);
+                            controls.push(Control::Expression(condition));
+                        }
+                        Statement::Initialize { place, value, .. } => {
+                            controls.push(Control::Store {
+                                local: place.local,
+                                initialize: true,
+                            });
+                            controls.push(Control::Expression(value));
+                        }
+                        Statement::Assign { place, value, .. } => {
+                            controls.push(Control::Store {
+                                local: place.local,
+                                initialize: false,
+                            });
+                            controls.push(Control::Expression(value));
+                        }
+                        Statement::Evaluate(expression) => {
+                            controls.push(Control::Discard);
+                            controls.push(Control::Expression(expression));
+                        }
+                        Statement::If {
+                            condition,
+                            then_branch,
+                            else_branch,
+                            ..
+                        } => {
+                            controls.push(Control::SelectBranch {
+                                function,
+                                then_branch,
+                                else_branch,
+                            });
+                            controls.push(Control::Expression(condition));
+                        }
+                        Statement::Pass(_) => {}
+                    }
+                }
+                Control::FinishReturn { return_type } => {
+                    let value = self.pop_value(&mut frames)?;
+                    let value = coerce(value, return_type)
+                        .ok_or(EvalFailure::Creator(RejectKind::ReturnTypeMismatch))?;
+                    if let Some(result) = self.complete_frame(&mut frames, value)? {
+                        return Ok(result);
+                    }
+                }
+                Control::FinishPanic { site } => {
+                    let _ = self.pop_value(&mut frames)?;
+                    return Err(EvalFailure::Panic(PanicKind::Explicit, site.clone()));
+                }
+                Control::Discard => {
+                    let _ = self.pop_value(&mut frames)?;
+                }
+                Control::Store { local, initialize } => {
+                    let value = self.pop_value(&mut frames)?;
+                    let index = local.0 as usize;
+                    let previous = {
+                        let frame = frames.last_mut().expect("machine has current frame");
+                        if frame.locals.len() <= index {
+                            frame.locals.resize(index + 1, None);
+                        }
+                        frame.locals[index].take()
+                    };
+                    if initialize && previous.is_some() {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "verified initializer targets an initialized local",
+                        )));
+                    }
+                    if !initialize && previous.is_none() {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "verified assignment targets no local",
+                        )));
+                    }
+                    if let Some(previous) = &previous {
+                        self.release(value_size(previous))?;
+                    }
+                    self.retain(value_size(&value))?;
+                    frames.last_mut().expect("machine has frame").locals[index] = Some(value);
+                }
+                Control::SelectBranch {
+                    function,
+                    then_branch,
+                    else_branch,
+                } => {
+                    let condition = self.pop_value(&mut frames)?;
+                    let branch = match condition {
+                        Value::Bool(true) => then_branch,
+                        Value::Bool(false) => else_branch,
+                        _ => {
+                            return Err(EvalFailure::Defect(Arc::from(
+                                "verified non-bool condition",
+                            )));
+                        }
+                    };
+                    frames
+                        .last_mut()
+                        .expect("machine has current frame")
+                        .controls
+                        .push(Control::Block {
+                            function,
+                            statements: branch,
+                            index: 0,
+                        });
+                }
+                Control::FinishArray { count } => {
+                    let values = self.pop_values(&mut frames, count)?;
+                    self.push_value(&mut frames, Value::Array(values.into()))?;
+                }
+                Control::FinishNegate { site } => {
+                    let value = match self.pop_value(&mut frames)? {
+                        Value::Integer { kind, value } => Value::Integer {
+                            kind,
+                            value: value.checked_neg().ok_or_else(|| {
+                                EvalFailure::Panic(PanicKind::IntegerOverflow, site.clone())
+                            })?,
+                        },
+                        Value::Float { kind, bits } => Value::Float {
+                            kind,
+                            bits: encode_float(kind, -decode_float(kind, bits)),
+                        },
+                        _ => {
+                            return Err(EvalFailure::Creator(RejectKind::InvalidUnaryOperand));
+                        }
+                    };
+                    self.push_value(&mut frames, value)?;
+                }
+                Control::FinishPropagate => {
+                    let value = self.pop_value(&mut frames)?;
+                    match value {
+                        Value::BuiltinVariant {
+                            variant: BuiltinVariant::ResultOk,
+                            payload,
+                        } => {
+                            let value = payload
+                                .first()
+                                .cloned()
+                                .ok_or(EvalFailure::Creator(RejectKind::ResultOkMissingPayload))?;
+                            self.push_value(&mut frames, value)?;
+                        }
+                        error @ Value::BuiltinVariant {
+                            variant: BuiltinVariant::ResultErr,
+                            ..
+                        } => {
+                            if !matches!(
+                                frames.last().map(|frame| &frame.kind),
+                                Some(FrameKind::Function(function))
+                                    if matches!(function.return_type, Type::Result { .. })
+                            ) {
+                                return Err(EvalFailure::Defect(Arc::from(
+                                    "verified propagation escaped a non-Result function",
+                                )));
+                            }
+                            frames
+                                .last_mut()
+                                .expect("machine has current frame")
+                                .controls
+                                .clear();
+                            if let Some(result) = self.complete_frame(&mut frames, error)? {
+                                return Ok(result);
+                            }
+                        }
+                        _ => {
+                            return Err(EvalFailure::Creator(
+                                RejectKind::PropagationRequiresResult,
+                            ));
+                        }
+                    }
+                }
+                Control::FinishBinary { operator, site } => {
+                    let right = self.pop_value(&mut frames)?;
+                    let left = self.pop_value(&mut frames)?;
+                    let value = apply_binary(operator, left, right, site)?;
+                    self.push_value(&mut frames, value)?;
+                }
+                Control::FinishCall {
+                    target,
+                    argument_count,
+                    site,
+                } => {
+                    let arguments = self.pop_values(&mut frames, argument_count)?;
+                    match target {
+                        CallTarget::TemplateFunction { .. } => {
+                            return Err(EvalFailure::Defect(Arc::from(
+                                "template call reached the concrete evaluator",
+                            )));
+                        }
+                        CallTarget::Function {
+                            specialization,
+                            argument_order,
+                            ..
+                        } => {
+                            let function = program
+                                .specialization_function(*specialization)
+                                .ok_or(EvalFailure::Creator(RejectKind::UnresolvedCall))?;
+                            self.push_function_frame(
+                                &mut frames,
+                                function,
+                                reorder_values(arguments, argument_order)?,
+                                site,
+                            )?;
+                        }
+                        CallTarget::Build(primitive) => {
+                            let value = self.construct(primitive.kind, &arguments, site)?;
+                            self.push_value(&mut frames, value)?;
+                        }
+                        CallTarget::BuiltinVariant(variant) => {
+                            self.push_value(
+                                &mut frames,
+                                Value::BuiltinVariant {
+                                    variant: *variant,
+                                    payload: arguments.into(),
+                                },
+                            )?;
+                        }
+                        CallTarget::UserVariant {
+                            id,
+                            type_display,
+                            variant_display,
+                            argument_order,
+                        } => {
+                            self.push_value(
+                                &mut frames,
+                                Value::UserVariant {
+                                    id: *id,
+                                    type_display: type_display.clone(),
+                                    variant_display: variant_display.clone(),
+                                    payload: reorder_values(arguments, argument_order)?.into(),
+                                },
+                            )?;
+                        }
+                        CallTarget::Struct {
+                            definition,
+                            type_display,
+                            field_order,
+                            argument_fields,
+                        } => {
+                            let authored = argument_fields
+                                .iter()
+                                .cloned()
+                                .zip(arguments)
+                                .collect::<BTreeMap<_, _>>();
+                            let fields = field_order
+                                .iter()
+                                .map(|name| {
+                                    authored
+                                        .get(name)
+                                        .cloned()
+                                        .map(|value| (name.clone(), value))
+                                        .ok_or_else(|| {
+                                            EvalFailure::Defect(Arc::from(
+                                                "verified struct construction omitted a field",
+                                            ))
+                                        })
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            self.push_value(
+                                &mut frames,
+                                Value::Struct {
+                                    definition: *definition,
+                                    type_display: type_display.clone(),
+                                    fields: fields.into(),
+                                },
+                            )?;
+                        }
+                        CallTarget::Test { id, argument_order } => {
+                            self.push_value(
+                                &mut frames,
+                                Value::TestApplication {
+                                    id: *id,
+                                    payload: reorder_values(arguments, argument_order)?.into(),
+                                },
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn push_function_frame<'hir>(
         &mut self,
-        id: crate::model::SpecializationId,
+        frames: &mut Vec<MachineFrame<'hir>>,
+        function: &'hir HirFunction,
         arguments: Vec<Value>,
-    ) -> Result<Value, EvalFailure> {
+        call_site: &SourceRange,
+    ) -> Result<(), EvalFailure> {
         self.charge(5)?;
-        let function = self
-            .program
-            .specialization_function(id)
-            .cloned()
-            .ok_or(EvalFailure::Creator(RejectKind::UnresolvedCall))?;
         if self.call_stack.len() == CALL_DEPTH_LIMIT {
             return Err(EvalFailure::Limit {
                 policy: LimitPolicy::CallDepth,
@@ -316,199 +899,137 @@ impl<'a> Engine<'a> {
         if function.parameters.len() != arguments.len() {
             return Err(EvalFailure::Creator(RejectKind::ArgumentCount));
         }
-        let locals = function
+        let local_count = function
             .parameters
             .iter()
-            .zip(arguments)
-            .map(|((local, type_, _access), value)| {
-                coerce(value, type_)
-                    .map(|value| (*local, value))
-                    .ok_or(EvalFailure::Creator(RejectKind::ArgumentTypeMismatch))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
+            .map(|(local, _, _)| local.0 as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut locals = vec![None; local_count];
+        self.retain(64)?;
+        for ((local, type_, _), value) in function.parameters.iter().zip(arguments) {
+            let value = coerce(value, type_)
+                .ok_or(EvalFailure::Creator(RejectKind::ArgumentTypeMismatch))?;
+            self.retain(value_size(&value))?;
+            locals[local.0 as usize] = Some(value);
+        }
         self.call_stack
-            .push((function.id, function.name.clone(), function.source.clone()));
-        let result = self.execute(&function, locals);
-        self.call_stack.pop();
-        result
+            .push((function.id, function.name.clone(), call_site.clone()));
+        frames.push(MachineFrame {
+            kind: FrameKind::Function(function),
+            controls: vec![
+                Control::FunctionFallthrough,
+                Control::Block {
+                    function,
+                    statements: &function.body,
+                    index: 0,
+                },
+            ],
+            values: Vec::new(),
+            locals,
+        });
+        Ok(())
     }
 
-    fn execute(
+    fn push_value<'hir>(
         &mut self,
-        function: &HirFunction,
-        mut locals: BTreeMap<LocalId, Value>,
-    ) -> Result<Value, EvalFailure> {
-        self.retain(u64::try_from(locals.len()).unwrap_or(u64::MAX) * 32)?;
-        self.execute_block(function, &function.body, &mut locals)?
-            .map_or(Ok(Value::Unit), Ok)
+        frames: &mut [MachineFrame<'hir>],
+        value: Value,
+    ) -> Result<(), EvalFailure> {
+        self.retain(value_size(&value))?;
+        frames
+            .last_mut()
+            .ok_or_else(|| EvalFailure::Defect(Arc::from("value produced without a frame")))?
+            .values
+            .push(value);
+        Ok(())
     }
 
-    fn execute_block(
+    fn pop_value<'hir>(&mut self, frames: &mut [MachineFrame<'hir>]) -> Result<Value, EvalFailure> {
+        let value = frames
+            .last_mut()
+            .and_then(|frame| frame.values.pop())
+            .ok_or_else(|| EvalFailure::Defect(Arc::from("evaluator value stack underflow")))?;
+        self.release(value_size(&value))?;
+        Ok(value)
+    }
+
+    fn pop_values<'hir>(
         &mut self,
-        function: &HirFunction,
-        statements: &[Statement],
-        locals: &mut BTreeMap<LocalId, Value>,
+        frames: &mut [MachineFrame<'hir>],
+        count: usize,
+    ) -> Result<Vec<Value>, EvalFailure> {
+        let mut values = (0..count)
+            .map(|_| self.pop_value(frames))
+            .collect::<Result<Vec<_>, _>>()?;
+        values.reverse();
+        Ok(values)
+    }
+
+    fn complete_frame<'hir>(
+        &mut self,
+        frames: &mut Vec<MachineFrame<'hir>>,
+        value: Value,
     ) -> Result<Option<Value>, EvalFailure> {
-        for statement in statements {
-            self.charge(1)?;
-            match statement {
-                Statement::Return {
-                    value: Some(expression),
-                    ..
-                } => {
-                    return coerce(self.expression(expression, locals)?, &function.return_type)
-                        .map(Some)
-                        .ok_or(EvalFailure::Creator(RejectKind::ReturnTypeMismatch));
-                }
-                Statement::Return { value: None, .. } => return Ok(Some(Value::Unit)),
-                Statement::Panic { value, source } => {
-                    let _ = self.expression(value, locals)?;
-                    return Err(EvalFailure::Panic(PanicKind::Explicit, source.clone()));
-                }
-                Statement::Initialize { place, value, .. } => {
-                    let value = self.expression(value, locals)?;
-                    locals.insert(place.local, value);
-                }
-                Statement::Evaluate(expression) => {
-                    let _ = self.expression(expression, locals)?;
-                }
-                Statement::If {
-                    condition,
-                    then_branch,
-                    else_branch,
-                    ..
-                } => {
-                    let branch = match self.expression(condition, locals)? {
-                        Value::Bool(true) => then_branch,
-                        Value::Bool(false) => else_branch,
-                        _ => {
-                            return Err(EvalFailure::Defect(Arc::from(
-                                "verified non-bool condition",
-                            )));
-                        }
-                    };
-                    if let Some(value) = self.execute_block(function, branch, locals)? {
-                        return Ok(Some(value));
-                    }
-                }
-                Statement::Pass(_) => {}
+        let frame = frames
+            .pop()
+            .ok_or_else(|| EvalFailure::Defect(Arc::from("completed missing evaluator frame")))?;
+        let frame_memory = 64_u64
+            .saturating_add(frame.locals.iter().flatten().map(value_size).sum::<u64>())
+            .saturating_add(frame.values.iter().map(value_size).sum::<u64>());
+        self.release(frame_memory)?;
+        let value = match frame.kind {
+            FrameKind::Root => value,
+            FrameKind::Function(_) => {
+                self.call_stack.pop().ok_or_else(|| {
+                    EvalFailure::Defect(Arc::from("function frame had no call-stack entry"))
+                })?;
+                value
             }
-        }
-        Ok(None)
-    }
-
-    fn expression(
-        &mut self,
-        expression: &Expression,
-        locals: &BTreeMap<LocalId, Value>,
-    ) -> Result<Value, EvalFailure> {
-        self.charge(1)?;
-        match &expression.kind {
-            ExpressionKind::Literal(value) => Ok(match value {
-                Literal::Unit => Value::Unit,
-                Literal::Bool(value) => Value::Bool(*value),
-                Literal::Integer { kind, value } => Value::Integer {
-                    kind: *kind,
-                    value: *value,
-                },
-                Literal::Float { kind, bits } => Value::Float {
-                    kind: *kind,
-                    bits: *bits,
-                },
-                Literal::Text(value) => Value::Text(value.clone()),
-            }),
-            ExpressionKind::Read(place) => locals
-                .get(&place.local)
-                .cloned()
-                .ok_or(EvalFailure::Creator(RejectKind::MissingLocal)),
-            ExpressionKind::Constant(id) => self.constant(*id),
-            ExpressionKind::Array(values) => values
-                .iter()
-                .map(|value| self.expression(value, locals))
-                .collect::<Result<Vec<_>, _>>()
-                .map(|values| Value::Array(values.into())),
-            ExpressionKind::Negate(value) => match self.expression(value, locals)? {
-                Value::Integer { kind, value } => Ok(Value::Integer {
-                    kind,
-                    value: value.checked_neg().ok_or_else(|| {
-                        EvalFailure::Panic(PanicKind::IntegerOverflow, expression.source.clone())
-                    })?,
-                }),
-                Value::Float { kind, bits } => Ok(Value::Float {
-                    kind,
-                    bits: encode_float(kind, -decode_float(kind, bits)),
-                }),
-                _ => Err(EvalFailure::Creator(RejectKind::InvalidUnaryOperand)),
-            },
-            ExpressionKind::Await(_) => {
-                Err(EvalFailure::Creator(RejectKind::AwaitNotEvaluatorEligible))
-            }
-            ExpressionKind::Propagate(value) => match self.expression(value, locals)? {
-                Value::BuiltinVariant {
-                    variant: BuiltinVariant::ResultOk,
-                    payload,
-                } => payload
-                    .first()
-                    .cloned()
-                    .ok_or(EvalFailure::Creator(RejectKind::ResultOkMissingPayload)),
-                Value::BuiltinVariant {
-                    variant: BuiltinVariant::ResultErr,
-                    ..
-                } => Err(EvalFailure::Creator(RejectKind::PropagatedError)),
-                _ => Err(EvalFailure::Creator(RejectKind::PropagationRequiresResult)),
-            },
-            ExpressionKind::Binary {
-                operator,
-                left,
-                right,
-            } => apply_binary(
-                *operator,
-                self.expression(left, locals)?,
-                self.expression(right, locals)?,
-                &expression.source,
-            ),
-            ExpressionKind::Call { target, arguments } => {
-                let arguments = arguments
-                    .iter()
-                    .map(|argument| self.expression(argument, locals))
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.call_target(target, arguments, &expression.source)
-            }
-        }
-    }
-
-    fn call_target(
-        &mut self,
-        target: &CallTarget,
-        arguments: Vec<Value>,
-        site: &SourceRange,
-    ) -> Result<Value, EvalFailure> {
-        match target {
-            CallTarget::TemplateFunction(_) => Err(EvalFailure::Defect(Arc::from(
-                "template call reached the concrete evaluator",
-            ))),
-            CallTarget::Function { specialization, .. } => {
-                self.call_specialization(*specialization, arguments)
-            }
-            CallTarget::Build(kind) => self.construct(*kind, &arguments, site),
-            CallTarget::BuiltinVariant(variant) => Ok(Value::BuiltinVariant {
-                variant: *variant,
-                payload: arguments.into(),
-            }),
-            CallTarget::UserVariant {
+            FrameKind::Constant {
                 id,
-                type_display,
-                variant_display,
-            } => Ok(Value::UserVariant {
-                id: *id,
-                type_display: type_display.clone(),
-                variant_display: variant_display.clone(),
-                payload: arguments.into(),
-            }),
-            CallTarget::Test(id) => Ok(Value::TestApplication {
-                id: *id,
-                payload: arguments.into(),
-            }),
+                type_,
+                fuel_before,
+                peak_before,
+                dependencies_before,
+            } => {
+                if self.evaluating_constants.pop() != Some(id) {
+                    return Err(EvalFailure::Defect(Arc::from(
+                        "constant evaluation stack disagrees with machine frame",
+                    )));
+                }
+                let value = coerce(value, type_)
+                    .ok_or(EvalFailure::Creator(RejectKind::ArgumentTypeMismatch))?;
+                self.constant_values.insert(
+                    id,
+                    CachedConstant {
+                        value: value.clone(),
+                        fuel: self.fuel.saturating_sub(fuel_before),
+                        peak_memory: self.peak_memory.saturating_sub(peak_before),
+                        dependencies: self
+                            .root_dependencies
+                            .difference(&dependencies_before)
+                            .copied()
+                            .collect(),
+                    },
+                );
+                self.compilation_memory =
+                    self.compilation_memory.saturating_add(value_size(&value));
+                if self.compilation_memory > COMPILATION_MEMORY_LIMIT {
+                    return Err(EvalFailure::Limit {
+                        policy: LimitPolicy::CompilationMemory,
+                        ceiling: COMPILATION_MEMORY_LIMIT,
+                        used: self.compilation_memory,
+                    });
+                }
+                value
+            }
+        };
+        if frames.is_empty() {
+            Ok(Some(value))
+        } else {
+            self.push_value(frames, value)?;
+            Ok(None)
         }
     }
 
@@ -519,10 +1040,12 @@ impl<'a> Engine<'a> {
         site: &SourceRange,
     ) -> Result<Value, EvalFailure> {
         self.charge(3)?;
-        let coordinate = self.constructions.len();
         let mut key = b"wrela.construction\0\x02".to_vec();
-        for (id, _, _) in &self.call_stack {
+        for (id, _, call_site) in &self.call_stack {
             key.extend_from_slice(&id.0.to_be_bytes());
+            key.extend_from_slice(call_site.path().as_bytes());
+            key.extend_from_slice(&call_site.start().to_be_bytes());
+            key.extend_from_slice(&call_site.end().to_be_bytes());
         }
         key.push(match kind {
             BuildKind::Image => 1,
@@ -531,8 +1054,16 @@ impl<'a> Engine<'a> {
         key.extend_from_slice(site.path().as_bytes());
         key.extend_from_slice(&site.start().to_be_bytes());
         key.extend_from_slice(&site.end().to_be_bytes());
-        key.extend_from_slice(&u64::try_from(coordinate).unwrap_or(u64::MAX).to_be_bytes());
         let identity = xxh3_128(&key);
+        let key: Arc<[u8]> = key.into();
+        if let Some(previous) = self.construction_keys.get(&identity) {
+            return Err(EvalFailure::Defect(if previous == &key {
+                Arc::from("duplicate semantic construction coordinate")
+            } else {
+                Arc::from("construction identity digest collision")
+            }));
+        }
+        self.construction_keys.insert(identity, key);
         let mut edges = Vec::new();
         for argument in arguments {
             collect_construction_edges(argument, &mut edges);
@@ -540,13 +1071,78 @@ impl<'a> Engine<'a> {
                 collect_test_applications(argument, &mut self.test_applications);
             }
         }
+        let construction_memory = 64_u64.saturating_add(
+            u64::try_from(edges.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(16),
+        );
         self.constructions.push(Construction {
             identity,
             kind,
             site: site.clone(),
             edges,
         });
+        self.retain(construction_memory)?;
         Ok(Value::SymbolicHandle { kind, identity })
+    }
+}
+
+fn reorder_values(
+    values: Vec<Value>,
+    source_to_parameter: &[u16],
+) -> Result<Vec<Value>, EvalFailure> {
+    if values.len() != source_to_parameter.len() {
+        return Err(EvalFailure::Defect(Arc::from(
+            "verified call argument binding length disagrees with values",
+        )));
+    }
+    let mut ordered = vec![None; values.len()];
+    for (value, parameter) in values.into_iter().zip(source_to_parameter) {
+        let Some(slot) = ordered.get_mut(usize::from(*parameter)) else {
+            return Err(EvalFailure::Defect(Arc::from(
+                "verified call argument binding names an invalid parameter",
+            )));
+        };
+        if slot.replace(value).is_some() {
+            return Err(EvalFailure::Defect(Arc::from(
+                "verified call argument binding initializes a parameter twice",
+            )));
+        }
+    }
+    ordered
+        .into_iter()
+        .map(|value| {
+            value.ok_or_else(|| {
+                EvalFailure::Defect(Arc::from(
+                    "verified call argument binding omits a parameter",
+                ))
+            })
+        })
+        .collect()
+}
+
+fn value_size(value: &Value) -> u64 {
+    match value {
+        Value::Unit => 0,
+        Value::Bool(_) => 1,
+        Value::Integer { .. } | Value::Float { .. } | Value::SymbolicHandle { .. } => 16,
+        Value::Text(value) => 16_u64.saturating_add(value.len() as u64),
+        Value::Array(values)
+        | Value::BuiltinVariant {
+            payload: values, ..
+        }
+        | Value::UserVariant {
+            payload: values, ..
+        }
+        | Value::TestApplication {
+            payload: values, ..
+        } => values
+            .iter()
+            .fold(16_u64, |size, value| size.saturating_add(value_size(value))),
+        Value::Struct { fields, .. } => fields.iter().fold(16_u64, |size, (name, value)| {
+            size.saturating_add(name.len() as u64)
+                .saturating_add(value_size(value))
+        }),
     }
 }
 
@@ -564,6 +1160,11 @@ fn collect_construction_edges(value: &Value, edges: &mut Vec<u128>) {
             payload: values, ..
         } => {
             for value in &**values {
+                collect_construction_edges(value, edges);
+            }
+        }
+        Value::Struct { fields, .. } => {
+            for (_, value) in &**fields {
                 collect_construction_edges(value, edges);
             }
         }
@@ -594,6 +1195,11 @@ fn collect_test_applications(value: &Value, applications: &mut Vec<TestId>) {
                 collect_test_applications(value, applications);
             }
         }
+        Value::Struct { fields, .. } => {
+            for (_, value) in &**fields {
+                collect_test_applications(value, applications);
+            }
+        }
         Value::Unit
         | Value::Bool(_)
         | Value::Integer { .. }
@@ -610,7 +1216,18 @@ fn apply_binary(
     site: &SourceRange,
 ) -> Result<Value, EvalFailure> {
     match (left, right) {
-        (Value::Integer { kind, value: left }, Value::Integer { value: right, .. }) => {
+        (
+            Value::Integer { kind, value: left },
+            Value::Integer {
+                kind: right_kind,
+                value: right,
+            },
+        ) => {
+            if kind != right_kind {
+                return Err(EvalFailure::Defect(Arc::from(
+                    "verified integer operation mixes formats",
+                )));
+            }
             match operator {
                 BinaryOperator::Add => checked_integer(kind, left.checked_add(right), site),
                 BinaryOperator::Subtract => checked_integer(kind, left.checked_sub(right), site),
@@ -633,7 +1250,18 @@ fn apply_binary(
             BinaryOperator::NotEqual => Ok(Value::Bool(left != right)),
             _ => Err(EvalFailure::Creator(RejectKind::InvalidBooleanOperator)),
         },
-        (Value::Float { kind, bits: left }, Value::Float { bits: right, .. }) => {
+        (
+            Value::Float { kind, bits: left },
+            Value::Float {
+                kind: right_kind,
+                bits: right,
+            },
+        ) => {
+            if kind != right_kind {
+                return Err(EvalFailure::Defect(Arc::from(
+                    "verified float operation mixes formats",
+                )));
+            }
             apply_float(operator, kind, left, right)
         }
         _ => Err(EvalFailure::Creator(RejectKind::BinaryTypeMismatch)),
@@ -681,16 +1309,17 @@ fn apply_float(
 }
 
 fn coerce(value: Value, expected: &Type) -> Option<Value> {
+    if value_matches(&value, expected) {
+        return Some(value);
+    }
     match (value, expected) {
-        (Value::Integer { value, .. }, Type::Integer(kind)) if kind.fits(value) => {
-            Some(Value::Integer { kind: *kind, value })
-        }
-        (Value::Float { kind, bits }, Type::Float(expected)) => Some(Value::Float {
-            kind: *expected,
-            bits: encode_float(*expected, decode_float(kind, bits)),
-        }),
         (value, Type::Parameter { .. } | Type::Infer) => Some(value),
-        (value, expected) if value_matches(&value, expected) => Some(value),
+        (value, Type::Result { success, .. }) => {
+            coerce(value, success).map(|value| Value::BuiltinVariant {
+                variant: BuiltinVariant::ResultOk,
+                payload: Arc::from([value]),
+            })
+        }
         _ => None,
     }
 }
@@ -724,6 +1353,13 @@ fn value_matches(value: &Value, expected: &Type) -> bool {
                 ..
             },
         ) => id.owner == *expected,
+        (
+            Value::Struct { definition, .. },
+            Type::Nominal {
+                definition: expected,
+                ..
+            },
+        ) => definition == expected,
         (
             Value::SymbolicHandle {
                 kind: BuildKind::Image,
@@ -786,13 +1422,28 @@ fn canonical(value: Value) -> CanonicalValue {
             variant: variant_display,
             payload: payload.iter().cloned().map(canonical).collect(),
         },
+        Value::Struct {
+            type_display,
+            fields,
+            ..
+        } => CanonicalValue::Struct {
+            type_name: type_display,
+            fields: fields
+                .iter()
+                .cloned()
+                .map(|(name, value)| (name, canonical(value)))
+                .collect(),
+        },
         Value::TestApplication { id, payload } => CanonicalValue::Variant {
             type_name: Arc::from("TestApplication"),
             variant: Arc::from(format!("{:032x}", id.identity)),
             payload: payload.iter().cloned().map(canonical).collect(),
         },
         Value::SymbolicHandle { kind, identity } => CanonicalValue::SymbolicHandle {
-            kind: Arc::from(kind.name()),
+            kind: match kind {
+                BuildKind::Image => crate::ConstructionKind::Image,
+                BuildKind::Test => crate::ConstructionKind::Test,
+            },
             identity,
         },
     }
@@ -862,5 +1513,60 @@ mod tests {
         cancellation.cancel();
         let mut engine = Engine::new(&program, &cancellation);
         assert_eq!(engine.charge(1), Err(EvalFailure::Cancelled));
+    }
+
+    #[test]
+    fn retained_memory_and_compilation_tariffs_have_exact_boundaries() {
+        let mut identities = crate::identity::IdentityCatalog::empty();
+        let program = typed_hir::verify(
+            ProgramInput::default(),
+            &BuildAuthority::compiler_distribution(),
+            &mut identities,
+            &Cancellation::new(),
+        )
+        .expect("empty program verifies");
+        let cancellation = Cancellation::new();
+        let mut engine = Engine::new(&program, &cancellation);
+        engine
+            .retain(MEMORY_LIMIT)
+            .expect("root memory ceiling is inclusive");
+        assert_eq!(engine.peak_memory, MEMORY_LIMIT);
+        assert_eq!(
+            engine.retain(1),
+            Err(EvalFailure::Limit {
+                policy: LimitPolicy::RootMemory,
+                ceiling: MEMORY_LIMIT,
+                used: MEMORY_LIMIT + 1,
+            })
+        );
+
+        let mut engine = Engine::new(&program, &cancellation);
+        engine.compilation_fuel = COMPILATION_FUEL_LIMIT;
+        assert_eq!(
+            engine.charge(1),
+            Err(EvalFailure::Limit {
+                policy: LimitPolicy::CompilationFuel,
+                ceiling: COMPILATION_FUEL_LIMIT,
+                used: COMPILATION_FUEL_LIMIT + 1,
+            })
+        );
+        assert_eq!(value_size(&Value::Text(Arc::from("abc"))), 19);
+        assert_eq!(
+            value_size(&Value::Array(Arc::from([
+                Value::Integer {
+                    kind: IntegerType::I64,
+                    value: 1
+                },
+                Value::Bool(true),
+            ]))),
+            33
+        );
+        assert_eq!(
+            value_size(&Value::BuiltinVariant {
+                variant: BuiltinVariant::OptionSome,
+                payload: Arc::from([Value::Bool(true)]),
+            }),
+            17
+        );
     }
 }

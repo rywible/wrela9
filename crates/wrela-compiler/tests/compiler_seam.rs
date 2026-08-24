@@ -1,7 +1,7 @@
 use wrela_compiler::{
     Cancellation, CanonicalValue, CompilationOutcome, CompilationRequest, Compiler,
     CompilerInstallation, EvaluationOutcome, IdentityDomain, InspectSelection, ProjectFile,
-    ProjectSnapshot, Root,
+    ProjectSnapshot, Root, SyntaxElementKind, SyntaxNodeKind, SyntaxTokenKind,
 };
 
 #[test]
@@ -21,24 +21,24 @@ fn valid_image_is_accepted_without_losing_source_bytes() {
     assert_eq!(syntax.len(), 1);
     assert_eq!(syntax[0].path(), "src/image.wr");
     assert_eq!(syntax[0].source_bytes(), source);
-    assert_eq!(syntax[0].nodes()[0].kind(), "source");
+    assert_eq!(syntax[0].nodes()[0].kind(), SyntaxNodeKind::Source);
     assert!(
         syntax[0]
             .nodes()
             .iter()
-            .any(|node| node.kind() == "function" && node.depth() == 1)
+            .any(|node| node.kind() == SyntaxNodeKind::Function && node.depth() == 1)
     );
     assert!(
         syntax[0]
             .nodes()
             .iter()
-            .any(|node| node.kind() == "return_statement" && node.depth() >= 3)
+            .any(|node| node.kind() == SyntaxNodeKind::ReturnStatement && node.depth() >= 3)
     );
     assert!(
         syntax[0]
             .nodes()
             .iter()
-            .any(|node| node.kind() == "call_expression" && node.depth() >= 4)
+            .any(|node| node.kind() == SyntaxNodeKind::CallExpression && node.depth() >= 4)
     );
     assert!(accepted.diagnostics().is_empty());
 }
@@ -58,21 +58,16 @@ fn syntax_exposes_closed_exact_token_kinds_instead_of_broad_categories() {
     let CompilationOutcome::Accepted(accepted) = outcome else {
         panic!("closed-token example must accept");
     };
-    let names: Vec<_> = accepted.inspection().syntax().expect("syntax")[0]
+    let kinds: Vec<_> = accepted.inspection().syntax().expect("syntax")[0]
         .elements()
         .iter()
-        .map(|element| element.name())
+        .map(|element| *element.kind())
         .collect();
-    assert!(names.contains(&"fn"));
-    assert!(names.contains(&"identifier"));
-    assert!(names.contains(&"left_paren"));
-    assert!(names.contains(&"arrow"));
-    assert!(names.contains(&"return"));
-    assert!(
-        !names
-            .iter()
-            .any(|name| matches!(*name, "word" | "number" | "symbol" | "punctuation"))
-    );
+    assert!(kinds.contains(&SyntaxElementKind::Token(SyntaxTokenKind::Fn)));
+    assert!(kinds.contains(&SyntaxElementKind::Token(SyntaxTokenKind::Identifier)));
+    assert!(kinds.contains(&SyntaxElementKind::Token(SyntaxTokenKind::LeftParen)));
+    assert!(kinds.contains(&SyntaxElementKind::Token(SyntaxTokenKind::Arrow)));
+    assert!(kinds.contains(&SyntaxElementKind::Token(SyntaxTokenKind::Return)));
 }
 
 #[test]
@@ -97,6 +92,23 @@ fn exponent_float_is_one_exact_literal_token() {
             .filter(|element| element.name() == "float_literal")
             .count(),
         1
+    );
+}
+
+#[test]
+fn comment_marker_inside_text_is_not_reinterpreted_by_layout() {
+    let source = b"@image\nfn build() -> Image:\n    return Image.new(label=\"x#y\")\n";
+    let compiler = Compiler::open(CompilerInstallation::empty()).expect("distribution opens");
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        ),
+        &Cancellation::new(),
+    );
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "a comment marker inside Text remains literal content: {outcome:#?}"
     );
 }
 
@@ -334,6 +346,49 @@ fn unrecognized_top_level_text_is_not_silently_accepted() {
 }
 
 #[test]
+fn declaration_introducer_without_a_name_is_explicitly_rejected() {
+    let source = b"fn\n\n@image\nfn build() -> Image:\n    return Image.new()\n";
+    let compiler = Compiler::open(CompilerInstallation::empty()).expect("distribution opens");
+    let CompilationOutcome::Rejected(rejected) = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        ),
+        &Cancellation::new(),
+    ) else {
+        panic!("a declaration introducer must own malformed-declaration evidence");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "syntax.malformed_declaration")
+    );
+}
+
+#[test]
+fn earlier_diagnostic_does_not_suppress_later_malformed_declaration() {
+    let source = b"\t\nconst broken: = 1\n\n@image\nfn build() -> Image:\n    return Image.new()\n";
+    let compiler = Compiler::open(CompilerInstallation::empty()).expect("distribution opens");
+    let CompilationOutcome::Rejected(rejected) = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        ),
+        &Cancellation::new(),
+    ) else {
+        panic!("each malformed declaration must retain local evidence");
+    };
+    let codes = rejected
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| diagnostic.code())
+        .collect::<Vec<_>>();
+    assert!(codes.contains(&"syntax.tab_outside_literal"));
+    assert!(codes.contains(&"syntax.malformed_declaration"));
+}
+
+#[test]
 fn only_reachable_modules_can_reject_the_selected_root() {
     let compiler = Compiler::open(CompilerInstallation::empty()).expect("distribution opens");
     let project = ProjectSnapshot::new(vec![
@@ -350,9 +405,9 @@ fn only_reachable_modules_can_reject_the_selected_root() {
     let request =
         CompilationRequest::new(project, Root::Image).with_inspection(InspectSelection::all());
 
-    let CompilationOutcome::Accepted(accepted) = compiler.compile(request, &Cancellation::new())
-    else {
-        panic!("unreachable malformed source must be inert");
+    let outcome = compiler.compile(request, &Cancellation::new());
+    let CompilationOutcome::Accepted(accepted) = &outcome else {
+        panic!("unreachable malformed source must be inert: {outcome:#?}");
     };
     assert_eq!(
         accepted
@@ -483,15 +538,91 @@ fn semantic_identity_survives_body_edits_while_fingerprint_changes() {
 }
 
 #[test]
+fn attributes_belong_to_the_declaration_they_modify() {
+    fn fingerprints(attribute: &str) -> (u128, u128) {
+        let source = format!(
+            "fn helper():\n    pass\n\n{attribute}\nfn build() -> Image:\n    return Image.new()\n"
+        );
+        let compiler = Compiler::open(CompilerInstallation::empty()).expect("distribution opens");
+        let CompilationOutcome::Accepted(accepted) = compiler.compile(
+            CompilationRequest::new(
+                ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+                Root::Image,
+            )
+            .with_inspection(InspectSelection::all()),
+            &Cancellation::new(),
+        ) else {
+            panic!("attribute ownership fixture must compile");
+        };
+        let fingerprint = |name: &str| {
+            accepted
+                .inspection()
+                .identities()
+                .iter()
+                .find(|identity| {
+                    identity.domain() == IdentityDomain::Definition && identity.name() == name
+                })
+                .expect("definition identity")
+                .fingerprint()
+        };
+        (fingerprint("helper"), fingerprint("build"))
+    }
+
+    let before = fingerprints("@image");
+    let after = fingerprints("@image()");
+    assert_eq!(before.0, after.0, "the preceding declaration is unchanged");
+    assert_ne!(before.1, after.1, "the attributed declaration changed");
+}
+
+#[test]
+fn documentation_belongs_to_the_declaration_it_documents() {
+    fn fingerprints(documentation: &str) -> (u128, u128) {
+        let source = format!(
+            "fn helper():\n    pass\n\n## {documentation}\n@image\nfn build() -> Image:\n    return Image.new()\n"
+        );
+        let outcome = Compiler::open(CompilerInstallation::empty())
+            .expect("distribution opens")
+            .compile(
+                CompilationRequest::new(
+                    ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+                    Root::Image,
+                )
+                .with_inspection(InspectSelection::all()),
+                &Cancellation::new(),
+            );
+        let CompilationOutcome::Accepted(accepted) = outcome else {
+            panic!("documentation ownership fixture must compile: {outcome:#?}");
+        };
+        let find = |name: &str| {
+            accepted
+                .inspection()
+                .identities()
+                .iter()
+                .find(|identity| {
+                    identity.domain() == IdentityDomain::Definition && identity.name() == name
+                })
+                .expect("definition")
+                .fingerprint()
+        };
+        (find("helper"), find("build"))
+    }
+    let before = fingerprints("first");
+    let after = fingerprints("second");
+    assert_eq!(before.0, after.0);
+    assert_ne!(before.1, after.1);
+}
+
+#[test]
 fn identities_do_not_depend_on_snapshot_enumeration_order() {
     fn compile(files: Vec<ProjectFile>) -> Vec<(IdentityDomain, String, u128)> {
         let compiler = Compiler::open(CompilerInstallation::empty()).expect("distribution opens");
-        let CompilationOutcome::Accepted(accepted) = compiler.compile(
+        let outcome = compiler.compile(
             CompilationRequest::new(ProjectSnapshot::new(files), Root::Image)
                 .with_inspection(InspectSelection::all()),
             &Cancellation::new(),
-        ) else {
-            panic!("source must compile");
+        );
+        let CompilationOutcome::Accepted(accepted) = &outcome else {
+            panic!("source must compile: {outcome:#?}");
         };
         accepted
             .inspection()
@@ -519,6 +650,114 @@ fn identities_do_not_depend_on_snapshot_enumeration_order() {
         compile(vec![root.clone(), cards.clone()]),
         compile(vec![cards, root])
     );
+}
+
+#[test]
+fn nested_and_specialized_fingerprints_own_their_complete_meaning() {
+    fn accepted(source: &[u8], root: Root) -> wrela_compiler::AcceptedCompilation {
+        let outcome = Compiler::open(CompilerInstallation::empty())
+            .expect("distribution opens")
+            .compile(
+                CompilationRequest::new(
+                    ProjectSnapshot::new(vec![ProjectFile::new(root_path(root), source)]),
+                    root,
+                )
+                .with_inspection(InspectSelection::all()),
+                &Cancellation::new(),
+            );
+        let CompilationOutcome::Accepted(accepted) = outcome else {
+            panic!("fingerprint fixture must compile: {outcome:#?}");
+        };
+        accepted
+    }
+    fn root_path(root: Root) -> &'static str {
+        match root {
+            Root::Image => "src/image.wr",
+            Root::Test => "src/test.wr",
+        }
+    }
+    fn fingerprint(
+        accepted: &wrela_compiler::AcceptedCompilation,
+        domain: IdentityDomain,
+        name: &str,
+    ) -> u128 {
+        accepted
+            .inspection()
+            .identities()
+            .iter()
+            .find(|identity| identity.domain() == domain && identity.name() == name)
+            .expect("identity observation")
+            .fingerprint()
+    }
+
+    let test_before = accepted(
+        br#"pub suite behavior:
+    test works():
+        expect true
+
+@image
+fn build() -> Image:
+    return Image.new(tests=Test.new(cases=[behavior.works()]))
+"#,
+        Root::Test,
+    );
+    let test_after = accepted(
+        br#"pub suite behavior:
+    test works():
+        expect 1 == 1
+
+@image
+fn build() -> Image:
+    return Image.new(tests=Test.new(cases=[behavior.works()]))
+"#,
+        Root::Test,
+    );
+    assert_ne!(
+        fingerprint(&test_before, IdentityDomain::Test, "behavior.works"),
+        fingerprint(&test_after, IdentityDomain::Test, "behavior.works")
+    );
+
+    let variant_before = accepted(
+        b"enum Choice:\n    Item(value: i64)\n\n@image\nfn build() -> Image:\n    return Image.new()\n",
+        Root::Image,
+    );
+    let variant_after = accepted(
+        b"enum Choice:\n    Item(value: bool)\n\n@image\nfn build() -> Image:\n    return Image.new()\n",
+        Root::Image,
+    );
+    assert_ne!(
+        fingerprint(&variant_before, IdentityDomain::Generated, "Choice.Item"),
+        fingerprint(&variant_after, IdentityDomain::Generated, "Choice.Item")
+    );
+
+    let specialization_before = accepted(
+        b"pure fn answer() -> i64:\n    return 41\n\nconst VALUE: i64 = answer()\n\n@image\nfn build() -> Image:\n    return Image.new(value=VALUE)\n",
+        Root::Image,
+    );
+    let specialization_after = accepted(
+        b"pure fn answer() -> i64:\n    return 42\n\nconst VALUE: i64 = answer()\n\n@image\nfn build() -> Image:\n    return Image.new(value=VALUE)\n",
+        Root::Image,
+    );
+    let specialization = specialization_before
+        .inspection()
+        .specializations()
+        .iter()
+        .find(|specialization| specialization.function() == "answer")
+        .expect("answer specialization");
+    let before = specialization_before
+        .inspection()
+        .identities()
+        .iter()
+        .find(|identity| identity.digest() == specialization.identity())
+        .expect("specialization identity");
+    let after = specialization_after
+        .inspection()
+        .identities()
+        .iter()
+        .find(|identity| identity.digest() == specialization.identity())
+        .expect("stable specialization identity");
+    assert_eq!(before.digest(), after.digest());
+    assert_ne!(before.fingerprint(), after.fingerprint());
 }
 
 #[test]

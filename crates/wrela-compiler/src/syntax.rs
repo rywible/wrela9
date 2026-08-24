@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use crate::{
-    Cancellation, Diagnostic, ProjectFile, RecoveryAction, SourceRange, SyntaxElement,
-    SyntaxElementKind, SyntaxNodeObservation,
+    Cancellation, Diagnostic, DiagnosticValue, ProjectFile, RecoveryAction, SourceRange,
+    SyntaxElement, SyntaxElementKind, SyntaxErrorKind, SyntaxInvalidKind, SyntaxLayoutKind,
+    SyntaxMissingKind, SyntaxNodeKind, SyntaxNodeObservation, SyntaxTokenKind, SyntaxTriviaKind,
 };
 
 const MAX_SOURCE_BYTES: usize = 1_048_576;
@@ -22,7 +24,7 @@ pub(crate) struct ParsedSource {
 
 #[derive(Clone, Debug)]
 struct GreenNode {
-    kind: GreenKind,
+    kind: SyntaxNodeKind,
     range: SourceRange,
     children: std::sync::Arc<[GreenChild]>,
 }
@@ -33,14 +35,8 @@ enum GreenChild {
     Leaf(SyntaxElement),
 }
 
-#[derive(Clone, Copy, Debug)]
-enum GreenKind {
-    Source,
-    Syntax(&'static str),
-}
-
 enum Event {
-    Start(GreenKind, SourceRange),
+    Start(SyntaxNodeKind, SourceRange),
     Token(usize),
     Missing(usize),
     Error(usize),
@@ -48,136 +44,17 @@ enum Event {
 }
 
 struct SyntaxRegion {
-    kind: &'static str,
+    kind: SyntaxNodeKind,
     range: SourceRange,
     children: Vec<SyntaxRegion>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TokenKind {
-    Identifier,
-    IntegerLiteral,
-    FloatLiteral,
-    TextLiteral,
-    Fn,
-    Pub,
-    Pure,
-    Async,
-    Return,
-    If,
-    Else,
-    Const,
-    Struct,
-    Resource,
-    Enum,
-    Interface,
-    Type,
-    Pool,
-    Suite,
-    Test,
-    From,
-    Import,
-    As,
-    Comptime,
-    Assert,
-    Await,
-    Panic,
-    Pass,
-    Take,
-    Expect,
-    True,
-    False,
-    LeftParen,
-    RightParen,
-    LeftBracket,
-    RightBracket,
-    Colon,
-    Comma,
-    Dot,
-    At,
-    Arrow,
-    Equal,
-    EqualEqual,
-    BangEqual,
-    Less,
-    LessEqual,
-    Greater,
-    GreaterEqual,
-    Plus,
-    Minus,
-    Star,
-    Slash,
-    Percent,
-    Question,
-    Invalid,
-}
+pub(crate) type TokenKind = SyntaxTokenKind;
 
 #[derive(Clone, Debug)]
 struct Lexeme {
     kind: TokenKind,
     range: SourceRange,
-}
-
-impl TokenKind {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Identifier => "identifier",
-            Self::IntegerLiteral => "integer_literal",
-            Self::FloatLiteral => "float_literal",
-            Self::TextLiteral => "text_literal",
-            Self::Fn => "fn",
-            Self::Pub => "pub",
-            Self::Pure => "pure",
-            Self::Async => "async",
-            Self::Return => "return",
-            Self::If => "if",
-            Self::Else => "else",
-            Self::Const => "const",
-            Self::Struct => "struct",
-            Self::Resource => "resource",
-            Self::Enum => "enum",
-            Self::Interface => "interface",
-            Self::Type => "type",
-            Self::Pool => "pool",
-            Self::Suite => "suite",
-            Self::Test => "test",
-            Self::From => "from",
-            Self::Import => "import",
-            Self::As => "as",
-            Self::Comptime => "comptime",
-            Self::Assert => "assert",
-            Self::Await => "await",
-            Self::Panic => "panic",
-            Self::Pass => "pass",
-            Self::Take => "take",
-            Self::Expect => "expect",
-            Self::True => "true",
-            Self::False => "false",
-            Self::LeftParen => "left_paren",
-            Self::RightParen => "right_paren",
-            Self::LeftBracket => "left_bracket",
-            Self::RightBracket => "right_bracket",
-            Self::Colon => "colon",
-            Self::Comma => "comma",
-            Self::Dot => "dot",
-            Self::At => "at",
-            Self::Arrow => "arrow",
-            Self::Equal => "equal",
-            Self::EqualEqual => "equal_equal",
-            Self::BangEqual => "bang_equal",
-            Self::Less => "less",
-            Self::LessEqual => "less_equal",
-            Self::Greater => "greater",
-            Self::GreaterEqual => "greater_equal",
-            Self::Plus => "plus",
-            Self::Minus => "minus",
-            Self::Star => "star",
-            Self::Slash => "slash",
-            Self::Percent => "percent",
-            Self::Question => "question",
-            Self::Invalid => "invalid",
-        }
-    }
 }
 
 fn classify_token_bytes(bytes: &[u8]) -> TokenKind {
@@ -207,6 +84,10 @@ fn classify_token_bytes(bytes: &[u8]) -> TokenKind {
         b"panic" => TokenKind::Panic,
         b"pass" => TokenKind::Pass,
         b"take" => TokenKind::Take,
+        b"read" => TokenKind::Read,
+        b"mut" => TokenKind::Mut,
+        b"self" => TokenKind::SelfValue,
+        b"implements" => TokenKind::Implements,
         b"expect" => TokenKind::Expect,
         b"true" => TokenKind::True,
         b"false" => TokenKind::False,
@@ -253,6 +134,7 @@ pub(crate) struct Declaration {
     pub(crate) syntax: Option<DeclarationSyntax>,
     pub(crate) range: SourceRange,
     pub(crate) start: u64,
+    pub(crate) header_start: u64,
     pub(crate) end: u64,
     pub(crate) structurally_valid: bool,
 }
@@ -284,6 +166,20 @@ impl DeclarationKind {
             Self::Suite => "suite",
         }
     }
+
+    const fn node_kind(self) -> SyntaxNodeKind {
+        match self {
+            Self::Function => SyntaxNodeKind::Function,
+            Self::Constant => SyntaxNodeKind::Constant,
+            Self::Pool => SyntaxNodeKind::Pool,
+            Self::TypeAlias => SyntaxNodeKind::TypeAlias,
+            Self::Struct => SyntaxNodeKind::Struct,
+            Self::ResourceStruct => SyntaxNodeKind::ResourceStruct,
+            Self::Enum => SyntaxNodeKind::Enum,
+            Self::Interface => SyntaxNodeKind::Interface,
+            Self::Suite => SyntaxNodeKind::Suite,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,9 +189,21 @@ pub(crate) enum FunctionModifier {
     Async,
 }
 
+impl FunctionModifier {
+    pub(crate) const fn canonical_tag(self) -> u8 {
+        match self {
+            Self::Ordinary => 0x01,
+            Self::Pure => 0x02,
+            Self::Async => 0x03,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OwnershipSyntax {
     Value,
+    Read,
+    Mut,
     Take,
 }
 
@@ -336,19 +244,64 @@ pub(crate) struct ParameterSyntax {
 pub(crate) enum DeclarationSyntax {
     Function(FunctionSyntax),
     Constant(ConstantSyntax),
+    TypeAlias(TypeSyntax),
     Suite(SuiteSyntax),
     Enum(EnumSyntax),
-    Named,
+    Struct(StructSyntax),
+    ResourceStruct(StructSyntax),
+    Interface(InterfaceSyntax),
+    Pool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StructSyntax {
+    pub(crate) implements: Vec<NameSyntax>,
+    pub(crate) fields: Vec<FieldSyntax>,
+    pub(crate) functions: Vec<MemberFunctionSyntax>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MemberFunctionSyntax {
+    pub(crate) name: String,
+    pub(crate) public: bool,
+    pub(crate) function: FunctionSyntax,
+    pub(crate) range: SourceRange,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FieldSyntax {
+    pub(crate) name: String,
+    pub(crate) public: bool,
+    pub(crate) mutable: bool,
+    pub(crate) type_syntax: TypeSyntax,
+    pub(crate) range: SourceRange,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct InterfaceSyntax {
+    pub(crate) requirements: Vec<FunctionRequirementSyntax>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FunctionRequirementSyntax {
+    pub(crate) name: String,
+    pub(crate) modifier: FunctionModifier,
+    pub(crate) parameters: Vec<ParameterSyntax>,
+    pub(crate) return_type: TypeSyntax,
+    pub(crate) range: SourceRange,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct EnumSyntax {
+    pub(crate) type_parameters: Vec<String>,
     pub(crate) variants: Vec<VariantSyntax>,
+    pub(crate) functions: Vec<MemberFunctionSyntax>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct VariantSyntax {
     pub(crate) name: String,
+    pub(crate) parameters: Vec<ParameterSyntax>,
     pub(crate) range: SourceRange,
 }
 
@@ -377,6 +330,7 @@ pub(crate) struct TestSyntax {
     pub(crate) name: String,
     pub(crate) asynchronous: bool,
     pub(crate) parameters: Vec<ParameterSyntax>,
+    pub(crate) body: Vec<StatementSyntax>,
     pub(crate) range: SourceRange,
 }
 
@@ -390,8 +344,13 @@ pub(crate) enum StatementSyntax {
         value: ExpressionSyntax,
         range: SourceRange,
     },
+    Expect {
+        condition: ExpressionSyntax,
+        range: SourceRange,
+    },
     Assign {
         name: String,
+        mutable_binding: bool,
         value: ExpressionSyntax,
         range: SourceRange,
     },
@@ -480,11 +439,11 @@ impl ParsedSource {
 
 impl GreenNode {
     fn project(&self, depth: u16, output: &mut Vec<SyntaxNodeObservation>) {
-        let kind = match self.kind {
-            GreenKind::Source => "source",
-            GreenKind::Syntax(kind) => kind,
-        };
-        output.push(SyntaxNodeObservation::new(kind, self.range.clone(), depth));
+        output.push(SyntaxNodeObservation::new(
+            self.kind,
+            self.range.clone(),
+            depth,
+        ));
         for child in &*self.children {
             if let GreenChild::Node(node) = child {
                 node.project(depth.saturating_add(1), output);
@@ -500,9 +459,9 @@ impl GreenNode {
                 GreenChild::Leaf(leaf)
                     if matches!(
                         leaf.kind(),
-                        SyntaxElementKind::Token
-                            | SyntaxElementKind::Trivia
-                            | SyntaxElementKind::Invalid
+                        SyntaxElementKind::Token(_)
+                            | SyntaxElementKind::Trivia(_)
+                            | SyntaxElementKind::Invalid(_)
                     ) =>
                 {
                     leaf.range().end().saturating_sub(leaf.range().start())
@@ -515,11 +474,10 @@ impl GreenNode {
 
 pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSource {
     let bytes = file.bytes();
-    let path = file.path();
+    let path = file.path_arc();
     if bytes.len() > MAX_SOURCE_BYTES {
         let elements = vec![SyntaxElement::new(
-            SyntaxElementKind::Invalid,
-            "oversized_source",
+            SyntaxElementKind::Invalid(SyntaxInvalidKind::OversizedSource),
             path,
             0,
             bytes.len(),
@@ -530,7 +488,7 @@ pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSo
             elements,
             diagnostics: vec![Diagnostic::new(
                 "syntax.source_too_large",
-                SourceRange::new(path, MAX_SOURCE_BYTES, bytes.len()),
+                SourceRange::new_shared(path, MAX_SOURCE_BYTES, bytes.len()),
                 RecoveryAction::PreservedInvalidBytes,
             )],
             imports: Vec::new(),
@@ -551,7 +509,7 @@ pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSo
             return cancelled_source(file, elements, diagnostics, imports, declarations);
         }
         let start = offset;
-        let (kind, name, token_kind) = match bytes[offset] {
+        let (kind, token_kind) = match bytes[offset] {
             b' ' => {
                 offset += 1;
                 while bytes.get(offset) == Some(&b' ') {
@@ -560,33 +518,36 @@ pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSo
                     }
                     offset += 1;
                 }
-                (SyntaxElementKind::Trivia, "spaces", None)
+                (SyntaxElementKind::Trivia(SyntaxTriviaKind::Spaces), None)
             }
             b'\t' => {
                 offset += 1;
                 diagnostics.push(Diagnostic::new(
                     "syntax.tab_outside_literal",
-                    SourceRange::new(path, start, offset),
+                    SourceRange::new_shared(path, start, offset),
                     RecoveryAction::PreservedInvalidBytes,
                 ));
-                (SyntaxElementKind::Invalid, "invalid_tab", None)
+                (SyntaxElementKind::Invalid(SyntaxInvalidKind::Tab), None)
             }
             b'\n' => {
                 offset += 1;
-                (SyntaxElementKind::Trivia, "lf", None)
+                (SyntaxElementKind::Trivia(SyntaxTriviaKind::Lf), None)
             }
             b'\r' if bytes.get(offset + 1) == Some(&b'\n') => {
                 offset += 2;
-                (SyntaxElementKind::Trivia, "crlf", None)
+                (SyntaxElementKind::Trivia(SyntaxTriviaKind::Crlf), None)
             }
             b'\r' => {
                 offset += 1;
                 diagnostics.push(Diagnostic::new(
                     "syntax.bare_carriage_return",
-                    SourceRange::new(path, start, offset),
+                    SourceRange::new_shared(path, start, offset),
                     RecoveryAction::PreservedInvalidBytes,
                 ));
-                (SyntaxElementKind::Invalid, "invalid_line_ending", None)
+                (
+                    SyntaxElementKind::Invalid(SyntaxInvalidKind::LineEnding),
+                    None,
+                )
             }
             b'#' => {
                 offset += 1;
@@ -597,9 +558,12 @@ pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSo
                     offset += 1;
                 }
                 if bytes.get(start + 1) == Some(&b'#') {
-                    (SyntaxElementKind::Trivia, "documentation_comment", None)
+                    (
+                        SyntaxElementKind::Trivia(SyntaxTriviaKind::DocumentationComment),
+                        None,
+                    )
                 } else {
-                    (SyntaxElementKind::Trivia, "comment", None)
+                    (SyntaxElementKind::Trivia(SyntaxTriviaKind::Comment), None)
                 }
             }
             b'A'..=b'Z' | b'a'..=b'z' | b'_' => {
@@ -614,12 +578,12 @@ pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSo
                     offset += 1;
                 }
                 let token = classify_token_bytes(&bytes[start..offset]);
-                (SyntaxElementKind::Token, token.name(), Some(token))
+                (SyntaxElementKind::Token(token), Some(token))
             }
             b'0'..=b'9' => {
                 offset = numeric_token_end(bytes, start, cancellation);
                 let token = classify_token_bytes(&bytes[start..offset]);
-                (SyntaxElementKind::Token, token.name(), Some(token))
+                (SyntaxElementKind::Token(token), Some(token))
             }
             quote @ (b'\'' | b'"') => {
                 offset += 1;
@@ -645,8 +609,7 @@ pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSo
                 }
                 if closed && std::str::from_utf8(&bytes[start..offset]).is_ok() {
                     (
-                        SyntaxElementKind::Token,
-                        "text_literal",
+                        SyntaxElementKind::Token(TokenKind::TextLiteral),
                         Some(TokenKind::TextLiteral),
                     )
                 } else {
@@ -656,10 +619,10 @@ pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSo
                         } else {
                             "syntax.unclosed_literal"
                         },
-                        SourceRange::new(path, start, offset),
+                        SourceRange::new_shared(path, start, offset),
                         RecoveryAction::PreservedInvalidBytes,
                     ));
-                    (SyntaxElementKind::Invalid, "invalid_literal", None)
+                    (SyntaxElementKind::Invalid(SyntaxInvalidKind::Literal), None)
                 }
             }
             byte if byte.is_ascii_punctuation() => {
@@ -675,12 +638,12 @@ pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSo
                 if token == TokenKind::Invalid {
                     diagnostics.push(Diagnostic::new(
                         "syntax.invalid_token",
-                        SourceRange::new(path, start, offset),
+                        SourceRange::new_shared(path, start, offset),
                         RecoveryAction::PreservedInvalidBytes,
                     ));
-                    (SyntaxElementKind::Invalid, "invalid_token", None)
+                    (SyntaxElementKind::Invalid(SyntaxInvalidKind::Token), None)
                 } else {
-                    (SyntaxElementKind::Token, token.name(), Some(token))
+                    (SyntaxElementKind::Token(token), Some(token))
                 }
             }
             byte => {
@@ -692,17 +655,17 @@ pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSo
                 offset += extent;
                 diagnostics.push(Diagnostic::new(
                     code,
-                    SourceRange::new(path, start, offset),
+                    SourceRange::new_shared(path, start, offset),
                     RecoveryAction::PreservedInvalidBytes,
                 ));
-                (SyntaxElementKind::Invalid, "invalid_byte", None)
+                (SyntaxElementKind::Invalid(SyntaxInvalidKind::Byte), None)
             }
         };
-        elements.push(SyntaxElement::new(kind, name, path, start, offset));
+        elements.push(SyntaxElement::new(kind, path, start, offset));
         if let Some(kind) = token_kind {
             lexemes.push(Lexeme {
                 kind,
-                range: SourceRange::new(path, start, offset),
+                range: SourceRange::new_shared(path, start, offset),
             });
         }
     }
@@ -711,21 +674,31 @@ pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSo
         diagnostics.push(
             Diagnostic::new(
                 "syntax.byte_order_mark",
-                SourceRange::new(path, 0, 3),
+                SourceRange::new_shared(path, 0, 3),
                 RecoveryAction::PreservedInvalidBytes,
             )
             .with_parameter("encoding", "utf-8"),
         );
     }
 
-    if scan_layout_and_delimiters(file, &mut elements, &mut diagnostics, cancellation) {
+    let mut layout_elements = Vec::new();
+    if scan_layout_and_delimiters(
+        file,
+        &lexemes,
+        &mut layout_elements,
+        &mut diagnostics,
+        cancellation,
+    ) {
         return cancelled_source(file, elements, diagnostics, imports, declarations);
     }
+    elements = merge_syntax_elements(elements, layout_elements);
     let Some(parsed_imports) = parse_imports(file, &lexemes, &mut diagnostics, cancellation) else {
         return cancelled_source(file, elements, diagnostics, imports, declarations);
     };
     imports = parsed_imports;
-    let Some(parsed_declarations) = parse_declarations(file, &lexemes, cancellation) else {
+    let Some(parsed_declarations) =
+        parse_declarations(file, &lexemes, &mut diagnostics, cancellation)
+    else {
         return cancelled_source(file, elements, diagnostics, imports, declarations);
     };
     declarations = parsed_declarations;
@@ -764,26 +737,21 @@ pub(crate) fn parse(file: &ProjectFile, cancellation: &Cancellation) -> ParsedSo
                     || (start == declaration.end
                         && declaration.end == u64::try_from(bytes.len()).unwrap_or(u64::MAX)));
             let unmatched_opener = diagnostic.code() == "syntax.missing_closer"
-                && diagnostic.parameters().iter().any(|(name, value)| {
+                && diagnostic.typed_parameters().iter().any(|(name, value)| {
                     name.as_ref() == "opener_offset"
-                        && value.parse::<u64>().is_ok_and(|offset| {
+                        && matches!(value, DiagnosticValue::Unsigned(offset) if
+                            u64::try_from(*offset).is_ok_and(|offset| {
                             offset >= declaration.start && offset < declaration.end
-                        })
+                        }))
                 });
             direct || unmatched_opener
         });
     }
-    elements.sort_by(|left, right| {
-        left.range()
-            .start()
-            .cmp(&right.range().start())
-            .then(left.range().end().cmp(&right.range().end()))
-    });
     if diagnostics.len() > 64 {
         diagnostics.truncate(64);
         diagnostics.push(Diagnostic::new(
             "syntax.diagnostics_truncated",
-            SourceRange::new(path, bytes.len(), bytes.len()),
+            SourceRange::new_shared(path, bytes.len(), bytes.len()),
             RecoveryAction::TruncatedDiagnostics,
         ));
     }
@@ -826,8 +794,8 @@ fn cancelled_source(
 
 fn cancelled_green(file: &ProjectFile) -> GreenNode {
     GreenNode {
-        kind: GreenKind::Source,
-        range: SourceRange::new(file.path(), 0, file.bytes().len()),
+        kind: SyntaxNodeKind::Source,
+        range: SourceRange::new_shared(file.path_arc(), 0, file.bytes().len()),
         children: std::sync::Arc::from([]),
     }
 }
@@ -920,8 +888,8 @@ fn build_green_tree(
     cancellation: &Cancellation,
 ) -> Option<GreenNode> {
     let mut events = vec![Event::Start(
-        GreenKind::Source,
-        SourceRange::new(file.path(), 0, file.bytes().len()),
+        SyntaxNodeKind::Source,
+        SourceRange::new_shared(file.path_arc(), 0, file.bytes().len()),
     )];
     let mut element_index = 0;
     for declaration in declarations {
@@ -953,7 +921,7 @@ fn build_green_tree(
     }
     events.push(Event::Finish);
 
-    let mut stack: Vec<(GreenKind, SourceRange, Vec<GreenChild>)> = Vec::new();
+    let mut stack: Vec<(SyntaxNodeKind, SourceRange, Vec<GreenChild>)> = Vec::new();
     let mut root = None;
     for (event_index, event) in events.into_iter().enumerate() {
         if event_index.is_multiple_of(256) && cancellation.is_cancelled() {
@@ -984,19 +952,45 @@ fn build_green_tree(
     Some(root.expect("source event produces a root"))
 }
 
+fn merge_syntax_elements(
+    physical: Vec<SyntaxElement>,
+    layout: Vec<SyntaxElement>,
+) -> Vec<SyntaxElement> {
+    let mut physical = physical.into_iter().peekable();
+    let mut layout = layout.into_iter().peekable();
+    let mut merged = Vec::with_capacity(physical.len() + layout.len());
+    loop {
+        let take_layout = match (physical.peek(), layout.peek()) {
+            (Some(physical), Some(layout)) => {
+                (layout.range().start(), layout.range().end())
+                    < (physical.range().start(), physical.range().end())
+            }
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (None, None) => break,
+        };
+        if take_layout {
+            merged.push(layout.next().expect("peeked layout element"));
+        } else {
+            merged.push(physical.next().expect("peeked physical element"));
+        }
+    }
+    merged
+}
+
 fn declaration_region(file: &ProjectFile, declaration: &Declaration) -> SyntaxRegion {
     let mut children = Vec::new();
     if let Some(syntax) = &declaration.syntax {
         match syntax {
             DeclarationSyntax::Function(function) => {
                 children.push(SyntaxRegion {
-                    kind: "function_signature",
+                    kind: SyntaxNodeKind::FunctionSignature,
                     range: declaration.range.clone(),
                     children: function
                         .parameters
                         .iter()
                         .map(|parameter| SyntaxRegion {
-                            kind: "parameter",
+                            kind: SyntaxNodeKind::Parameter,
                             range: parameter.range.clone(),
                             children: Vec::new(),
                         })
@@ -1005,9 +999,9 @@ fn declaration_region(file: &ProjectFile, declaration: &Declaration) -> SyntaxRe
                 let mut statements = Vec::new();
                 collect_statement_regions(&function.body, &mut statements);
                 children.push(SyntaxRegion {
-                    kind: "block",
-                    range: SourceRange::from_u64(
-                        file.path(),
+                    kind: SyntaxNodeKind::Block,
+                    range: SourceRange::from_u64_shared(
+                        file.path_arc(),
                         declaration.range.end(),
                         declaration.end,
                     ),
@@ -1015,29 +1009,87 @@ fn declaration_region(file: &ProjectFile, declaration: &Declaration) -> SyntaxRe
                 });
             }
             DeclarationSyntax::Constant(constant) => children.push(SyntaxRegion {
-                kind: "constant_value",
+                kind: SyntaxNodeKind::ConstantValue,
                 range: declaration.range.clone(),
                 children: vec![expression_region(&constant.value)],
             }),
+            DeclarationSyntax::TypeAlias(_) => {}
             DeclarationSyntax::Suite(suite) => {
                 children.push(SyntaxRegion {
-                    kind: "suite_header",
+                    kind: SyntaxNodeKind::SuiteHeader,
                     range: declaration.range.clone(),
                     children: Vec::new(),
                 });
                 children.extend(suite.tests.iter().map(|test| {
+                    let mut test_children = test
+                        .parameters
+                        .iter()
+                        .map(|parameter| SyntaxRegion {
+                            kind: SyntaxNodeKind::Parameter,
+                            range: parameter.range.clone(),
+                            children: Vec::new(),
+                        })
+                        .collect::<Vec<_>>();
+                    collect_statement_regions(&test.body, &mut test_children);
                     SyntaxRegion {
                         kind: if test.asynchronous {
-                            "async_test"
+                            SyntaxNodeKind::AsyncTest
                         } else {
-                            "test"
+                            SyntaxNodeKind::Test
                         },
                         range: test.range.clone(),
-                        children: test
+                        children: test_children,
+                    }
+                }));
+            }
+            DeclarationSyntax::Enum(enum_) => {
+                let variants = enum_
+                    .variants
+                    .iter()
+                    .map(|variant| SyntaxRegion {
+                        kind: SyntaxNodeKind::Variant,
+                        range: variant.range.clone(),
+                        children: variant
                             .parameters
                             .iter()
                             .map(|parameter| SyntaxRegion {
-                                kind: "parameter",
+                                kind: SyntaxNodeKind::Parameter,
+                                range: parameter.range.clone(),
+                                children: Vec::new(),
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                let functions = enum_.functions.iter().map(member_function_region).collect();
+                children.extend(merge_regions(variants, functions));
+            }
+            DeclarationSyntax::Struct(struct_) | DeclarationSyntax::ResourceStruct(struct_) => {
+                let fields = struct_
+                    .fields
+                    .iter()
+                    .map(|field| SyntaxRegion {
+                        kind: SyntaxNodeKind::Field,
+                        range: field.range.clone(),
+                        children: Vec::new(),
+                    })
+                    .collect();
+                let functions = struct_
+                    .functions
+                    .iter()
+                    .map(member_function_region)
+                    .collect();
+                children.extend(merge_regions(fields, functions));
+            }
+            DeclarationSyntax::Interface(interface) => {
+                children.extend(interface.requirements.iter().map(|requirement| {
+                    SyntaxRegion {
+                        kind: SyntaxNodeKind::FunctionRequirement,
+                        range: requirement.range.clone(),
+                        children: requirement
+                            .parameters
+                            .iter()
+                            .map(|parameter| SyntaxRegion {
+                                kind: SyntaxNodeKind::Parameter,
                                 range: parameter.range.clone(),
                                 children: Vec::new(),
                             })
@@ -1045,54 +1097,53 @@ fn declaration_region(file: &ProjectFile, declaration: &Declaration) -> SyntaxRe
                     }
                 }));
             }
-            DeclarationSyntax::Enum(enum_) => {
-                children.extend(enum_.variants.iter().map(|variant| SyntaxRegion {
-                    kind: "variant",
-                    range: variant.range.clone(),
-                    children: Vec::new(),
-                }))
-            }
-            DeclarationSyntax::Named => {}
+            DeclarationSyntax::Pool => {}
         }
     }
-    children.sort_by(|left, right| {
-        left.range
-            .start()
-            .cmp(&right.range.start())
-            .then(left.range.end().cmp(&right.range.end()))
-    });
     SyntaxRegion {
-        kind: declaration.kind.name(),
-        range: SourceRange::from_u64(file.path(), declaration.start, declaration.end),
+        kind: declaration.kind.node_kind(),
+        range: SourceRange::from_u64_shared(file.path_arc(), declaration.start, declaration.end),
         children,
     }
 }
 
 fn collect_statement_regions(statements: &[StatementSyntax], output: &mut Vec<SyntaxRegion>) {
-    for statement in statements {
+    let mut pending = statements.iter().rev().collect::<Vec<_>>();
+    while let Some(statement) = pending.pop() {
         let (kind, range, expressions) = match statement {
             StatementSyntax::Return { value, range } => (
-                "return_statement",
+                SyntaxNodeKind::ReturnStatement,
                 range,
                 value.iter().map(expression_region).collect(),
             ),
-            StatementSyntax::Panic { value, range } => {
-                ("panic_statement", range, vec![expression_region(value)])
-            }
+            StatementSyntax::Panic { value, range } => (
+                SyntaxNodeKind::PanicStatement,
+                range,
+                vec![expression_region(value)],
+            ),
+            StatementSyntax::Expect { condition, range } => (
+                SyntaxNodeKind::ExpectStatement,
+                range,
+                vec![expression_region(condition)],
+            ),
             StatementSyntax::Assign { value, range, .. } => (
-                "initialize_statement",
+                SyntaxNodeKind::InitializeStatement,
                 range,
                 vec![expression_region(value)],
             ),
             StatementSyntax::Evaluate(value) => (
-                "expression_statement",
+                SyntaxNodeKind::ExpressionStatement,
                 &value.range,
                 vec![expression_region(value)],
             ),
             StatementSyntax::If {
                 condition, range, ..
-            } => ("if_statement", range, vec![expression_region(condition)]),
-            StatementSyntax::Pass(range) => ("pass_statement", range, Vec::new()),
+            } => (
+                SyntaxNodeKind::IfStatement,
+                range,
+                vec![expression_region(condition)],
+            ),
+            StatementSyntax::Pass(range) => (SyntaxNodeKind::PassStatement, range, Vec::new()),
         };
         output.push(SyntaxRegion {
             kind,
@@ -1105,41 +1156,84 @@ fn collect_statement_regions(statements: &[StatementSyntax], output: &mut Vec<Sy
             ..
         } = statement
         {
-            collect_statement_regions(then_branch, output);
-            collect_statement_regions(else_branch, output);
+            pending.extend(else_branch.iter().rev());
+            pending.extend(then_branch.iter().rev());
         }
     }
-    output.sort_by_key(|region| region.range.start());
+}
+
+fn member_function_region(function: &MemberFunctionSyntax) -> SyntaxRegion {
+    let mut children = function
+        .function
+        .parameters
+        .iter()
+        .map(|parameter| SyntaxRegion {
+            kind: SyntaxNodeKind::Parameter,
+            range: parameter.range.clone(),
+            children: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    collect_statement_regions(&function.function.body, &mut children);
+    SyntaxRegion {
+        kind: SyntaxNodeKind::MemberFunction,
+        range: function.range.clone(),
+        children,
+    }
+}
+
+fn merge_regions(left: Vec<SyntaxRegion>, right: Vec<SyntaxRegion>) -> Vec<SyntaxRegion> {
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    let mut merged = Vec::with_capacity(left.len() + right.len());
+    loop {
+        let take_right = match (left.peek(), right.peek()) {
+            (Some(left), Some(right)) => right.range.start() < left.range.start(),
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (None, None) => break,
+        };
+        if take_right {
+            merged.push(right.next().expect("peeked right region"));
+        } else {
+            merged.push(left.next().expect("peeked left region"));
+        }
+    }
+    merged
 }
 
 fn expression_region(expression: &ExpressionSyntax) -> SyntaxRegion {
     let (kind, children) = match &expression.kind {
-        ExpressionSyntaxKind::Integer(_) => ("integer_expression", Vec::new()),
-        ExpressionSyntaxKind::Float(_) => ("float_expression", Vec::new()),
-        ExpressionSyntaxKind::Text(_) => ("text_expression", Vec::new()),
-        ExpressionSyntaxKind::Bool(_) => ("bool_expression", Vec::new()),
-        ExpressionSyntaxKind::Name(_) => ("name_expression", Vec::new()),
+        ExpressionSyntaxKind::Integer(_) => (SyntaxNodeKind::IntegerExpression, Vec::new()),
+        ExpressionSyntaxKind::Float(_) => (SyntaxNodeKind::FloatExpression, Vec::new()),
+        ExpressionSyntaxKind::Text(_) => (SyntaxNodeKind::TextExpression, Vec::new()),
+        ExpressionSyntaxKind::Bool(_) => (SyntaxNodeKind::BoolExpression, Vec::new()),
+        ExpressionSyntaxKind::Name(_) => (SyntaxNodeKind::NameExpression, Vec::new()),
         ExpressionSyntaxKind::Call { arguments, .. } => (
-            "call_expression",
+            SyntaxNodeKind::CallExpression,
             arguments
                 .iter()
                 .map(|argument| expression_region(&argument.value))
                 .collect(),
         ),
         ExpressionSyntaxKind::Array(values) => (
-            "array_expression",
+            SyntaxNodeKind::ArrayExpression,
             values.iter().map(expression_region).collect(),
         ),
-        ExpressionSyntaxKind::Unit => ("unit_expression", Vec::new()),
-        ExpressionSyntaxKind::Negate(value) => {
-            ("negate_expression", vec![expression_region(value)])
-        }
-        ExpressionSyntaxKind::Await(value) => ("await_expression", vec![expression_region(value)]),
-        ExpressionSyntaxKind::Propagate(value) => {
-            ("propagate_expression", vec![expression_region(value)])
-        }
+        ExpressionSyntaxKind::Unit => (SyntaxNodeKind::UnitExpression, Vec::new()),
+        ExpressionSyntaxKind::Negate(value) => (
+            SyntaxNodeKind::NegateExpression,
+            vec![expression_region(value)],
+        ),
+        ExpressionSyntaxKind::Await(value) => (
+            SyntaxNodeKind::AwaitExpression,
+            vec![expression_region(value)],
+        ),
+        ExpressionSyntaxKind::Propagate(value) => (
+            SyntaxNodeKind::PropagateExpression,
+            vec![expression_region(value)],
+        ),
         ExpressionSyntaxKind::Binary { left, right, .. } => (
-            "binary_expression",
+            SyntaxNodeKind::BinaryExpression,
             vec![expression_region(left), expression_region(right)],
         ),
     };
@@ -1157,35 +1251,41 @@ fn emit_region(
     events: &mut Vec<Event>,
     cancellation: &Cancellation,
 ) -> bool {
-    if cancellation.is_cancelled() {
-        return true;
-    }
-    events.push(Event::Start(
-        GreenKind::Syntax(region.kind),
-        region.range.clone(),
-    ));
-    for child in &region.children {
+    let mut stack = vec![(region, 0_usize, false)];
+    while let Some((current, child_index, started)) = stack.last_mut() {
+        if cancellation.is_cancelled() {
+            return true;
+        }
+        if !*started {
+            events.push(Event::Start(current.kind, current.range.clone()));
+            *started = true;
+        }
+        if let Some(child) = current.children.get(*child_index) {
+            *child_index += 1;
+            if emit_elements_before(
+                child.range.start(),
+                elements,
+                element_index,
+                events,
+                cancellation,
+            ) {
+                return true;
+            }
+            stack.push((child, 0, false));
+            continue;
+        }
         if emit_elements_before(
-            child.range.start(),
+            current.range.end(),
             elements,
             element_index,
             events,
             cancellation,
-        ) || emit_region(child, elements, element_index, events, cancellation)
-        {
+        ) {
             return true;
         }
+        events.push(Event::Finish);
+        stack.pop();
     }
-    if emit_elements_before(
-        region.range.end(),
-        elements,
-        element_index,
-        events,
-        cancellation,
-    ) {
-        return true;
-    }
-    events.push(Event::Finish);
     false
 }
 
@@ -1211,11 +1311,11 @@ fn emit_elements_before(
 
 fn emit_element(elements: &[SyntaxElement], index: usize, events: &mut Vec<Event>) {
     events.push(match elements[index].kind() {
-        SyntaxElementKind::Missing => Event::Missing(index),
-        SyntaxElementKind::Error | SyntaxElementKind::Invalid => Event::Error(index),
-        SyntaxElementKind::Token | SyntaxElementKind::Trivia | SyntaxElementKind::Layout => {
-            Event::Token(index)
-        }
+        SyntaxElementKind::Missing(_) => Event::Missing(index),
+        SyntaxElementKind::Error(_) | SyntaxElementKind::Invalid(_) => Event::Error(index),
+        SyntaxElementKind::Token(_)
+        | SyntaxElementKind::Trivia(_)
+        | SyntaxElementKind::Layout(_) => Event::Token(index),
     });
 }
 
@@ -1272,7 +1372,7 @@ fn validate_top_level(
         if !accepted {
             diagnostics.push(Diagnostic::new(
                 "syntax.unexpected_top_level",
-                SourceRange::new(file.path(), offset, offset + line.len()),
+                SourceRange::new_shared(file.path_arc(), offset, offset + line.len()),
                 RecoveryAction::SkippedToBoundary,
             ));
         }
@@ -1284,16 +1384,23 @@ fn validate_top_level(
 fn parse_declarations(
     file: &ProjectFile,
     lexemes: &[Lexeme],
+    diagnostics: &mut Vec<Diagnostic>,
     cancellation: &Cancellation,
 ) -> Option<Vec<Declaration>> {
     let mut starts = Vec::new();
     let mut index = 0;
+    let mut pending_attribute_start = None;
     while index < lexemes.len() {
         if index.is_multiple_of(256) && cancellation.is_cancelled() {
             return None;
         }
         let lexeme = &lexemes[index];
         if !at_top_level(file.bytes(), lexeme.range.start()) {
+            index += 1;
+            continue;
+        }
+        if lexeme.kind == TokenKind::At {
+            pending_attribute_start.get_or_insert(lexeme.range.start());
             index += 1;
             continue;
         }
@@ -1341,12 +1448,25 @@ fn parse_declarations(
             && let Some(bytes) = checked_slice(file.bytes(), name.range.start(), name.range.end())
             && let Ok(name) = std::str::from_utf8(bytes)
         {
+            let authored_start = usize::try_from(
+                pending_attribute_start
+                    .take()
+                    .unwrap_or(lexeme.range.start()),
+            )
+            .expect("admitted source offset");
             starts.push((
+                declaration_prefix_start(file.bytes(), authored_start),
                 usize::try_from(lexeme.range.start()).expect("admitted source offset"),
                 usize::try_from(line_end).expect("admitted source offset"),
                 kind,
                 name.to_owned(),
                 public,
+            ));
+        } else {
+            diagnostics.push(Diagnostic::new(
+                "syntax.malformed_declaration",
+                SourceRange::from_u64_shared(file.path_arc(), lexeme.range.start(), line_end),
+                RecoveryAction::SkippedToBoundary,
             ));
         }
         index += 1;
@@ -1356,22 +1476,56 @@ fn parse_declarations(
         starts
             .iter()
             .enumerate()
-            .map(|(index, (start, header_end, kind, name, public))| {
-                let end = starts.get(index + 1).map_or(source_len, |(next, ..)| *next);
-                Declaration {
-                    kind: *kind,
-                    name: name.clone(),
-                    public: *public,
-                    attributes: Vec::new(),
-                    syntax: None,
-                    range: SourceRange::new(file.path(), *start, *header_end),
-                    start: u64::try_from(*start).expect("admitted source offset fits u64"),
-                    end: u64::try_from(end).expect("admitted source offset fits u64"),
-                    structurally_valid: true,
-                }
-            })
+            .map(
+                |(index, (start, header_start, header_end, kind, name, public))| {
+                    let end = starts.get(index + 1).map_or(source_len, |(next, ..)| *next);
+                    Declaration {
+                        kind: *kind,
+                        name: name.clone(),
+                        public: *public,
+                        attributes: Vec::new(),
+                        syntax: None,
+                        range: SourceRange::new_shared(file.path_arc(), *start, *header_end),
+                        start: u64::try_from(*start).expect("admitted source offset fits u64"),
+                        header_start: u64::try_from(*header_start)
+                            .expect("admitted source offset fits u64"),
+                        end: u64::try_from(end).expect("admitted source offset fits u64"),
+                        structurally_valid: true,
+                    }
+                },
+            )
             .collect(),
     )
+}
+
+fn declaration_prefix_start(bytes: &[u8], mut start: usize) -> usize {
+    while start > 0 {
+        let before_newline = if bytes.get(start.wrapping_sub(1)) == Some(&b'\n') {
+            start - 1
+        } else {
+            start
+        };
+        if before_newline == 0 {
+            break;
+        }
+        let line_start = bytes[..before_newline]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let line = &bytes[line_start..before_newline];
+        let content = line
+            .strip_suffix(b"\r")
+            .unwrap_or(line)
+            .iter()
+            .skip_while(|byte| **byte == b' ')
+            .copied()
+            .collect::<Vec<_>>();
+        if !content.starts_with(b"##") {
+            break;
+        }
+        start = line_start;
+    }
+    start
 }
 
 #[derive(Clone)]
@@ -1417,7 +1571,7 @@ fn token_lines<'a>(
             lines.push(TokenLine {
                 indent,
                 tokens,
-                range: SourceRange::new(file.path(), offset, content_end),
+                range: SourceRange::new_shared(file.path_arc(), offset, content_end),
             });
         }
         offset = physical_end;
@@ -1508,12 +1662,12 @@ fn assign_attributes(
         }
         while declarations
             .get(declaration_index)
-            .is_some_and(|declaration| declaration.start < first.range.start())
+            .is_some_and(|declaration| declaration.header_start < first.range.start())
         {
             declaration_index += 1;
         }
         if let Some(declaration) = declarations.get_mut(declaration_index)
-            && declaration.start == first.range.start()
+            && declaration.header_start == first.range.start()
         {
             declaration.attributes = std::mem::take(&mut pending);
             declaration_index += 1;
@@ -1534,7 +1688,7 @@ fn parse_declaration_syntax(
     let lines = token_lines(
         file,
         lexemes,
-        declaration.start,
+        declaration.header_start,
         declaration.end,
         cancellation,
     )?;
@@ -1553,31 +1707,52 @@ fn parse_declaration_syntax(
             parse_function_syntax(file, &mut cursor, modifier, &lines, cancellation)
         }
         DeclarationKind::Constant => parse_constant_syntax(&mut cursor),
+        DeclarationKind::TypeAlias => {
+            cursor.expect(TokenKind::Type)?;
+            cursor.expect_identifier()?;
+            cursor.expect(TokenKind::Equal)?;
+            let target = cursor.parse_type()?;
+            cursor
+                .at_end()
+                .then_some(DeclarationSyntax::TypeAlias(target))
+        }
         DeclarationKind::Suite => {
             parse_suite_syntax(file, &mut cursor, &lines, diagnostics, cancellation)
         }
         DeclarationKind::Enum => {
             parse_enum_syntax(file, &mut cursor, &lines, diagnostics, cancellation)
         }
-        DeclarationKind::ResourceStruct => {
-            cursor.expect(TokenKind::Resource)?;
-            cursor.expect(TokenKind::Struct)?;
-            cursor.expect_identifier()?;
-            Some(DeclarationSyntax::Named)
+        DeclarationKind::Struct => {
+            parse_struct_syntax(file, &mut cursor, &lines, false, cancellation)
         }
-        kind => {
-            cursor.expect(match kind {
-                DeclarationKind::Pool => TokenKind::Pool,
-                DeclarationKind::TypeAlias => TokenKind::Type,
-                DeclarationKind::Struct => TokenKind::Struct,
-                DeclarationKind::Interface => TokenKind::Interface,
-                _ => return None,
-            })?;
+        DeclarationKind::ResourceStruct => {
+            parse_struct_syntax(file, &mut cursor, &lines, true, cancellation)
+        }
+        DeclarationKind::Interface => {
+            parse_interface_syntax(file, &mut cursor, &lines, cancellation)
+        }
+        DeclarationKind::Pool => {
+            cursor.expect(TokenKind::Pool)?;
             cursor.expect_identifier()?;
-            Some(DeclarationSyntax::Named)
+            cursor.at_end().then_some(DeclarationSyntax::Pool)
         }
     };
-    if parsed.is_none() && diagnostics.is_empty() {
+    let has_local_syntax_evidence = diagnostics.iter().any(|diagnostic| {
+        let primary = diagnostic.primary();
+        let direct = primary.start() >= declaration.start && primary.start() <= declaration.end;
+        let unmatched_opener = diagnostic.code() == "syntax.missing_closer"
+            && diagnostic.typed_parameters().iter().any(|(name, value)| {
+                name.as_ref() == "opener_offset"
+                    && matches!(value, DiagnosticValue::Unsigned(offset) if
+                        u64::try_from(*offset).is_ok_and(|offset| {
+                        offset >= declaration.start && offset < declaration.end
+                    }))
+            });
+        diagnostic.code().starts_with("syntax.")
+            && primary.path() == declaration.range.path()
+            && (direct || unmatched_opener)
+    });
+    if parsed.is_none() && !has_local_syntax_evidence {
         diagnostics.push(Diagnostic::new(
             "syntax.malformed_declaration",
             declaration.range.clone(),
@@ -1640,6 +1815,164 @@ fn parse_constant_syntax(cursor: &mut SyntaxCursor<'_, '_>) -> Option<Declaratio
     }))
 }
 
+fn parse_struct_syntax(
+    file: &ProjectFile,
+    cursor: &mut SyntaxCursor<'_, '_>,
+    lines: &[TokenLine<'_>],
+    resource: bool,
+    cancellation: &Cancellation,
+) -> Option<DeclarationSyntax> {
+    if resource {
+        cursor.expect(TokenKind::Resource)?;
+    }
+    cursor.expect(TokenKind::Struct)?;
+    cursor.expect_identifier()?;
+    let mut implements = Vec::new();
+    if cursor.consume(TokenKind::Implements) {
+        loop {
+            implements.push(cursor.parse_name()?);
+            if !cursor.consume(TokenKind::Comma) {
+                break;
+            }
+        }
+    }
+    cursor.expect(TokenKind::Colon)?;
+    if !cursor.at_end() {
+        return None;
+    }
+    let mut fields = Vec::new();
+    let mut functions = Vec::new();
+    let mut line_index = 1;
+    while let Some(line) = lines.get(line_index) {
+        if cancellation.is_cancelled() || line.indent != 4 {
+            return None;
+        }
+        let mut member = SyntaxCursor::new(file, &line.tokens, cancellation);
+        let public = member.consume(TokenKind::Pub);
+        let modifier = if member.consume(TokenKind::Pure) {
+            FunctionModifier::Pure
+        } else if member.consume(TokenKind::Async) {
+            FunctionModifier::Async
+        } else {
+            FunctionModifier::Ordinary
+        };
+        if member.consume(TokenKind::Fn) {
+            let name = member.expect_identifier()?.to_owned();
+            let type_parameters = parse_type_parameter_names(&mut member)?;
+            let parameters = parse_parameters(&mut member)?;
+            let return_type = if member.consume(TokenKind::Arrow) {
+                member.parse_type()?
+            } else {
+                TypeSyntax::Unit
+            };
+            member.expect(TokenKind::Colon)?;
+            if !member.at_end() {
+                return None;
+            }
+            line_index += 1;
+            let body = parse_statement_block(file, lines, &mut line_index, 8, cancellation)?;
+            if body.is_empty() {
+                return None;
+            }
+            let range = SourceRange::from_u64_shared(
+                line.range.path_arc(),
+                line.range.start(),
+                statement_range(body.last()?).end(),
+            );
+            functions.push(MemberFunctionSyntax {
+                name,
+                public,
+                function: FunctionSyntax {
+                    modifier,
+                    type_parameters,
+                    parameters,
+                    return_type,
+                    body,
+                },
+                range,
+            });
+            continue;
+        }
+        if modifier != FunctionModifier::Ordinary {
+            return None;
+        }
+        let mutable = member.consume(TokenKind::Mut);
+        let name = member.expect_identifier()?.to_owned();
+        member.expect(TokenKind::Colon)?;
+        let type_syntax = member.parse_type()?;
+        if !member.at_end() {
+            return None;
+        }
+        fields.push(FieldSyntax {
+            name,
+            public,
+            mutable,
+            type_syntax,
+            range: line.range.clone(),
+        });
+        line_index += 1;
+    }
+    let syntax = StructSyntax {
+        implements,
+        fields,
+        functions,
+    };
+    Some(if resource {
+        DeclarationSyntax::ResourceStruct(syntax)
+    } else {
+        DeclarationSyntax::Struct(syntax)
+    })
+}
+
+fn parse_interface_syntax(
+    file: &ProjectFile,
+    cursor: &mut SyntaxCursor<'_, '_>,
+    lines: &[TokenLine<'_>],
+    cancellation: &Cancellation,
+) -> Option<DeclarationSyntax> {
+    cursor.expect(TokenKind::Interface)?;
+    cursor.expect_identifier()?;
+    cursor.expect(TokenKind::Colon)?;
+    if !cursor.at_end() {
+        return None;
+    }
+    let mut requirements = Vec::new();
+    for line in lines.iter().skip(1) {
+        if cancellation.is_cancelled() || line.indent != 4 {
+            return None;
+        }
+        let mut requirement = SyntaxCursor::new(file, &line.tokens, cancellation);
+        let modifier = if requirement.consume(TokenKind::Pure) {
+            FunctionModifier::Pure
+        } else if requirement.consume(TokenKind::Async) {
+            FunctionModifier::Async
+        } else {
+            FunctionModifier::Ordinary
+        };
+        requirement.expect(TokenKind::Fn)?;
+        let name = requirement.expect_identifier()?.to_owned();
+        let parameters = parse_parameters(&mut requirement)?;
+        let return_type = if requirement.consume(TokenKind::Arrow) {
+            requirement.parse_type()?
+        } else {
+            TypeSyntax::Unit
+        };
+        if !requirement.at_end() {
+            return None;
+        }
+        requirements.push(FunctionRequirementSyntax {
+            name,
+            modifier,
+            parameters,
+            return_type,
+            range: line.range.clone(),
+        });
+    }
+    Some(DeclarationSyntax::Interface(InterfaceSyntax {
+        requirements,
+    }))
+}
+
 fn parse_suite_syntax(
     file: &ProjectFile,
     cursor: &mut SyntaxCursor<'_, '_>,
@@ -1655,7 +1988,14 @@ fn parse_suite_syntax(
     }
     let mut tests = Vec::new();
     let mut names = std::collections::BTreeSet::new();
-    for line in lines.iter().skip(1).filter(|line| line.indent == 4) {
+    let mut line_index = 1;
+    while let Some(line) = lines.get(line_index) {
+        if line.indent < 4 {
+            break;
+        }
+        if line.indent > 4 {
+            return None;
+        }
         let mut test = SyntaxCursor::new(file, &line.tokens, cancellation);
         let asynchronous = test.consume(TokenKind::Async);
         if !test.consume(TokenKind::Test) {
@@ -1677,14 +2017,37 @@ fn parse_suite_syntax(
                 .with_parameter("name", name.clone()),
             );
         }
+        line_index += 1;
+        let body = parse_statement_block(file, lines, &mut line_index, 8, cancellation)?;
+        if body.is_empty() {
+            return None;
+        }
+        let range = SourceRange::from_u64_shared(
+            line.range.path_arc(),
+            line.range.start(),
+            statement_range(body.last().expect("non-empty Test body")).end(),
+        );
         tests.push(TestSyntax {
             name,
             asynchronous,
             parameters,
-            range: line.range.clone(),
+            body,
+            range,
         });
     }
     Some(DeclarationSyntax::Suite(SuiteSyntax { tests }))
+}
+
+fn statement_range(statement: &StatementSyntax) -> &SourceRange {
+    match statement {
+        StatementSyntax::Return { range, .. }
+        | StatementSyntax::Panic { range, .. }
+        | StatementSyntax::Expect { range, .. }
+        | StatementSyntax::Assign { range, .. }
+        | StatementSyntax::If { range, .. }
+        | StatementSyntax::Pass(range) => range,
+        StatementSyntax::Evaluate(expression) => &expression.range,
+    }
 }
 
 fn parse_enum_syntax(
@@ -1696,19 +2059,83 @@ fn parse_enum_syntax(
 ) -> Option<DeclarationSyntax> {
     cursor.expect(TokenKind::Enum)?;
     cursor.expect_identifier()?;
+    let mut type_parameters = Vec::new();
+    if cursor.consume(TokenKind::LeftBracket) {
+        while !cursor.consume(TokenKind::RightBracket) {
+            type_parameters.push(cursor.expect_identifier()?.to_owned());
+            if !cursor.consume(TokenKind::Comma) {
+                cursor.expect(TokenKind::RightBracket)?;
+                break;
+            }
+        }
+    }
     cursor.expect(TokenKind::Colon)?;
     if !cursor.at_end() {
         return None;
     }
     let mut variants = Vec::new();
+    let mut functions = Vec::new();
     let mut names = BTreeSet::new();
-    for line in lines.iter().skip(1).filter(|line| line.indent == 4) {
-        if cancellation.is_cancelled() {
+    let mut line_index = 1;
+    while let Some(line) = lines.get(line_index) {
+        if cancellation.is_cancelled() || line.indent != 4 {
             return None;
         }
-        let mut variant = SyntaxCursor::new(file, &line.tokens, cancellation);
-        let name = variant.expect_identifier()?.to_owned();
-        if !variant.at_end() {
+        let mut member = SyntaxCursor::new(file, &line.tokens, cancellation);
+        let public = member.consume(TokenKind::Pub);
+        let modifier = if member.consume(TokenKind::Pure) {
+            FunctionModifier::Pure
+        } else if member.consume(TokenKind::Async) {
+            FunctionModifier::Async
+        } else {
+            FunctionModifier::Ordinary
+        };
+        if member.consume(TokenKind::Fn) {
+            let name = member.expect_identifier()?.to_owned();
+            let member_type_parameters = parse_type_parameter_names(&mut member)?;
+            let parameters = parse_parameters(&mut member)?;
+            let return_type = if member.consume(TokenKind::Arrow) {
+                member.parse_type()?
+            } else {
+                TypeSyntax::Unit
+            };
+            member.expect(TokenKind::Colon)?;
+            if !member.at_end() {
+                return None;
+            }
+            line_index += 1;
+            let body = parse_statement_block(file, lines, &mut line_index, 8, cancellation)?;
+            if body.is_empty() {
+                return None;
+            }
+            functions.push(MemberFunctionSyntax {
+                name,
+                public,
+                function: FunctionSyntax {
+                    modifier,
+                    type_parameters: member_type_parameters,
+                    parameters,
+                    return_type,
+                    body: body.clone(),
+                },
+                range: SourceRange::from_u64_shared(
+                    line.range.path_arc(),
+                    line.range.start(),
+                    statement_range(body.last()?).end(),
+                ),
+            });
+            continue;
+        }
+        if public || modifier != FunctionModifier::Ordinary {
+            return None;
+        }
+        let name = member.expect_identifier()?.to_owned();
+        let parameters = if member.peek_kind() == Some(TokenKind::LeftParen) {
+            parse_parameters(&mut member)?
+        } else {
+            Vec::new()
+        };
+        if !member.at_end() {
             return None;
         }
         if !names.insert(name.clone()) {
@@ -1723,10 +2150,16 @@ fn parse_enum_syntax(
         }
         variants.push(VariantSyntax {
             name,
+            parameters,
             range: line.range.clone(),
         });
+        line_index += 1;
     }
-    Some(DeclarationSyntax::Enum(EnumSyntax { variants }))
+    Some(DeclarationSyntax::Enum(EnumSyntax {
+        type_parameters,
+        variants,
+        functions,
+    }))
 }
 
 fn parse_parameters(cursor: &mut SyntaxCursor<'_, '_>) -> Option<Vec<ParameterSyntax>> {
@@ -1734,24 +2167,57 @@ fn parse_parameters(cursor: &mut SyntaxCursor<'_, '_>) -> Option<Vec<ParameterSy
     let mut parameters = Vec::new();
     while !cursor.consume(TokenKind::RightParen) {
         let start = cursor.current_range()?.clone();
-        let ownership = if cursor.consume(TokenKind::Take) {
+        let ownership = if cursor.consume(TokenKind::Read) {
+            OwnershipSyntax::Read
+        } else if cursor.consume(TokenKind::Mut) {
+            OwnershipSyntax::Mut
+        } else if cursor.consume(TokenKind::Take) {
             OwnershipSyntax::Take
         } else {
             OwnershipSyntax::Value
         };
-        let name = cursor.expect_identifier()?.to_owned();
-        cursor.expect(TokenKind::Colon)?;
-        let type_syntax = cursor.parse_type()?;
+        let is_self = cursor.consume(TokenKind::SelfValue);
+        let (name, type_syntax) = if is_self {
+            (
+                "self".to_owned(),
+                TypeSyntax::Named(NameSyntax {
+                    segments: vec!["Self".to_owned()],
+                }),
+            )
+        } else {
+            let name = cursor.expect_identifier()?.to_owned();
+            cursor.expect(TokenKind::Colon)?;
+            (name, cursor.parse_type()?)
+        };
+        let ownership = if is_self && ownership == OwnershipSyntax::Value {
+            OwnershipSyntax::Read
+        } else {
+            ownership
+        };
         let end = cursor.previous_range()?.end();
         parameters.push(ParameterSyntax {
             name,
             ownership,
             type_syntax,
-            range: SourceRange::from_u64(start.path(), start.start(), end),
+            range: SourceRange::from_u64_shared(start.path_arc(), start.start(), end),
         });
         if !cursor.consume(TokenKind::Comma) {
             cursor.expect(TokenKind::RightParen)?;
             break;
+        }
+    }
+    Some(parameters)
+}
+
+fn parse_type_parameter_names(cursor: &mut SyntaxCursor<'_, '_>) -> Option<Vec<String>> {
+    let mut parameters = Vec::new();
+    if cursor.consume(TokenKind::LeftBracket) {
+        while !cursor.consume(TokenKind::RightBracket) {
+            parameters.push(cursor.expect_identifier()?.to_owned());
+            if !cursor.consume(TokenKind::Comma) {
+                cursor.expect(TokenKind::RightBracket)?;
+                break;
+            }
         }
     }
     Some(parameters)
@@ -1838,6 +2304,13 @@ fn parse_statement_block(
                     range: line.range.clone(),
                 }
             }
+            TokenKind::Expect => {
+                cursor.advance();
+                StatementSyntax::Expect {
+                    condition: cursor.parse_complete_expression()?,
+                    range: line.range.clone(),
+                }
+            }
             TokenKind::Pass => {
                 cursor.advance();
                 if !cursor.at_end() {
@@ -1846,11 +2319,23 @@ fn parse_statement_block(
                 StatementSyntax::Pass(line.range.clone())
             }
             TokenKind::At => continue,
+            TokenKind::Mut => {
+                cursor.advance();
+                let name = cursor.expect_identifier()?.to_owned();
+                cursor.expect(TokenKind::Equal)?;
+                StatementSyntax::Assign {
+                    name,
+                    mutable_binding: true,
+                    value: cursor.parse_complete_expression()?,
+                    range: line.range.clone(),
+                }
+            }
             TokenKind::Identifier if cursor.peek_n_kind(1) == Some(TokenKind::Equal) => {
                 let name = cursor.expect_identifier()?.to_owned();
                 cursor.expect(TokenKind::Equal)?;
                 StatementSyntax::Assign {
                     name,
+                    mutable_binding: false,
                     value: cursor.parse_complete_expression()?,
                     range: line.range.clone(),
                 }
@@ -1984,7 +2469,12 @@ impl<'a, 'tokens> SyntaxCursor<'a, 'tokens> {
     }
 
     fn parse_name(&mut self) -> Option<NameSyntax> {
-        let mut segments = vec![self.expect_identifier()?.to_owned()];
+        let first = if self.consume(TokenKind::SelfValue) {
+            "self".to_owned()
+        } else {
+            self.expect_identifier()?.to_owned()
+        };
+        let mut segments = vec![first];
         while self.consume(TokenKind::Dot) {
             segments.push(self.expect_identifier()?.to_owned());
         }
@@ -2061,8 +2551,8 @@ impl<'a, 'tokens> SyntaxCursor<'a, 'tokens> {
         }
         let mut left = self.parse_primary(depth)?;
         if self.consume(TokenKind::Question) {
-            let range = SourceRange::from_u64(
-                left.range.path(),
+            let range = SourceRange::from_u64_shared(
+                left.range.path_arc(),
                 left.range.start(),
                 self.previous_range()?.end(),
             );
@@ -2077,8 +2567,11 @@ impl<'a, 'tokens> SyntaxCursor<'a, 'tokens> {
             }
             self.advance();
             let right = self.parse_expression_at(precedence + 1, depth + 1)?;
-            let range =
-                SourceRange::from_u64(left.range.path(), left.range.start(), right.range.end());
+            let range = SourceRange::from_u64_shared(
+                left.range.path_arc(),
+                left.range.start(),
+                right.range.end(),
+            );
             left = ExpressionSyntax {
                 kind: ExpressionSyntaxKind::Binary {
                     operator,
@@ -2095,7 +2588,7 @@ impl<'a, 'tokens> SyntaxCursor<'a, 'tokens> {
         let token = *self.tokens.get(self.index)?;
         self.index += 1;
         let start = token.range.start();
-        let path = token.range.path();
+        let path = token.range.path_arc();
         let mut expression = match token.kind {
             TokenKind::IntegerLiteral => ExpressionSyntax {
                 kind: ExpressionSyntaxKind::Integer(token_text(self.file, token)?.to_owned()),
@@ -2118,20 +2611,25 @@ impl<'a, 'tokens> SyntaxCursor<'a, 'tokens> {
                 kind: ExpressionSyntaxKind::Bool(token.kind == TokenKind::True),
                 range: token.range.clone(),
             },
-            TokenKind::Identifier => {
+            TokenKind::Identifier | TokenKind::SelfValue => {
                 self.index -= 1;
                 let name = self.parse_name()?;
                 let end = self.previous_range()?.end();
                 if self.consume(TokenKind::LeftParen) {
                     let mut arguments = Vec::new();
+                    let mut saw_named = false;
                     while !self.consume(TokenKind::RightParen) {
                         let label = if self.peek_kind() == Some(TokenKind::Identifier)
                             && self.peek_n_kind(1) == Some(TokenKind::Equal)
                         {
                             let label = self.expect_identifier()?.to_owned();
                             self.expect(TokenKind::Equal)?;
+                            saw_named = true;
                             Some(label)
                         } else {
+                            if saw_named {
+                                return None;
+                            }
                             None
                         };
                         arguments.push(ArgumentSyntax {
@@ -2148,12 +2646,16 @@ impl<'a, 'tokens> SyntaxCursor<'a, 'tokens> {
                             callee: name,
                             arguments,
                         },
-                        range: SourceRange::from_u64(path, start, self.previous_range()?.end()),
+                        range: SourceRange::from_u64_shared(
+                            path,
+                            start,
+                            self.previous_range()?.end(),
+                        ),
                     }
                 } else {
                     ExpressionSyntax {
                         kind: ExpressionSyntaxKind::Name(name),
-                        range: SourceRange::from_u64(path, start, end),
+                        range: SourceRange::from_u64_shared(path, start, end),
                     }
                 }
             }
@@ -2161,12 +2663,17 @@ impl<'a, 'tokens> SyntaxCursor<'a, 'tokens> {
                 if self.consume(TokenKind::RightParen) {
                     ExpressionSyntax {
                         kind: ExpressionSyntaxKind::Unit,
-                        range: SourceRange::from_u64(path, start, self.previous_range()?.end()),
+                        range: SourceRange::from_u64_shared(
+                            path,
+                            start,
+                            self.previous_range()?.end(),
+                        ),
                     }
                 } else {
                     let mut inner = self.parse_expression_at(0, depth + 1)?;
                     self.expect(TokenKind::RightParen)?;
-                    inner.range = SourceRange::from_u64(path, start, self.previous_range()?.end());
+                    inner.range =
+                        SourceRange::from_u64_shared(path, start, self.previous_range()?.end());
                     inner
                 }
             }
@@ -2181,7 +2688,7 @@ impl<'a, 'tokens> SyntaxCursor<'a, 'tokens> {
                 }
                 ExpressionSyntax {
                     kind: ExpressionSyntaxKind::Array(values),
-                    range: SourceRange::from_u64(path, start, self.previous_range()?.end()),
+                    range: SourceRange::from_u64_shared(path, start, self.previous_range()?.end()),
                 }
             }
             TokenKind::Minus => {
@@ -2189,7 +2696,7 @@ impl<'a, 'tokens> SyntaxCursor<'a, 'tokens> {
                 let end = value.range.end();
                 ExpressionSyntax {
                     kind: ExpressionSyntaxKind::Negate(Box::new(value)),
-                    range: SourceRange::from_u64(path, start, end),
+                    range: SourceRange::from_u64_shared(path, start, end),
                 }
             }
             TokenKind::Await => {
@@ -2197,14 +2704,14 @@ impl<'a, 'tokens> SyntaxCursor<'a, 'tokens> {
                 let end = value.range.end();
                 ExpressionSyntax {
                     kind: ExpressionSyntaxKind::Await(Box::new(value)),
-                    range: SourceRange::from_u64(path, start, end),
+                    range: SourceRange::from_u64_shared(path, start, end),
                 }
             }
             _ => return None,
         };
         if self.consume(TokenKind::Question) {
             expression = ExpressionSyntax {
-                range: SourceRange::from_u64(path, start, self.previous_range()?.end()),
+                range: SourceRange::from_u64_shared(path, start, self.previous_range()?.end()),
                 kind: ExpressionSyntaxKind::Propagate(Box::new(expression)),
             };
         }
@@ -2250,16 +2757,23 @@ fn line_end(bytes: &[u8], offset: u64, cancellation: &Cancellation) -> Option<u6
 
 fn scan_layout_and_delimiters(
     file: &ProjectFile,
+    lexemes: &[Lexeme],
     elements: &mut Vec<SyntaxElement>,
     diagnostics: &mut Vec<Diagnostic>,
     cancellation: &Cancellation,
 ) -> bool {
     let bytes = file.bytes();
-    let path = file.path();
+    let path = file.path_arc();
     let mut indent_stack = vec![0_usize];
     let mut delimiter_stack: Vec<(u8, usize)> = Vec::new();
     let mut expected_block = false;
     let mut offset = 0;
+    let text_ranges = lexemes
+        .iter()
+        .filter(|lexeme| lexeme.kind == TokenKind::TextLiteral)
+        .map(|lexeme| (lexeme.range.start(), lexeme.range.end()))
+        .collect::<Vec<_>>();
+    let mut text_index = 0;
 
     while offset < bytes.len() {
         if cancellation.is_cancelled() {
@@ -2278,7 +2792,17 @@ fn scan_layout_and_delimiters(
             if index.is_multiple_of(256) && cancellation.is_cancelled() {
                 return true;
             }
-            if *byte == b'#' {
+            let absolute = u64::try_from(offset + leading + index).unwrap_or(u64::MAX);
+            while text_ranges
+                .get(text_index)
+                .is_some_and(|(_, end)| *end <= absolute)
+            {
+                text_index += 1;
+            }
+            let inside_text = text_ranges
+                .get(text_index)
+                .is_some_and(|(start, end)| *start <= absolute && absolute < *end);
+            if *byte == b'#' && !inside_text {
                 significant_end = leading + index;
                 break;
             }
@@ -2297,7 +2821,7 @@ fn scan_layout_and_delimiters(
             if leading % 4 != 0 {
                 diagnostics.push(Diagnostic::new(
                     "syntax.invalid_indentation_width",
-                    SourceRange::new(path, offset, offset + leading),
+                    SourceRange::new_shared(path, offset, offset + leading),
                     RecoveryAction::SkippedToBoundary,
                 ));
             }
@@ -2305,8 +2829,7 @@ fn scan_layout_and_delimiters(
                 if expected_block && leading == current + 4 {
                     indent_stack.push(leading);
                     elements.push(SyntaxElement::new(
-                        SyntaxElementKind::Layout,
-                        "indent",
+                        SyntaxElementKind::Layout(SyntaxLayoutKind::Indent),
                         path,
                         offset + leading,
                         offset + leading,
@@ -2314,13 +2837,12 @@ fn scan_layout_and_delimiters(
                 } else {
                     diagnostics.push(Diagnostic::new(
                         "syntax.unexpected_indentation",
-                        SourceRange::new(path, offset, offset + leading),
+                        SourceRange::new_shared(path, offset, offset + leading),
                         RecoveryAction::SkippedToBoundary,
                     ));
                     indent_stack.push(leading);
                     elements.push(SyntaxElement::new(
-                        SyntaxElementKind::Error,
-                        "unexpected_indent_block",
+                        SyntaxElementKind::Error(SyntaxErrorKind::UnexpectedIndentBlock),
                         path,
                         offset + leading,
                         offset + leading,
@@ -2330,14 +2852,13 @@ fn scan_layout_and_delimiters(
                 if expected_block && leading <= current {
                     diagnostics.push(Diagnostic::new(
                         "syntax.missing_block",
-                        SourceRange::new(path, offset + leading, offset + leading),
+                        SourceRange::new_shared(path, offset + leading, offset + leading),
                         RecoveryAction::InsertedMissing {
                             expected: "indented block".into(),
                         },
                     ));
                     elements.push(SyntaxElement::new(
-                        SyntaxElementKind::Missing,
-                        "missing_block",
+                        SyntaxElementKind::Missing(SyntaxMissingKind::Block),
                         path,
                         offset + leading,
                         offset + leading,
@@ -2347,8 +2868,7 @@ fn scan_layout_and_delimiters(
                     while indent_stack.last().is_some_and(|indent| *indent > leading) {
                         indent_stack.pop();
                         elements.push(SyntaxElement::new(
-                            SyntaxElementKind::Layout,
-                            "dedent",
+                            SyntaxElementKind::Layout(SyntaxLayoutKind::Dedent),
                             path,
                             offset + leading,
                             offset + leading,
@@ -2357,7 +2877,7 @@ fn scan_layout_and_delimiters(
                     if indent_stack.last().copied() != Some(leading) {
                         diagnostics.push(Diagnostic::new(
                             "syntax.inconsistent_dedent",
-                            SourceRange::new(path, offset, offset + leading),
+                            SourceRange::new_shared(path, offset, offset + leading),
                             RecoveryAction::SkippedToBoundary,
                         ));
                     }
@@ -2384,14 +2904,13 @@ fn scan_layout_and_delimiters(
     if expected_block && delimiter_stack.is_empty() {
         diagnostics.push(Diagnostic::new(
             "syntax.missing_block",
-            SourceRange::new(path, bytes.len(), bytes.len()),
+            SourceRange::new_shared(path, bytes.len(), bytes.len()),
             RecoveryAction::InsertedMissing {
                 expected: "indented block".into(),
             },
         ));
         elements.push(SyntaxElement::new(
-            SyntaxElementKind::Missing,
-            "missing_block",
+            SyntaxElementKind::Missing(SyntaxMissingKind::Block),
             path,
             bytes.len(),
             bytes.len(),
@@ -2400,8 +2919,7 @@ fn scan_layout_and_delimiters(
     while indent_stack.len() > 1 {
         indent_stack.pop();
         elements.push(SyntaxElement::new(
-            SyntaxElementKind::Layout,
-            "dedent",
+            SyntaxElementKind::Layout(SyntaxLayoutKind::Dedent),
             path,
             bytes.len(),
             bytes.len(),
@@ -2411,7 +2929,7 @@ fn scan_layout_and_delimiters(
         diagnostics.push(
             Diagnostic::new(
                 "syntax.missing_closer",
-                SourceRange::new(path, bytes.len(), bytes.len()),
+                SourceRange::new_shared(path, bytes.len(), bytes.len()),
                 RecoveryAction::InsertedMissing {
                     expected: match opener {
                         b'(' => ")".into(),
@@ -2420,11 +2938,10 @@ fn scan_layout_and_delimiters(
                     },
                 },
             )
-            .with_parameter("opener_offset", opener_offset.to_string()),
+            .with_unsigned_parameter("opener_offset", opener_offset as u128),
         );
         elements.push(SyntaxElement::new(
-            SyntaxElementKind::Missing,
-            "missing_closer",
+            SyntaxElementKind::Missing(SyntaxMissingKind::Closer),
             path,
             bytes.len(),
             bytes.len(),
@@ -2436,7 +2953,7 @@ fn scan_layout_and_delimiters(
 fn scan_line_delimiters(
     line: &[u8],
     base: usize,
-    path: &str,
+    path: &Arc<str>,
     stack: &mut Vec<(u8, usize)>,
     diagnostics: &mut Vec<Diagnostic>,
     cancellation: &Cancellation,
@@ -2463,7 +2980,7 @@ fn scan_line_delimiters(
                 if stack.len() == MAX_NESTING {
                     diagnostics.push(Diagnostic::new(
                         "syntax.nesting_limit_exceeded",
-                        SourceRange::new(path, base + index, base + index + 1),
+                        SourceRange::new_shared(path, base + index, base + index + 1),
                         RecoveryAction::PreservedInvalidBytes,
                     ));
                 } else {
@@ -2477,7 +2994,7 @@ fn scan_line_delimiters(
                 } else {
                     diagnostics.push(Diagnostic::new(
                         "syntax.unmatched_closer",
-                        SourceRange::new(path, base + index, base + index + 1),
+                        SourceRange::new_shared(path, base + index, base + index + 1),
                         RecoveryAction::SkippedToBoundary,
                     ));
                 }
@@ -2530,7 +3047,7 @@ fn parse_imports(
             if declarations_started {
                 diagnostics.push(Diagnostic::new(
                     "syntax.import_after_declaration",
-                    SourceRange::new(file.path(), offset, end),
+                    SourceRange::new_shared(file.path_arc(), offset, end),
                     RecoveryAction::SkippedToBoundary,
                 ));
             }
@@ -2538,11 +3055,11 @@ fn parse_imports(
                 Some((target_path, alias)) => imports.push(Import {
                     target_path,
                     alias,
-                    range: SourceRange::new(file.path(), offset, end),
+                    range: SourceRange::new_shared(file.path_arc(), offset, end),
                 }),
                 None => diagnostics.push(Diagnostic::new(
                     "syntax.malformed_import",
-                    SourceRange::new(file.path(), offset, end),
+                    SourceRange::new_shared(file.path_arc(), offset, end),
                     RecoveryAction::SkippedToBoundary,
                 )),
             }

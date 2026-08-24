@@ -13,17 +13,18 @@ use crate::compiler::{
 use crate::evaluator::{Construction, Engine};
 use crate::identity::IdentityCatalog;
 use crate::model::{
-    BuildKind, BuiltinVariant, DefinitionId, ModuleId, SpecializationId, TestId, Type,
+    BuildKind, BuiltinType, BuiltinVariant, DefinitionId, ModuleId, SpecializationId, TestId, Type,
     TypeParameterId, resolve_builtin_type,
 };
 use crate::syntax::{
-    AttributeSyntax, Declaration, DeclarationKind, DeclarationSyntax, FunctionSyntax,
-    OwnershipSyntax, ParsedSource, TypeSyntax,
+    AttributeSyntax, Declaration, DeclarationKind, DeclarationSyntax, OwnershipSyntax,
+    ParameterSyntax, ParsedSource, StatementSyntax, TypeSyntax,
 };
+use crate::type_semantics::can_unify;
 use crate::typed_hir::{
-    self, BuildAuthority, CallTarget, Expression, ExpressionKind, NameKey, ProgramInput,
-    ResolvedConstant, ResolvedFunction, ResolvedName, ResolvedParameter, ResolvedTest, Statement,
-    VerifiedProgram,
+    self, BuildAuthority, CallTarget, Expression, ExpressionKind, NamespaceCatalog, ProgramInput,
+    ResolvedConstant, ResolvedField, ResolvedFunction, ResolvedName, ResolvedParameter,
+    ResolvedStruct, ResolvedTest, ResolvedVariant, Statement, VerifiedProgram,
 };
 
 pub(crate) struct Analysis {
@@ -58,6 +59,15 @@ struct TestRecord {
     range: SourceRange,
 }
 
+#[derive(Clone)]
+struct InterfaceRequirement {
+    name: String,
+    modifier: crate::syntax::FunctionModifier,
+    parameters: Vec<ResolvedParameter>,
+    return_type: Type,
+    range: SourceRange,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FunctionFacts {
     pure: bool,
@@ -68,7 +78,8 @@ struct FunctionFacts {
     bounded: bool,
     logical_cost: u64,
     constructs: BTreeSet<BuildKind>,
-    calls: BTreeSet<DefinitionId>,
+    calls: BTreeMap<DefinitionId, u64>,
+    specialization_calls: BTreeMap<SpecializationId, u64>,
 }
 
 pub(crate) fn analyze<'a>(
@@ -158,13 +169,45 @@ pub(crate) fn analyze<'a>(
         }
     }
 
-    let mut names = BTreeMap::new();
+    let mut namespace = NamespaceCatalog::default();
     for definition in definitions.values() {
-        names.insert(
-            NameKey::new(definition.module, Arc::from([definition.name.clone()])),
-            resolved_name(definition),
-        );
+        if let Some(name) = resolved_name(definition) {
+            namespace.declare(
+                definition.module,
+                Arc::from([definition.name.clone()]),
+                name,
+                definition.public,
+            );
+        }
     }
+    for definition in definitions.values() {
+        let functions = match definition.declaration.syntax.as_ref() {
+            Some(
+                DeclarationSyntax::Struct(struct_) | DeclarationSyntax::ResourceStruct(struct_),
+            ) => &struct_.functions,
+            Some(DeclarationSyntax::Enum(enum_)) => &enum_.functions,
+            _ => continue,
+        };
+        for member in functions {
+            let id = identity_catalog
+                .associated_function(definition.id, &member.name)
+                .expect("structured associated function was catalogued");
+            namespace.declare(
+                definition.module,
+                Arc::from([definition.name.clone(), member.name.clone()]),
+                ResolvedName::Function(id),
+                definition.public && member.public,
+            );
+            namespace.declare_member(
+                definition.id,
+                definition.module,
+                member.name.clone(),
+                ResolvedName::Function(id),
+                definition.public && member.public,
+            );
+        }
+    }
+    let mut module_bindings = BTreeMap::new();
     for (path, parsed) in parsed_sources {
         let importer = modules[path];
         for import in &parsed.imports {
@@ -182,18 +225,20 @@ pub(crate) fn analyze<'a>(
                 );
                 continue;
             }
-            for definition in definitions
-                .values()
-                .filter(|definition| definition.module == target && definition.public)
-            {
-                names.insert(
-                    NameKey::new(
-                        importer,
-                        Arc::from([import.alias.clone(), definition.name.clone()]),
-                    ),
-                    resolved_name(definition),
+            let binding = (importer, import.alias.clone());
+            if module_bindings.contains_key(&binding) {
+                diagnostics.push(
+                    Diagnostic::new(
+                        "semantic.duplicate_import_alias",
+                        import.range.clone(),
+                        RecoveryAction::None,
+                    )
+                    .with_parameter("alias", import.alias.clone()),
                 );
+                continue;
             }
+            module_bindings.insert(binding, target);
+            namespace.bind(importer, import.alias.clone(), target);
         }
     }
 
@@ -208,8 +253,83 @@ pub(crate) fn analyze<'a>(
             .expect("nominal declaration has a catalogued TypeId");
     }
 
+    let alias_declarations = definitions
+        .values()
+        .filter_map(|definition| {
+            let DeclarationSyntax::TypeAlias(target) = definition.declaration.syntax.as_ref()?
+            else {
+                return None;
+            };
+            Some((
+                definition.id,
+                (
+                    definition.module,
+                    target.clone(),
+                    definition.declaration.range.clone(),
+                ),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut alias_types = BTreeMap::new();
+    let mut unresolved_aliases = alias_declarations.keys().copied().collect::<BTreeSet<_>>();
+    loop {
+        let before = unresolved_aliases.len();
+        for id in unresolved_aliases.iter().copied().collect::<Vec<_>>() {
+            let (module, target, _) = &alias_declarations[&id];
+            if let Some(type_) = resolve_type(
+                target,
+                *module,
+                &namespace,
+                &nominal_displays,
+                &alias_types,
+                &BTreeMap::new(),
+            ) {
+                alias_types.insert(id, type_);
+                unresolved_aliases.remove(&id);
+            }
+        }
+        if unresolved_aliases.is_empty() || unresolved_aliases.len() == before {
+            break;
+        }
+    }
+    let mut alias_dependencies = BTreeMap::new();
+    let mut missing_aliases = BTreeSet::new();
+    for id in &unresolved_aliases {
+        let (module, syntax, _) = &alias_declarations[id];
+        let (dependencies, missing) = unresolved_alias_dependencies(syntax, *module, &namespace);
+        alias_dependencies.insert(*id, dependencies);
+        if missing {
+            missing_aliases.insert(*id);
+        }
+    }
+    loop {
+        let before = missing_aliases.len();
+        for (id, dependencies) in &alias_dependencies {
+            if dependencies
+                .iter()
+                .any(|dependency| missing_aliases.contains(dependency))
+            {
+                missing_aliases.insert(*id);
+            }
+        }
+        if missing_aliases.len() == before {
+            break;
+        }
+    }
+    for id in unresolved_aliases {
+        diagnostics.push(Diagnostic::new(
+            if missing_aliases.contains(&id) {
+                "semantic.unresolved_type"
+            } else {
+                "semantic.recursive_type_alias"
+            },
+            alias_declarations[&id].2.clone(),
+            RecoveryAction::None,
+        ));
+    }
+
     let mut input = ProgramInput {
-        names,
+        namespace,
         nominal_displays,
         ..ProgramInput::default()
     };
@@ -222,6 +342,66 @@ pub(crate) fn analyze<'a>(
                 .cloned()
                 .map(|assertion| (module, assertion)),
         );
+    }
+    let mut interfaces = BTreeMap::<DefinitionId, Vec<InterfaceRequirement>>::new();
+    for definition in definitions
+        .values()
+        .filter(|definition| definition.kind == DeclarationKind::Interface)
+    {
+        let Some(DeclarationSyntax::Interface(interface)) = definition.declaration.syntax.as_ref()
+        else {
+            continue;
+        };
+        let self_parameters = BTreeMap::from([("Self".to_owned(), Type::Infer)]);
+        let mut names = BTreeSet::new();
+        let mut requirements = Vec::new();
+        for requirement in &interface.requirements {
+            if !names.insert(&requirement.name) {
+                diagnostics.push(
+                    Diagnostic::new(
+                        "semantic.duplicate_interface_requirement",
+                        requirement.range.clone(),
+                        RecoveryAction::None,
+                    )
+                    .with_parameter("name", requirement.name.clone()),
+                );
+                continue;
+            }
+            let Some(parameters) = resolve_parameters(
+                &requirement.parameters,
+                definition.module,
+                &input.namespace,
+                &input.nominal_displays,
+                &alias_types,
+                &self_parameters,
+                &mut diagnostics,
+            ) else {
+                continue;
+            };
+            let Some(return_type) = resolve_type(
+                &requirement.return_type,
+                definition.module,
+                &input.namespace,
+                &input.nominal_displays,
+                &alias_types,
+                &self_parameters,
+            ) else {
+                diagnostics.push(Diagnostic::new(
+                    "semantic.unresolved_type",
+                    requirement.range.clone(),
+                    RecoveryAction::None,
+                ));
+                continue;
+            };
+            requirements.push(InterfaceRequirement {
+                name: requirement.name.clone(),
+                modifier: requirement.modifier,
+                parameters,
+                return_type,
+                range: requirement.range.clone(),
+            });
+        }
+        interfaces.insert(definition.id, requirements);
     }
     let mut tests_in_source_order = Vec::new();
     let mut image_functions = Vec::new();
@@ -252,21 +432,29 @@ pub(crate) fn analyze<'a>(
                     })
                     .collect::<BTreeMap<_, _>>();
                 let parameters = match resolve_parameters(
-                    function,
+                    &function.parameters,
                     definition.module,
-                    &input.names,
+                    &input.namespace,
                     &input.nominal_displays,
+                    &alias_types,
                     &type_parameters,
                     &mut diagnostics,
                 ) {
                     Some(parameters) => parameters,
                     None => continue,
                 };
+                validate_parameter_modes(
+                    &parameters,
+                    &function.parameters,
+                    &definitions,
+                    &mut diagnostics,
+                );
                 let Some(return_type) = resolve_type(
                     &function.return_type,
                     definition.module,
-                    &input.names,
+                    &input.namespace,
                     &input.nominal_displays,
+                    &alias_types,
                     &type_parameters,
                 ) else {
                     diagnostics.push(Diagnostic::new(
@@ -276,6 +464,14 @@ pub(crate) fn analyze<'a>(
                     ));
                     continue;
                 };
+                if return_type != Type::Unit && !statements_definitely_terminate(&function.body) {
+                    diagnostics.push(Diagnostic::new(
+                        "semantic.missing_return",
+                        definition.declaration.range.clone(),
+                        RecoveryAction::None,
+                    ));
+                    continue;
+                }
                 if definition.public
                     && (exposes_private_type(&return_type, &definitions)
                         || parameters
@@ -300,6 +496,17 @@ pub(crate) fn analyze<'a>(
                     .attributes
                     .contains(&AttributeSyntax::Image)
                 {
+                    if !parameters.is_empty()
+                        || !function.type_parameters.is_empty()
+                        || function.modifier == crate::syntax::FunctionModifier::Async
+                        || return_type != Type::Builtin(BuiltinType::Image)
+                    {
+                        diagnostics.push(Diagnostic::new(
+                            "semantic.invalid_image_constructor_signature",
+                            definition.declaration.range.clone(),
+                            RecoveryAction::None,
+                        ));
+                    }
                     image_functions.push((definition.id, definition.declaration.range.clone()));
                 }
                 input.functions.insert(
@@ -328,8 +535,9 @@ pub(crate) fn analyze<'a>(
                 let Some(type_) = resolve_type(
                     &constant.type_syntax,
                     definition.module,
-                    &input.names,
+                    &input.namespace,
                     &input.nominal_displays,
+                    &alias_types,
                     &BTreeMap::new(),
                 ) else {
                     diagnostics.push(Diagnostic::new(
@@ -367,45 +575,42 @@ pub(crate) fn analyze<'a>(
                     let id = identity_catalog
                         .test(&definition.path, &definition.name, &test.name)
                         .expect("structured Test was catalogued");
-                    let parameters = test
-                        .parameters
-                        .iter()
-                        .filter_map(|parameter| {
-                            if parameter.ownership != OwnershipSyntax::Take {
-                                diagnostics.push(Diagnostic::new(
-                                    "test.parameter_requires_take",
-                                    parameter.range.clone(),
-                                    RecoveryAction::None,
-                                ));
-                            }
-                            resolve_type(
-                                &parameter.type_syntax,
-                                definition.module,
-                                &input.names,
-                                &input.nominal_displays,
-                                &BTreeMap::new(),
-                            )
-                            .map(|type_| ResolvedParameter {
-                                name: parameter.name.clone(),
-                                ownership: parameter.ownership,
-                                type_,
-                            })
-                        })
-                        .collect::<Vec<_>>();
+                    for parameter in &test.parameters {
+                        if parameter.ownership != OwnershipSyntax::Take {
+                            diagnostics.push(Diagnostic::new(
+                                "test.parameter_requires_take",
+                                parameter.range.clone(),
+                                RecoveryAction::None,
+                            ));
+                        }
+                    }
+                    let Some(parameters) = resolve_parameters(
+                        &test.parameters,
+                        definition.module,
+                        &input.namespace,
+                        &input.nominal_displays,
+                        &alias_types,
+                        &BTreeMap::new(),
+                        &mut diagnostics,
+                    ) else {
+                        continue;
+                    };
                     let resolved = ResolvedTest {
                         id,
                         suite: definition.name.clone(),
                         test: test.name.clone(),
                         asynchronous: test.asynchronous,
                         parameters,
+                        module: definition.module,
+                        body: test.body.clone(),
+                        source: test.range.clone(),
                     };
                     input.tests.insert(id, resolved);
-                    input.names.insert(
-                        NameKey::new(
-                            definition.module,
-                            Arc::from([definition.name.clone(), test.name.clone()]),
-                        ),
+                    input.namespace.declare(
+                        definition.module,
+                        Arc::from([definition.name.clone(), test.name.clone()]),
                         ResolvedName::Test(id),
+                        definition.public,
                     );
                     tests_in_source_order.push(TestRecord {
                         id,
@@ -413,7 +618,220 @@ pub(crate) fn analyze<'a>(
                     });
                 }
             }
-            DeclarationSyntax::Enum(_) | DeclarationSyntax::Named => {}
+            DeclarationSyntax::Struct(struct_) | DeclarationSyntax::ResourceStruct(struct_) => {
+                let resource = definition.kind == DeclarationKind::ResourceStruct;
+                let mut field_names = BTreeSet::new();
+                let mut resolved_fields = Vec::new();
+                for field in &struct_.fields {
+                    if !field_names.insert(&field.name) {
+                        diagnostics.push(
+                            Diagnostic::new(
+                                "semantic.duplicate_field",
+                                field.range.clone(),
+                                RecoveryAction::None,
+                            )
+                            .with_parameter("name", field.name.clone()),
+                        );
+                        continue;
+                    }
+                    let Some(type_) = resolve_type(
+                        &field.type_syntax,
+                        definition.module,
+                        &input.namespace,
+                        &input.nominal_displays,
+                        &alias_types,
+                        &BTreeMap::new(),
+                    ) else {
+                        diagnostics.push(Diagnostic::new(
+                            "semantic.unresolved_type",
+                            field.range.clone(),
+                            RecoveryAction::None,
+                        ));
+                        continue;
+                    };
+                    if !resource && is_resource_type(&type_, &definitions) {
+                        diagnostics.push(Diagnostic::new(
+                            "semantic.resource_field_requires_resource_struct",
+                            field.range.clone(),
+                            RecoveryAction::None,
+                        ));
+                    }
+                    if definition.public
+                        && field.public
+                        && exposes_private_type(&type_, &definitions)
+                    {
+                        diagnostics.push(Diagnostic::new(
+                            "semantic.private_type_in_public_signature",
+                            field.range.clone(),
+                            RecoveryAction::None,
+                        ));
+                    }
+                    resolved_fields.push(ResolvedField {
+                        name: field.name.clone(),
+                        public: field.public,
+                        type_,
+                    });
+                    let _ = field.mutable;
+                }
+                input.structs.insert(
+                    definition.id,
+                    ResolvedStruct {
+                        definition: definition.id,
+                        module: definition.module,
+                        display: Arc::from(definition.name.as_str()),
+                        fields: resolved_fields,
+                    },
+                );
+                for member in &struct_.functions {
+                    if field_names.contains(&member.name) {
+                        diagnostics.push(
+                            Diagnostic::new(
+                                "semantic.duplicate_member",
+                                member.range.clone(),
+                                RecoveryAction::None,
+                            )
+                            .with_parameter("name", member.name.clone()),
+                        );
+                    }
+                }
+                let member_functions = resolve_associated_functions(
+                    definition,
+                    &struct_.functions,
+                    &input.namespace,
+                    &input.nominal_displays,
+                    &alias_types,
+                    &definitions,
+                    identity_catalog,
+                    &mut diagnostics,
+                );
+                for function in &member_functions {
+                    input.functions.insert(function.id, function.clone());
+                }
+                for interface in &struct_.implements {
+                    let Some(ResolvedName::Nominal(interface_id)) = input
+                        .namespace
+                        .resolve(definition.module, &interface.segments)
+                    else {
+                        diagnostics.push(Diagnostic::new(
+                            "semantic.unresolved_interface",
+                            definition.declaration.range.clone(),
+                            RecoveryAction::None,
+                        ));
+                        continue;
+                    };
+                    if definitions
+                        .get(&interface_id)
+                        .is_none_or(|record| record.kind != DeclarationKind::Interface)
+                    {
+                        diagnostics.push(Diagnostic::new(
+                            "semantic.implements_requires_interface",
+                            definition.declaration.range.clone(),
+                            RecoveryAction::None,
+                        ));
+                        continue;
+                    }
+                    for requirement in interfaces.get(&interface_id).into_iter().flatten() {
+                        let implementation = member_functions.iter().find(|function| {
+                            function
+                                .name
+                                .rsplit_once('.')
+                                .is_some_and(|(_, name)| name == requirement.name)
+                        });
+                        let Some(implementation) = implementation else {
+                            diagnostics.push(
+                                Diagnostic::new(
+                                    "semantic.missing_interface_requirement",
+                                    definition.declaration.range.clone(),
+                                    RecoveryAction::None,
+                                )
+                                .with_parameter("member", requirement.name.clone()),
+                            );
+                            continue;
+                        };
+                        let signature_matches = implementation.modifier == requirement.modifier
+                            && implementation.parameters.len() == requirement.parameters.len()
+                            && implementation
+                                .parameters
+                                .iter()
+                                .zip(&requirement.parameters)
+                                .all(|(actual, expected)| {
+                                    actual.ownership == expected.ownership
+                                        && can_unify(&actual.type_, &expected.type_)
+                                })
+                            && can_unify(&implementation.return_type, &requirement.return_type);
+                        if !signature_matches {
+                            diagnostics.push(
+                                Diagnostic::new(
+                                    "semantic.interface_signature_mismatch",
+                                    implementation.source.clone(),
+                                    RecoveryAction::None,
+                                )
+                                .with_label(requirement.range.clone(), DiagnosticLabelRole::Related)
+                                .with_parameter("member", requirement.name.clone()),
+                            );
+                        }
+                    }
+                }
+            }
+            DeclarationSyntax::Interface(_) => {}
+            DeclarationSyntax::Enum(enum_) => {
+                let type_parameters = enum_
+                    .type_parameters
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        (
+                            name.clone(),
+                            Type::Parameter {
+                                owner: definition.id,
+                                id: TypeParameterId(u16::try_from(index).unwrap_or(u16::MAX)),
+                                display: Arc::from(name.as_str()),
+                            },
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                for variant in &enum_.variants {
+                    let Some(parameters) = resolve_parameters(
+                        &variant.parameters,
+                        definition.module,
+                        &input.namespace,
+                        &input.nominal_displays,
+                        &alias_types,
+                        &type_parameters,
+                        &mut diagnostics,
+                    ) else {
+                        continue;
+                    };
+                    if variant
+                        .parameters
+                        .iter()
+                        .any(|parameter| parameter.ownership != OwnershipSyntax::Value)
+                    {
+                        diagnostics.push(Diagnostic::new(
+                            "semantic.enum_payload_requires_value_mode",
+                            variant.range.clone(),
+                            RecoveryAction::None,
+                        ));
+                    }
+                    let id = identity_catalog
+                        .variant(definition.id, &variant.name)
+                        .expect("structured enum variant was catalogued");
+                    input.variants.insert(id, ResolvedVariant { parameters });
+                }
+                for function in resolve_associated_functions(
+                    definition,
+                    &enum_.functions,
+                    &input.namespace,
+                    &input.nominal_displays,
+                    &alias_types,
+                    &definitions,
+                    identity_catalog,
+                    &mut diagnostics,
+                ) {
+                    input.functions.insert(function.id, function);
+                }
+            }
+            DeclarationSyntax::TypeAlias(_) | DeclarationSyntax::Pool => {}
         }
     }
 
@@ -462,6 +880,8 @@ pub(crate) fn analyze<'a>(
                 parameter.name.clone(),
                 match parameter.ownership {
                     OwnershipSyntax::Value => OwnershipMode::Value,
+                    OwnershipSyntax::Read => OwnershipMode::Read,
+                    OwnershipSyntax::Mut => OwnershipMode::Mut,
                     OwnershipSyntax::Take => OwnershipMode::Take,
                 },
             ));
@@ -494,6 +914,8 @@ pub(crate) fn analyze<'a>(
                 parameter.name.clone(),
                 match parameter.ownership {
                     OwnershipSyntax::Value => OwnershipMode::Value,
+                    OwnershipSyntax::Read => OwnershipMode::Read,
+                    OwnershipSyntax::Mut => OwnershipMode::Mut,
                     OwnershipSyntax::Take => OwnershipMode::Take,
                 },
             ));
@@ -505,10 +927,42 @@ pub(crate) fn analyze<'a>(
             return defect("typed HIR verification", evidence);
         }
         Err(typed_hir::VerificationFailure::Creator { kind, site }) => {
-            diagnostics.push(
-                Diagnostic::new("semantic.invalid_typed_hir", site, RecoveryAction::None)
-                    .with_parameter("kind", kind.code()),
-            );
+            if kind == typed_hir::CreatorFailureKind::ReadAfterMove {
+                diagnostics.push(Diagnostic::new(
+                    "semantic.read_after_move",
+                    site,
+                    RecoveryAction::None,
+                ));
+            } else if kind == typed_hir::CreatorFailureKind::ImmutableReassignment {
+                diagnostics.push(Diagnostic::new(
+                    "semantic.immutable_reassignment",
+                    site,
+                    RecoveryAction::None,
+                ));
+            } else if kind == typed_hir::CreatorFailureKind::DuplicateLocal {
+                diagnostics.push(Diagnostic::new(
+                    "semantic.duplicate_local",
+                    site,
+                    RecoveryAction::None,
+                ));
+            } else if kind == typed_hir::CreatorFailureKind::ExpectRequiresBool {
+                diagnostics.push(Diagnostic::new(
+                    "semantic.expect_requires_bool",
+                    site,
+                    RecoveryAction::None,
+                ));
+            } else if kind == typed_hir::CreatorFailureKind::AwaitRequiresAsync {
+                diagnostics.push(Diagnostic::new(
+                    "semantic.await_requires_async",
+                    site,
+                    RecoveryAction::None,
+                ));
+            } else {
+                diagnostics.push(
+                    Diagnostic::new("semantic.invalid_typed_hir", site, RecoveryAction::None)
+                        .with_parameter("kind", kind.code()),
+                );
+            }
             None
         }
         Err(typed_hir::VerificationFailure::Cancelled) => return cancelled(),
@@ -522,13 +976,33 @@ pub(crate) fn analyze<'a>(
     let mut test_plan = Vec::new();
     if let Some(program) = &program {
         let facts = solve_function_facts(program, cancellation);
+        let concrete_facts = solve_specialization_facts(program, cancellation);
         if cancellation.is_cancelled() {
             return cancelled();
         }
         for (id, facts) in &facts {
+            let function = &program.functions()[id];
+            if facts.suspends && function.modifier != crate::syntax::FunctionModifier::Async {
+                diagnostics.push(Diagnostic::new(
+                    "semantic.await_requires_async",
+                    function.source.clone(),
+                    RecoveryAction::None,
+                ));
+            }
+            if function.modifier == crate::syntax::FunctionModifier::Pure && !facts.pure {
+                diagnostics.push(Diagnostic::new(
+                    "semantic.pure_effect_violation",
+                    function.source.clone(),
+                    RecoveryAction::None,
+                ));
+            }
+        }
+        for (id, facts) in &concrete_facts {
+            let specialization = &program.specializations()[id];
+            let function = &program.functions()[&specialization.definition];
             function_facts.push(FunctionFactsObservation::new(
                 id.0,
-                program.functions()[id].name.clone(),
+                function.name.clone(),
                 FunctionFactsValues {
                     pure: facts.pure,
                     may_panic: facts.may_panic,
@@ -555,7 +1029,7 @@ pub(crate) fn analyze<'a>(
         }
         let call_graph = facts
             .iter()
-            .map(|(id, facts)| (*id, facts.calls.clone()))
+            .map(|(id, facts)| (*id, facts.calls.keys().copied().collect()))
             .collect::<BTreeMap<_, _>>();
         for constant in program.constants().values() {
             if expression_constructs(&constant.expression) {
@@ -591,13 +1065,17 @@ pub(crate) fn analyze<'a>(
         diagnostics.extend(error_diagnostics);
 
         if executable_allowed && diagnostics.is_empty() {
+            let mut engine = Engine::new(program, cancellation);
             for constant in program.constants().values() {
-                let mut engine = Engine::new(program, cancellation);
                 let run = engine.evaluate_constant(constant.id);
                 if run.outcome == EvaluationOutcome::Cancelled {
                     return cancelled();
                 }
-                map_evaluation_failure(&run.outcome, &constant.source, &mut diagnostics);
+                if let Err(evidence) =
+                    map_evaluation_failure(&run.outcome, &constant.source, &mut diagnostics)
+                {
+                    return defect("constant evaluation", evidence);
+                }
                 let record = definitions.get(&constant.id).expect("constant definition");
                 evaluations.push(EvaluationObservation::new(
                     format!("{}.{}", record.module_display, record.name),
@@ -610,19 +1088,38 @@ pub(crate) fn analyze<'a>(
                 for assertion in &parsed.comptime_assertions {
                     match program.verify_expression(assertion) {
                         Ok(expression) => {
-                            let mut engine = Engine::new(program, cancellation);
                             let run = engine.evaluate_expression(&expression);
                             if run.outcome == EvaluationOutcome::Cancelled {
                                 return cancelled();
                             }
-                            if run.outcome
-                                != EvaluationOutcome::Completed(crate::CanonicalValue::Bool(true))
-                            {
-                                diagnostics.push(Diagnostic::new(
-                                    "evaluation.assertion_failed",
-                                    assertion.range.clone(),
-                                    RecoveryAction::None,
-                                ));
+                            match &run.outcome {
+                                EvaluationOutcome::Completed(crate::CanonicalValue::Bool(true)) => {
+                                }
+                                EvaluationOutcome::Completed(_) => {
+                                    diagnostics.push(Diagnostic::new(
+                                        "evaluation.assertion_failed",
+                                        assertion.range.clone(),
+                                        RecoveryAction::None,
+                                    ))
+                                }
+                                EvaluationOutcome::Defect { evidence } => {
+                                    return defect(
+                                        "compile-time assertion evaluation",
+                                        evidence.clone(),
+                                    );
+                                }
+                                _ => {
+                                    if let Err(evidence) = map_evaluation_failure(
+                                        &run.outcome,
+                                        &assertion.range,
+                                        &mut diagnostics,
+                                    ) {
+                                        return defect(
+                                            "compile-time assertion evaluation",
+                                            evidence,
+                                        );
+                                    }
+                                }
                             }
                             evaluations.push(EvaluationObservation::new(
                                 format!("{}.comptime_assert", module_displays[&module]),
@@ -642,12 +1139,15 @@ pub(crate) fn analyze<'a>(
             if diagnostics.is_empty()
                 && let Some((image, image_range)) = image_functions.first()
             {
-                let mut engine = Engine::new(program, cancellation);
                 let run = engine.evaluate_function(*image);
                 if run.outcome == EvaluationOutcome::Cancelled {
                     return cancelled();
                 }
-                map_evaluation_failure(&run.outcome, image_range, &mut diagnostics);
+                if let Err(evidence) =
+                    map_evaluation_failure(&run.outcome, image_range, &mut diagnostics)
+                {
+                    return defect("Image Constructor evaluation", evidence);
+                }
                 if root == Root::Test {
                     test_plan = plan_tests(
                         program,
@@ -657,20 +1157,28 @@ pub(crate) fn analyze<'a>(
                         &mut diagnostics,
                     );
                 }
-                if let Err(kind) = seal_construction_graph(run.root_handle, &run.constructions) {
-                    diagnostics.push(
-                        Diagnostic::new(
-                            "construction.invalid_graph",
-                            image_range.clone(),
-                            RecoveryAction::None,
-                        )
-                        .with_parameter("kind", kind),
-                    );
+                if let Err(failure) = seal_construction_graph(run.root_handle, &run.constructions) {
+                    match failure {
+                        GraphSealFailure::Creator(kind) => diagnostics.push(
+                            Diagnostic::new(
+                                "construction.invalid_graph",
+                                image_range.clone(),
+                                RecoveryAction::None,
+                            )
+                            .with_parameter("kind", kind),
+                        ),
+                        GraphSealFailure::Defect(evidence) => {
+                            return defect("construction graph verification", Arc::from(evidence));
+                        }
+                    }
                 }
                 constructions.extend(run.constructions.into_iter().map(|construction| {
                     ConstructionObservation::new(
                         construction.identity,
-                        construction.kind.name(),
+                        match construction.kind {
+                            BuildKind::Image => crate::ConstructionKind::Image,
+                            BuildKind::Test => crate::ConstructionKind::Test,
+                        },
                         construction.site,
                     )
                 }));
@@ -714,13 +1222,17 @@ pub(crate) fn analyze<'a>(
     }
 }
 
-fn resolved_name(definition: &DefinitionRecord) -> ResolvedName {
-    match definition.kind {
+fn resolved_name(definition: &DefinitionRecord) -> Option<ResolvedName> {
+    Some(match definition.kind {
         DeclarationKind::Function => ResolvedName::Function(definition.id),
         DeclarationKind::Constant => ResolvedName::Constant(definition.id),
-        kind if is_nominal(kind) => ResolvedName::Nominal(definition.id),
-        _ => ResolvedName::Nominal(definition.id),
-    }
+        DeclarationKind::TypeAlias => ResolvedName::Alias(definition.id),
+        DeclarationKind::Struct
+        | DeclarationKind::ResourceStruct
+        | DeclarationKind::Enum
+        | DeclarationKind::Interface => ResolvedName::Nominal(definition.id),
+        DeclarationKind::Pool | DeclarationKind::Suite => return None,
+    })
 }
 
 fn is_nominal(kind: DeclarationKind) -> bool {
@@ -730,27 +1242,186 @@ fn is_nominal(kind: DeclarationKind) -> bool {
             | DeclarationKind::ResourceStruct
             | DeclarationKind::Enum
             | DeclarationKind::Interface
-            | DeclarationKind::TypeAlias
     )
 }
 
-fn resolve_parameters(
-    function: &FunctionSyntax,
-    module: ModuleId,
-    names: &BTreeMap<NameKey, ResolvedName>,
+fn statements_definitely_terminate(statements: &[StatementSyntax]) -> bool {
+    statements.iter().any(|statement| match statement {
+        StatementSyntax::Return { .. } | StatementSyntax::Panic { .. } => true,
+        StatementSyntax::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            !else_branch.is_empty()
+                && statements_definitely_terminate(then_branch)
+                && statements_definitely_terminate(else_branch)
+        }
+        StatementSyntax::Assign { .. }
+        | StatementSyntax::Expect { .. }
+        | StatementSyntax::Evaluate(_)
+        | StatementSyntax::Pass(_) => false,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_associated_functions(
+    definition: &DefinitionRecord,
+    functions: &[crate::syntax::MemberFunctionSyntax],
+    namespace: &NamespaceCatalog,
     displays: &BTreeMap<DefinitionId, Arc<str>>,
+    aliases: &BTreeMap<DefinitionId, Type>,
+    definitions: &BTreeMap<DefinitionId, DefinitionRecord>,
+    identity_catalog: &IdentityCatalog,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<ResolvedFunction> {
+    let self_type = Type::Nominal {
+        definition: definition.id,
+        display: displays[&definition.id].clone(),
+    };
+    let mut member_names = BTreeSet::new();
+    let mut resolved = Vec::new();
+    for member in functions {
+        if !member_names.insert(&member.name) {
+            diagnostics.push(
+                Diagnostic::new(
+                    "semantic.duplicate_member",
+                    member.range.clone(),
+                    RecoveryAction::None,
+                )
+                .with_parameter("name", member.name.clone()),
+            );
+            continue;
+        }
+        let id = identity_catalog
+            .associated_function(definition.id, &member.name)
+            .expect("associated function identity exists");
+        let mut type_parameters = BTreeMap::from([("Self".to_owned(), self_type.clone())]);
+        for (index, name) in member.function.type_parameters.iter().enumerate() {
+            if type_parameters
+                .insert(
+                    name.clone(),
+                    Type::Parameter {
+                        owner: id,
+                        id: TypeParameterId(u16::try_from(index).unwrap_or(u16::MAX)),
+                        display: Arc::from(name.as_str()),
+                    },
+                )
+                .is_some()
+            {
+                diagnostics.push(
+                    Diagnostic::new(
+                        "semantic.duplicate_type_parameter",
+                        member.range.clone(),
+                        RecoveryAction::None,
+                    )
+                    .with_parameter("name", name.clone()),
+                );
+            }
+        }
+        let Some(parameters) = resolve_parameters(
+            &member.function.parameters,
+            definition.module,
+            namespace,
+            displays,
+            aliases,
+            &type_parameters,
+            diagnostics,
+        ) else {
+            continue;
+        };
+        for parameter in &parameters {
+            let resource = is_resource_type(&parameter.type_, definitions);
+            match parameter.ownership {
+                OwnershipSyntax::Value if resource => diagnostics.push(Diagnostic::new(
+                    "semantic.resource_parameter_requires_mode",
+                    member.range.clone(),
+                    RecoveryAction::None,
+                )),
+                OwnershipSyntax::Read | OwnershipSyntax::Mut | OwnershipSyntax::Take
+                    if parameter.name != "self" && !resource =>
+                {
+                    diagnostics.push(Diagnostic::new(
+                        "semantic.ownership_mode_requires_resource",
+                        member.range.clone(),
+                        RecoveryAction::None,
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let Some(return_type) = resolve_type(
+            &member.function.return_type,
+            definition.module,
+            namespace,
+            displays,
+            aliases,
+            &type_parameters,
+        ) else {
+            diagnostics.push(Diagnostic::new(
+                "semantic.unresolved_type",
+                member.range.clone(),
+                RecoveryAction::None,
+            ));
+            continue;
+        };
+        if return_type != Type::Unit && !statements_definitely_terminate(&member.function.body) {
+            diagnostics.push(Diagnostic::new(
+                "semantic.missing_return",
+                member.range.clone(),
+                RecoveryAction::None,
+            ));
+            continue;
+        }
+        if definition.public
+            && member.public
+            && (exposes_private_type(&return_type, definitions)
+                || parameters
+                    .iter()
+                    .any(|parameter| exposes_private_type(&parameter.type_, definitions)))
+        {
+            diagnostics.push(Diagnostic::new(
+                "semantic.private_type_in_public_signature",
+                member.range.clone(),
+                RecoveryAction::None,
+            ));
+        }
+        resolved.push(ResolvedFunction {
+            id,
+            module: definition.module,
+            module_display: definition.module_display.clone(),
+            name: format!("{}.{}", definition.name, member.name),
+            modifier: member.function.modifier,
+            type_parameters: (0..member.function.type_parameters.len())
+                .map(|index| TypeParameterId(u16::try_from(index).unwrap_or(u16::MAX)))
+                .collect(),
+            parameters,
+            return_type,
+            body: member.function.body.clone(),
+            source: member.range.clone(),
+        });
+    }
+    resolved
+}
+
+fn resolve_parameters(
+    parameters: &[ParameterSyntax],
+    module: ModuleId,
+    namespace: &NamespaceCatalog,
+    displays: &BTreeMap<DefinitionId, Arc<str>>,
+    aliases: &BTreeMap<DefinitionId, Type>,
     type_parameters: &BTreeMap<String, Type>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<Vec<ResolvedParameter>> {
-    function
-        .parameters
+    parameters
         .iter()
         .map(|parameter| {
             let type_ = resolve_type(
                 &parameter.type_syntax,
                 module,
-                names,
+                namespace,
                 displays,
+                aliases,
                 type_parameters,
             );
             if type_.is_none() {
@@ -769,11 +1440,38 @@ fn resolve_parameters(
         .collect()
 }
 
+fn validate_parameter_modes(
+    parameters: &[ResolvedParameter],
+    syntax: &[ParameterSyntax],
+    definitions: &BTreeMap<DefinitionId, DefinitionRecord>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for (parameter, syntax) in parameters.iter().zip(syntax) {
+        let resource = is_resource_type(&parameter.type_, definitions);
+        let invalid = match parameter.ownership {
+            OwnershipSyntax::Value => resource,
+            OwnershipSyntax::Read | OwnershipSyntax::Mut | OwnershipSyntax::Take => !resource,
+        };
+        if invalid {
+            diagnostics.push(Diagnostic::new(
+                if resource {
+                    "semantic.resource_parameter_requires_mode"
+                } else {
+                    "semantic.ownership_mode_requires_resource"
+                },
+                syntax.range.clone(),
+                RecoveryAction::None,
+            ));
+        }
+    }
+}
+
 fn resolve_type(
     syntax: &TypeSyntax,
     module: ModuleId,
-    names: &BTreeMap<NameKey, ResolvedName>,
+    namespace: &NamespaceCatalog,
     displays: &BTreeMap<DefinitionId, Arc<str>>,
+    aliases: &BTreeMap<DefinitionId, Type>,
     type_parameters: &BTreeMap<String, Type>,
 ) -> Option<Type> {
     match syntax {
@@ -782,14 +1480,24 @@ fn resolve_type(
         TypeSyntax::Array(element) => Some(Type::Array(Arc::new(resolve_type(
             element,
             module,
-            names,
+            namespace,
             displays,
+            aliases,
             type_parameters,
         )?))),
         TypeSyntax::Tuple(members) => Some(Type::Tuple(
             members
                 .iter()
-                .map(|member| resolve_type(member, module, names, displays, type_parameters))
+                .map(|member| {
+                    resolve_type(
+                        member,
+                        module,
+                        namespace,
+                        displays,
+                        aliases,
+                        type_parameters,
+                    )
+                })
                 .collect::<Option<Vec<_>>>()?
                 .into(),
         )),
@@ -802,20 +1510,28 @@ fn resolve_type(
             if let Some(builtin) = resolve_builtin_type(name) {
                 return Some(builtin);
             }
-            let ResolvedName::Nominal(id) =
-                names.get(&NameKey::new(module, Arc::from(name.segments.clone())))?
-            else {
-                return None;
-            };
-            Some(Type::Nominal {
-                definition: *id,
-                display: displays.get(id)?.clone(),
-            })
+            match namespace.resolve(module, &name.segments)? {
+                ResolvedName::Nominal(id) => Some(Type::Nominal {
+                    definition: id,
+                    display: displays.get(&id)?.clone(),
+                }),
+                ResolvedName::Alias(id) => aliases.get(&id).cloned(),
+                _ => None,
+            }
         }
         TypeSyntax::Apply { base, arguments } => {
             let values = arguments
                 .iter()
-                .map(|argument| resolve_type(argument, module, names, displays, type_parameters))
+                .map(|argument| {
+                    resolve_type(
+                        argument,
+                        module,
+                        namespace,
+                        displays,
+                        aliases,
+                        type_parameters,
+                    )
+                })
                 .collect::<Option<Vec<_>>>()?;
             match base
                 .segments
@@ -833,6 +1549,62 @@ fn resolve_type(
             }
         }
     }
+}
+
+fn unresolved_alias_dependencies(
+    syntax: &TypeSyntax,
+    module: ModuleId,
+    namespace: &NamespaceCatalog,
+) -> (BTreeSet<DefinitionId>, bool) {
+    let mut dependencies = BTreeSet::new();
+    let mut missing = false;
+    fn visit(
+        syntax: &TypeSyntax,
+        module: ModuleId,
+        namespace: &NamespaceCatalog,
+        dependencies: &mut BTreeSet<DefinitionId>,
+        missing: &mut bool,
+    ) {
+        match syntax {
+            TypeSyntax::Unit | TypeSyntax::Infer => {}
+            TypeSyntax::Array(value) => visit(value, module, namespace, dependencies, missing),
+            TypeSyntax::Tuple(values) => {
+                for value in values {
+                    visit(value, module, namespace, dependencies, missing);
+                }
+            }
+            TypeSyntax::Named(name) => {
+                if resolve_builtin_type(name).is_some() {
+                    return;
+                }
+                match namespace.resolve(module, &name.segments) {
+                    Some(ResolvedName::Alias(id)) => {
+                        dependencies.insert(id);
+                    }
+                    Some(ResolvedName::Nominal(_)) => {}
+                    _ => *missing = true,
+                }
+            }
+            TypeSyntax::Apply { base, arguments } => {
+                let builtin = matches!(
+                    base.segments
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    ["Result"] | ["Option"]
+                );
+                if !builtin && namespace.resolve(module, &base.segments).is_none() {
+                    *missing = true;
+                }
+                for argument in arguments {
+                    visit(argument, module, namespace, dependencies, missing);
+                }
+            }
+        }
+    }
+    visit(syntax, module, namespace, &mut dependencies, &mut missing);
+    (dependencies, missing)
 }
 
 fn exposes_private_type(
@@ -857,6 +1629,25 @@ fn exposes_private_type(
     }
 }
 
+fn is_resource_type(type_: &Type, definitions: &BTreeMap<DefinitionId, DefinitionRecord>) -> bool {
+    match type_ {
+        Type::Nominal { definition, .. } => definitions
+            .get(definition)
+            .is_some_and(|definition| definition.kind == DeclarationKind::ResourceStruct),
+        Type::Array(value) | Type::Option(value) => is_resource_type(value, definitions),
+        Type::Tuple(values) => values
+            .iter()
+            .any(|value| is_resource_type(value, definitions)),
+        Type::Result { success, error } => {
+            is_resource_type(success, definitions)
+                || error
+                    .as_ref()
+                    .is_some_and(|error| is_resource_type(error, definitions))
+        }
+        _ => false,
+    }
+}
+
 fn solve_function_facts(
     program: &VerifiedProgram,
     cancellation: &Cancellation,
@@ -867,22 +1658,21 @@ fn solve_function_facts(
         .map(|(id, function)| (*id, local_facts(function)))
         .collect::<BTreeMap<_, _>>();
     let mut facts = base.clone();
-    for _ in 0..=facts.len() {
+    loop {
         if cancellation.is_cancelled() {
             return BTreeMap::new();
         }
-        let previous = facts;
+        let previous = facts.clone();
         let mut next = base.clone();
         for current in next.values_mut() {
-            for call in current.calls.clone() {
-                if let Some(callee) = previous.get(&call) {
+            for call in current.calls.keys() {
+                if let Some(callee) = previous.get(call) {
                     current.pure &= callee.pure;
                     current.may_panic |= callee.may_panic;
                     current.suspends |= callee.suspends;
                     current.evaluator_eligible &= callee.evaluator_eligible;
                     current.constructs.extend(callee.constructs.iter().copied());
                     current.ownership_transfer |= callee.ownership_transfer;
-                    current.logical_cost = current.logical_cost.saturating_add(callee.logical_cost);
                 }
             }
         }
@@ -894,12 +1684,128 @@ fn solve_function_facts(
     }
     let graph = facts
         .iter()
-        .map(|(id, facts)| (*id, facts.calls.clone()))
+        .map(|(id, facts)| (*id, facts.calls.keys().copied().collect()))
         .collect::<BTreeMap<_, _>>();
+    let recursive = crate::graph::recursive_nodes(&graph);
+    let costs = solve_weighted_costs(&base, &recursive, |fact| &fact.calls);
+    for (id, cost) in costs {
+        facts.get_mut(&id).expect("fact exists").logical_cost = cost;
+    }
     for (id, current) in &mut facts {
-        current.bounded = !reaches_definition(*id, *id, &graph, &mut BTreeSet::new());
+        current.bounded = current.logical_cost != u64::MAX && !recursive.contains(id);
     }
     facts
+}
+
+fn solve_specialization_facts(
+    program: &VerifiedProgram,
+    cancellation: &Cancellation,
+) -> BTreeMap<SpecializationId, FunctionFacts> {
+    let base = program
+        .specialized_functions()
+        .iter()
+        .map(|(id, function)| (*id, local_facts(function)))
+        .collect::<BTreeMap<_, _>>();
+    let mut facts = base.clone();
+    loop {
+        if cancellation.is_cancelled() {
+            return BTreeMap::new();
+        }
+        let previous = facts.clone();
+        let mut next = base.clone();
+        for current in next.values_mut() {
+            for call in current.specialization_calls.keys() {
+                if let Some(callee) = previous.get(call) {
+                    current.pure &= callee.pure;
+                    current.may_panic |= callee.may_panic;
+                    current.suspends |= callee.suspends;
+                    current.evaluator_eligible &= callee.evaluator_eligible;
+                    current.constructs.extend(callee.constructs.iter().copied());
+                    current.ownership_transfer |= callee.ownership_transfer;
+                }
+            }
+        }
+        if next == previous {
+            facts = next;
+            break;
+        }
+        facts = next;
+    }
+    let graph = facts
+        .iter()
+        .map(|(id, facts)| (*id, facts.specialization_calls.keys().copied().collect()))
+        .collect::<BTreeMap<_, BTreeSet<_>>>();
+    let recursive = crate::graph::recursive_nodes(&graph);
+    let costs = solve_weighted_costs(&base, &recursive, |fact| &fact.specialization_calls);
+    for (id, cost) in costs {
+        let fact = facts.get_mut(&id).expect("specialization fact exists");
+        fact.logical_cost = cost;
+        fact.bounded = cost != u64::MAX && !recursive.contains(&id);
+    }
+    facts
+}
+
+fn solve_weighted_costs<N>(
+    base: &BTreeMap<N, FunctionFacts>,
+    recursive: &BTreeSet<N>,
+    edges: impl Fn(&FunctionFacts) -> &BTreeMap<N, u64>,
+) -> BTreeMap<N, u64>
+where
+    N: Copy + Ord,
+{
+    let mut remaining = BTreeMap::new();
+    let mut callers = BTreeMap::<N, Vec<(N, u64)>>::new();
+    let mut costs = base
+        .iter()
+        .map(|(id, facts)| {
+            (
+                *id,
+                if recursive.contains(id) {
+                    u64::MAX
+                } else {
+                    facts.logical_cost
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (caller, facts) in base {
+        if recursive.contains(caller) {
+            continue;
+        }
+        let dependencies = edges(facts)
+            .iter()
+            .filter(|(callee, _)| base.contains_key(callee))
+            .map(|(callee, multiplicity)| (*callee, *multiplicity))
+            .collect::<Vec<_>>();
+        remaining.insert(*caller, dependencies.len());
+        for (callee, multiplicity) in dependencies {
+            callers
+                .entry(callee)
+                .or_default()
+                .push((*caller, multiplicity));
+        }
+    }
+    let mut ready = remaining
+        .iter()
+        .filter_map(|(id, count)| (*count == 0).then_some(*id))
+        .collect::<BTreeSet<_>>();
+    ready.extend(recursive.iter().copied());
+    while let Some(id) = ready.pop_first() {
+        let callee_cost = costs[&id];
+        for (caller, multiplicity) in callers.get(&id).into_iter().flatten() {
+            costs.entry(*caller).and_modify(|cost| {
+                *cost = cost.saturating_add(callee_cost.saturating_mul(*multiplicity));
+            });
+            let count = remaining
+                .get_mut(caller)
+                .expect("caller has dependency count");
+            *count -= 1;
+            if *count == 0 {
+                ready.insert(*caller);
+            }
+        }
+    }
+    costs
 }
 
 fn local_facts(function: &typed_hir::HirFunction) -> FunctionFacts {
@@ -915,10 +1821,11 @@ fn local_facts(function: &typed_hir::HirFunction) -> FunctionFacts {
         bounded: true,
         logical_cost: 1,
         constructs: BTreeSet::new(),
-        calls: BTreeSet::new(),
+        calls: BTreeMap::new(),
+        specialization_calls: BTreeMap::new(),
     };
     visit_statements(&function.body, &mut facts);
-    facts.pure = facts.constructs.is_empty() && !facts.suspends;
+    facts.pure = !facts.suspends;
     facts.evaluator_eligible = !facts.suspends;
     facts
 }
@@ -936,9 +1843,10 @@ fn visit_statements(statements: &[Statement], facts: &mut FunctionFacts) {
                 facts.may_panic = true;
                 visit_expression(value, facts);
             }
-            Statement::Initialize { value, .. } | Statement::Evaluate(value) => {
-                visit_expression(value, facts)
-            }
+            Statement::Expect { condition, .. } => visit_expression(condition, facts),
+            Statement::Initialize { value, .. }
+            | Statement::Assign { value, .. }
+            | Statement::Evaluate(value) => visit_expression(value, facts),
             Statement::If {
                 condition,
                 then_branch,
@@ -959,12 +1867,22 @@ fn visit_expression(expression: &Expression, facts: &mut FunctionFacts) {
     match &expression.kind {
         ExpressionKind::Call { target, arguments } => {
             match target {
-                CallTarget::TemplateFunction(definition)
-                | CallTarget::Function { definition, .. } => {
-                    facts.calls.insert(*definition);
+                CallTarget::TemplateFunction { definition, .. } => {
+                    *facts.calls.entry(*definition).or_default() += 1;
                 }
-                CallTarget::Build(kind) => {
-                    facts.constructs.insert(*kind);
+                CallTarget::Function {
+                    definition,
+                    specialization,
+                    ..
+                } => {
+                    *facts.calls.entry(*definition).or_default() += 1;
+                    *facts
+                        .specialization_calls
+                        .entry(*specialization)
+                        .or_default() += 1;
+                }
+                CallTarget::Build(primitive) => {
+                    facts.constructs.insert(primitive.kind);
                 }
                 _ => {}
             }
@@ -977,9 +1895,11 @@ fn visit_expression(expression: &Expression, facts: &mut FunctionFacts) {
                 visit_expression(value, facts);
             }
         }
-        ExpressionKind::Negate(value) | ExpressionKind::Propagate(value) => {
-            visit_expression(value, facts)
+        ExpressionKind::Negate(value) => {
+            facts.may_panic |= matches!(value.type_, Type::Integer(_));
+            visit_expression(value, facts);
         }
+        ExpressionKind::Propagate(value) => visit_expression(value, facts),
         ExpressionKind::Await(value) => {
             facts.suspends = true;
             visit_expression(value, facts);
@@ -989,10 +1909,16 @@ fn visit_expression(expression: &Expression, facts: &mut FunctionFacts) {
             left,
             right,
         } => {
-            if matches!(
-                operator,
-                typed_hir::BinaryOperator::Divide | typed_hir::BinaryOperator::Remainder
-            ) {
+            if matches!(left.type_, Type::Integer(_))
+                && matches!(
+                    operator,
+                    typed_hir::BinaryOperator::Add
+                        | typed_hir::BinaryOperator::Subtract
+                        | typed_hir::BinaryOperator::Multiply
+                        | typed_hir::BinaryOperator::Divide
+                        | typed_hir::BinaryOperator::Remainder
+                )
+            {
                 facts.may_panic = true;
             }
             visit_expression(left, facts);
@@ -1153,45 +2079,62 @@ fn direct_error_types(statements: &[Statement]) -> BTreeSet<Type> {
 }
 
 fn walk_expressions(statements: &[Statement], visitor: &mut impl FnMut(&Expression)) {
-    fn expression(value: &Expression, visitor: &mut impl FnMut(&Expression)) {
-        visitor(value);
-        match &value.kind {
-            ExpressionKind::Call { arguments, .. } | ExpressionKind::Array(arguments) => {
-                for argument in &**arguments {
-                    expression(argument, visitor);
-                }
-            }
-            ExpressionKind::Negate(value)
-            | ExpressionKind::Await(value)
-            | ExpressionKind::Propagate(value) => expression(value, visitor),
-            ExpressionKind::Binary { left, right, .. } => {
-                expression(left, visitor);
-                expression(right, visitor);
-            }
-            _ => {}
-        }
+    enum Work<'a> {
+        Statement(&'a Statement),
+        Expression(&'a Expression),
     }
-    for statement in statements {
-        match statement {
-            Statement::Return { value, .. } => {
-                if let Some(value) = value {
-                    expression(value, visitor);
+    let mut pending = statements
+        .iter()
+        .rev()
+        .map(Work::Statement)
+        .collect::<Vec<_>>();
+    while let Some(work) = pending.pop() {
+        match work {
+            Work::Expression(value) => {
+                visitor(value);
+                match &value.kind {
+                    ExpressionKind::Call { arguments, .. } | ExpressionKind::Array(arguments) => {
+                        pending.extend(arguments.iter().rev().map(Work::Expression));
+                    }
+                    ExpressionKind::Negate(value)
+                    | ExpressionKind::Await(value)
+                    | ExpressionKind::Propagate(value) => {
+                        pending.push(Work::Expression(value));
+                    }
+                    ExpressionKind::Binary { left, right, .. } => {
+                        pending.push(Work::Expression(right));
+                        pending.push(Work::Expression(left));
+                    }
+                    ExpressionKind::Literal(_)
+                    | ExpressionKind::Read(_)
+                    | ExpressionKind::Constant(_) => {}
                 }
             }
-            Statement::Panic { value, .. }
-            | Statement::Initialize { value, .. }
-            | Statement::Evaluate(value) => expression(value, visitor),
-            Statement::If {
-                condition,
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                expression(condition, visitor);
-                walk_expressions(then_branch, visitor);
-                walk_expressions(else_branch, visitor);
-            }
-            Statement::Pass(_) => {}
+            Work::Statement(statement) => match statement {
+                Statement::Return { value, .. } => {
+                    if let Some(value) = value {
+                        pending.push(Work::Expression(value));
+                    }
+                }
+                Statement::Panic { value, .. }
+                | Statement::Expect {
+                    condition: value, ..
+                }
+                | Statement::Initialize { value, .. }
+                | Statement::Assign { value, .. }
+                | Statement::Evaluate(value) => pending.push(Work::Expression(value)),
+                Statement::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    pending.extend(else_branch.iter().rev().map(Work::Statement));
+                    pending.extend(then_branch.iter().rev().map(Work::Statement));
+                    pending.push(Work::Expression(condition));
+                }
+                Statement::Pass(_) => {}
+            },
         }
     }
 }
@@ -1200,30 +2143,12 @@ fn recursive_functions(program: &VerifiedProgram) -> Vec<SourceRange> {
     let graph = program
         .functions()
         .iter()
-        .map(|(id, function)| (*id, local_facts(function).calls))
+        .map(|(id, function)| (*id, local_facts(function).calls.keys().copied().collect()))
         .collect::<BTreeMap<_, _>>();
-    graph
-        .keys()
-        .filter(|root| reaches_definition(**root, **root, &graph, &mut BTreeSet::new()))
+    crate::graph::recursive_nodes(&graph)
+        .iter()
         .map(|id| program.functions()[id].source.clone())
         .collect()
-}
-
-fn reaches_definition(
-    root: DefinitionId,
-    current: DefinitionId,
-    graph: &BTreeMap<DefinitionId, BTreeSet<DefinitionId>>,
-    visited: &mut BTreeSet<DefinitionId>,
-) -> bool {
-    if !visited.insert(current) {
-        return false;
-    }
-    graph.get(&current).is_some_and(|dependencies| {
-        dependencies.contains(&root)
-            || dependencies
-                .iter()
-                .any(|dependency| reaches_definition(root, *dependency, graph, visited))
-    })
 }
 
 fn reachable(
@@ -1320,6 +2245,8 @@ fn plan_tests(
                         parameter.type_.display(),
                         match parameter.ownership {
                             OwnershipSyntax::Value => OwnershipMode::Value,
+                            OwnershipSyntax::Read => OwnershipMode::Read,
+                            OwnershipSyntax::Mut => OwnershipMode::Mut,
                             OwnershipSyntax::Take => OwnershipMode::Take,
                         },
                     )
@@ -1330,15 +2257,23 @@ fn plan_tests(
     plan
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphSealFailure {
+    Creator(&'static str),
+    Defect(&'static str),
+}
+
 fn seal_construction_graph(
     root_handle: Option<(BuildKind, u128)>,
     constructions: &[Construction],
-) -> Result<(), &'static str> {
+) -> Result<(), GraphSealFailure> {
     let Some((kind, root)) = root_handle else {
-        return Ok(());
+        return Err(GraphSealFailure::Defect(
+            "Image evaluation produced no root",
+        ));
     };
     if kind != BuildKind::Image {
-        return Err("returned_root_is_not_image");
+        return Err(GraphSealFailure::Creator("returned_root_is_not_image"));
     }
     if constructions
         .iter()
@@ -1346,12 +2281,33 @@ fn seal_construction_graph(
         .count()
         != 1
     {
-        return Err("multiple_image_roots");
+        return Err(GraphSealFailure::Creator("multiple_image_roots"));
     }
-    let graph = constructions
-        .iter()
-        .map(|construction| (construction.identity, construction.edges.as_slice()))
-        .collect::<BTreeMap<_, _>>();
+    let mut graph = BTreeMap::new();
+    for construction in constructions {
+        if graph
+            .insert(construction.identity, construction.edges.as_slice())
+            .is_some()
+        {
+            return Err(GraphSealFailure::Defect(
+                "duplicate Construction identity escaped the evaluator catalog",
+            ));
+        }
+    }
+    if !graph.contains_key(&root) {
+        return Err(GraphSealFailure::Defect(
+            "returned Image root does not name a construction",
+        ));
+    }
+    if graph
+        .values()
+        .flat_map(|edges| edges.iter())
+        .any(|edge| !graph.contains_key(edge))
+    {
+        return Err(GraphSealFailure::Defect(
+            "construction edge names a node outside its evaluation root",
+        ));
+    }
     let mut reachable = BTreeSet::new();
     let mut pending = vec![root];
     while let Some(identity) = pending.pop() {
@@ -1362,7 +2318,7 @@ fn seal_construction_graph(
         }
     }
     if reachable.len() != constructions.len() {
-        return Err("unreachable_construction");
+        return Err(GraphSealFailure::Creator("unreachable_construction"));
     }
     Ok(())
 }
@@ -1371,15 +2327,15 @@ fn map_evaluation_failure(
     outcome: &EvaluationOutcome,
     range: &SourceRange,
     diagnostics: &mut Vec<Diagnostic>,
-) {
+) -> Result<(), Arc<str>> {
     match outcome {
         EvaluationOutcome::CreatorRejected { kind } => diagnostics.push(
             Diagnostic::new("evaluation.rejected", range.clone(), RecoveryAction::None)
-                .with_parameter("kind", kind.clone()),
+                .with_parameter("kind", kind.code()),
         ),
         EvaluationOutcome::Panicked { kind, site } => diagnostics.push(
             Diagnostic::new("evaluation.panicked", site.clone(), RecoveryAction::None)
-                .with_parameter("kind", kind.clone()),
+                .with_parameter("kind", kind.code()),
         ),
         EvaluationOutcome::LimitExceeded {
             policy,
@@ -1391,16 +2347,14 @@ fn map_evaluation_failure(
                 range.clone(),
                 RecoveryAction::None,
             )
-            .with_parameter("policy", policy.clone())
+            .with_parameter("policy", policy.code())
             .with_unsigned_parameter("ceiling", u128::from(*ceiling))
             .with_unsigned_parameter("used", u128::from(*used)),
         ),
-        EvaluationOutcome::Defect { evidence } => diagnostics.push(
-            Diagnostic::new("evaluation.defect", range.clone(), RecoveryAction::None)
-                .with_parameter("evidence", evidence.clone()),
-        ),
+        EvaluationOutcome::Defect { evidence } => return Err(evidence.clone()),
         EvaluationOutcome::Completed(_) | EvaluationOutcome::Cancelled => {}
     }
+    Ok(())
 }
 
 fn module_name(path: &str) -> String {
@@ -1439,5 +2393,130 @@ fn defect(phase: &'static str, evidence: Arc<str>) -> Analysis {
         test_plan: Vec::new(),
         defect: Some(Defect::new(phase, evidence)),
         cancelled: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cost_fact(cost: u64, calls: BTreeMap<DefinitionId, u64>) -> FunctionFacts {
+        FunctionFacts {
+            pure: true,
+            may_panic: false,
+            suspends: false,
+            evaluator_eligible: true,
+            ownership_transfer: false,
+            bounded: true,
+            logical_cost: cost,
+            constructs: BTreeSet::new(),
+            calls,
+            specialization_calls: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn recursive_logical_cost_is_stable_when_unrelated_functions_are_added() {
+        let recursive = DefinitionId(1);
+        let base = BTreeMap::from([(recursive, cost_fact(3, BTreeMap::from([(recursive, 1)])))]);
+        let recursive_nodes = crate::graph::recursive_nodes(&BTreeMap::from([(
+            recursive,
+            BTreeSet::from([recursive]),
+        )]));
+        let before = solve_weighted_costs(&base, &recursive_nodes, |facts| &facts.calls);
+        let mut with_unrelated = base;
+        with_unrelated.insert(DefinitionId(2), cost_fact(99, BTreeMap::new()));
+        let after = solve_weighted_costs(&with_unrelated, &recursive_nodes, |facts| &facts.calls);
+        assert_eq!(before[&recursive], u64::MAX);
+        assert_eq!(after[&recursive], before[&recursive]);
+        assert_eq!(after[&DefinitionId(2)], 99);
+    }
+
+    #[test]
+    fn graph_sealer_treats_missing_compiler_produced_root_as_defect() {
+        assert_eq!(
+            seal_construction_graph(None, &[]),
+            Err(GraphSealFailure::Defect(
+                "Image evaluation produced no root"
+            ))
+        );
+    }
+
+    #[test]
+    fn graph_sealer_contains_unknown_duplicate_and_cross_root_identities() {
+        let site = SourceRange::new("src/image.wr", 0, 1);
+        let node = |identity, edges| Construction {
+            identity,
+            kind: BuildKind::Image,
+            site: site.clone(),
+            edges,
+        };
+        assert!(matches!(
+            seal_construction_graph(Some((BuildKind::Image, 2)), &[node(1, vec![])]),
+            Err(GraphSealFailure::Defect(_))
+        ));
+        assert!(matches!(
+            seal_construction_graph(
+                Some((BuildKind::Image, 1)),
+                &[node(1, vec![]), node(1, vec![])]
+            ),
+            Err(GraphSealFailure::Creator("multiple_image_roots"))
+                | Err(GraphSealFailure::Defect(_))
+        ));
+        assert!(matches!(
+            seal_construction_graph(Some((BuildKind::Image, 1)), &[node(1, vec![9])]),
+            Err(GraphSealFailure::Defect(_))
+        ));
+    }
+
+    #[test]
+    fn graph_sealer_is_cycle_safe_and_rejects_only_unreachable_nodes() {
+        let site = SourceRange::new("src/image.wr", 0, 1);
+        let cycle = [
+            Construction {
+                identity: 1,
+                kind: BuildKind::Image,
+                site: site.clone(),
+                edges: vec![2],
+            },
+            Construction {
+                identity: 2,
+                kind: BuildKind::Test,
+                site: site.clone(),
+                edges: vec![1],
+            },
+        ];
+        assert_eq!(
+            seal_construction_graph(Some((BuildKind::Image, 1)), &cycle),
+            Ok(())
+        );
+        let mut unreachable = cycle.to_vec();
+        unreachable.push(Construction {
+            identity: 3,
+            kind: BuildKind::Test,
+            site,
+            edges: Vec::new(),
+        });
+        assert_eq!(
+            seal_construction_graph(Some((BuildKind::Image, 1)), &unreachable),
+            Err(GraphSealFailure::Creator("unreachable_construction"))
+        );
+    }
+
+    #[test]
+    fn evaluator_defect_cannot_be_downgraded_to_a_creator_diagnostic() {
+        let mut diagnostics = Vec::new();
+        let evidence = Arc::<str>::from("malformed verified operation");
+        assert_eq!(
+            map_evaluation_failure(
+                &EvaluationOutcome::Defect {
+                    evidence: evidence.clone(),
+                },
+                &SourceRange::new("src/image.wr", 0, 0),
+                &mut diagnostics,
+            ),
+            Err(evidence)
+        );
+        assert!(diagnostics.is_empty());
     }
 }

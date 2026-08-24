@@ -63,6 +63,10 @@ impl ProjectFile {
         &self.path
     }
 
+    pub(crate) const fn path_arc(&self) -> &Arc<str> {
+        &self.path
+    }
+
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -214,8 +218,29 @@ impl SourceRange {
         }
     }
 
+    pub(crate) fn from_u64_shared(path: &Arc<str>, start: u64, end: u64) -> Self {
+        debug_assert!(start <= end);
+        Self {
+            path: Arc::clone(path),
+            start,
+            end,
+        }
+    }
+
+    pub(crate) fn new_shared(path: &Arc<str>, start: usize, end: usize) -> Self {
+        Self {
+            path: Arc::clone(path),
+            start: u64::try_from(start).expect("usize always fits u64 on supported hosts"),
+            end: u64::try_from(end).expect("usize always fits u64 on supported hosts"),
+        }
+    }
+
     #[must_use]
     pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub(crate) fn path_arc(&self) -> &Arc<str> {
         &self.path
     }
 
@@ -284,7 +309,6 @@ pub struct Diagnostic {
     code: Arc<str>,
     primary: SourceRange,
     labels: Arc<[DiagnosticLabel]>,
-    parameters: Arc<[(Arc<str>, Arc<str>)]>,
     typed_parameters: Arc<[(Arc<str>, DiagnosticValue)]>,
     recovery: RecoveryAction,
 }
@@ -295,7 +319,6 @@ impl Diagnostic {
             code: Arc::from(code),
             primary,
             labels: Arc::from([]),
-            parameters: Arc::from([]),
             typed_parameters: Arc::from([]),
             recovery,
         }
@@ -303,9 +326,6 @@ impl Diagnostic {
 
     pub(crate) fn with_parameter(mut self, name: &'static str, value: impl Into<Arc<str>>) -> Self {
         let value = value.into();
-        let mut parameters = self.parameters.to_vec();
-        parameters.push((Arc::from(name), value.clone()));
-        self.parameters = parameters.into();
         let mut typed = self.typed_parameters.to_vec();
         typed.push((Arc::from(name), DiagnosticValue::Text(value)));
         self.typed_parameters = typed.into();
@@ -313,9 +333,6 @@ impl Diagnostic {
     }
 
     pub(crate) fn with_unsigned_parameter(mut self, name: &'static str, value: u128) -> Self {
-        let mut parameters = self.parameters.to_vec();
-        parameters.push((Arc::from(name), Arc::from(value.to_string())));
-        self.parameters = parameters.into();
         let mut typed = self.typed_parameters.to_vec();
         typed.push((Arc::from(name), DiagnosticValue::Unsigned(value)));
         self.typed_parameters = typed.into();
@@ -328,9 +345,6 @@ impl Diagnostic {
         domain: IdentityDomain,
         digest: u128,
     ) -> Self {
-        let mut parameters = self.parameters.to_vec();
-        parameters.push((Arc::from(name), Arc::from(format!("{digest:032x}"))));
-        self.parameters = parameters.into();
         let mut typed = self.typed_parameters.to_vec();
         typed.push((
             Arc::from(name),
@@ -363,11 +377,6 @@ impl Diagnostic {
     }
 
     #[must_use]
-    pub fn parameters(&self) -> &[(Arc<str>, Arc<str>)] {
-        &self.parameters
-    }
-
-    #[must_use]
     pub fn typed_parameters(&self) -> &[(Arc<str>, DiagnosticValue)] {
         &self.typed_parameters
     }
@@ -378,35 +387,126 @@ impl Diagnostic {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SyntaxElementKind {
-    Token,
-    Trivia,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntaxTokenKind {
+    Identifier,
+    IntegerLiteral,
+    FloatLiteral,
+    TextLiteral,
+    Fn,
+    Pub,
+    Pure,
+    Async,
+    Return,
+    If,
+    Else,
+    Const,
+    Struct,
+    Resource,
+    Enum,
+    Interface,
+    Type,
+    Pool,
+    Suite,
+    Test,
+    From,
+    Import,
+    As,
+    Comptime,
+    Assert,
+    Await,
+    Panic,
+    Pass,
+    Take,
+    Read,
+    Mut,
+    SelfValue,
+    Implements,
+    Expect,
+    True,
+    False,
+    LeftParen,
+    RightParen,
+    LeftBracket,
+    RightBracket,
+    Colon,
+    Comma,
+    Dot,
+    At,
+    Arrow,
+    Equal,
+    EqualEqual,
+    BangEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    Question,
     Invalid,
-    Layout,
-    Missing,
-    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntaxTriviaKind {
+    Spaces,
+    Lf,
+    Crlf,
+    Comment,
+    DocumentationComment,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntaxInvalidKind {
+    OversizedSource,
+    Tab,
+    LineEnding,
+    Literal,
+    Token,
+    Byte,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntaxLayoutKind {
+    Indent,
+    Dedent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntaxMissingKind {
+    Block,
+    Closer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntaxErrorKind {
+    UnexpectedIndentBlock,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntaxElementKind {
+    Token(SyntaxTokenKind),
+    Trivia(SyntaxTriviaKind),
+    Invalid(SyntaxInvalidKind),
+    Layout(SyntaxLayoutKind),
+    Missing(SyntaxMissingKind),
+    Error(SyntaxErrorKind),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyntaxElement {
     kind: SyntaxElementKind,
-    name: Arc<str>,
     range: SourceRange,
 }
 
 impl SyntaxElement {
-    pub(crate) fn new(
-        kind: SyntaxElementKind,
-        name: &'static str,
-        path: &str,
-        start: usize,
-        end: usize,
-    ) -> Self {
+    pub(crate) fn new(kind: SyntaxElementKind, path: &Arc<str>, start: usize, end: usize) -> Self {
         Self {
             kind,
-            name: Arc::from(name),
-            range: SourceRange::new(path, start, end),
+            range: SourceRange::new_shared(path, start, end),
         }
     }
 
@@ -417,12 +517,104 @@ impl SyntaxElement {
 
     #[must_use]
     pub fn name(&self) -> &str {
-        &self.name
+        self.kind.name()
     }
 
     #[must_use]
     pub fn range(&self) -> &SourceRange {
         &self.range
+    }
+}
+
+impl SyntaxElementKind {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Token(kind) => kind.name(),
+            Self::Trivia(SyntaxTriviaKind::Spaces) => "spaces",
+            Self::Trivia(SyntaxTriviaKind::Lf) => "lf",
+            Self::Trivia(SyntaxTriviaKind::Crlf) => "crlf",
+            Self::Trivia(SyntaxTriviaKind::Comment) => "comment",
+            Self::Trivia(SyntaxTriviaKind::DocumentationComment) => "documentation_comment",
+            Self::Invalid(SyntaxInvalidKind::OversizedSource) => "oversized_source",
+            Self::Invalid(SyntaxInvalidKind::Tab) => "invalid_tab",
+            Self::Invalid(SyntaxInvalidKind::LineEnding) => "invalid_line_ending",
+            Self::Invalid(SyntaxInvalidKind::Literal) => "invalid_literal",
+            Self::Invalid(SyntaxInvalidKind::Token) => "invalid_token",
+            Self::Invalid(SyntaxInvalidKind::Byte) => "invalid_byte",
+            Self::Layout(SyntaxLayoutKind::Indent) => "indent",
+            Self::Layout(SyntaxLayoutKind::Dedent) => "dedent",
+            Self::Missing(SyntaxMissingKind::Block) => "missing_block",
+            Self::Missing(SyntaxMissingKind::Closer) => "missing_closer",
+            Self::Error(SyntaxErrorKind::UnexpectedIndentBlock) => "unexpected_indent_block",
+        }
+    }
+}
+
+impl SyntaxTokenKind {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Identifier => "identifier",
+            Self::IntegerLiteral => "integer_literal",
+            Self::FloatLiteral => "float_literal",
+            Self::TextLiteral => "text_literal",
+            Self::Fn => "fn",
+            Self::Pub => "pub",
+            Self::Pure => "pure",
+            Self::Async => "async",
+            Self::Return => "return",
+            Self::If => "if",
+            Self::Else => "else",
+            Self::Const => "const",
+            Self::Struct => "struct",
+            Self::Resource => "resource",
+            Self::Enum => "enum",
+            Self::Interface => "interface",
+            Self::Type => "type",
+            Self::Pool => "pool",
+            Self::Suite => "suite",
+            Self::Test => "test",
+            Self::From => "from",
+            Self::Import => "import",
+            Self::As => "as",
+            Self::Comptime => "comptime",
+            Self::Assert => "assert",
+            Self::Await => "await",
+            Self::Panic => "panic",
+            Self::Pass => "pass",
+            Self::Take => "take",
+            Self::Read => "read",
+            Self::Mut => "mut",
+            Self::SelfValue => "self",
+            Self::Implements => "implements",
+            Self::Expect => "expect",
+            Self::True => "true",
+            Self::False => "false",
+            Self::LeftParen => "left_paren",
+            Self::RightParen => "right_paren",
+            Self::LeftBracket => "left_bracket",
+            Self::RightBracket => "right_bracket",
+            Self::Colon => "colon",
+            Self::Comma => "comma",
+            Self::Dot => "dot",
+            Self::At => "at",
+            Self::Arrow => "arrow",
+            Self::Equal => "equal",
+            Self::EqualEqual => "equal_equal",
+            Self::BangEqual => "bang_equal",
+            Self::Less => "less",
+            Self::LessEqual => "less_equal",
+            Self::Greater => "greater",
+            Self::GreaterEqual => "greater_equal",
+            Self::Plus => "plus",
+            Self::Minus => "minus",
+            Self::Star => "star",
+            Self::Slash => "slash",
+            Self::Percent => "percent",
+            Self::Question => "question",
+            Self::Invalid => "invalid",
+        }
     }
 }
 
@@ -471,23 +663,63 @@ impl SyntaxObservation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyntaxNodeObservation {
-    kind: Arc<str>,
+    kind: SyntaxNodeKind,
     range: SourceRange,
     depth: u16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntaxNodeKind {
+    Source,
+    Function,
+    Constant,
+    Pool,
+    TypeAlias,
+    Struct,
+    ResourceStruct,
+    Enum,
+    Interface,
+    Suite,
+    FunctionSignature,
+    Parameter,
+    Block,
+    ConstantValue,
+    SuiteHeader,
+    Test,
+    AsyncTest,
+    Variant,
+    Field,
+    MemberFunction,
+    FunctionRequirement,
+    ReturnStatement,
+    PanicStatement,
+    ExpectStatement,
+    InitializeStatement,
+    ExpressionStatement,
+    IfStatement,
+    PassStatement,
+    IntegerExpression,
+    FloatExpression,
+    TextExpression,
+    BoolExpression,
+    NameExpression,
+    CallExpression,
+    ArrayExpression,
+    UnitExpression,
+    NegateExpression,
+    AwaitExpression,
+    PropagateExpression,
+    BinaryExpression,
+}
+
 impl SyntaxNodeObservation {
-    pub(crate) fn new(kind: impl Into<Arc<str>>, range: SourceRange, depth: u16) -> Self {
-        Self {
-            kind: kind.into(),
-            range,
-            depth,
-        }
+    pub(crate) const fn new(kind: SyntaxNodeKind, range: SourceRange, depth: u16) -> Self {
+        Self { kind, range, depth }
     }
 
     #[must_use]
-    pub fn kind(&self) -> &str {
-        &self.kind
+    pub const fn kind(&self) -> SyntaxNodeKind {
+        self.kind
     }
 
     #[must_use]
@@ -678,8 +910,12 @@ pub enum CanonicalValue {
         variant: Arc<str>,
         payload: Arc<[CanonicalValue]>,
     },
+    Struct {
+        type_name: Arc<str>,
+        fields: Arc<[(Arc<str>, CanonicalValue)]>,
+    },
     SymbolicHandle {
-        kind: Arc<str>,
+        kind: ConstructionKind,
         identity: u128,
     },
 }
@@ -688,14 +924,14 @@ pub enum CanonicalValue {
 pub enum EvaluationOutcome {
     Completed(CanonicalValue),
     CreatorRejected {
-        kind: Arc<str>,
+        kind: EvaluationRejectionKind,
     },
     Panicked {
-        kind: Arc<str>,
+        kind: EvaluationPanicKind,
         site: SourceRange,
     },
     LimitExceeded {
-        policy: Arc<str>,
+        policy: EvaluationLimitPolicy,
         ceiling: u64,
         used: u64,
     },
@@ -705,18 +941,120 @@ pub enum EvaluationOutcome {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvaluationRejectionKind {
+    ConstantDependencyCycle,
+    UnresolvedConstant,
+    UnresolvedCall,
+    ArgumentCount,
+    ArgumentTypeMismatch,
+    ReturnTypeMismatch,
+    MissingLocal,
+    InvalidUnaryOperand,
+    PropagationRequiresResult,
+    ResultOkMissingPayload,
+    InvalidBooleanOperator,
+    BinaryTypeMismatch,
+    AwaitNotEvaluatorEligible,
+}
+
+impl EvaluationRejectionKind {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ConstantDependencyCycle => "constant_dependency_cycle",
+            Self::UnresolvedConstant => "unresolved_constant",
+            Self::UnresolvedCall => "unresolved_call",
+            Self::ArgumentCount => "argument_count",
+            Self::ArgumentTypeMismatch => "argument_type_mismatch",
+            Self::ReturnTypeMismatch => "return_type_mismatch",
+            Self::MissingLocal => "missing_local",
+            Self::InvalidUnaryOperand => "invalid_unary_operand",
+            Self::PropagationRequiresResult => "propagation_requires_result",
+            Self::ResultOkMissingPayload => "result_ok_missing_payload",
+            Self::InvalidBooleanOperator => "invalid_boolean_operator",
+            Self::BinaryTypeMismatch => "binary_type_mismatch",
+            Self::AwaitNotEvaluatorEligible => "await_not_evaluator_eligible",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvaluationPanicKind {
+    Explicit,
+    IntegerOverflow,
+    DivisionByZero,
+}
+
+impl EvaluationPanicKind {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::IntegerOverflow => "integer_overflow",
+            Self::DivisionByZero => "division_by_zero",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvaluationLimitPolicy {
+    RootFuel,
+    RootMemory,
+    CallDepth,
+    CompilationFuel,
+    CompilationMemory,
+}
+
+impl EvaluationLimitPolicy {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::RootFuel => "root_fuel",
+            Self::RootMemory => "root_memory",
+            Self::CallDepth => "call_depth",
+            Self::CompilationFuel => "compilation_fuel",
+            Self::CompilationMemory => "compilation_memory",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvaluationReceipt {
     tariff_schema: Arc<str>,
+    policy: EvaluationPolicy,
+    root_identity: u128,
+    argument_fingerprint: u128,
+    evaluator_eligible: bool,
+    dependency_roots: Arc<[u128]>,
     typed_hir_fingerprint: u128,
     fuel_used: u64,
     peak_memory: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvaluationPolicy {
+    Constant,
+    ComptimeAssertion,
+    ImageConstructor,
+}
+
 impl EvaluationReceipt {
-    pub(crate) fn new(typed_hir_fingerprint: u128, fuel_used: u64, peak_memory: u64) -> Self {
+    pub(crate) fn new(
+        policy: EvaluationPolicy,
+        root_identity: u128,
+        dependency_roots: Vec<u128>,
+        typed_hir_fingerprint: u128,
+        fuel_used: u64,
+        peak_memory: u64,
+    ) -> Self {
         Self {
-            tariff_schema: Arc::from("wrela.evaluator.tariff.v1"),
+            tariff_schema: Arc::from("wrela.evaluator.tariff.v2"),
+            policy,
+            root_identity,
+            argument_fingerprint: xxhash_rust::xxh3::xxh3_128(b"wrela.evaluation-arguments\0\x01"),
+            evaluator_eligible: true,
+            dependency_roots: dependency_roots.into(),
             typed_hir_fingerprint,
             fuel_used,
             peak_memory,
@@ -726,6 +1064,31 @@ impl EvaluationReceipt {
     #[must_use]
     pub fn tariff_schema(&self) -> &str {
         &self.tariff_schema
+    }
+
+    #[must_use]
+    pub const fn policy(&self) -> EvaluationPolicy {
+        self.policy
+    }
+
+    #[must_use]
+    pub const fn root_identity(&self) -> u128 {
+        self.root_identity
+    }
+
+    #[must_use]
+    pub const fn argument_fingerprint(&self) -> u128 {
+        self.argument_fingerprint
+    }
+
+    #[must_use]
+    pub const fn evaluator_eligible(&self) -> bool {
+        self.evaluator_eligible
+    }
+
+    #[must_use]
+    pub fn dependency_roots(&self) -> &[u128] {
+        &self.dependency_roots
     }
 
     #[must_use]
@@ -918,6 +1281,8 @@ impl TypeObservation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnershipMode {
     Value,
+    Read,
+    Mut,
     Take,
 }
 
@@ -1033,15 +1398,15 @@ impl InferredErrorObservation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConstructionObservation {
     identity: u128,
-    kind: Arc<str>,
+    kind: ConstructionKind,
     site: SourceRange,
 }
 
 impl ConstructionObservation {
-    pub(crate) fn new(identity: u128, kind: impl Into<Arc<str>>, site: SourceRange) -> Self {
+    pub(crate) const fn new(identity: u128, kind: ConstructionKind, site: SourceRange) -> Self {
         Self {
             identity,
-            kind: kind.into(),
+            kind,
             site,
         }
     }
@@ -1052,14 +1417,20 @@ impl ConstructionObservation {
     }
 
     #[must_use]
-    pub fn kind(&self) -> &str {
-        &self.kind
+    pub const fn kind(&self) -> ConstructionKind {
+        self.kind
     }
 
     #[must_use]
     pub const fn site(&self) -> &SourceRange {
         &self.site
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstructionKind {
+    Image,
+    Test,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1138,6 +1509,10 @@ impl IdentityObservation {
     #[must_use]
     pub const fn fingerprint(&self) -> u128 {
         self.fingerprint
+    }
+
+    pub(crate) fn replace_fingerprint(&mut self, fingerprint: u128) {
+        self.fingerprint = fingerprint;
     }
 }
 
@@ -1308,7 +1683,7 @@ impl Compiler {
             if files.contains_key(file.path()) {
                 diagnostics.push(Diagnostic::new(
                     "project.duplicate_path",
-                    SourceRange::new(file.path(), 0, 0),
+                    SourceRange::new_shared(file.path_arc(), 0, 0),
                     RecoveryAction::None,
                 ));
             } else {
@@ -1317,7 +1692,7 @@ impl Compiler {
             if !valid_module_path(file.path(), true) {
                 diagnostics.push(Diagnostic::new(
                     "project.invalid_module_path",
-                    SourceRange::new(file.path(), 0, 0),
+                    SourceRange::new_shared(file.path_arc(), 0, 0),
                     RecoveryAction::None,
                 ));
             }
@@ -1362,7 +1737,16 @@ impl Compiler {
                 return CompilationOutcome::Cancelled;
             }
             for import in &parsed.imports {
-                if matches!(import.target_path.as_str(), "src/image.wr" | "src/test.wr") {
+                if authenticated_paths.contains(path.as_str())
+                    && !authenticated_paths.contains(import.target_path.as_str())
+                    && files.contains_key(import.target_path.as_str())
+                {
+                    diagnostics.push(Diagnostic::new(
+                        "project.authenticated_imports_project_module",
+                        import.range.clone(),
+                        RecoveryAction::None,
+                    ));
+                } else if matches!(import.target_path.as_str(), "src/image.wr" | "src/test.wr") {
                     diagnostics.push(Diagnostic::new(
                         "project.root_not_importable",
                         import.range.clone(),
@@ -1533,43 +1917,48 @@ impl Compiler {
 }
 
 fn import_cycle(parsed_sources: &BTreeMap<String, syntax::ParsedSource>) -> Option<SourceRange> {
-    fn visit(
-        path: &str,
-        parsed_sources: &BTreeMap<String, syntax::ParsedSource>,
-        visiting: &mut BTreeSet<String>,
-        visited: &mut BTreeSet<String>,
-    ) -> Option<SourceRange> {
-        if visited.contains(path) {
-            return None;
-        }
-        visiting.insert(path.to_owned());
-        let parsed = &parsed_sources[path];
-        let mut imports = parsed.imports.iter().collect::<Vec<_>>();
-        imports.sort_by(|left, right| left.target_path.cmp(&right.target_path));
-        for import in imports {
-            if !parsed_sources.contains_key(import.target_path.as_str()) {
-                continue;
-            }
-            if visiting.contains(&import.target_path) {
-                return Some(import.range.clone());
-            }
-            if let Some(range) = visit(&import.target_path, parsed_sources, visiting, visited) {
-                return Some(range);
-            }
-        }
-        visiting.remove(path);
-        visited.insert(path.to_owned());
-        None
-    }
-
-    let mut visiting = BTreeSet::new();
-    let mut visited = BTreeSet::new();
-    for path in parsed_sources.keys() {
-        if let Some(range) = visit(path, parsed_sources, &mut visiting, &mut visited) {
-            return Some(range);
-        }
-    }
-    None
+    let paths = parsed_sources.keys().cloned().collect::<Vec<_>>();
+    let indexes = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (path.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    let graph = parsed_sources
+        .iter()
+        .map(|(path, parsed)| {
+            (
+                indexes[path.as_str()],
+                parsed
+                    .imports
+                    .iter()
+                    .filter_map(|import| indexes.get(import.target_path.as_str()).copied())
+                    .collect(),
+            )
+        })
+        .collect::<BTreeMap<usize, BTreeSet<usize>>>();
+    let components = crate::graph::strongly_connected_components(&graph);
+    let component_by_path = components
+        .iter()
+        .enumerate()
+        .flat_map(|(index, component)| component.iter().copied().map(move |path| (path, index)))
+        .collect::<BTreeMap<_, _>>();
+    parsed_sources.iter().find_map(|(path, parsed)| {
+        let path_index = indexes[path.as_str()];
+        let component = *component_by_path.get(&path_index)?;
+        let cyclic = components[component].len() > 1
+            || graph
+                .get(&path_index)
+                .is_some_and(|edges| edges.contains(&path_index));
+        cyclic.then(|| {
+            parsed.imports.iter().find_map(|import| {
+                (indexes
+                    .get(import.target_path.as_str())
+                    .and_then(|index| component_by_path.get(index))
+                    == Some(&component))
+                .then(|| import.range.clone())
+            })
+        })?
+    })
 }
 
 fn valid_module_path(path: &str, project: bool) -> bool {

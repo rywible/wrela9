@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Core IR Interface Prototype</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #1f231f;
+      --muted: #697069;
+      --paper: #f2f0e8;
+      --panel: #fffef8;
+      --line: #d8d6ca;
+      --accent: #335f91;
+      --accent-soft: #e1ebf6;
+      --warn: #9c5c28;
+      --bad: #963844;
+      --good: #2f684a;
+      --shadow: 0 12px 38px rgba(35, 41, 36, .08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }
+
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 42px 0 72px;
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { max-width: 900px; font-size: clamp(2rem, 5vw, 4.35rem); line-height: .99; letter-spacing: -.052em; }
+    h2 { font-size: 1.25rem; letter-spacing: -.02em; }
+    h3 { font-size: .95rem; }
+    code { font: .92em ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    .eyebrow {
+      color: var(--accent);
+      font-size: .74rem;
+      font-weight: 800;
+      letter-spacing: .13em;
+      text-transform: uppercase;
+    }
+
+    .lede { max-width: 920px; color: #495149; font-size: 1.05rem; }
+
+    .notice {
+      display: inline-flex;
+      padding: 7px 10px;
+      border: 1px solid #c8a98d;
+      border-radius: 999px;
+      color: #754120;
+      background: #fff3e5;
+      font-size: .78rem;
+      font-weight: 750;
+    }
+
+    .grid { display: grid; gap: 16px; }
+    .candidate-grid { grid-template-columns: repeat(3, 1fr); margin: 28px 0 16px; }
+    .state-grid { grid-template-columns: 1.05fr .95fr; }
+    .detail-grid { grid-template-columns: repeat(4, 1fr); }
+
+    .panel, .candidate {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .panel { padding: 20px; }
+
+    .candidate {
+      cursor: pointer;
+      padding: 18px;
+      text-align: left;
+      transition: border-color .12s ease, transform .12s ease;
+    }
+
+    .candidate:hover { transform: translateY(-2px); }
+    .candidate.selected { border: 2px solid var(--accent); padding: 17px; background: #fbfdff; }
+    .candidate .number { color: var(--accent); font-weight: 850; }
+    .candidate p { color: var(--muted); font-size: .88rem; margin-bottom: 0; }
+
+    .section-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .section-head p { margin: 0; color: var(--muted); font-size: .82rem; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+    button {
+      border: 1px solid #bbc4cd;
+      border-radius: 10px;
+      padding: 9px 12px;
+      color: var(--ink);
+      background: #fff;
+      font: inherit;
+      font-size: .86rem;
+      font-weight: 680;
+      cursor: pointer;
+    }
+
+    button:hover { border-color: var(--accent); }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button.danger { color: var(--bad); border-color: #d8aeb5; }
+    button[disabled] { opacity: .38; cursor: default; }
+
+    .state-list { display: grid; grid-template-columns: 150px 1fr; gap: 9px 14px; margin: 0; }
+    .state-list dt { color: var(--muted); font-size: .8rem; }
+    .state-list dd { margin: 0; font-size: .88rem; font-weight: 650; }
+
+    .pill {
+      display: inline-flex;
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: var(--accent-soft);
+      color: #244d75;
+      font-size: .75rem;
+      font-weight: 760;
+    }
+
+    .event-log {
+      display: grid;
+      gap: 7px;
+      max-height: 375px;
+      overflow: auto;
+      padding-right: 4px;
+    }
+
+    .event {
+      border-left: 3px solid var(--accent);
+      padding: 7px 9px;
+      background: #f4f7fa;
+      font-size: .82rem;
+    }
+
+    .event.rejected { border-left-color: var(--warn); background: #fff7ed; }
+    .empty { color: var(--muted); font-size: .86rem; font-style: italic; }
+
+    .interface {
+      margin: 0;
+      padding: 14px;
+      overflow: auto;
+      border-radius: 11px;
+      background: #1f2730;
+      color: #eff6fd;
+      font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: pre-wrap;
+    }
+
+    .evidence-card {
+      min-height: 172px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px;
+      background: #fafaf5;
+    }
+
+    .evidence-card p { color: var(--muted); font-size: .82rem; }
+    .evidence-card ul { padding-left: 18px; font-size: .8rem; }
+    .evidence-card li + li { margin-top: 5px; }
+
+    .walkthroughs { margin-top: 16px; }
+    .tabs { display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 13px; }
+    .tab.active { background: var(--accent-soft); border-color: var(--accent); }
+    .walkthrough-copy { color: var(--muted); font-size: .88rem; max-width: 820px; }
+    .steps { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .step-marker { color: var(--muted); font-size: .78rem; }
+
+    .recommendation {
+      margin-top: 16px;
+      border: 1px solid #9fb6ce;
+      background: #edf4fb;
+    }
+
+    .recommendation strong { color: #244e78; }
+
+    @media (max-width: 900px) {
+      .candidate-grid, .state-grid, .detail-grid { grid-template-columns: 1fr; }
+      .state-list { grid-template-columns: 125px 1fr; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <p class="eyebrow">Wrela Layer 2 · logic prototype</p>
+  <h1>What should Core IR make authoritative?</h1>
+  <p class="lede">This throwaway demo compares three private Core IR Module interfaces by driving the same ownership, proof, optimization, Panic, provenance, and verification cases through each. Watch what each design treats as truth, what it derives for callers, and what its verifier must independently reconstruct.</p>
+  <span class="notice">Prototype only — do not merge into production</span>
+
+  <section class="candidate-grid grid" id="candidates"></section>
+
+  <section class="panel">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Free play</p>
+        <h2>Push the semantic model</h2>
+      </div>
+      <p>Rejected actions leave the verified meaning unchanged.</p>
+    </div>
+    <div class="actions" id="actions"></div>
+  </section>
+
+  <section class="state-grid grid" style="margin-top:16px">
+    <article class="panel">
+      <div class="section-head">
+        <h2>Current Core state</h2>
+        <span class="pill" id="verdict">Awaiting derivation</span>
+      </div>
+      <dl class="state-list" id="state"></dl>
+    </article>
+    <article class="panel">
+      <div class="section-head">
+        <h2>Semantic observations</h2>
+        <p>Stable identity and provenance, never incidental indexes</p>
+      </div>
+      <div class="event-log" id="events"></div>
+    </article>
+  </section>
+
+  <section class="panel" style="margin-top:16px">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Selected interface</p>
+        <h2 id="candidate-title"></h2>
+      </div>
+      <p id="candidate-authority"></p>
+    </div>
+    <pre class="interface" id="interface"></pre>
+    <div class="detail-grid grid" id="details" style="margin-top:16px"></div>
+  </section>
+
+  <section class="panel walkthroughs">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Guided walkthroughs</p>
+        <h2>Awkward cases that decide the interface</h2>
+      </div>
+    </div>
+    <div class="tabs" id="tabs"></div>
+    <p class="walkthrough-copy" id="walkthrough-copy"></p>
+    <div class="steps" id="steps"></div>
+  </section>
+
+  <section class="panel recommendation">
+    <p class="eyebrow">Validated decision</p>
+    <h2>One-shot Interface, operation-graph authority, purpose-owned projections</h2>
+    <p><strong>Combine the strongest parts instead of selecting a proposal unchanged.</strong> Keep one private <code>derive</code> operation and one opaque <code>VerifiedCoreProgram</code>. Inside the Module, make the closed typed operation graph plus its centralized operation-law catalog authoritative. Keep proof and rewrite evidence explicit enough for independent verification, but keep pass orchestration and intermediate revisions private. Derive the function/region catalog, Flow input, ownership and capacity requirements, backend input, inspection, and receipt as purpose-owned projections. <code>ImagePlan</code> remains the final whole-Image admission authority.</p>
+  </section>
+</main>
+
+<script>
+const CorePrototype = (() => {
+  const initial = () => ({
+    phase: "Not derived",
+    specialization: "inventory[Item; scratch]",
+    sourceType: "Result[own[scratch] Item, PoolFull[Item]]",
+    operation: "try_allocate with checked Full path",
+    custody: "item → local submitted_value",
+    cleanup: "None registered",
+    exit: "Open",
+    effects: "Pool mutation; recoverable PoolFull",
+    proof: "No range proof",
+    capacity: "Requirement not emitted",
+    transformations: [],
+    evaluator: "Not compared",
+    fingerprintOrder: "canonical A → B",
+    fingerprint: "—",
+    verified: false,
+    events: []
+  });
+
+  const observe = (state, kind, text, rejected = false) => ({
+    ...state,
+    events: [...state.events, { sequence: state.events.length + 1, kind, text, rejected }]
+  });
+
+  const reject = (state, text) => observe(state, "Action rejected", text, true);
+  const requireDerived = state => state.phase === "Derived" || state.phase === "Verified";
+
+  function reduce(state, action) {
+    if (action.type === "RESET") return initial();
+
+    switch (action.type) {
+      case "DERIVE":
+        if (requireDerived(state)) return reject(state, "Core has already been derived from this completed semantic input.");
+        return observe({ ...state, phase: "Derived", capacity: "Pool scratch: one simultaneous live allocation", fingerprint: "core:v1:7d43…" }, "Core derived", "The exact reachable specialization became typed target-neutral operations with stable provenance.");
+      case "PROVE_RANGE":
+        if (!requireDerived(state)) return reject(state, "Derive Core before recording a proof.");
+        if (state.proof !== "No range proof") return reject(state, "The same range fact is already in the proof ledger.");
+        return observe({ ...state, proof: "index < length, justified by loop domain" }, "Proof recorded", "The proof cites stable operations, its assumptions, and the operation-law schema.");
+      case "ELIDE_BOUNDS":
+        if (!requireDerived(state)) return reject(state, "Derive Core before applying a rewrite.");
+        if (state.proof === "No range proof") return reject(state, "A checked bounds operation cannot disappear without a verified proof.");
+        if (state.transformations.includes("bounds check elided")) return reject(state, "The bounds check is already represented by its proven form.");
+        return observe({ ...state, transformations: [...state.transformations, "bounds check elided"] }, "Proof-backed rewrite", "The runtime branch was removed; Panic behavior and source site remain reconstructible from evidence.");
+      case "MOVE_RESOURCE":
+        if (!requireDerived(state)) return reject(state, "Derive Core before exercising ownership flow.");
+        if (state.custody.includes("moved")) return reject(state, "The submitted Resource has already moved and its old place is uninitialized.");
+        return observe({ ...state, custody: "submitted_value moved → Pool slot; old place uninitialized" }, "Resource moved", "One explicit ownership edge transferred custody without copying.");
+      case "DUPLICATE_RESOURCE":
+        if (!requireDerived(state)) return reject(state, "Derive Core before exercising ownership flow.");
+        return reject(state, "The verifier rejects two live custodians for one Resource identity.");
+      case "REGISTER_CLEANUP":
+        if (!requireDerived(state)) return reject(state, "Derive Core before registering cleanup.");
+        if (state.cleanup !== "None registered") return reject(state, "Cleanup is already registered for this obligation.");
+        return observe({ ...state, cleanup: "reclaim slot on recoverable exit" }, "Cleanup registered", "The obligation is ordered and tied to Resource custody.");
+      case "RETURN":
+        if (!requireDerived(state)) return reject(state, "Derive Core before taking an exit.");
+        if (state.exit !== "Open") return reject(state, "This path is already terminal.");
+        return observe({ ...state, exit: "Recoverable return", cleanup: state.cleanup === "None registered" ? "No cleanup required" : "Executed: reclaim slot" }, "Recoverable exit", "Registered cleanup ran in defined reverse order before the Result returned.");
+      case "PANIC":
+        if (!requireDerived(state)) return reject(state, "Derive Core before taking an exit.");
+        if (state.exit !== "Open") return reject(state, "This path is already terminal.");
+        return observe({ ...state, exit: "Terminal Panic", cleanup: state.cleanup === "None registered" ? "No cleanup" : "Registered but not executed" }, "Panic", "The complete Image terminates; no source cleanup or recoverable outcome is fabricated.");
+      case "FOLD_PURE":
+        if (!requireDerived(state)) return reject(state, "Derive Core before optimizing.");
+        if (state.transformations.includes("pure branch folded")) return reject(state, "The pure branch is already folded.");
+        return observe({ ...state, transformations: [...state.transformations, "pure branch folded"] }, "Effect-aware fold", "Only a proven pure region folded; Pool mutation and failure order stayed fixed.");
+      case "CHANGE_SOURCE_TYPE":
+        if (!requireDerived(state)) return reject(state, "Derive Core before proposing a rewrite.");
+        return reject(state, "Capacity success may erase a runtime branch, but it cannot change the source-visible Result type.");
+      case "REORDER_INPUT": {
+        if (!requireDerived(state)) return reject(state, "Derive Core before checking determinism.");
+        const nextOrder = state.fingerprintOrder === "canonical A → B" ? "observed B → A; canonicalized A → B" : "canonical A → B";
+        return observe({ ...state, fingerprintOrder: nextOrder, fingerprint: "core:v1:7d43…" }, "Canonical reorder", "Incidental discovery order changed; stable identities, sorted structure, and the fingerprint did not.");
+      }
+      case "COMPARE":
+        if (!requireDerived(state)) return reject(state, "Derive Core before differential evaluation.");
+        return observe({ ...state, evaluator: "Equivalent value / Panic site / failure order" }, "Differential evidence", "Typed HIR and optimized Core agree on value, effect order, ownership outcome, and specialized Panic provenance.");
+      case "VERIFY":
+        if (!requireDerived(state)) return reject(state, "There is no Core artifact to verify.");
+        if (state.verified) return reject(state, "This immutable artifact already carries its verifier marker.");
+        return observe({ ...state, phase: "Verified", verified: true, fingerprint: "core:v1:7d43…" }, "Artifact verified", "An independent traversal reconstructed operation laws, typing, control, ownership, proof applicability, effects, order, provenance, and receipts.");
+      default:
+        return reject(state, "Unknown action.");
+    }
+  }
+
+  return { initial, reduce };
+})();
+
+const candidates = {
+  minimal: {
+    number: "01",
+    title: "One-shot program bundle",
+    short: "One derivation operation hides every pass and returns one opaque verified program with narrow projections.",
+    authority: "Authority: completed program bundle",
+    interface: `core::derive(CoreInputs, Cancellation)\n  -> CoreOutcome<VerifiedCoreProgram>\n\nVerifiedCoreProgram\n  .regions()\n  .requirements()\n  .inspection()\n  .receipt()`,
+    cards: [
+      ["Caller learns", ["One private operation", "One immutable result", "No pass ordering or verifier runner"]],
+      ["Implementation hides", ["Lowering and specialization", "Proof search and rewrites", "Canonicalization and independent verification"]],
+      ["High leverage", ["Smallest Interface", "Strongest Locality", "Invalid intermediate states never cross the Seam"]],
+      ["Pressure point", ["Bundle can become a bag of sibling authorities", "Purpose projections need explicit ownership"]]
+    ]
+  },
+  graph: {
+    number: "02",
+    title: "Proof-bearing operation graph",
+    short: "Closed typed operations, law references, ownership edges, and checked rewrite evidence are the explicit artifact.",
+    authority: "Authority: typed operations and proof edges",
+    interface: `core::construct(CoreInputs) -> CoreDraft\nCoreDraft::rewrite(Proof) -> CoreRevision\ncore::verify(CoreRevision)\n  -> CoreOutcome<VerifiedOperationGraph>\n\nVerifiedOperationGraph::project(CorePurpose)`,
+    cards: [
+      ["Caller learns", ["Draft/revision lifecycle", "Proof and rewrite protocol", "General projection purpose"]],
+      ["Implementation hides", ["Operation-law implementation", "Verifier traversal", "Canonical serialization"]],
+      ["High leverage", ["Excellent auditability", "Strong proof provenance", "Differential stages are explicit"]],
+      ["Pressure point", ["A shallow public pipeline", "Callers can coordinate invalid order", "Graph-walking leaks representation"]]
+    ]
+  },
+  catalog: {
+    number: "03",
+    title: "Function and region catalog",
+    short: "Flow and backend callers receive ready-to-consume specialized functions, regions, demands, and generated roles.",
+    authority: "Authority: callable function/region records",
+    interface: `core::plan_catalog(CoreInputs, Cancellation)\n  -> CoreOutcome<VerifiedCoreCatalog>\n\nVerifiedCoreCatalog\n  .function(SpecializationId)\n  .generated(GeneratedCoreId)\n  .flow_regions()\n  .ownership_demands()\n  .receipt()`,
+    cards: [
+      ["Caller learns", ["Stable specialization lookup", "Ready Flow regions", "Ready backend functions"]],
+      ["Implementation hides", ["Whole-program optimization", "Proof and law machinery", "Catalog construction"]],
+      ["High leverage", ["Common caller is trivial", "No downstream graph interpretation", "Purpose-specific iteration"]],
+      ["Pressure point", ["Catalog records may duplicate semantic truth", "Cross-function laws become harder to locate"]]
+    ]
+  }
+};
+
+const actions = [
+  ["Reset", "RESET", "primary"], ["Derive Core", "DERIVE"], ["Prove index range", "PROVE_RANGE"],
+  ["Elide bounds check", "ELIDE_BOUNDS"], ["Move Resource", "MOVE_RESOURCE"],
+  ["Attempt duplicate", "DUPLICATE_RESOURCE", "danger"], ["Register cleanup", "REGISTER_CLEANUP"],
+  ["Recoverable return", "RETURN"], ["Panic", "PANIC", "danger"], ["Fold pure branch", "FOLD_PURE"],
+  ["Change source type", "CHANGE_SOURCE_TYPE", "danger"], ["Reorder discovery", "REORDER_INPUT"],
+  ["Compare evaluator", "COMPARE"], ["Verify and seal", "VERIFY"]
+];
+
+const walkthroughs = [
+  {
+    title: "Proof-backed rewrite",
+    copy: "A checked operation may disappear only when the verifier can reconstruct the proof and the exact law that licenses the rewrite.",
+    steps: [["Derive", "DERIVE"], ["Try too early", "ELIDE_BOUNDS"], ["Record proof", "PROVE_RANGE"], ["Elide check", "ELIDE_BOUNDS"], ["Verify", "VERIFY"]]
+  },
+  {
+    title: "Linear Resource",
+    copy: "A Resource move must leave one custodian and one uninitialized source. A second use is a verifier failure, not an optimizer preference.",
+    steps: [["Derive", "DERIVE"], ["Move Resource", "MOVE_RESOURCE"], ["Try to duplicate", "DUPLICATE_RESOURCE"], ["Verify", "VERIFY"]]
+  },
+  {
+    title: "Cleanup vs Panic",
+    copy: "Recoverable exits honor registered cleanup. Panic terminates the Image without pretending that source cleanup ran.",
+    steps: [["Derive", "DERIVE"], ["Register cleanup", "REGISTER_CLEANUP"], ["Return", "RETURN"], ["Reset", "RESET"], ["Derive again", "DERIVE"], ["Register cleanup", "REGISTER_CLEANUP"], ["Panic", "PANIC"]]
+  },
+  {
+    title: "Capacity and type",
+    copy: "Whole-Image evidence may remove a runtime failure branch, but the source-visible Result remains stable. ImagePlan still decides final admission.",
+    steps: [["Derive", "DERIVE"], ["Try to change type", "CHANGE_SOURCE_TYPE"], ["Fold a pure branch", "FOLD_PURE"], ["Verify", "VERIFY"]]
+  },
+  {
+    title: "Deterministic evidence",
+    copy: "Incidental discovery order must not change the artifact fingerprint, and optimized Core must match the Typed HIR evaluator's observable semantics.",
+    steps: [["Derive", "DERIVE"], ["Reorder discovery", "REORDER_INPUT"], ["Compare evaluators", "COMPARE"], ["Verify", "VERIFY"]]
+  }
+];
+
+let state = CorePrototype.initial();
+let selected = "minimal";
+let activeWalkthrough = 0;
+let walkthroughStep = 0;
+
+const $ = id => document.getElementById(id);
+
+function dispatch(type) {
+  state = CorePrototype.reduce(state, { type });
+  render();
+}
+
+function selectCandidate(key) {
+  selected = key;
+  render();
+}
+
+function startWalkthrough(index) {
+  activeWalkthrough = index;
+  walkthroughStep = 0;
+  state = CorePrototype.initial();
+  render();
+}
+
+function runWalkthroughStep(index) {
+  const step = walkthroughs[activeWalkthrough].steps[index];
+  state = CorePrototype.reduce(state, { type: step[1] });
+  walkthroughStep = Math.max(walkthroughStep, index + 1);
+  render();
+}
+
+function artifactEvidence(event) {
+  if (!event) return ["No semantic event yet."];
+  if (selected === "minimal") return [`Program observation: ${event.kind}`, "Private operation/proof graph updated", "Purpose projections stay mutually consistent"];
+  if (selected === "graph") return [`Graph node or rewrite: ${event.kind}`, "Law and premise edges recorded", "New immutable revision requires verification"];
+  return [`Catalog consequence: ${event.kind}`, "Affected function/region record refreshed", "Flow/backend views must correspond to one authority"];
+}
+
+function renderCandidates() {
+  $("candidates").innerHTML = Object.entries(candidates).map(([key, candidate]) => `
+    <button class="candidate ${selected === key ? "selected" : ""}" onclick="selectCandidate('${key}')">
+      <span class="number">${candidate.number}</span>
+      <h2>${candidate.title}</h2>
+      <p>${candidate.short}</p>
+    </button>`).join("");
+}
+
+function renderActions() {
+  $("actions").innerHTML = actions.map(([label, type, cls = ""]) => `<button class="${cls}" onclick="dispatch('${type}')">${label}</button>`).join("");
+}
+
+function renderState() {
+  const rows = [
+    ["Artifact", state.phase], ["Specialization", state.specialization], ["Source-visible type", state.sourceType],
+    ["Operation", state.operation], ["Resource custody", state.custody], ["Cleanup", state.cleanup],
+    ["Exit", state.exit], ["Effects", state.effects], ["Local proof", state.proof],
+    ["Image requirement", state.capacity], ["Transforms", state.transformations.length ? state.transformations.join("; ") : "None"],
+    ["Differential result", state.evaluator], ["Fingerprint input", state.fingerprintOrder], ["Fingerprint", state.fingerprint]
+  ];
+  $("state").innerHTML = rows.map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("");
+  $("verdict").textContent = state.exit === "Terminal Panic" ? "Terminal Panic path" : state.verified ? "Verified immutable artifact" : state.phase;
+  $("verdict").style.background = state.exit === "Terminal Panic" ? "#f5dfe2" : state.verified ? "#deefe5" : "var(--accent-soft)";
+  $("verdict").style.color = state.exit === "Terminal Panic" ? "var(--bad)" : state.verified ? "var(--good)" : "#244d75";
+}
+
+function renderEvents() {
+  $("events").innerHTML = state.events.length ? [...state.events].reverse().map(event => `
+    <div class="event ${event.rejected ? "rejected" : ""}">
+      <strong>${event.sequence}. ${event.kind}</strong><br>${event.text}
+    </div>`).join("") : `<p class="empty">Choose an action or start a walkthrough.</p>`;
+}
+
+function renderInterface() {
+  const candidate = candidates[selected];
+  $("candidate-title").textContent = candidate.title;
+  $("candidate-authority").textContent = candidate.authority;
+  $("interface").textContent = candidate.interface;
+  const last = state.events[state.events.length - 1];
+  const cards = [...candidate.cards, ["Latest representation", artifactEvidence(last)]];
+  $("details").innerHTML = cards.map(([title, items]) => `<div class="evidence-card"><h3>${title}</h3><ul>${items.map(item => `<li>${item}</li>`).join("")}</ul></div>`).join("");
+}
+
+function renderWalkthroughs() {
+  $("tabs").innerHTML = walkthroughs.map((walkthrough, index) => `<button class="tab ${index === activeWalkthrough ? "active" : ""}" onclick="startWalkthrough(${index})">${walkthrough.title}</button>`).join("");
+  const walkthrough = walkthroughs[activeWalkthrough];
+  $("walkthrough-copy").textContent = walkthrough.copy;
+  $("steps").innerHTML = walkthrough.steps.map(([label], index) => `<button class="${index === walkthroughStep ? "primary" : ""}" ${index > walkthroughStep ? "disabled" : ""} onclick="runWalkthroughStep(${index})">${index + 1}. ${label}</button>`).join("") + `<span class="step-marker">${walkthroughStep}/${walkthrough.steps.length} steps explored</span>`;
+}
+
+function render() {
+  renderCandidates();
+  renderActions();
+  renderState();
+  renderEvents();
+  renderInterface();
+  renderWalkthroughs();
+}
+
+render();
+</script>
+</body>
+</html>

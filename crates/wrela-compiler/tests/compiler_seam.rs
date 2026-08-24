@@ -1,8 +1,77 @@
 use wrela_compiler::{
     Cancellation, CanonicalValue, CompilationOutcome, CompilationRequest, Compiler,
     CompilerInstallation, EvaluationOutcome, IdentityDomain, InspectSelection, OpenError,
-    ProjectFile, ProjectSnapshot, Root, SyntaxElementKind, SyntaxNodeKind, SyntaxTokenKind,
+    ProjectFile, ProjectSnapshot, ResolutionKind, Root, SyntaxElementKind, SyntaxNodeKind,
+    SyntaxTokenKind,
 };
+
+#[test]
+fn resolution_inspection_exposes_resolved_calls_and_references() {
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let source = br#"pure fn add(left: i64, right: i64) -> i64:
+    return left + right
+
+const ANSWER: i64 = add(40, 2)
+
+@image
+fn build() -> Image:
+    return Image.new(answer=ANSWER)
+"#;
+    let request = CompilationRequest::new(
+        ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+        Root::Image,
+    )
+    .with_inspection(InspectSelection::all());
+    let CompilationOutcome::Accepted(accepted) = compiler.compile(request, &Cancellation::new())
+    else {
+        panic!("resolution inspection requires an accepted semantic revision");
+    };
+
+    let add = accepted
+        .inspection()
+        .identities()
+        .iter()
+        .find(|identity| {
+            identity.domain() == IdentityDomain::Definition && identity.name() == "add"
+        })
+        .expect("add identity");
+    let answer = accepted
+        .inspection()
+        .identities()
+        .iter()
+        .find(|identity| {
+            identity.domain() == IdentityDomain::Definition && identity.name() == "ANSWER"
+        })
+        .expect("ANSWER identity");
+    assert!(
+        accepted
+            .inspection()
+            .resolutions()
+            .iter()
+            .any(|resolution| {
+                resolution.kind() == ResolutionKind::Call
+                    && resolution.target_domain() == IdentityDomain::Definition
+                    && resolution.target_identity() == add.digest()
+                    && &source
+                        [resolution.range().start() as usize..resolution.range().end() as usize]
+                        == b"add(40, 2)"
+            })
+    );
+    assert!(
+        accepted
+            .inspection()
+            .resolutions()
+            .iter()
+            .any(|resolution| {
+                resolution.kind() == ResolutionKind::Reference
+                    && resolution.target_domain() == IdentityDomain::Definition
+                    && resolution.target_identity() == answer.digest()
+                    && &source
+                        [resolution.range().start() as usize..resolution.range().end() as usize]
+                        == b"ANSWER"
+            })
+    );
+}
 
 #[test]
 fn valid_image_is_accepted_without_losing_source_bytes() {

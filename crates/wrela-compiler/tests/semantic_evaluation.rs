@@ -1583,6 +1583,137 @@ fn build() -> Image:
 }
 
 #[test]
+fn comptime_callable_selection_is_owned_by_each_concrete_specialization() {
+    let source = br#"pure fn selected[const N: u64](values: [i64; N]) -> i64:
+    comptime if N == 1u64:
+        return values[0]
+    else:
+        return values[1]
+
+const ONE: i64 = selected([7])
+const TWO: i64 = selected([7, 9])
+
+@image
+fn build() -> Image:
+    return Image.new(one=ONE, two=TWO)
+"#;
+
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("each Specialization must evaluate its own compile-time branch: {outcome:#?}");
+    };
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.ONE"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 7
+            )
+    }));
+    assert!(accepted.inspection().evaluations().iter().any(|evaluation| {
+        evaluation.root() == "image.TWO"
+            && matches!(
+                evaluation.outcome(),
+                EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. }) if *value == 9
+            )
+    }));
+}
+
+#[test]
+fn comptime_member_selection_is_owned_by_each_applied_nominal_type() {
+    let source = br#"struct Bucket[const N: u64]:
+    values: [i64; N]
+    pure fn selected(read self) -> i64:
+        comptime if N == 1u64:
+            return self.values[0]
+        else:
+            return self.values[1]
+
+pure fn one() -> i64:
+    bucket = Bucket(values=[7])
+    return bucket.selected()
+
+pure fn two() -> i64:
+    bucket = Bucket(values=[7, 9])
+    return bucket.selected()
+
+const ONE: i64 = one()
+const TWO: i64 = two()
+
+@image
+fn build() -> Image:
+    return Image.new(one=ONE, two=TWO)
+"#;
+
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("each applied nominal Type must select its member body independently: {outcome:#?}");
+    };
+    for (root, expected) in [("image.ONE", 7), ("image.TWO", 9)] {
+        assert!(
+            accepted
+                .inspection()
+                .evaluations()
+                .iter()
+                .any(|evaluation| {
+                    evaluation.root() == root
+                        && matches!(
+                            evaluation.outcome(),
+                            EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. })
+                                if *value == expected
+                        )
+                })
+        );
+    }
+}
+
+#[test]
+fn comptime_member_declarations_are_selected_per_applied_nominal_type() {
+    let source = br#"struct Bucket[const N: u64]:
+    comptime if N == 1u64:
+        value: i64
+    else:
+        other: i64
+
+const ONE: Bucket[1] = Bucket(value=7)
+const TWO: Bucket[2] = Bucket(other=9)
+
+pure fn one(bucket: Bucket[1]) -> i64:
+    return bucket.value
+
+pure fn two(bucket: Bucket[2]) -> i64:
+    return bucket.other
+
+const ONE_VALUE: i64 = one(ONE)
+const TWO_VALUE: i64 = two(TWO)
+
+@image
+fn build() -> Image:
+    return Image.new(one=ONE_VALUE, two=TWO_VALUE)
+"#;
+
+    let outcome = compile(source);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("each applied TypeId must own its selected member declarations: {outcome:#?}");
+    };
+    for (root, expected) in [("image.ONE_VALUE", 7), ("image.TWO_VALUE", 9)] {
+        assert!(
+            accepted
+                .inspection()
+                .evaluations()
+                .iter()
+                .any(|evaluation| {
+                    evaluation.root() == root
+                        && matches!(
+                            evaluation.outcome(),
+                            EvaluationOutcome::Completed(CanonicalValue::Integer { value, .. })
+                                if *value == expected
+                        )
+                })
+        );
+    }
+}
+
+#[test]
 fn public_signature_cannot_expose_a_private_nominal_type() {
     let source = br#"struct Secret:
     value: i64
@@ -1866,12 +1997,33 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = compile(source) else {
         panic!("conflicting errors must reject");
     };
-    assert!(
-        rejected
-            .diagnostics()
-            .iter()
-            .any(|diagnostic| diagnostic.code() == "semantic.conflicting_inferred_errors")
-    );
+    let diagnostic = rejected
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.code() == "semantic.conflicting_inferred_errors")
+        .expect("conflicting inference diagnostic");
+    let contribution_ranges = diagnostic
+        .labels()
+        .iter()
+        .filter(|label| label.role() == "propagation_source")
+        .map(|label| &source[label.range().start() as usize..label.range().end() as usize])
+        .collect::<Vec<_>>();
+    assert!(contribution_ranges.iter().any(|range| {
+        range
+            .windows(b"ReadError.Missing".len())
+            .any(|window| window == b"ReadError.Missing")
+    }));
+    assert!(contribution_ranges.iter().any(|range| {
+        range
+            .windows(b"ParseError.Invalid".len())
+            .any(|window| window == b"ParseError.Invalid")
+    }));
+    assert!(has_text_parameter(
+        diagnostic,
+        "repair",
+        "explicit_error_annotation"
+    ));
+    assert!(has_text_parameter(diagnostic, "conversion", "map_error"));
 }
 
 #[test]

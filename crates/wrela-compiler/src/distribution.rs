@@ -55,7 +55,10 @@ impl CompilerDistribution {
         let mut parsed = BTreeMap::new();
         let cancellation = Cancellation::new();
         for module in &*installation.authenticated_modules {
-            if !super::compiler::valid_module_path(module.path(), false) {
+            if !crate::project_closure::valid_module_path(
+                module.path(),
+                crate::project_closure::ModuleOrigin::Authenticated,
+            ) {
                 return Err(OpenError::InvalidAuthenticatedModulePath {
                     path: module.path_arc().clone(),
                 });
@@ -84,8 +87,8 @@ impl CompilerDistribution {
                 }
             }
         }
-        if let Some(path) = authenticated_import_cycle(&parsed) {
-            return Err(OpenError::AuthenticatedImportCycle { path });
+        if let Some(cycle) = crate::project_closure::first_import_cycle(&parsed) {
+            return Err(OpenError::AuthenticatedImportCycle { path: cycle.path });
         }
 
         let files = installation
@@ -108,7 +111,7 @@ impl CompilerDistribution {
             };
         let build_authority = authenticated_build_authority(&parsed, &identities);
         let pool_authority = authenticated_pool_authority(&parsed, &identities);
-        let analysis = semantic::analyze(
+        let revision = semantic::analyze(
             &parsed,
             &files,
             &mut identities,
@@ -117,13 +120,19 @@ impl CompilerDistribution {
             false,
             AuthorityContext::new(&build_authority, &pool_authority),
         );
-        if let Some(defect) = analysis.defect {
-            return Err(OpenError::AuthenticatedModuleDefect {
-                phase: Arc::from(defect.phase()),
-                evidence: Arc::from(defect.evidence()),
-            });
-        }
-        if let Some(diagnostic) = analysis.diagnostics.first() {
+        let (diagnostics, _) = match revision.finalize(false, false, false, false) {
+            Ok(revision) => revision,
+            Err(semantic::SemanticFailure::Defect(defect)) => {
+                return Err(OpenError::AuthenticatedModuleDefect {
+                    phase: Arc::from(defect.phase()),
+                    evidence: Arc::from(defect.evidence()),
+                });
+            }
+            Err(semantic::SemanticFailure::Cancelled) => {
+                unreachable!("fresh cancellation is not cancelled")
+            }
+        };
+        if let Some(diagnostic) = diagnostics.first() {
             return Err(OpenError::InvalidAuthenticatedModule {
                 path: Arc::from(diagnostic.primary().path()),
                 code: Arc::from(diagnostic.code()),
@@ -305,39 +314,6 @@ fn build_signature_matches(
         }
         BuildKind::Node { .. } => named(return_type, owner_name),
     }
-}
-
-fn authenticated_import_cycle(parsed: &BTreeMap<String, syntax::ParsedSource>) -> Option<Arc<str>> {
-    let paths = parsed.keys().map(String::as_str).collect::<Vec<_>>();
-    let indexes = paths
-        .iter()
-        .enumerate()
-        .map(|(index, path)| (*path, index))
-        .collect::<BTreeMap<_, _>>();
-    let graph = parsed
-        .iter()
-        .map(|(path, source)| {
-            (
-                indexes[path.as_str()],
-                source
-                    .imports
-                    .iter()
-                    .filter_map(|import| indexes.get(import.target_path.as_str()).copied())
-                    .collect(),
-            )
-        })
-        .collect::<BTreeMap<usize, BTreeSet<usize>>>();
-    crate::graph::strongly_connected_components(&graph)
-        .into_iter()
-        .filter(|component| {
-            component.len() > 1
-                || component
-                    .first()
-                    .is_some_and(|node| graph.get(node).is_some_and(|edges| edges.contains(node)))
-        })
-        .flat_map(|component| component.into_iter())
-        .min()
-        .map(|index| Arc::from(paths[index]))
 }
 
 fn role_for(path: &str) -> ModuleRole {

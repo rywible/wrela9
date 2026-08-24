@@ -13,7 +13,7 @@ use crate::typed_hir::{
 
 #[derive(Clone, Debug, Default)]
 struct FlowFacts {
-    direct_errors: BTreeSet<Type>,
+    direct_errors: BTreeMap<Type, BTreeSet<crate::compiler::SourceRange>>,
     dependencies: BTreeSet<SpecializationId>,
     propagated: BTreeSet<SpecializationId>,
     propagated_errors: BTreeMap<crate::compiler::SourceRange, Type>,
@@ -265,7 +265,11 @@ pub(crate) fn analyze(
     let mut errors = candidates
         .iter()
         .map(|id| {
-            let mut errors = facts[id].direct_errors.clone();
+            let mut errors = facts[id]
+                .direct_errors
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
             errors.extend(facts[id].propagated_errors.values().cloned());
             (*id, errors)
         })
@@ -319,7 +323,7 @@ pub(crate) fn analyze(
                 set.first().expect("one inferred error").display(),
             ));
         } else {
-            diagnostics.push(Diagnostic::new(
+            let mut diagnostic = Diagnostic::new(
                 if set.is_empty() {
                     "semantic.unconstrained_inferred_error"
                 } else {
@@ -327,7 +331,28 @@ pub(crate) fn analyze(
                 },
                 function.source.clone(),
                 RecoveryAction::None,
-            ));
+            )
+            .with_parameter("repair", "explicit_error_annotation")
+            .with_parameter("conversion", "map_error");
+            for type_ in set {
+                for site in facts[id]
+                    .direct_errors
+                    .get(type_)
+                    .into_iter()
+                    .flatten()
+                    .chain(
+                        facts[id]
+                            .propagated_errors
+                            .iter()
+                            .filter_map(|(site, error)| (error == type_).then_some(site)),
+                    )
+                    .take(8)
+                {
+                    diagnostic =
+                        diagnostic.with_label(site.clone(), DiagnosticLabelRole::PropagationSource);
+                }
+            }
+            diagnostics.push(diagnostic);
         }
     }
 
@@ -480,7 +505,11 @@ fn walk_expression(expression: &Expression, facts: &mut FlowFacts) {
                 CallTarget::BuiltinVariant(BuiltinVariant::ResultErr)
             ) && let Some(error) = arguments.first()
             {
-                facts.direct_errors.insert(error.type_.clone());
+                facts
+                    .direct_errors
+                    .entry(error.type_.clone())
+                    .or_default()
+                    .insert(expression.source.clone());
             }
         }
         ExpressionKind::Propagate(value) => {

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -12,8 +13,8 @@ use crate::model::{
     resolve_builtin_type, resolve_builtin_variant,
 };
 use crate::syntax::{
-    BinaryOperatorSyntax, ExpressionSyntax, ExpressionSyntaxKind, MatchCaseSyntax, NameSyntax,
-    OwnershipSyntax, PatternSyntaxKind, PlaceProjectionSyntax, PlaceSyntax, StatementSyntax,
+    BinaryOperatorSyntax, ExpressionSyntax, ExpressionSyntaxKind, NameSyntax, OwnershipSyntax,
+    PatternSyntaxKind, PlaceProjectionSyntax, PlaceSyntax, StatementSyntax,
 };
 use crate::type_semantics::{
     CallError, CallableParameter, CallableSignature, LabelMode, can_initialize, can_pass,
@@ -178,6 +179,7 @@ pub(crate) struct ResolvedFunction {
     pub(crate) name: String,
     pub(crate) modifier: crate::syntax::FunctionModifier,
     pub(crate) type_parameters: Arc<[crate::model::TypeParameterId]>,
+    pub(crate) generic_parameter_names: Arc<[String]>,
     pub(crate) generic_constraints: Arc<[GenericConstraint]>,
     pub(crate) parameters: Vec<ResolvedParameter>,
     pub(crate) return_type: Type,
@@ -222,8 +224,24 @@ pub(crate) struct ResolvedStruct {
     pub(crate) display: Arc<str>,
     pub(crate) resource: bool,
     pub(crate) type_parameters: Vec<crate::model::TypeParameterId>,
+    pub(crate) generic_parameter_names: Arc<[String]>,
     pub(crate) generic_constraints: Arc<[GenericConstraint]>,
     pub(crate) fields: Vec<ResolvedField>,
+    pub(crate) field_selections: Arc<[ResolvedFieldSelection]>,
+    pub(crate) applied_fields: AppliedFieldTable,
+}
+
+type AppliedFieldTable = RefCell<BTreeMap<Arc<[Type]>, Arc<[ResolvedField]>>>;
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedFieldSelection {
+    pub(crate) branches: Arc<[ResolvedFieldBranch]>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedFieldBranch {
+    pub(crate) condition: Option<ExpressionSyntax>,
+    pub(crate) fields: Arc<[ResolvedField]>,
 }
 
 #[derive(Clone, Debug)]
@@ -784,6 +802,7 @@ pub(crate) enum CreatorFailureKind {
     AwaitRequiresAsync,
     ExpectRequiresBool,
     TestApplicationOutsideCases,
+    InvalidComptimeExpression,
     UnsupportedLayerOneSyntax,
     InvalidMatchPattern,
     NonExhaustiveMatch,
@@ -827,6 +846,7 @@ impl CreatorFailureKind {
             Self::AwaitRequiresAsync => "semantic.await_requires_async",
             Self::ExpectRequiresBool => "semantic.expect_requires_bool",
             Self::TestApplicationOutsideCases => "semantic.test_application_outside_cases",
+            Self::InvalidComptimeExpression => "semantic.invalid_comptime_expression",
             Self::UnsupportedLayerOneSyntax => "semantic.unsupported_layer_one_syntax",
             Self::InvalidMatchPattern => "semantic.invalid_match_pattern",
             Self::NonExhaustiveMatch => "semantic.non_exhaustive_match",
@@ -1108,7 +1128,7 @@ pub(crate) fn verify(
             },
             function.type_parameters.is_empty(),
         );
-        lowerer.set_generic_context(function);
+        lowerer.set_generic_context(function, None);
         let mut parameters = Vec::new();
         for parameter in &function.parameters {
             let local = lowerer.bind_parameter(
@@ -1387,11 +1407,34 @@ pub(crate) fn verify_comptime_condition(
     identity_catalog: &mut IdentityCatalog,
     cancellation: &Cancellation,
 ) -> Result<(VerifiedProgram, Expression), VerificationFailure> {
+    verify_comptime_condition_with_values(
+        input,
+        module,
+        condition,
+        build_authority,
+        pool_authority,
+        identity_catalog,
+        cancellation,
+        &BTreeMap::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_comptime_condition_with_values(
+    input: &ProgramInput,
+    module: ModuleId,
+    condition: &ExpressionSyntax,
+    build_authority: &BuildAuthority,
+    pool_authority: &PoolAuthority,
+    identity_catalog: &mut IdentityCatalog,
+    cancellation: &Cancellation,
+    generic_const_values: &BTreeMap<String, (IntegerType, u64)>,
+) -> Result<(VerifiedProgram, Expression), VerificationFailure> {
     validate_input(input)?;
     intern_input_types(input, identity_catalog)?;
     let mut specializations = BTreeMap::new();
     let mut pending_specializations = BTreeSet::new();
-    let expression = Lowerer::new(
+    let mut lowerer = Lowerer::new(
         module,
         input,
         AuthorityContext::new(build_authority, pool_authority),
@@ -1402,8 +1445,11 @@ pub(crate) fn verify_comptime_condition(
             pending: &mut pending_specializations,
         },
         true,
-    )
-    .expression_expected(condition, &Type::Bool)?;
+    );
+    lowerer
+        .generic_const_values
+        .clone_from(generic_const_values);
+    let expression = lowerer.expression_expected(condition, &Type::Bool)?;
     if expression.type_ != Type::Bool {
         return creator(
             CreatorFailureKind::IfConditionRequiresBool,
@@ -1578,7 +1624,7 @@ fn lower_concrete_function(
         },
         true,
     );
-    lowerer.set_generic_context(function);
+    lowerer.set_generic_context(function, None);
     let mut parameters = Vec::new();
     for parameter in &function.parameters {
         let local = lowerer.bind_parameter(
@@ -1774,7 +1820,7 @@ pub(crate) fn lower_functions_for_error_inference(
             },
             false,
         );
-        lowerer.set_generic_context(function);
+        lowerer.set_generic_context(function, None);
         let mut parameters = Vec::new();
         for parameter in &function.parameters {
             let local = lowerer.bind_parameter(
@@ -1879,7 +1925,7 @@ fn materialize_missing_specializations(
             },
             true,
         );
-        lowerer.set_generic_context(function);
+        lowerer.set_generic_context(function, Some(&substitutions));
         let mut parameters = Vec::new();
         for parameter in &function.parameters {
             let type_ = substitute(&parameter.type_, &substitutions);
@@ -1970,6 +2016,23 @@ struct ArtifactCatalog<'a> {
     variants: &'a BTreeMap<VariantId, ResolvedVariant>,
     structs: &'a BTreeMap<DefinitionId, ResolvedStruct>,
     interfaces: &'a BTreeMap<DefinitionId, ResolvedInterface>,
+}
+
+fn artifact_struct_fields(
+    struct_: &ResolvedStruct,
+    arguments: &[Type],
+) -> Result<Arc<[ResolvedField]>, VerificationFailure> {
+    if struct_.field_selections.is_empty() || arguments.iter().any(type_has_placeholder) {
+        return Ok(struct_.fields.clone().into());
+    }
+    struct_
+        .applied_fields
+        .borrow()
+        .get(arguments)
+        .cloned()
+        .ok_or_else(|| VerificationFailure::Defect {
+            evidence: Arc::from("applied nominal has no selected member table"),
+        })
 }
 
 fn type_has_placeholder(type_: &Type) -> bool {
@@ -2480,10 +2543,10 @@ fn verify_statements(
                     provenance_owner,
                     previous_source_start,
                 )?;
-                if !hir_statements_terminate(then_branch) {
+                if !crate::control_flow::verified_statements_terminate(then_branch) {
                     moved.extend(then_moved);
                 }
-                if !hir_statements_terminate(else_branch) {
+                if !crate::control_flow::verified_statements_terminate(else_branch) {
                     moved.extend(else_moved);
                 }
             }
@@ -2518,10 +2581,10 @@ fn verify_statements(
                     provenance_owner,
                     previous_source_start,
                 )?;
-                if !hir_statements_terminate(then_branch) {
+                if !crate::control_flow::verified_statements_terminate(then_branch) {
                     moved.extend(then_moved);
                 }
-                if !hir_statements_terminate(else_branch) {
+                if !crate::control_flow::verified_statements_terminate(else_branch) {
                     moved.extend(else_moved);
                 }
             }
@@ -2630,7 +2693,7 @@ fn verify_statements(
                         provenance_owner,
                         previous_source_start,
                     )?;
-                    if !hir_statements_terminate(&case.body) {
+                    if !crate::control_flow::verified_statements_terminate(&case.body) {
                         branch_moved.push(case_moved);
                     }
                 }
@@ -2753,7 +2816,8 @@ fn verify_place_artifact(
                 let Some(struct_) = catalog.structs.get(definition) else {
                     return defect("lowered field place references an unknown struct");
                 };
-                let Some(field) = struct_.fields.iter().find(|field| field.name == **name) else {
+                let fields = artifact_struct_fields(struct_, arguments)?;
+                let Some(field) = fields.iter().find(|field| field.name == **name) else {
                     return defect("lowered field place references an unknown field");
                 };
                 let substitutions = struct_
@@ -3211,8 +3275,8 @@ fn verify_expression_artifact(
                         .copied()
                         .zip(type_arguments.iter().cloned())
                         .collect::<BTreeMap<_, _>>();
-                    let declared_order = signature
-                        .fields
+                    let fields = artifact_struct_fields(signature, type_arguments)?;
+                    let declared_order = fields
                         .iter()
                         .map(|field| field.name.as_str())
                         .collect::<Vec<_>>();
@@ -3222,7 +3286,7 @@ fn verify_expression_artifact(
                         );
                     }
                     if argument_fields.len() != argument_types.len()
-                        || argument_fields.len() != signature.fields.len()
+                        || argument_fields.len() != fields.len()
                     {
                         return defect("struct construction does not initialize every field");
                     }
@@ -3231,8 +3295,7 @@ fn verify_expression_artifact(
                         if !seen.insert(field_name.as_ref()) {
                             return defect("struct construction initializes a field twice");
                         }
-                        let Some(field) = signature
-                            .fields
+                        let Some(field) = fields
                             .iter()
                             .find(|field| field.name == field_name.as_ref())
                         else {
@@ -3463,6 +3526,7 @@ fn validate_input(input: &ProgramInput) -> Result<(), VerificationFailure> {
 
 struct Lowerer<'a> {
     module: ModuleId,
+    input: &'a ProgramInput,
     functions: &'a BTreeMap<DefinitionId, ResolvedFunction>,
     constants: &'a BTreeMap<DefinitionId, ResolvedConstant>,
     tests: &'a BTreeMap<TestId, ResolvedTest>,
@@ -3486,6 +3550,7 @@ struct Lowerer<'a> {
     test_application_context: u16,
     expected_expression_type: Option<Type>,
     generic_interface_bounds: BTreeMap<TypeParameterId, DefinitionId>,
+    generic_const_values: BTreeMap<String, (IntegerType, u64)>,
 }
 
 struct SpecializationDemands<'a> {
@@ -3505,6 +3570,7 @@ impl<'a> Lowerer<'a> {
     ) -> Self {
         Self {
             module,
+            input,
             functions: &input.functions,
             constants: &input.constants,
             tests: &input.tests,
@@ -3528,10 +3594,15 @@ impl<'a> Lowerer<'a> {
             test_application_context: 0,
             expected_expression_type: None,
             generic_interface_bounds: BTreeMap::new(),
+            generic_const_values: BTreeMap::new(),
         }
     }
 
-    fn set_generic_context(&mut self, function: &ResolvedFunction) {
+    fn set_generic_context(
+        &mut self,
+        function: &ResolvedFunction,
+        substitutions: Option<&BTreeMap<TypeParameterId, Type>>,
+    ) {
         self.generic_interface_bounds = function
             .type_parameters
             .iter()
@@ -3544,6 +3615,119 @@ impl<'a> Lowerer<'a> {
                 _ => None,
             })
             .collect();
+        self.generic_const_values = function
+            .generic_parameter_names
+            .iter()
+            .zip(function.type_parameters.iter())
+            .zip(function.generic_constraints.iter())
+            .filter_map(|((name, parameter), constraint)| {
+                let GenericConstraint::Const {
+                    type_: Type::Integer(kind),
+                } = constraint
+                else {
+                    return None;
+                };
+                let Type::ConstU64(value) = substitutions?.get(parameter)? else {
+                    return None;
+                };
+                Some((name.clone(), (*kind, *value)))
+            })
+            .collect();
+    }
+
+    fn struct_fields(
+        &mut self,
+        definition: DefinitionId,
+        arguments: &[Type],
+        site: &SourceRange,
+    ) -> Result<Arc<[ResolvedField]>, VerificationFailure> {
+        let key = Arc::<[Type]>::from(arguments.to_vec());
+        let (mut fields, selections, parameter_names, constraints) = {
+            let struct_ = self
+                .structs
+                .get(&definition)
+                .ok_or_else(|| creator_value(CreatorFailureKind::UnresolvedName, site))?;
+            if struct_.field_selections.is_empty() || arguments.iter().any(type_has_placeholder) {
+                return Ok(struct_.fields.clone().into());
+            }
+            if let Some(fields) = struct_.applied_fields.borrow().get(&key) {
+                return Ok(fields.clone());
+            }
+            (
+                struct_.fields.clone(),
+                struct_.field_selections.clone(),
+                struct_.generic_parameter_names.clone(),
+                struct_.generic_constraints.clone(),
+            )
+        };
+        let values = parameter_names
+            .iter()
+            .zip(constraints.iter())
+            .zip(arguments.iter())
+            .filter_map(|((name, constraint), argument)| {
+                let GenericConstraint::Const {
+                    type_: Type::Integer(kind),
+                } = constraint
+                else {
+                    return None;
+                };
+                let Type::ConstU64(value) = argument else {
+                    return None;
+                };
+                Some((name.clone(), (*kind, *value)))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for selection in selections.iter() {
+            for branch in selection.branches.iter() {
+                let selected = if let Some(condition) = &branch.condition {
+                    self.evaluate_comptime_condition(condition, &values)?
+                } else {
+                    true
+                };
+                if selected {
+                    fields.extend(branch.fields.iter().cloned());
+                    break;
+                }
+            }
+        }
+        let fields = Arc::<[ResolvedField]>::from(fields);
+        self.structs
+            .get(&definition)
+            .expect("selected struct remains catalogued")
+            .applied_fields
+            .borrow_mut()
+            .insert(key, fields.clone());
+        Ok(fields)
+    }
+
+    fn evaluate_comptime_condition(
+        &mut self,
+        condition: &ExpressionSyntax,
+        generic_const_values: &BTreeMap<String, (IntegerType, u64)>,
+    ) -> Result<bool, VerificationFailure> {
+        let (program, expression) = verify_comptime_condition_with_values(
+            self.input,
+            self.module,
+            condition,
+            self.build_authority,
+            self.pool_authority,
+            self.identity_catalog,
+            self.cancellation,
+            generic_const_values,
+        )?;
+        let run = crate::evaluator::Engine::new(&program, self.cancellation)
+            .evaluate_expression(&expression);
+        match run.outcome {
+            crate::EvaluationOutcome::Completed(crate::CanonicalValue::Bool(value)) => Ok(value),
+            crate::EvaluationOutcome::Cancelled => Err(VerificationFailure::Cancelled),
+            crate::EvaluationOutcome::Defect { evidence } => {
+                Err(VerificationFailure::Defect { evidence })
+            }
+            _ => creator(
+                CreatorFailureKind::InvalidComptimeExpression,
+                &condition.range,
+            ),
+        }
     }
 
     fn bind_local(&mut self, name: &str, type_: Type) -> Result<LocalId, VerificationFailure> {
@@ -3604,17 +3788,19 @@ impl<'a> Lowerer<'a> {
                     else {
                         return creator(CreatorFailureKind::UnresolvedName, range);
                     };
-                    let Some(struct_) = self.structs.get(definition) else {
+                    let struct_module = self
+                        .structs
+                        .get(definition)
+                        .map(|struct_| struct_.module)
+                        .ok_or_else(|| creator_value(CreatorFailureKind::UnresolvedName, range))?;
+                    let fields = self.struct_fields(*definition, arguments, range)?;
+                    let Some(field) = fields.iter().find(|field| field.name == *name) else {
                         return creator(CreatorFailureKind::UnresolvedName, range);
                     };
-                    let Some(field) = struct_.fields.iter().find(|field| field.name == *name)
-                    else {
-                        return creator(CreatorFailureKind::UnresolvedName, range);
-                    };
-                    if !field.public && struct_.module != self.module {
+                    if !field.public && struct_module != self.module {
                         return creator(CreatorFailureKind::UnresolvedName, range);
                     }
-                    let substitutions = struct_
+                    let substitutions = self.structs[definition]
                         .type_parameters
                         .iter()
                         .copied()
@@ -3768,6 +3954,15 @@ impl<'a> Lowerer<'a> {
         for statement in syntax {
             if self.cancellation.is_cancelled() {
                 return Err(VerificationFailure::Cancelled);
+            }
+            if let StatementSyntax::Comptime { branches, range } = statement {
+                if self.concrete_context {
+                    let selected = self.select_comptime_statements(branches)?;
+                    statements.extend(self.statements(&selected, return_type)?);
+                } else {
+                    statements.push(Statement::Pass(range.clone()));
+                }
+                continue;
             }
             statements.push(match statement {
                 StatementSyntax::Return { value, range } => {
@@ -3972,8 +4167,10 @@ impl<'a> Lowerer<'a> {
                             .ok_or_else(|| {
                                 creator_value(CreatorFailureKind::InvalidMatchPattern, range)
                             })?;
-                        let then_terminates = syntax_statements_terminate(then_branch);
-                        let else_terminates = syntax_statements_terminate(else_branch);
+                        let then_terminates =
+                            crate::control_flow::syntax_statements_terminate(then_branch);
+                        let else_terminates =
+                            crate::control_flow::syntax_statements_terminate(else_branch);
                         let then_branch = self.statements(then_branch, return_type)?;
                         let then_moved = self.moved.clone();
                         let then_known = self.known_integers.clone();
@@ -4012,8 +4209,10 @@ impl<'a> Lowerer<'a> {
                         let before = self.locals.clone();
                         let moved_before = self.moved.clone();
                         let known_before = self.known_integers.clone();
-                        let then_terminates = syntax_statements_terminate(then_branch);
-                        let else_terminates = syntax_statements_terminate(else_branch);
+                        let then_terminates =
+                            crate::control_flow::syntax_statements_terminate(then_branch);
+                        let else_terminates =
+                            crate::control_flow::syntax_statements_terminate(else_branch);
                         let then_branch = self.statements(then_branch, return_type)?;
                         let then_moved = self.moved.clone();
                         let then_known = self.known_integers.clone();
@@ -4179,7 +4378,7 @@ impl<'a> Lowerer<'a> {
                             );
                         }
                         let body = self.statements(&case.body, return_type)?;
-                        if !syntax_statements_terminate(&case.body) {
+                        if !crate::control_flow::syntax_statements_terminate(&case.body) {
                             joined_moved.extend(self.moved.clone());
                             continuing_known.push(self.known_integers.clone());
                         }
@@ -4261,13 +4460,56 @@ impl<'a> Lowerer<'a> {
                 StatementSyntax::Unsupported { range, .. } => {
                     return creator(CreatorFailureKind::UnsupportedLayerOneSyntax, range);
                 }
-                StatementSyntax::Comptime { range, .. } => {
-                    return creator(CreatorFailureKind::UnsupportedLayerOneSyntax, range);
-                }
+                StatementSyntax::Comptime { range, .. } => Statement::Pass(range.clone()),
                 StatementSyntax::Pass(range) => Statement::Pass(range.clone()),
             });
         }
         Ok(statements)
+    }
+
+    fn select_comptime_statements(
+        &mut self,
+        branches: &[crate::syntax::ComptimeStatementBranch],
+    ) -> Result<Vec<StatementSyntax>, VerificationFailure> {
+        for branch in branches {
+            let matches = if let Some(condition) = &branch.condition {
+                let (program, expression) = verify_comptime_condition_with_values(
+                    self.input,
+                    self.module,
+                    condition,
+                    self.build_authority,
+                    self.pool_authority,
+                    self.identity_catalog,
+                    self.cancellation,
+                    &self.generic_const_values,
+                )?;
+                let run = crate::evaluator::Engine::new(&program, self.cancellation)
+                    .evaluate_expression(&expression);
+                match run.outcome {
+                    crate::EvaluationOutcome::Completed(crate::CanonicalValue::Bool(value)) => {
+                        value
+                    }
+                    crate::EvaluationOutcome::Cancelled => {
+                        return Err(VerificationFailure::Cancelled);
+                    }
+                    crate::EvaluationOutcome::Defect { evidence } => {
+                        return Err(VerificationFailure::Defect { evidence });
+                    }
+                    _ => {
+                        return creator(
+                            CreatorFailureKind::InvalidComptimeExpression,
+                            &condition.range,
+                        );
+                    }
+                }
+            } else {
+                true
+            };
+            if matches {
+                return Ok(branch.statements.clone());
+            }
+        }
+        Ok(Vec::new())
     }
 
     fn expression_expected(
@@ -4529,25 +4771,26 @@ impl<'a> Lowerer<'a> {
                         &syntax.range,
                     )?;
                 }
-                if let CallTarget::Struct { definition, .. } = &target {
-                    let resource_fields = self
-                        .structs
-                        .get(definition)
-                        .map(|struct_| {
-                            labels
-                                .iter()
-                                .map(|label| {
-                                    label.as_deref().and_then(|label| {
-                                        struct_
-                                            .fields
-                                            .iter()
-                                            .find(|field| field.name == label)
-                                            .map(|field| self.type_owns_resource(&field.type_))
-                                    })
-                                })
-                                .collect::<Vec<_>>()
+                if let (
+                    CallTarget::Struct { definition, .. },
+                    Type::Nominal {
+                        arguments: type_arguments,
+                        ..
+                    },
+                ) = (&target, &type_)
+                {
+                    let fields = self.struct_fields(*definition, type_arguments, &syntax.range)?;
+                    let resource_fields = labels
+                        .iter()
+                        .map(|label| {
+                            label.as_deref().and_then(|label| {
+                                fields
+                                    .iter()
+                                    .find(|field| field.name == label)
+                                    .map(|field| self.type_owns_resource(&field.type_))
+                            })
                         })
-                        .unwrap_or_default();
+                        .collect::<Vec<_>>();
                     for (argument, resource) in lowered.iter().zip(resource_fields) {
                         if resource == Some(true) {
                             self.require_owned_transfer(argument)?;
@@ -5469,8 +5712,17 @@ impl<'a> Lowerer<'a> {
                 let Some(struct_) = self.structs.get(definition) else {
                     return false;
                 };
+                let selected_fields = if struct_.field_selections.is_empty() {
+                    Arc::from(struct_.fields.clone())
+                } else {
+                    let Some(fields) = struct_.applied_fields.borrow().get(arguments).cloned()
+                    else {
+                        return false;
+                    };
+                    fields
+                };
                 if definition != expected
-                    || fields.len() != struct_.fields.len()
+                    || fields.len() != selected_fields.len()
                     || arguments.len() != struct_.type_parameters.len()
                 {
                     return false;
@@ -5481,9 +5733,12 @@ impl<'a> Lowerer<'a> {
                     .copied()
                     .zip(arguments.iter().cloned())
                     .collect::<BTreeMap<_, _>>();
-                fields.iter().zip(&struct_.fields).all(|(pattern, field)| {
-                    self.pattern_irrefutable(pattern, &substitute(&field.type_, &substitutions))
-                })
+                fields
+                    .iter()
+                    .zip(selected_fields.iter())
+                    .all(|(pattern, field)| {
+                        self.pattern_irrefutable(pattern, &substitute(&field.type_, &substitutions))
+                    })
             }
         }
     }
@@ -5681,7 +5936,8 @@ impl<'a> Lowerer<'a> {
                     let Some(struct_) = self.structs.get(&resolved).cloned() else {
                         return creator(CreatorFailureKind::InvalidMatchPattern, &pattern.range);
                     };
-                    if arguments.len() != struct_.fields.len()
+                    let fields = self.struct_fields(resolved, type_arguments, &pattern.range)?;
+                    if arguments.len() != fields.len()
                         || type_arguments.len() != struct_.type_parameters.len()
                     {
                         return creator(CreatorFailureKind::InvalidMatchPattern, &pattern.range);
@@ -5692,7 +5948,7 @@ impl<'a> Lowerer<'a> {
                         .copied()
                         .zip(type_arguments.iter().cloned())
                         .collect::<BTreeMap<_, _>>();
-                    let mut ordered = vec![None; struct_.fields.len()];
+                    let mut ordered = vec![None; fields.len()];
                     for argument in arguments {
                         let Some(label) = &argument.label else {
                             return creator(
@@ -5700,8 +5956,7 @@ impl<'a> Lowerer<'a> {
                                 &argument.pattern.range,
                             );
                         };
-                        let index = struct_
-                            .fields
+                        let index = fields
                             .iter()
                             .position(|field| field.name == *label)
                             .ok_or_else(|| {
@@ -5718,7 +5973,7 @@ impl<'a> Lowerer<'a> {
                         }
                         ordered[index] = Some(self.lower_match_pattern_with_reuse(
                             &argument.pattern,
-                            &substitute(&struct_.fields[index].type_, &substitutions),
+                            &substitute(&fields[index].type_, &substitutions),
                             reuse,
                         )?);
                     }
@@ -5833,24 +6088,27 @@ impl<'a> Lowerer<'a> {
                 else {
                     return creator(CreatorFailureKind::UnresolvedName, &syntax.range);
                 };
-                let struct_ = self.structs.get(&definition).ok_or_else(|| {
-                    creator_value(CreatorFailureKind::UnresolvedName, &syntax.range)
-                })?;
-                let field = struct_
-                    .fields
+                let (struct_module, type_parameters) = self
+                    .structs
+                    .get(&definition)
+                    .map(|struct_| (struct_.module, struct_.type_parameters.clone()))
+                    .ok_or_else(|| {
+                        creator_value(CreatorFailureKind::UnresolvedName, &syntax.range)
+                    })?;
+                let selected_fields = self.struct_fields(definition, arguments, &syntax.range)?;
+                let field = selected_fields
                     .iter()
                     .find(|field| field.name == *field_name)
                     .ok_or_else(|| {
                         creator_value(CreatorFailureKind::UnresolvedName, &syntax.range)
                     })?;
-                if struct_.module != self.module && !field.public {
+                if struct_module != self.module && !field.public {
                     return creator(CreatorFailureKind::UnresolvedName, &syntax.range);
                 }
-                if arguments.len() != struct_.type_parameters.len() {
+                if arguments.len() != type_parameters.len() {
                     return creator(CreatorFailureKind::GenericArgumentConflict, &syntax.range);
                 }
-                let substitutions = struct_
-                    .type_parameters
+                let substitutions = type_parameters
                     .iter()
                     .copied()
                     .zip(arguments.iter().cloned())
@@ -5886,6 +6144,18 @@ impl<'a> Lowerer<'a> {
             return self.finish_expression(
                 ExpressionKind::Read(Place::local(*id)),
                 type_.clone(),
+                syntax.range.clone(),
+            );
+        }
+        if let [name] = name.segments.as_slice()
+            && let Some((kind, value)) = self.generic_const_values.get(name).copied()
+        {
+            return self.finish_expression(
+                ExpressionKind::Literal(Literal::Integer {
+                    kind,
+                    value: i128::from(value),
+                }),
+                Type::Integer(kind),
                 syntax.range.clone(),
             );
         }
@@ -6097,26 +6367,11 @@ impl<'a> Lowerer<'a> {
             return self.function_call(id, arguments, labels, site);
         }
         if let Some(ResolvedName::Nominal(id)) = self.namespace.resolve(self.module, &name.segments)
-            && let Some(struct_) = self.structs.get(&id)
+            && let Some(struct_) = self.structs.get(&id).cloned()
         {
             if struct_.definition != id {
                 return defect("struct catalog key disagrees with DefinitionId");
             }
-            if struct_.module != self.module && struct_.fields.iter().any(|field| !field.public) {
-                return creator(CreatorFailureKind::UnresolvedCall, site);
-            }
-            let signature = CallableSignature {
-                parameters: struct_
-                    .fields
-                    .iter()
-                    .map(|field| CallableParameter {
-                        name: &field.name,
-                        type_: &field.type_,
-                    })
-                    .collect(),
-                label_mode: LabelMode::Required,
-            };
-            check_callable_signature(&signature, arguments, labels, site)?;
             let mut substitutions = BTreeMap::new();
             if let Some(Type::Nominal {
                 definition,
@@ -6134,12 +6389,21 @@ impl<'a> Lowerer<'a> {
                         .zip(expected_arguments.iter().cloned()),
                 );
             }
+            let known_arguments = struct_
+                .type_parameters
+                .iter()
+                .map(|parameter| substitutions.get(parameter).cloned())
+                .collect::<Option<Vec<_>>>();
+            let binding_fields = if let Some(arguments) = &known_arguments {
+                self.struct_fields(id, arguments, site)?
+            } else {
+                struct_.fields.clone().into()
+            };
             for (argument, label) in arguments.iter().zip(labels) {
                 let label = label.as_deref().ok_or_else(|| {
                     creator_value(CreatorFailureKind::ArgumentLabelMismatch, site)
                 })?;
-                let field = struct_
-                    .fields
+                let field = binding_fields
                     .iter()
                     .find(|field| field.name == label)
                     .ok_or_else(|| {
@@ -6157,6 +6421,21 @@ impl<'a> Lowerer<'a> {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             self.validate_generic_arguments(&struct_.generic_constraints, &type_arguments, site)?;
+            let fields = self.struct_fields(id, &type_arguments, site)?;
+            if struct_.module != self.module && fields.iter().any(|field| !field.public) {
+                return creator(CreatorFailureKind::UnresolvedCall, site);
+            }
+            let signature = CallableSignature {
+                parameters: fields
+                    .iter()
+                    .map(|field| CallableParameter {
+                        name: &field.name,
+                        type_: &field.type_,
+                    })
+                    .collect(),
+                label_mode: LabelMode::Required,
+            };
+            check_callable_signature(&signature, arguments, labels, site)?;
             let argument_fields = labels
                 .iter()
                 .map(|label| {
@@ -6171,8 +6450,7 @@ impl<'a> Lowerer<'a> {
                     let label = label.as_deref().ok_or_else(|| {
                         creator_value(CreatorFailureKind::ArgumentLabelMismatch, site)
                     })?;
-                    struct_
-                        .fields
+                    fields
                         .iter()
                         .find(|field| field.name == label)
                         .map(|field| field.definition)
@@ -6185,8 +6463,7 @@ impl<'a> Lowerer<'a> {
                 CallTarget::Struct {
                     definition: id,
                     type_display: struct_.display.clone(),
-                    field_order: struct_
-                        .fields
+                    field_order: fields
                         .iter()
                         .map(|field| Arc::from(field.name.as_str()))
                         .collect(),
@@ -6888,132 +7165,6 @@ fn bind_type(
     }
 }
 
-fn syntax_statements_terminate(statements: &[StatementSyntax]) -> bool {
-    statements.iter().any(|statement| match statement {
-        StatementSyntax::Return { .. } | StatementSyntax::Panic { .. } => true,
-        StatementSyntax::If {
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            !else_branch.is_empty()
-                && syntax_statements_terminate(then_branch)
-                && syntax_statements_terminate(else_branch)
-        }
-        StatementSyntax::Comptime { branches, .. } => {
-            branches
-                .last()
-                .is_some_and(|branch| branch.condition.is_none())
-                && branches
-                    .iter()
-                    .all(|branch| syntax_statements_terminate(&branch.statements))
-        }
-        StatementSyntax::Match { cases, .. } => {
-            syntax_match_exhaustive(cases)
-                && cases
-                    .iter()
-                    .all(|case| syntax_statements_terminate(&case.body))
-        }
-        StatementSyntax::With { body, .. } => syntax_statements_terminate(body),
-        StatementSyntax::Assert { .. }
-        | StatementSyntax::Expect { .. }
-        | StatementSyntax::Assign { .. }
-        | StatementSyntax::Evaluate(_)
-        | StatementSyntax::For { .. }
-        | StatementSyntax::While { .. }
-        | StatementSyntax::Break(_)
-        | StatementSyntax::Continue(_)
-        | StatementSyntax::Defer { .. }
-        | StatementSyntax::Unsupported { .. }
-        | StatementSyntax::Pass(_) => false,
-    })
-}
-
-fn syntax_match_exhaustive(cases: &[MatchCaseSyntax]) -> bool {
-    if cases.last().is_some_and(|case| {
-        matches!(
-            case.pattern.kind,
-            PatternSyntaxKind::Wildcard
-                | PatternSyntaxKind::Binding(_)
-                | PatternSyntaxKind::Take(_)
-        ) && case.guard.is_none()
-    }) {
-        return true;
-    }
-    let mut saw_false = false;
-    let mut saw_true = false;
-    let mut only_bools = true;
-    for case in cases {
-        match &case.pattern.kind {
-            PatternSyntaxKind::Literal(ExpressionSyntax {
-                kind: ExpressionSyntaxKind::Bool(false),
-                ..
-            }) if case.guard.is_none() => saw_false = true,
-            PatternSyntaxKind::Literal(ExpressionSyntax {
-                kind: ExpressionSyntaxKind::Bool(true),
-                ..
-            }) if case.guard.is_none() => saw_true = true,
-            _ => only_bools = false,
-        }
-    }
-    (only_bools && saw_false && saw_true)
-        || (!cases.is_empty()
-            && cases.iter().all(|case| {
-                case.guard.is_none() && syntax_pattern_can_close_match(&case.pattern.kind)
-            }))
-}
-
-fn syntax_pattern_can_close_match(kind: &PatternSyntaxKind) -> bool {
-    match kind {
-        PatternSyntaxKind::Constructor { .. }
-        | PatternSyntaxKind::Tuple(_)
-        | PatternSyntaxKind::FixedArray(_)
-        | PatternSyntaxKind::Take(_) => true,
-        PatternSyntaxKind::Or(alternatives) => alternatives
-            .iter()
-            .all(|alternative| syntax_pattern_can_close_match(&alternative.kind)),
-        _ => false,
-    }
-}
-
-fn hir_statements_terminate(statements: &[Statement]) -> bool {
-    statements.iter().any(|statement| match statement {
-        Statement::Return { .. } | Statement::Panic { .. } => true,
-        Statement::If {
-            then_branch,
-            else_branch,
-            ..
-        }
-        | Statement::IfPattern {
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            !else_branch.is_empty()
-                && hir_statements_terminate(then_branch)
-                && hir_statements_terminate(else_branch)
-        }
-        Statement::Match { cases, .. } => {
-            hir_match_exhaustive(cases)
-                && cases
-                    .iter()
-                    .all(|case| hir_statements_terminate(&case.body))
-        }
-        Statement::WithPool { body, .. } => hir_statements_terminate(body),
-        Statement::Assert { .. }
-        | Statement::Expect { .. }
-        | Statement::Initialize { .. }
-        | Statement::Assign { .. }
-        | Statement::Evaluate(_)
-        | Statement::For { .. }
-        | Statement::While { .. }
-        | Statement::Break(_)
-        | Statement::Continue(_)
-        | Statement::Defer { .. }
-        | Statement::Pass(_) => false,
-    })
-}
-
 fn expression_contains_propagation(expression: &Expression) -> bool {
     if matches!(expression.kind, ExpressionKind::Propagate(_)) {
         return true;
@@ -7021,29 +7172,6 @@ fn expression_contains_propagation(expression: &Expression) -> bool {
     let mut found = false;
     expression.visit_children(&mut |child| found |= expression_contains_propagation(child));
     found
-}
-
-fn hir_match_exhaustive(cases: &[HirMatchCase]) -> bool {
-    if cases.last().is_some_and(|case| {
-        case.guard.is_none()
-            && (case.pattern.is_none()
-                || matches!(
-                    case.pattern,
-                    Some(HirMatchPattern::Binding { .. } | HirMatchPattern::Wildcard)
-                ))
-    }) {
-        return true;
-    }
-    let mut saw_false = false;
-    let mut saw_true = false;
-    for case in cases {
-        match (&case.pattern, &case.guard) {
-            (Some(HirMatchPattern::Literal(Literal::Bool(false))), None) => saw_false = true,
-            (Some(HirMatchPattern::Literal(Literal::Bool(true))), None) => saw_true = true,
-            _ => return false,
-        }
-    }
-    saw_false && saw_true
 }
 
 fn match_pattern_binding_signature(
@@ -7167,8 +7295,9 @@ fn verify_match_pattern_artifact(
             let Some(struct_) = catalog.structs.get(definition) else {
                 return defect("lowered struct pattern references an unknown struct");
             };
+            let selected_fields = artifact_struct_fields(struct_, arguments)?;
             if struct_.type_parameters.len() != arguments.len()
-                || struct_.fields.len() != fields.len()
+                || selected_fields.len() != fields.len()
             {
                 return defect("lowered struct pattern has the wrong field shape");
             }
@@ -7178,7 +7307,7 @@ fn verify_match_pattern_artifact(
                 .copied()
                 .zip(arguments.iter().cloned())
                 .collect::<BTreeMap<_, _>>();
-            for (pattern, field) in fields.iter().zip(&struct_.fields) {
+            for (pattern, field) in fields.iter().zip(selected_fields.iter()) {
                 verify_match_pattern_artifact(
                     pattern,
                     &substitute(&field.type_, &substitutions),
@@ -7257,7 +7386,7 @@ fn hir_match_exhaustive_for_type(
         return true;
     }
     match type_ {
-        Type::Bool => hir_match_exhaustive(cases),
+        Type::Bool => crate::control_flow::verified_match_exhaustive(cases),
         Type::Nominal { definition, .. } => {
             let declared = catalog
                 .variants
@@ -7325,8 +7454,11 @@ fn artifact_pattern_irrefutable(
             let Some(struct_) = catalog.structs.get(definition) else {
                 return false;
             };
+            let Ok(selected_fields) = artifact_struct_fields(struct_, arguments) else {
+                return false;
+            };
             if definition != expected
-                || fields.len() != struct_.fields.len()
+                || fields.len() != selected_fields.len()
                 || arguments.len() != struct_.type_parameters.len()
             {
                 return false;
@@ -7337,13 +7469,16 @@ fn artifact_pattern_irrefutable(
                 .copied()
                 .zip(arguments.iter().cloned())
                 .collect::<BTreeMap<_, _>>();
-            fields.iter().zip(&struct_.fields).all(|(pattern, field)| {
-                artifact_pattern_irrefutable(
-                    pattern,
-                    &substitute(&field.type_, &substitutions),
-                    catalog,
-                )
-            })
+            fields
+                .iter()
+                .zip(selected_fields.iter())
+                .all(|(pattern, field)| {
+                    artifact_pattern_irrefutable(
+                        pattern,
+                        &substitute(&field.type_, &substitutions),
+                        catalog,
+                    )
+                })
         }
     }
 }
@@ -8380,6 +8515,7 @@ mod tests {
                 name: "broken".to_owned(),
                 modifier: crate::syntax::FunctionModifier::Ordinary,
                 type_parameters: Arc::from([]),
+                generic_parameter_names: Arc::from([]),
                 generic_constraints: Arc::from([]),
                 parameters: Vec::new(),
                 return_type: Type::Unit,

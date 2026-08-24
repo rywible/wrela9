@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -7,15 +8,16 @@ use crate::compiler::{
     Cancellation, ConstructionObservation, Defect, Diagnostic, DiagnosticLabelRole,
     EvaluationObservation, EvaluationOutcome, FunctionFactsObservation, FunctionFactsValues,
     IdentityDomain, InferredErrorObservation, OwnershipMode, OwnershipObservation, ProjectFile,
-    RecoveryAction, Root, SourceRange, SpecializationObservation, TestApplicationObservation,
-    TestBindingObservation, TypeObservation, TypeRole,
+    RecoveryAction, ResolutionKind, ResolutionObservation, Root, SourceRange,
+    SpecializationObservation, TestApplicationObservation, TestBindingObservation, TypeObservation,
+    TypeRole,
 };
 use crate::evaluator::{AppliedTest, Engine};
 use crate::identity::{IdentityCatalog, IdentityFailure};
 use crate::image_evaluation::{self, GraphSealFailure, ImageEvaluationStatus};
 use crate::model::{
-    ArrayLength, BuildKind, BuiltinType, DefinitionId, ModuleId, PoolTerm, SpecializationId,
-    TestId, Type, TypeParameterId, resolve_builtin_type,
+    ArrayLength, BuiltinType, DefinitionId, ModuleId, PoolTerm, TestId, Type, TypeParameterId,
+    resolve_builtin_type,
 };
 use crate::syntax::{
     AttributeSyntax, ComptimeMemberBranch, ComptimeStatementBranch, Declaration, DeclarationKind,
@@ -26,23 +28,87 @@ use crate::type_semantics::{can_unify, contains_resource};
 use crate::typed_hir::{
     self, AuthorityContext, BuildAuthority, CallTarget, Expression, ExpressionKind,
     NamespaceCatalog, PoolAuthority, ProgramInput, ResolvedConstant, ResolvedField,
-    ResolvedFunction, ResolvedInterface, ResolvedInterfaceRequirement, ResolvedName,
-    ResolvedParameter, ResolvedStruct, ResolvedTest, ResolvedVariant, Statement, VerifiedProgram,
+    ResolvedFieldBranch, ResolvedFieldSelection, ResolvedFunction, ResolvedInterface,
+    ResolvedInterfaceRequirement, ResolvedName, ResolvedParameter, ResolvedStruct, ResolvedTest,
+    ResolvedVariant, Statement, VerifiedProgram,
 };
 
-pub(crate) struct Analysis {
-    pub(crate) diagnostics: Vec<Diagnostic>,
-    pub(crate) function_facts: Vec<FunctionFactsObservation>,
-    pub(crate) types: Vec<TypeObservation>,
-    pub(crate) ownership: Vec<OwnershipObservation>,
-    pub(crate) specializations: Vec<SpecializationObservation>,
-    pub(crate) inferred_errors: Vec<InferredErrorObservation>,
-    pub(crate) evaluations: Vec<EvaluationObservation>,
-    pub(crate) constructions: Vec<ConstructionObservation>,
-    pub(crate) test_plan: Vec<TestApplicationObservation>,
-    pub(crate) defect: Option<Defect>,
-    pub(crate) cancelled: bool,
+pub(crate) struct SemanticRevision {
+    diagnostics: Vec<Diagnostic>,
+    observations: SemanticObservations,
+    defect: Option<Defect>,
+    cancelled: bool,
     selection_value: Option<bool>,
+}
+
+#[derive(Default)]
+struct SemanticObservations {
+    resolutions: Vec<ResolutionObservation>,
+    function_facts: Vec<FunctionFactsObservation>,
+    types: Vec<TypeObservation>,
+    ownership: Vec<OwnershipObservation>,
+    specializations: Vec<SpecializationObservation>,
+    inferred_errors: Vec<InferredErrorObservation>,
+    evaluations: Vec<EvaluationObservation>,
+    constructions: Vec<ConstructionObservation>,
+    test_plan: Vec<TestApplicationObservation>,
+}
+
+pub(crate) struct SemanticProjection {
+    pub(crate) resolutions: Arc<[ResolutionObservation]>,
+    pub(crate) function_facts: Arc<[FunctionFactsObservation]>,
+    pub(crate) types: Arc<[TypeObservation]>,
+    pub(crate) ownership: Arc<[OwnershipObservation]>,
+    pub(crate) specializations: Arc<[SpecializationObservation]>,
+    pub(crate) inferred_errors: Arc<[InferredErrorObservation]>,
+    pub(crate) evaluations: Arc<[EvaluationObservation]>,
+    pub(crate) constructions: Arc<[ConstructionObservation]>,
+    pub(crate) test_plan: Arc<[TestApplicationObservation]>,
+}
+
+pub(crate) enum SemanticFailure {
+    Cancelled,
+    Defect(Defect),
+}
+
+impl SemanticRevision {
+    pub(crate) fn finalize(
+        self,
+        semantics: bool,
+        evaluation: bool,
+        construction: bool,
+        tests: bool,
+    ) -> Result<(Vec<Diagnostic>, SemanticProjection), SemanticFailure> {
+        if self.cancelled {
+            return Err(SemanticFailure::Cancelled);
+        }
+        if let Some(defect) = self.defect {
+            return Err(SemanticFailure::Defect(defect));
+        }
+        let observations = self.observations;
+        Ok((
+            self.diagnostics,
+            SemanticProjection {
+                resolutions: project_observations(semantics, observations.resolutions),
+                function_facts: project_observations(semantics, observations.function_facts),
+                types: project_observations(semantics, observations.types),
+                ownership: project_observations(semantics, observations.ownership),
+                specializations: project_observations(semantics, observations.specializations),
+                inferred_errors: project_observations(semantics, observations.inferred_errors),
+                evaluations: project_observations(evaluation, observations.evaluations),
+                constructions: project_observations(construction, observations.constructions),
+                test_plan: project_observations(tests, observations.test_plan),
+            },
+        ))
+    }
+}
+
+fn project_observations<T>(selected: bool, observations: Vec<T>) -> Arc<[T]> {
+    if selected {
+        observations.into()
+    } else {
+        Arc::from([])
+    }
 }
 
 pub(crate) enum SelectionFailure {
@@ -222,10 +288,16 @@ fn first_nested_member_selection(
         for declaration in &parsed.declarations {
             let selection = match declaration.syntax.as_ref() {
                 Some(DeclarationSyntax::Struct(struct_))
-                | Some(DeclarationSyntax::ResourceStruct(struct_)) => {
-                    struct_.comptime_selections.first()
-                }
-                Some(DeclarationSyntax::Enum(enum_)) => enum_.comptime_selections.first(),
+                | Some(DeclarationSyntax::ResourceStruct(struct_)) => struct_
+                    .generic_parameters
+                    .is_empty()
+                    .then(|| struct_.comptime_selections.first())
+                    .flatten(),
+                Some(DeclarationSyntax::Enum(enum_)) => enum_
+                    .generic_parameters
+                    .is_empty()
+                    .then(|| enum_.comptime_selections.first())
+                    .flatten(),
                 _ => None,
             };
             if let Some(selection) = selection {
@@ -306,16 +378,28 @@ fn first_nested_statement_selection(
     for (path, parsed) in parsed_sources {
         for declaration in &parsed.declarations {
             let bodies = match declaration.syntax.as_ref() {
-                Some(DeclarationSyntax::Function(function)) => vec![&function.body],
+                Some(DeclarationSyntax::Function(function))
+                    if function.generic_parameters.is_empty() =>
+                {
+                    vec![&function.body]
+                }
                 Some(DeclarationSyntax::Struct(struct_))
                 | Some(DeclarationSyntax::ResourceStruct(struct_)) => struct_
                     .functions
                     .iter()
+                    .filter(|member| {
+                        struct_.generic_parameters.is_empty()
+                            && member.function.generic_parameters.is_empty()
+                    })
                     .map(|member| &member.function.body)
                     .collect(),
                 Some(DeclarationSyntax::Enum(enum_)) => enum_
                     .functions
                     .iter()
+                    .filter(|member| {
+                        enum_.generic_parameters.is_empty()
+                            && member.function.generic_parameters.is_empty()
+                    })
                     .map(|member| &member.function.body)
                     .collect(),
                 Some(DeclarationSyntax::Suite(suite)) => {
@@ -622,20 +706,6 @@ struct InterfaceRequirement {
     range: SourceRange,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FunctionFacts {
-    pure: bool,
-    may_panic: bool,
-    suspends: bool,
-    evaluator_eligible: bool,
-    ownership_transfer: bool,
-    bounded: bool,
-    logical_cost: u64,
-    constructs: BTreeSet<BuildKind>,
-    calls: BTreeMap<DefinitionId, u64>,
-    specialization_calls: BTreeMap<SpecializationId, u64>,
-}
-
 pub(crate) fn analyze<'a>(
     parsed_sources: &BTreeMap<String, ParsedSource>,
     _files: &BTreeMap<&'a str, &'a ProjectFile>,
@@ -644,7 +714,7 @@ pub(crate) fn analyze<'a>(
     cancellation: &Cancellation,
     executable_allowed: bool,
     authorities: AuthorityContext<'_>,
-) -> Analysis {
+) -> SemanticRevision {
     analyze_with_probe(
         parsed_sources,
         identity_catalog,
@@ -664,7 +734,7 @@ fn analyze_with_probe(
     executable_allowed: bool,
     authorities: AuthorityContext<'_>,
     selection_probe: Option<(&str, &crate::syntax::ExpressionSyntax)>,
-) -> Analysis {
+) -> SemanticRevision {
     let build_authority = authorities.build();
     let pool_authority = authorities.pool();
     let mut diagnostics = Vec::new();
@@ -1154,7 +1224,9 @@ fn analyze_with_probe(
                     ));
                     continue;
                 };
-                if return_type != Type::Unit && !statements_definitely_terminate(&function.body) {
+                if return_type != Type::Unit
+                    && !crate::control_flow::syntax_statements_terminate(&function.body)
+                {
                     diagnostics.push(Diagnostic::new(
                         "semantic.missing_return",
                         definition.declaration.range.clone(),
@@ -1221,6 +1293,7 @@ fn analyze_with_probe(
                         type_parameters: (0..function.type_parameters.len())
                             .map(|index| TypeParameterId(u16::try_from(index).unwrap_or(u16::MAX)))
                             .collect(),
+                        generic_parameter_names: function.type_parameters.clone().into(),
                         generic_constraints: resolve_generic_constraints(
                             &function.generic_parameters,
                             definition.module,
@@ -1484,6 +1557,62 @@ fn analyze_with_probe(
                         type_,
                     });
                 }
+                let field_selections = struct_
+                    .comptime_selections
+                    .iter()
+                    .map(|selection| ResolvedFieldSelection {
+                        branches: selection
+                            .branches
+                            .iter()
+                            .map(|branch| {
+                                let mut branch_names = field_names.clone();
+                                let fields = branch
+                                    .fields
+                                    .iter()
+                                    .filter_map(|field| {
+                                        if !branch_names.insert(&field.name) {
+                                            diagnostics.push(
+                                                Diagnostic::new(
+                                                    "semantic.duplicate_field",
+                                                    field.range.clone(),
+                                                    RecoveryAction::None,
+                                                )
+                                                .with_parameter("name", field.name.clone()),
+                                            );
+                                            return None;
+                                        }
+                                        let type_ = resolve_type(
+                                            &field.type_syntax,
+                                            definition.module,
+                                            &input.namespace,
+                                            &input.nominal_displays,
+                                            &alias_types,
+                                            &type_parameters,
+                                        )?;
+                                        Some(ResolvedField {
+                                            definition: identity_catalog
+                                                .nested_definition(
+                                                    definition.id,
+                                                    "field",
+                                                    &field.name,
+                                                )
+                                                .expect("conditional field identity exists"),
+                                            name: field.name.clone(),
+                                            public: field.public,
+                                            mutable: field.mutable,
+                                            type_,
+                                        })
+                                    })
+                                    .collect::<Vec<_>>();
+                                ResolvedFieldBranch {
+                                    condition: branch.condition.clone(),
+                                    fields: fields.into(),
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .into(),
+                    })
+                    .collect::<Vec<_>>();
                 input.structs.insert(
                     definition.id,
                     ResolvedStruct {
@@ -1494,6 +1623,7 @@ fn analyze_with_probe(
                         type_parameters: (0..struct_.type_parameters.len())
                             .map(|index| TypeParameterId(u16::try_from(index).unwrap_or(u16::MAX)))
                             .collect(),
+                        generic_parameter_names: struct_.type_parameters.clone().into(),
                         generic_constraints: resolve_generic_constraints(
                             &struct_.generic_parameters,
                             definition.module,
@@ -1506,6 +1636,8 @@ fn analyze_with_probe(
                             &mut diagnostics,
                         ),
                         fields: resolved_fields,
+                        field_selections: field_selections.into(),
+                        applied_fields: RefCell::new(BTreeMap::new()),
                     },
                 );
                 for member in &struct_.functions {
@@ -1844,7 +1976,7 @@ fn analyze_with_probe(
     let inferred_signature_types = inference_functions
         .as_ref()
         .map_or_else(BTreeMap::new, |functions| {
-            crate::error_flow::infer_signatures(functions, cancellation)
+            crate::semantic_facts::infer_error_signatures(functions, cancellation)
         });
     if cancellation.is_cancelled() {
         return cancelled();
@@ -2117,6 +2249,7 @@ fn analyze_with_probe(
         Err(typed_hir::VerificationFailure::Cancelled) => return cancelled(),
     };
 
+    let mut resolutions = Vec::new();
     let mut function_facts = Vec::new();
     let mut specialization_observations = Vec::new();
     let mut inferred_errors = Vec::new();
@@ -2124,32 +2257,13 @@ fn analyze_with_probe(
     let mut constructions = Vec::new();
     let mut test_plan = Vec::new();
     if let Some(program) = &program {
-        let recursion = analyze_recursion(program);
-        let local_definition_facts = program
-            .functions()
-            .iter()
-            .map(|(id, function)| (*id, local_facts(function)))
-            .collect::<BTreeMap<_, _>>();
-        let mut facts = solve_function_facts(local_definition_facts.clone(), cancellation);
-        let mut concrete_facts =
-            solve_specialization_facts(program, &local_definition_facts, cancellation);
-        for (definition, maximum_calls) in &recursion.proven {
-            if let Some(facts) = facts.get_mut(definition) {
-                facts.bounded = true;
-                facts.logical_cost = local_definition_facts[definition]
-                    .logical_cost
-                    .saturating_mul(*maximum_calls);
-            }
-        }
-        for (specialization, facts) in &mut concrete_facts {
-            let definition = program.specializations()[specialization].definition;
-            if let Some(maximum_calls) = recursion.proven.get(&definition) {
-                facts.bounded = true;
-                facts.logical_cost = local_definition_facts[&definition]
-                    .logical_cost
-                    .saturating_mul(*maximum_calls);
-            }
-        }
+        resolutions = resolution_observations(program);
+        let solved_facts = crate::semantic_facts::solve(program, cancellation);
+        let facts = solved_facts.definitions;
+        let concrete_facts = solved_facts.specializations;
+        let recursion = solved_facts.recursion;
+        inferred_errors = solved_facts.inferred_errors;
+        diagnostics.extend(solved_facts.diagnostics);
         if cancellation.is_cancelled() {
             return cancelled();
         }
@@ -2211,7 +2325,7 @@ fn analyze_with_probe(
             });
         if executable_allowed {
             for constant in program.constants().values() {
-                if expression_constructs(&constant.expression) {
+                if crate::semantic_facts::expression_constructs(&constant.expression) {
                     diagnostics.push(Diagnostic::new(
                         "semantic.build_constructor_outside_image",
                         constant.source.clone(),
@@ -2236,8 +2350,6 @@ fn analyze_with_probe(
                 RecoveryAction::None,
             ));
         }
-        let (errors, error_diagnostics) = crate::error_flow::analyze(program, cancellation);
-        inferred_errors = errors;
         for specialization in program.specializations().values() {
             if !inferred_signature_types.contains_key(&specialization.definition) {
                 continue;
@@ -2259,8 +2371,6 @@ fn analyze_with_probe(
             ));
         }
         inferred_errors.sort_by_key(InferredErrorObservation::specialization_identity);
-        diagnostics.extend(error_diagnostics);
-
         if executable_allowed && diagnostics.is_empty() {
             let mut engine = Engine::new(program, cancellation);
             for constant in program.constants().values() {
@@ -2396,16 +2506,19 @@ fn analyze_with_probe(
             .then(left.name().cmp(right.name()))
     });
     specialization_observations.sort_by_key(SpecializationObservation::identity);
-    Analysis {
+    SemanticRevision {
         diagnostics,
-        function_facts,
-        types: type_observations,
-        ownership: ownership_observations,
-        specializations: specialization_observations,
-        inferred_errors,
-        evaluations,
-        constructions,
-        test_plan,
+        observations: SemanticObservations {
+            resolutions,
+            function_facts,
+            types: type_observations,
+            ownership: ownership_observations,
+            specializations: specialization_observations,
+            inferred_errors,
+            evaluations,
+            constructions,
+            test_plan,
+        },
         defect: None,
         cancelled: false,
         selection_value: None,
@@ -2433,94 +2546,6 @@ fn is_nominal(kind: DeclarationKind) -> bool {
             | DeclarationKind::Enum
             | DeclarationKind::Interface
     )
-}
-
-fn statements_definitely_terminate(statements: &[StatementSyntax]) -> bool {
-    statements.iter().any(|statement| match statement {
-        StatementSyntax::Return { .. } | StatementSyntax::Panic { .. } => true,
-        StatementSyntax::If {
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            !else_branch.is_empty()
-                && statements_definitely_terminate(then_branch)
-                && statements_definitely_terminate(else_branch)
-        }
-        StatementSyntax::Comptime { branches, .. } => {
-            branches
-                .last()
-                .is_some_and(|branch| branch.condition.is_none())
-                && branches
-                    .iter()
-                    .all(|branch| statements_definitely_terminate(&branch.statements))
-        }
-        StatementSyntax::Match { cases, .. } => {
-            syntax_match_is_exhaustive(cases)
-                && cases
-                    .iter()
-                    .all(|case| statements_definitely_terminate(&case.body))
-        }
-        StatementSyntax::With { body, .. } => statements_definitely_terminate(body),
-        StatementSyntax::Assert { .. }
-        | StatementSyntax::Assign { .. }
-        | StatementSyntax::Expect { .. }
-        | StatementSyntax::Evaluate(_)
-        | StatementSyntax::For { .. }
-        | StatementSyntax::While { .. }
-        | StatementSyntax::Break(_)
-        | StatementSyntax::Continue(_)
-        | StatementSyntax::Defer { .. }
-        | StatementSyntax::Unsupported { .. }
-        | StatementSyntax::Pass(_) => false,
-    })
-}
-
-fn syntax_match_is_exhaustive(cases: &[crate::syntax::MatchCaseSyntax]) -> bool {
-    if cases.last().is_some_and(|case| {
-        matches!(
-            case.pattern.kind,
-            crate::syntax::PatternSyntaxKind::Wildcard
-                | crate::syntax::PatternSyntaxKind::Binding(_)
-                | crate::syntax::PatternSyntaxKind::Take(_)
-        ) && case.guard.is_none()
-    }) {
-        return true;
-    }
-    let mut saw_false = false;
-    let mut saw_true = false;
-    let mut only_bools = true;
-    for case in cases {
-        match &case.pattern.kind {
-            crate::syntax::PatternSyntaxKind::Literal(crate::syntax::ExpressionSyntax {
-                kind: crate::syntax::ExpressionSyntaxKind::Bool(false),
-                ..
-            }) if case.guard.is_none() => saw_false = true,
-            crate::syntax::PatternSyntaxKind::Literal(crate::syntax::ExpressionSyntax {
-                kind: crate::syntax::ExpressionSyntaxKind::Bool(true),
-                ..
-            }) if case.guard.is_none() => saw_true = true,
-            _ => only_bools = false,
-        }
-    }
-    (only_bools && saw_false && saw_true)
-        || (!cases.is_empty()
-            && cases.iter().all(|case| {
-                case.guard.is_none() && syntax_pattern_can_close_match(&case.pattern.kind)
-            }))
-}
-
-fn syntax_pattern_can_close_match(kind: &crate::syntax::PatternSyntaxKind) -> bool {
-    match kind {
-        crate::syntax::PatternSyntaxKind::Constructor { .. }
-        | crate::syntax::PatternSyntaxKind::Tuple(_)
-        | crate::syntax::PatternSyntaxKind::FixedArray(_)
-        | crate::syntax::PatternSyntaxKind::Take(_) => true,
-        crate::syntax::PatternSyntaxKind::Or(alternatives) => alternatives
-            .iter()
-            .all(|alternative| syntax_pattern_can_close_match(&alternative.kind)),
-        _ => false,
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2659,7 +2684,9 @@ fn resolve_associated_functions(
             ));
             continue;
         };
-        if return_type != Type::Unit && !statements_definitely_terminate(&member.function.body) {
+        if return_type != Type::Unit
+            && !crate::control_flow::syntax_statements_terminate(&member.function.body)
+        {
             diagnostics.push(Diagnostic::new(
                 "semantic.missing_return",
                 member.range.clone(),
@@ -2714,6 +2741,11 @@ fn resolve_associated_functions(
                 .len()
                 .saturating_add(member.function.type_parameters.len()))
                 .map(|index| TypeParameterId(u16::try_from(index).unwrap_or(u16::MAX)))
+                .collect(),
+            generic_parameter_names: enclosing_parameter_names
+                .iter()
+                .cloned()
+                .chain(member.function.type_parameters.iter().cloned())
                 .collect(),
             generic_constraints: {
                 let mut constraints = enclosing_generic_parameters.to_vec();
@@ -3340,543 +3372,194 @@ fn invalid_resource_argument_in_data_nominal(
     }
 }
 
-fn solve_function_facts(
-    base: BTreeMap<DefinitionId, FunctionFacts>,
-    cancellation: &Cancellation,
-) -> BTreeMap<DefinitionId, FunctionFacts> {
-    let graph = base
-        .iter()
-        .map(|(id, facts)| (*id, facts.calls.keys().copied().collect()))
-        .collect::<BTreeMap<_, _>>();
-    solve_fact_graph(base, graph, |fact| &fact.calls, cancellation)
-}
-
-fn solve_specialization_facts(
-    program: &VerifiedProgram,
-    local_definitions: &BTreeMap<DefinitionId, FunctionFacts>,
-    cancellation: &Cancellation,
-) -> BTreeMap<SpecializationId, FunctionFacts> {
-    let base = program
-        .specialized_functions()
-        .iter()
-        .map(|(id, function)| {
-            let specialization = &program.specializations()[id];
-            let facts = if specialization.type_arguments.is_empty() {
-                local_definitions[&specialization.definition].clone()
-            } else {
-                local_facts(function)
+fn resolution_observations(program: &VerifiedProgram) -> Vec<ResolutionObservation> {
+    fn expression(value: &Expression, observations: &mut BTreeSet<ResolutionObservation>) {
+        {
+            let mut observe = |kind, domain, identity| {
+                observations.insert(ResolutionObservation::new(
+                    kind,
+                    value.source.clone(),
+                    domain,
+                    identity,
+                ));
             };
-            (*id, facts)
-        })
-        .collect::<BTreeMap<_, _>>();
-    let graph = base
-        .iter()
-        .map(|(id, facts)| (*id, facts.specialization_calls.keys().copied().collect()))
-        .collect::<BTreeMap<_, BTreeSet<_>>>();
-    solve_fact_graph(base, graph, |fact| &fact.specialization_calls, cancellation)
-}
-
-fn solve_fact_graph<N>(
-    base: BTreeMap<N, FunctionFacts>,
-    graph: BTreeMap<N, BTreeSet<N>>,
-    weighted_edges: impl Fn(&FunctionFacts) -> &BTreeMap<N, u64>,
-    cancellation: &Cancellation,
-) -> BTreeMap<N, FunctionFacts>
-where
-    N: Copy + Ord,
-{
-    let Some(mut facts) =
-        crate::graph::propagate_monotone(&graph, &base, merge_function_facts, || {
-            cancellation.is_cancelled()
-        })
-    else {
-        return BTreeMap::new();
-    };
-    let recursive = crate::graph::recursive_nodes(&graph);
-    let costs = solve_weighted_costs(&base, &recursive, weighted_edges);
-    for (id, cost) in costs {
-        let fact = facts.get_mut(&id).expect("fact exists");
-        fact.logical_cost = cost;
-        fact.bounded = cost != u64::MAX && !recursive.contains(&id);
-    }
-    facts
-}
-
-fn merge_function_facts(caller: &mut FunctionFacts, callee: &FunctionFacts) -> bool {
-    let previous = (
-        caller.pure,
-        caller.may_panic,
-        caller.suspends,
-        caller.evaluator_eligible,
-        caller.ownership_transfer,
-        caller.constructs.len(),
-    );
-    caller.pure &= callee.pure;
-    caller.may_panic |= callee.may_panic;
-    caller.suspends |= callee.suspends;
-    caller.evaluator_eligible &= callee.evaluator_eligible;
-    caller.constructs.extend(callee.constructs.iter().copied());
-    caller.ownership_transfer |= callee.ownership_transfer;
-    previous
-        != (
-            caller.pure,
-            caller.may_panic,
-            caller.suspends,
-            caller.evaluator_eligible,
-            caller.ownership_transfer,
-            caller.constructs.len(),
-        )
-}
-
-fn solve_weighted_costs<N>(
-    base: &BTreeMap<N, FunctionFacts>,
-    recursive: &BTreeSet<N>,
-    edges: impl Fn(&FunctionFacts) -> &BTreeMap<N, u64>,
-) -> BTreeMap<N, u64>
-where
-    N: Copy + Ord,
-{
-    let mut remaining = BTreeMap::new();
-    let mut callers = BTreeMap::<N, Vec<(N, u64)>>::new();
-    let mut costs = base
-        .iter()
-        .map(|(id, facts)| {
-            (
-                *id,
-                if recursive.contains(id) {
-                    u64::MAX
-                } else {
-                    facts.logical_cost
-                },
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    for (caller, facts) in base {
-        if recursive.contains(caller) {
-            continue;
-        }
-        let dependencies = edges(facts)
-            .iter()
-            .filter(|(callee, _)| base.contains_key(callee))
-            .map(|(callee, multiplicity)| (*callee, *multiplicity))
-            .collect::<Vec<_>>();
-        remaining.insert(*caller, dependencies.len());
-        for (callee, multiplicity) in dependencies {
-            callers
-                .entry(callee)
-                .or_default()
-                .push((*caller, multiplicity));
-        }
-    }
-    let mut ready = remaining
-        .iter()
-        .filter_map(|(id, count)| (*count == 0).then_some(*id))
-        .collect::<BTreeSet<_>>();
-    ready.extend(recursive.iter().copied());
-    while let Some(id) = ready.pop_first() {
-        let callee_cost = costs[&id];
-        for (caller, multiplicity) in callers.get(&id).into_iter().flatten() {
-            costs.entry(*caller).and_modify(|cost| {
-                *cost = cost.saturating_add(callee_cost.saturating_mul(*multiplicity));
-            });
-            let count = remaining
-                .get_mut(caller)
-                .expect("caller has dependency count");
-            *count -= 1;
-            if *count == 0 {
-                ready.insert(*caller);
-            }
-        }
-    }
-    costs
-}
-
-fn local_facts(function: &typed_hir::HirFunction) -> FunctionFacts {
-    let mut facts = FunctionFacts {
-        pure: true,
-        may_panic: false,
-        suspends: function.modifier == crate::syntax::FunctionModifier::Async,
-        evaluator_eligible: true,
-        ownership_transfer: function
-            .parameters
-            .iter()
-            .any(|(_, _, access)| *access == typed_hir::AccessMode::Move),
-        bounded: true,
-        logical_cost: 1,
-        constructs: BTreeSet::new(),
-        calls: BTreeMap::new(),
-        specialization_calls: BTreeMap::new(),
-    };
-    visit_statements(&function.body, &mut facts);
-    facts.pure = !facts.suspends;
-    facts.evaluator_eligible = !facts.suspends;
-    facts
-}
-
-fn visit_statements(statements: &[Statement], facts: &mut FunctionFacts) {
-    for statement in statements {
-        facts.logical_cost = facts.logical_cost.saturating_add(1);
-        match statement {
-            Statement::Return { value, .. } => {
-                if let Some(value) = value {
-                    visit_expression(value, facts);
+            match &value.kind {
+                ExpressionKind::Constant(definition) => {
+                    observe(
+                        ResolutionKind::Reference,
+                        IdentityDomain::Definition,
+                        definition.0,
+                    );
                 }
-            }
-            Statement::Panic { value, .. } => {
-                facts.may_panic = true;
-                visit_expression(value, facts);
-            }
-            Statement::Assert { condition, .. } => {
-                facts.may_panic = true;
-                visit_expression(condition, facts);
-            }
-            Statement::Expect { condition, .. } => visit_expression(condition, facts),
-            Statement::Initialize { value, .. }
-            | Statement::Assign { value, .. }
-            | Statement::Evaluate(value)
-            | Statement::Defer {
-                expression: value, ..
-            } => visit_expression(value, facts),
-            Statement::If {
-                condition: value,
-                then_branch,
-                else_branch,
-                ..
-            }
-            | Statement::IfPattern {
-                value,
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                visit_expression(value, facts);
-                visit_statements(then_branch, facts);
-                visit_statements(else_branch, facts);
-            }
-            Statement::For { iterable, body, .. } => {
-                visit_expression(iterable, facts);
-                visit_statements(body, facts);
-            }
-            Statement::While {
-                condition, body, ..
-            } => {
-                visit_expression(condition, facts);
-                visit_statements(body, facts);
-            }
-            Statement::Break(_) | Statement::Continue(_) => {}
-            Statement::Match { value, cases, .. } => {
-                visit_expression(value, facts);
-                for case in cases.iter() {
-                    visit_statements(&case.body, facts);
-                }
-            }
-            Statement::WithPool { scope, body, .. } => {
-                visit_expression(scope, facts);
-                visit_statements(body, facts);
-            }
-            Statement::Pass(_) => {}
-        }
-    }
-}
-
-fn visit_expression(expression: &Expression, facts: &mut FunctionFacts) {
-    facts.logical_cost = facts.logical_cost.saturating_add(1);
-    match &expression.kind {
-        ExpressionKind::Call { target, arguments } => {
-            match target {
-                CallTarget::TemplateFunction { definition, .. } => {
-                    *facts.calls.entry(*definition).or_default() += 1;
-                }
-                CallTarget::Function {
+                ExpressionKind::FunctionValue {
                     definition,
                     specialization,
-                    ..
                 } => {
-                    *facts.calls.entry(*definition).or_default() += 1;
-                    *facts
-                        .specialization_calls
-                        .entry(*specialization)
-                        .or_default() += 1;
+                    observe(
+                        ResolutionKind::Reference,
+                        IdentityDomain::Definition,
+                        definition.0,
+                    );
+                    if let Some(specialization) = specialization {
+                        observe(
+                            ResolutionKind::Reference,
+                            IdentityDomain::Specialization,
+                            specialization.0,
+                        );
+                    }
                 }
-                CallTarget::Build { primitive, .. } => {
-                    facts.constructs.insert(primitive.kind);
+                ExpressionKind::Read(place) => {
+                    for projection in place.projections.iter() {
+                        if let typed_hir::PlaceProjection::Field { definition, .. } = projection {
+                            observe(
+                                ResolutionKind::Reference,
+                                IdentityDomain::Definition,
+                                definition.0,
+                            );
+                        }
+                    }
                 }
+                ExpressionKind::Call { target, .. } => match target {
+                    CallTarget::TemplateFunction { definition, .. } => {
+                        observe(
+                            ResolutionKind::Call,
+                            IdentityDomain::Definition,
+                            definition.0,
+                        );
+                    }
+                    CallTarget::Function {
+                        definition,
+                        specialization,
+                        ..
+                    } => {
+                        observe(
+                            ResolutionKind::Call,
+                            IdentityDomain::Definition,
+                            definition.0,
+                        );
+                        observe(
+                            ResolutionKind::Call,
+                            IdentityDomain::Specialization,
+                            specialization.0,
+                        );
+                    }
+                    CallTarget::Build { primitive, .. } => {
+                        observe(
+                            ResolutionKind::Call,
+                            IdentityDomain::Definition,
+                            primitive.definition.0,
+                        );
+                    }
+                    CallTarget::UserVariant { id, .. } => {
+                        observe(
+                            ResolutionKind::Call,
+                            IdentityDomain::Definition,
+                            id.definition.0,
+                        );
+                    }
+                    CallTarget::Interface { interface, .. } => {
+                        observe(
+                            ResolutionKind::Call,
+                            IdentityDomain::Definition,
+                            interface.0,
+                        );
+                    }
+                    CallTarget::Struct { definition, .. } => {
+                        observe(
+                            ResolutionKind::Call,
+                            IdentityDomain::Definition,
+                            definition.0,
+                        );
+                    }
+                    CallTarget::Test { id, .. } => {
+                        observe(ResolutionKind::Call, IdentityDomain::Test, id.identity);
+                    }
+                    CallTarget::Callable { .. } | CallTarget::BuiltinVariant(_) => {}
+                },
                 _ => {}
             }
-            if let CallTarget::Callable { value } = target {
-                visit_expression(value, facts);
-            }
-            for argument in &**arguments {
-                visit_expression(argument, facts);
-            }
         }
-        ExpressionKind::Array(values) | ExpressionKind::Tuple(values) => {
-            for value in &**values {
-                visit_expression(value, facts);
-            }
-        }
-        ExpressionKind::RepeatedArray { value, length } => {
-            facts.logical_cost = facts.logical_cost.saturating_add(*length);
-            visit_expression(value, facts);
-        }
-        ExpressionKind::Positive(value) | ExpressionKind::BitNot(value) => {
-            visit_expression(value, facts);
-        }
-        ExpressionKind::Negate(value) => {
-            facts.may_panic |= matches!(value.type_, Type::Integer(_));
-            visit_expression(value, facts);
-        }
-        ExpressionKind::Not(value) => visit_expression(value, facts),
-        ExpressionKind::Index { value, index } => {
-            facts.may_panic = true;
-            visit_expression(value, facts);
-            visit_expression(index, facts);
-        }
-        ExpressionKind::Is { value, .. } => visit_expression(value, facts),
-        ExpressionKind::Propagate(value) => visit_expression(value, facts),
-        ExpressionKind::Await(value) => {
-            facts.suspends = true;
-            visit_expression(value, facts);
-        }
-        ExpressionKind::Closure(closure) => visit_expression(&closure.body, facts),
-        ExpressionKind::Binary {
-            operator,
-            left,
-            right,
-        } => {
-            if matches!(left.type_, Type::Integer(_))
-                && matches!(
-                    operator,
-                    typed_hir::BinaryOperator::Add
-                        | typed_hir::BinaryOperator::Subtract
-                        | typed_hir::BinaryOperator::Multiply
-                        | typed_hir::BinaryOperator::Divide
-                        | typed_hir::BinaryOperator::Remainder
-                )
-            {
-                facts.may_panic = true;
-            }
-            visit_expression(left, facts);
-            visit_expression(right, facts);
-        }
-        ExpressionKind::Literal(_)
-        | ExpressionKind::Read(_)
-        | ExpressionKind::Constant(_)
-        | ExpressionKind::FunctionValue { .. } => {}
+        value.visit_children(&mut |child| expression(child, observations));
     }
-}
 
-fn expression_constructs(expression: &Expression) -> bool {
-    match &expression.kind {
-        ExpressionKind::Call { target, arguments } => {
-            matches!(target, CallTarget::Build { .. })
-                || matches!(target, CallTarget::Callable { value } if expression_constructs(value))
-                || arguments.iter().any(expression_constructs)
-        }
-        ExpressionKind::Array(values) | ExpressionKind::Tuple(values) => {
-            values.iter().any(expression_constructs)
-        }
-        ExpressionKind::RepeatedArray { value, .. } => expression_constructs(value),
-        ExpressionKind::Positive(value)
-        | ExpressionKind::Negate(value)
-        | ExpressionKind::BitNot(value)
-        | ExpressionKind::Not(value)
-        | ExpressionKind::Await(value)
-        | ExpressionKind::Propagate(value) => expression_constructs(value),
-        ExpressionKind::Index { value, index } => {
-            expression_constructs(value) || expression_constructs(index)
-        }
-        ExpressionKind::Is { value, .. } => expression_constructs(value),
-        ExpressionKind::Binary { left, right, .. } => {
-            expression_constructs(left) || expression_constructs(right)
-        }
-        ExpressionKind::Closure(closure) => expression_constructs(&closure.body),
-        ExpressionKind::Literal(_)
-        | ExpressionKind::Read(_)
-        | ExpressionKind::Constant(_)
-        | ExpressionKind::FunctionValue { .. } => false,
-    }
-}
-
-struct RecursionAnalysis {
-    proven: BTreeMap<DefinitionId, u64>,
-    unproven: Vec<SourceRange>,
-}
-
-fn analyze_recursion(program: &VerifiedProgram) -> RecursionAnalysis {
-    let graph = program
-        .functions()
-        .iter()
-        .map(|(id, function)| (*id, local_facts(function).calls.keys().copied().collect()))
-        .collect::<BTreeMap<_, _>>();
-    let mut proven = BTreeMap::new();
-    let mut unproven = Vec::new();
-    for component in crate::graph::strongly_connected_components(&graph) {
-        let recursive = component.len() > 1
-            || component
-                .first()
-                .is_some_and(|id| graph.get(id).is_some_and(|callees| callees.contains(id)));
-        if !recursive {
-            continue;
-        }
-        let members = component.iter().copied().collect::<BTreeSet<_>>();
-        let measures = component
-            .iter()
-            .filter_map(|id| {
-                let function = &program.functions()[id];
-                function
-                    .parameters
-                    .iter()
-                    .enumerate()
-                    .find_map(|(index, (local, type_, _))| match type_ {
-                        Type::Integer(kind) => {
-                            Some((*id, (index, *local, integer_measure_cardinality(*kind))))
+    fn statements(values: &[Statement], observations: &mut BTreeSet<ResolutionObservation>) {
+        for statement in values {
+            match statement {
+                Statement::Return { value, .. } => {
+                    if let Some(value) = value {
+                        expression(value, observations);
+                    }
+                }
+                Statement::Panic { value, .. }
+                | Statement::Initialize { value, .. }
+                | Statement::Assign { value, .. }
+                | Statement::Evaluate(value)
+                | Statement::Defer {
+                    expression: value, ..
+                } => expression(value, observations),
+                Statement::Assert { condition, .. } | Statement::Expect { condition, .. } => {
+                    expression(condition, observations);
+                }
+                Statement::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    expression(condition, observations);
+                    statements(then_branch, observations);
+                    statements(else_branch, observations);
+                }
+                Statement::IfPattern {
+                    value,
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    expression(value, observations);
+                    statements(then_branch, observations);
+                    statements(else_branch, observations);
+                }
+                Statement::For { iterable, body, .. } => {
+                    expression(iterable, observations);
+                    statements(body, observations);
+                }
+                Statement::While {
+                    condition, body, ..
+                } => {
+                    expression(condition, observations);
+                    statements(body, observations);
+                }
+                Statement::Match { value, cases, .. } => {
+                    expression(value, observations);
+                    for case in cases.iter() {
+                        if let Some(guard) = &case.guard {
+                            expression(guard, observations);
                         }
-                        _ => None,
-                    })
-            })
-            .collect::<BTreeMap<_, _>>();
-        let decreases = measures.len() == component.len()
-            && component.iter().all(|id| {
-                recursive_calls_decrease(
-                    &program.functions()[id].body,
-                    measures[id].1,
-                    &members,
-                    &measures,
-                )
-            });
-        if decreases {
-            for id in component {
-                proven.insert(id, measures[&id].2);
-            }
-        } else {
-            unproven.extend(
-                component
-                    .iter()
-                    .map(|id| program.functions()[id].source.clone()),
-            );
-        }
-    }
-    RecursionAnalysis { proven, unproven }
-}
-
-fn integer_measure_cardinality(kind: crate::model::IntegerType) -> u64 {
-    1_u64.checked_shl(kind.bits()).unwrap_or(u64::MAX)
-}
-
-fn recursive_calls_decrease(
-    statements: &[Statement],
-    caller_measure: typed_hir::LocalId,
-    members: &BTreeSet<DefinitionId>,
-    measures: &BTreeMap<DefinitionId, (usize, typed_hir::LocalId, u64)>,
-) -> bool {
-    fn expression_decreases(
-        expression: &Expression,
-        caller_measure: typed_hir::LocalId,
-        members: &BTreeSet<DefinitionId>,
-        measures: &BTreeMap<DefinitionId, (usize, typed_hir::LocalId, u64)>,
-    ) -> bool {
-        if let ExpressionKind::Call { target, arguments } = &expression.kind {
-            let call = match target {
-                CallTarget::Function {
-                    definition,
-                    argument_order,
-                    ..
+                        statements(&case.body, observations);
+                    }
                 }
-                | CallTarget::TemplateFunction {
-                    definition,
-                    argument_order,
-                    ..
-                } if members.contains(definition) => Some((*definition, argument_order)),
-                _ => None,
-            };
-            if let Some((callee, argument_order)) = call {
-                let parameter_index = measures[&callee].0;
-                let Some(source_index) = argument_order
-                    .iter()
-                    .position(|bound| usize::from(*bound) == parameter_index)
-                else {
-                    return false;
-                };
-                let Some(argument) = arguments.get(source_index) else {
-                    return false;
-                };
-                if !matches!(
-                    &argument.kind,
-                    ExpressionKind::Binary {
-                        operator: typed_hir::BinaryOperator::Subtract,
-                        left,
-                        right,
-                    } if matches!(&left.kind, ExpressionKind::Read(place) if place.local == caller_measure)
-                        && matches!(right.kind, ExpressionKind::Literal(typed_hir::Literal::Integer { value, .. }) if value > 0)
-                ) {
-                    return false;
+                Statement::WithPool { scope, body, .. } => {
+                    expression(scope, observations);
+                    statements(body, observations);
                 }
+                Statement::Break(_) | Statement::Continue(_) | Statement::Pass(_) => {}
             }
         }
-        let mut valid = true;
-        expression.visit_children(&mut |child| {
-            valid &= expression_decreases(child, caller_measure, members, measures);
-        });
-        valid
     }
 
-    statements.iter().all(|statement| match statement {
-        Statement::Return { value, .. } => value
-            .as_ref()
-            .is_none_or(|value| expression_decreases(value, caller_measure, members, measures)),
-        Statement::Panic { value, .. }
-        | Statement::Assert {
-            condition: value, ..
-        }
-        | Statement::Expect {
-            condition: value, ..
-        }
-        | Statement::Initialize { value, .. }
-        | Statement::Assign { value, .. }
-        | Statement::Evaluate(value)
-        | Statement::Defer {
-            expression: value, ..
-        } => expression_decreases(value, caller_measure, members, measures),
-        Statement::If {
-            condition: value,
-            then_branch,
-            else_branch,
-            ..
-        }
-        | Statement::IfPattern {
-            value,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            expression_decreases(value, caller_measure, members, measures)
-                && recursive_calls_decrease(then_branch, caller_measure, members, measures)
-                && recursive_calls_decrease(else_branch, caller_measure, members, measures)
-        }
-        Statement::For { iterable, body, .. } => {
-            expression_decreases(iterable, caller_measure, members, measures)
-                && recursive_calls_decrease(body, caller_measure, members, measures)
-        }
-        Statement::While {
-            condition, body, ..
-        } => {
-            expression_decreases(condition, caller_measure, members, measures)
-                && recursive_calls_decrease(body, caller_measure, members, measures)
-        }
-        Statement::Break(_) | Statement::Continue(_) => true,
-        Statement::Match { value, cases, .. } => {
-            expression_decreases(value, caller_measure, members, measures)
-                && cases.iter().all(|case| {
-                    recursive_calls_decrease(&case.body, caller_measure, members, measures)
-                })
-        }
-        Statement::WithPool { scope, body, .. } => {
-            expression_decreases(scope, caller_measure, members, measures)
-                && recursive_calls_decrease(body, caller_measure, members, measures)
-        }
-        Statement::Pass(_) => true,
-    })
+    let mut observations = BTreeSet::new();
+    for constant in program.constants().values() {
+        expression(&constant.expression, &mut observations);
+    }
+    for function in program
+        .functions()
+        .values()
+        .chain(program.specialized_functions().values())
+    {
+        statements(&function.body, &mut observations);
+    }
+    observations.into_iter().collect()
 }
 
 fn plan_tests(
@@ -4019,51 +3702,33 @@ fn module_name(path: &str) -> String {
         .replace('/', ".")
 }
 
-fn cancelled() -> Analysis {
-    Analysis {
+fn cancelled() -> SemanticRevision {
+    SemanticRevision {
         diagnostics: Vec::new(),
-        function_facts: Vec::new(),
-        types: Vec::new(),
-        ownership: Vec::new(),
-        specializations: Vec::new(),
-        inferred_errors: Vec::new(),
-        evaluations: Vec::new(),
-        constructions: Vec::new(),
-        test_plan: Vec::new(),
+        observations: SemanticObservations::default(),
         defect: None,
         cancelled: true,
         selection_value: None,
     }
 }
 
-fn defect(phase: &'static str, evidence: Arc<str>) -> Analysis {
-    Analysis {
+fn defect(phase: &'static str, evidence: Arc<str>) -> SemanticRevision {
+    SemanticRevision {
         diagnostics: Vec::new(),
-        function_facts: Vec::new(),
-        types: Vec::new(),
-        ownership: Vec::new(),
-        specializations: Vec::new(),
-        inferred_errors: Vec::new(),
-        evaluations: Vec::new(),
-        constructions: Vec::new(),
-        test_plan: Vec::new(),
+        observations: SemanticObservations::default(),
         defect: Some(Defect::new(phase, evidence)),
         cancelled: false,
         selection_value: None,
     }
 }
 
-fn selection_analysis(diagnostics: Vec<Diagnostic>, selection_value: Option<bool>) -> Analysis {
-    Analysis {
+fn selection_analysis(
+    diagnostics: Vec<Diagnostic>,
+    selection_value: Option<bool>,
+) -> SemanticRevision {
+    SemanticRevision {
         diagnostics,
-        function_facts: Vec::new(),
-        types: Vec::new(),
-        ownership: Vec::new(),
-        specializations: Vec::new(),
-        inferred_errors: Vec::new(),
-        evaluations: Vec::new(),
-        constructions: Vec::new(),
-        test_plan: Vec::new(),
+        observations: SemanticObservations::default(),
         defect: None,
         cancelled: false,
         selection_value,
@@ -4073,6 +3738,7 @@ fn selection_analysis(diagnostics: Vec<Diagnostic>, selection_value: Option<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantic_facts::{FunctionFacts, solve_weighted_costs};
 
     fn cost_fact(cost: u64, calls: BTreeMap<DefinitionId, u64>) -> FunctionFacts {
         FunctionFacts {

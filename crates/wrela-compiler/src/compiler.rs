@@ -928,6 +928,7 @@ pub struct Inspection {
     syntax: Arc<[SyntaxObservation]>,
     closure: Arc<[Arc<str>]>,
     identities: Arc<[IdentityObservation]>,
+    resolutions: Arc<[ResolutionObservation]>,
     function_facts: Arc<[FunctionFactsObservation]>,
     types: Arc<[TypeObservation]>,
     ownership: Arc<[OwnershipObservation]>,
@@ -980,6 +981,11 @@ impl Inspection {
     }
 
     #[must_use]
+    pub fn resolutions(&self) -> &[ResolutionObservation] {
+        &self.resolutions
+    }
+
+    #[must_use]
     pub fn function_facts(&self) -> &[FunctionFactsObservation] {
         &self.function_facts
     }
@@ -1017,6 +1023,56 @@ impl Inspection {
     #[must_use]
     pub fn test_plan(&self) -> &[TestApplicationObservation] {
         &self.test_plan
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ResolutionKind {
+    Reference,
+    Call,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ResolutionObservation {
+    kind: ResolutionKind,
+    range: SourceRange,
+    target_domain: IdentityDomain,
+    target_identity: u128,
+}
+
+impl ResolutionObservation {
+    pub(crate) const fn new(
+        kind: ResolutionKind,
+        range: SourceRange,
+        target_domain: IdentityDomain,
+        target_identity: u128,
+    ) -> Self {
+        Self {
+            kind,
+            range,
+            target_domain,
+            target_identity,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> ResolutionKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn range(&self) -> &SourceRange {
+        &self.range
+    }
+
+    #[must_use]
+    pub const fn target_domain(&self) -> IdentityDomain {
+        self.target_domain
+    }
+
+    #[must_use]
+    pub const fn target_identity(&self) -> u128 {
+        self.target_identity
     }
 }
 
@@ -2065,7 +2121,10 @@ impl Compiler {
             } else {
                 files.insert(file.path(), file);
             }
-            if !valid_module_path(file.path(), true) {
+            if !crate::project_closure::valid_module_path(
+                file.path(),
+                crate::project_closure::ModuleOrigin::Project,
+            ) {
                 diagnostics.push(Diagnostic::new(
                     "project.invalid_module_path",
                     SourceRange::new_shared(file.path_arc(), 0, 0),
@@ -2161,10 +2220,10 @@ impl Compiler {
             diagnostics.extend(parsed.diagnostics.iter().cloned());
             parsed_sources.insert(path, parsed);
         }
-        if let Some(range) = import_cycle(&parsed_sources) {
+        if let Some(cycle) = crate::project_closure::first_import_cycle(&parsed_sources) {
             diagnostics.push(Diagnostic::new(
                 "project.import_cycle",
-                range,
+                cycle.range,
                 RecoveryAction::None,
             ));
         }
@@ -2197,7 +2256,7 @@ impl Compiler {
                 }
             }
         }
-        let semantic_closure_digest = closure_digest(
+        let semantic_closure_digest = crate::project_closure::digest(
             &parsed_sources,
             &files,
             &authenticated_paths,
@@ -2227,7 +2286,7 @@ impl Compiler {
             }
         };
         let front_end_clean = diagnostics.is_empty();
-        let analysis = semantic::analyze(
+        let revision = semantic::analyze(
             &parsed_sources,
             &files,
             &mut identity_catalog,
@@ -2239,13 +2298,19 @@ impl Compiler {
                 self.distribution.pool_authority(),
             ),
         );
-        if analysis.cancelled {
-            return CompilationOutcome::Cancelled;
-        }
-        if let Some(defect) = analysis.defect.clone() {
-            return CompilationOutcome::Defect(defect);
-        }
-        diagnostics.extend(analysis.diagnostics.iter().cloned());
+        let (semantic_diagnostics, semantic_projection) = match revision.finalize(
+            request.inspection.semantics,
+            request.inspection.evaluation,
+            request.inspection.construction,
+            request.inspection.tests,
+        ) {
+            Ok(revision) => revision,
+            Err(semantic::SemanticFailure::Cancelled) => return CompilationOutcome::Cancelled,
+            Err(semantic::SemanticFailure::Defect(defect)) => {
+                return CompilationOutcome::Defect(defect);
+            }
+        };
+        diagnostics.extend(semantic_diagnostics);
         diagnostics.sort_by(|left, right| {
             left.primary
                 .path
@@ -2304,46 +2369,15 @@ impl Compiler {
             } else {
                 Arc::from([])
             },
-            function_facts: if request.inspection.semantics {
-                analysis.function_facts.into()
-            } else {
-                Arc::from([])
-            },
-            types: if request.inspection.semantics {
-                analysis.types.into()
-            } else {
-                Arc::from([])
-            },
-            ownership: if request.inspection.semantics {
-                analysis.ownership.into()
-            } else {
-                Arc::from([])
-            },
-            specializations: if request.inspection.semantics {
-                analysis.specializations.into()
-            } else {
-                Arc::from([])
-            },
-            inferred_errors: if request.inspection.semantics {
-                analysis.inferred_errors.into()
-            } else {
-                Arc::from([])
-            },
-            evaluations: if request.inspection.evaluation {
-                analysis.evaluations.into()
-            } else {
-                Arc::from([])
-            },
-            constructions: if request.inspection.construction {
-                analysis.constructions.into()
-            } else {
-                Arc::from([])
-            },
-            test_plan: if request.inspection.tests {
-                analysis.test_plan.into()
-            } else {
-                Arc::from([])
-            },
+            resolutions: semantic_projection.resolutions,
+            function_facts: semantic_projection.function_facts,
+            types: semantic_projection.types,
+            ownership: semantic_projection.ownership,
+            specializations: semantic_projection.specializations,
+            inferred_errors: semantic_projection.inferred_errors,
+            evaluations: semantic_projection.evaluations,
+            constructions: semantic_projection.constructions,
+            test_plan: semantic_projection.test_plan,
         };
 
         if diagnostics.is_empty() {
@@ -2392,73 +2426,6 @@ fn parse_unreachable_project_syntax(
     Some(observations)
 }
 
-fn import_cycle(parsed_sources: &BTreeMap<String, syntax::ParsedSource>) -> Option<SourceRange> {
-    let paths = parsed_sources.keys().cloned().collect::<Vec<_>>();
-    let indexes = paths
-        .iter()
-        .enumerate()
-        .map(|(index, path)| (path.as_str(), index))
-        .collect::<BTreeMap<_, _>>();
-    let graph = parsed_sources
-        .iter()
-        .map(|(path, parsed)| {
-            (
-                indexes[path.as_str()],
-                parsed
-                    .imports
-                    .iter()
-                    .filter_map(|import| indexes.get(import.target_path.as_str()).copied())
-                    .collect(),
-            )
-        })
-        .collect::<BTreeMap<usize, BTreeSet<usize>>>();
-    let components = crate::graph::strongly_connected_components(&graph);
-    let component_by_path = components
-        .iter()
-        .enumerate()
-        .flat_map(|(index, component)| component.iter().copied().map(move |path| (path, index)))
-        .collect::<BTreeMap<_, _>>();
-    parsed_sources.iter().find_map(|(path, parsed)| {
-        let path_index = indexes[path.as_str()];
-        let component = *component_by_path.get(&path_index)?;
-        let cyclic = components[component].len() > 1
-            || graph
-                .get(&path_index)
-                .is_some_and(|edges| edges.contains(&path_index));
-        cyclic.then(|| {
-            parsed.imports.iter().find_map(|import| {
-                (indexes
-                    .get(import.target_path.as_str())
-                    .and_then(|index| component_by_path.get(index))
-                    == Some(&component))
-                .then(|| import.range.clone())
-            })
-        })?
-    })
-}
-
-pub(crate) fn valid_module_path(path: &str, project: bool) -> bool {
-    let Some(relative) = path.strip_prefix("src/") else {
-        return false;
-    };
-    let Some(stem) = relative.strip_suffix(".wr") else {
-        return false;
-    };
-    let mut segments = stem.split('/');
-    let first = segments.next().unwrap_or_default();
-    let rest: Vec<_> = segments.collect();
-    if rest.is_empty() {
-        if project {
-            if !matches!(first, "image" | "test") {
-                return false;
-            }
-        } else {
-            return false;
-        }
-    }
-    [first].into_iter().chain(rest).all(valid_path_segment)
-}
-
 fn project_snapshot_digest(files: &[ProjectFile]) -> u128 {
     let mut files = files.iter().collect::<Vec<_>>();
     files.sort_by(|left, right| {
@@ -2475,32 +2442,9 @@ fn project_snapshot_digest(files: &[ProjectFile]) -> u128 {
     hasher.digest128()
 }
 
-fn closure_digest<'a>(
-    parsed_sources: &BTreeMap<String, syntax::ParsedSource>,
-    files: &BTreeMap<&'a str, &'a ProjectFile>,
-    authenticated_paths: &BTreeSet<&str>,
-    distribution_digest: u128,
-) -> u128 {
-    let mut hasher = Xxh3::new();
-    hasher.update(b"wrela.semantic-closure\0\x01");
-    hasher.update(&distribution_digest.to_be_bytes());
-    for path in parsed_sources.keys() {
-        hasher.update(&[u8::from(authenticated_paths.contains(path.as_str()))]);
-        hash_digest_part(&mut hasher, path.as_bytes());
-        hash_digest_part(&mut hasher, files[path.as_str()].bytes());
-    }
-    hasher.digest128()
-}
-
 fn hash_digest_part(hasher: &mut Xxh3, bytes: &[u8]) {
     hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
     hasher.update(bytes);
-}
-
-fn valid_path_segment(segment: &str) -> bool {
-    let mut bytes = segment.bytes();
-    matches!(bytes.next(), Some(b'a'..=b'z'))
-        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 #[cfg(test)]

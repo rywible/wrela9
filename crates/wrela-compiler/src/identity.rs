@@ -539,6 +539,31 @@ where
                 )
                 .map_err(IdentityFailure::Collision)?;
             }
+            let conditional_fields = match declaration.syntax.as_ref() {
+                Some(DeclarationSyntax::Struct(struct_))
+                | Some(DeclarationSyntax::ResourceStruct(struct_)) => struct_
+                    .comptime_selections
+                    .iter()
+                    .flat_map(|selection| &selection.branches)
+                    .flat_map(|branch| &branch.fields)
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            for field in conditional_fields {
+                intern_nested_definition(
+                    definition_id,
+                    "field",
+                    &field.name,
+                    format!("{}.{}", declaration.name, field.name),
+                    origin,
+                    bytes,
+                    &hasher,
+                    &mut digests,
+                    &mut records,
+                    &mut nested_definitions,
+                )
+                .map_err(IdentityFailure::Collision)?;
+            }
             if let Some(DeclarationSyntax::Suite(suite)) = &declaration.syntax {
                 for test in &suite.tests {
                     let test_bytes = usize::try_from(test.range.start())

@@ -1,0 +1,532 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flow IR Interface Prototype</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17221d;
+      --muted: #66716b;
+      --paper: #f3f1e9;
+      --panel: #fffef9;
+      --line: #d8d8cd;
+      --accent: #236a4b;
+      --accent-soft: #dcecdf;
+      --warn: #9d542c;
+      --bad: #962f3c;
+      --shadow: 0 12px 38px rgba(31, 45, 37, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }
+
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 42px 0 72px;
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { max-width: 760px; font-size: clamp(2rem, 5vw, 4.4rem); line-height: .98; letter-spacing: -.055em; }
+    h2 { font-size: 1.25rem; letter-spacing: -.02em; }
+    h3 { font-size: .95rem; }
+
+    .eyebrow {
+      color: var(--accent);
+      font-size: .74rem;
+      font-weight: 800;
+      letter-spacing: .13em;
+      text-transform: uppercase;
+    }
+
+    .lede { max-width: 850px; color: #445049; font-size: 1.05rem; }
+
+    .notice {
+      display: inline-flex;
+      padding: 7px 10px;
+      border: 1px solid #c8a98d;
+      border-radius: 999px;
+      color: #754120;
+      background: #fff3e5;
+      font-size: .78rem;
+      font-weight: 750;
+    }
+
+    .grid { display: grid; gap: 16px; }
+    .candidate-grid { grid-template-columns: repeat(3, 1fr); margin: 28px 0 16px; }
+    .state-grid { grid-template-columns: 1.1fr .9fr; }
+    .detail-grid { grid-template-columns: repeat(3, 1fr); }
+
+    .panel, .candidate {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .panel { padding: 20px; }
+
+    .candidate {
+      cursor: pointer;
+      padding: 18px;
+      text-align: left;
+      transition: border-color .12s ease, transform .12s ease;
+    }
+
+    .candidate:hover { transform: translateY(-2px); }
+    .candidate.selected { border: 2px solid var(--accent); padding: 17px; background: #fbfff9; }
+    .candidate .number { color: var(--accent); font-weight: 850; }
+    .candidate p { color: var(--muted); font-size: .88rem; margin-bottom: 0; }
+
+    .section-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .section-head p { margin: 0; color: var(--muted); font-size: .82rem; }
+
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+    button {
+      border: 1px solid #bdc8c0;
+      border-radius: 10px;
+      padding: 9px 12px;
+      color: var(--ink);
+      background: #fff;
+      font: inherit;
+      font-size: .86rem;
+      font-weight: 680;
+      cursor: pointer;
+    }
+
+    button:hover { border-color: var(--accent); }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button.danger { color: var(--bad); border-color: #d8aeb5; }
+    button[disabled] { opacity: .38; cursor: default; }
+
+    .state-list { display: grid; grid-template-columns: 145px 1fr; gap: 9px 14px; margin: 0; }
+    .state-list dt { color: var(--muted); font-size: .8rem; }
+    .state-list dd { margin: 0; font-size: .88rem; font-weight: 650; }
+
+    .pill {
+      display: inline-flex;
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: var(--accent-soft);
+      color: #20563f;
+      font-size: .75rem;
+      font-weight: 760;
+    }
+
+    .event-log {
+      display: grid;
+      gap: 7px;
+      max-height: 325px;
+      overflow: auto;
+      padding-right: 4px;
+    }
+
+    .event {
+      border-left: 3px solid var(--accent);
+      padding: 7px 9px;
+      background: #f5f7f2;
+      font-size: .82rem;
+    }
+
+    .event.rejected { border-left-color: var(--warn); background: #fff7ed; }
+    .empty { color: var(--muted); font-size: .86rem; font-style: italic; }
+
+    .interface {
+      margin: 0;
+      padding: 14px;
+      overflow: auto;
+      border-radius: 11px;
+      background: #17221d;
+      color: #eff8f1;
+      font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: pre-wrap;
+    }
+
+    .facts { margin: 0; padding-left: 18px; color: #4c5851; font-size: .86rem; }
+    .facts li + li { margin-top: 6px; }
+
+    .evidence-card {
+      min-height: 154px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px;
+      background: #fafaf5;
+    }
+
+    .evidence-card p { color: var(--muted); font-size: .82rem; }
+    .evidence-card ul { padding-left: 18px; font-size: .8rem; }
+
+    .walkthroughs { margin-top: 16px; }
+    .tabs { display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 13px; }
+    .tab.active { background: var(--accent-soft); border-color: var(--accent); }
+    .walkthrough-copy { color: var(--muted); font-size: .88rem; max-width: 760px; }
+    .steps { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .step-marker { color: var(--muted); font-size: .78rem; }
+
+    .recommendation {
+      margin-top: 16px;
+      border: 1px solid #9cbea9;
+      background: #eef8f0;
+    }
+
+    .recommendation strong { color: #174a34; }
+
+    @media (max-width: 860px) {
+      .candidate-grid, .state-grid, .detail-grid { grid-template-columns: 1fr; }
+      .state-list { grid-template-columns: 120px 1fr; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <p class="eyebrow">Wrela Layer 2 · logic prototype</p>
+  <h1>What should Flow IR make authoritative?</h1>
+  <p class="lede">This throwaway demo compares three private Flow IR Module interfaces by driving the same Actor, Mailbox, Reply, Group, cancellation, frame, and Panic scenarios through each. Watch what each design treats as truth, what it derives, and what its verifier must reconstruct.</p>
+  <span class="notice">Prototype only — do not merge into production</span>
+
+  <section class="candidate-grid grid" id="candidates"></section>
+
+  <section class="panel">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Free play</p>
+        <h2>Push the semantic model</h2>
+      </div>
+      <p>Illegal actions are recorded but cannot corrupt state.</p>
+    </div>
+    <div class="actions" id="actions"></div>
+  </section>
+
+  <section class="state-grid grid" style="margin-top:16px">
+    <article class="panel">
+      <div class="section-head">
+        <h2>Current Image state</h2>
+        <span class="pill" id="verdict">Verified</span>
+      </div>
+      <dl class="state-list" id="state"></dl>
+    </article>
+    <article class="panel">
+      <div class="section-head">
+        <h2>Semantic observations</h2>
+        <p>Stable names, never private state numbers</p>
+      </div>
+      <div class="event-log" id="events"></div>
+    </article>
+  </section>
+
+  <section class="panel" style="margin-top:16px">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Selected interface</p>
+        <h2 id="candidate-title"></h2>
+      </div>
+      <p id="candidate-authority"></p>
+    </div>
+    <pre class="interface" id="interface"></pre>
+    <div class="detail-grid grid" id="details" style="margin-top:16px"></div>
+  </section>
+
+  <section class="panel walkthroughs">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Guided walkthroughs</p>
+        <h2>Awkward cases that decide the interface</h2>
+      </div>
+    </div>
+    <div class="tabs" id="tabs"></div>
+    <p class="walkthrough-copy" id="walkthrough-copy"></p>
+    <div class="steps" id="steps"></div>
+  </section>
+
+  <section class="panel recommendation">
+    <p class="eyebrow">Validated decision</p>
+    <h2>One-shot interface, obligation-first authority, resume-catalog projections</h2>
+    <p><strong>Combine the strongest parts rather than picking a proposal unchanged.</strong> Keep one private <code>derive</code> operation and one opaque verified result. Make the semantic event-and-obligation graph authoritative inside the Module because it gives the verifier and scheduler model the strongest independent footing. Generate the resume catalog, Core resume functions, demand ledger, inspection, and model contract as purpose-owned projections. Keep final capacity, placement, service-plan, and Logical Image Layout admission in <code>ImagePlan</code>.</p>
+  </section>
+</main>
+
+<script>
+const FlowPrototype = (() => {
+  const initial = () => ({
+    image: "Running",
+    turn: "Idle",
+    mailbox: [],
+    proposals: [],
+    messageCustody: "Sender A",
+    reply: "Absent",
+    responseCustody: "Receiver",
+    group: "Closed",
+    cleanups: [],
+    cleanupResult: [],
+    frame: "No activation",
+    frameHome: "—",
+    suspensionCount: 0,
+    events: []
+  });
+
+  const observe = (state, kind, text, rejected = false) => ({
+    ...state,
+    events: [...state.events, { sequence: state.events.length + 1, kind, text, rejected }]
+  });
+
+  const reject = (state, text) => observe(state, "Action rejected", text, true);
+
+  function reduce(state, action) {
+    if (action.type === "RESET") return initial();
+    if (state.image === "Panicked") return reject(state, "Panic is terminal; reset starts a fresh Image.");
+
+    switch (action.type) {
+      case "START_TURN":
+        if (state.turn !== "Idle") return reject(state, "A suspended or running Turn remains non-reentrant.");
+        return observe({ ...state, turn: "Running" }, "Turn started", "Actor inventory began one exclusive Turn.");
+      case "SUSPEND_TURN":
+        if (state.turn !== "Running") return reject(state, "Only a running Turn may suspend.");
+        return observe({ ...state, turn: "Suspended", frame: "Stored", frameHome: "slot resource.0", suspensionCount: state.suspensionCount + 1 }, "Turn suspended", "The Turn lease and live Resource moved into a static frame home.");
+      case "RESUME_TURN":
+        if (state.turn !== "Suspended") return reject(state, "No suspended Turn is ready to resume.");
+        return observe({ ...state, turn: "Running", frame: "Loaded" }, "Turn resumed", "The same Turn recovered its frame; no second Turn was admitted.");
+      case "COMPLETE_TURN":
+        if (state.turn !== "Running") return reject(state, "Only a running Turn may complete.");
+        return observe({ ...state, turn: "Idle", frame: "Released", frameHome: "—" }, "Turn completed", "The exclusive Turn lease and frame were released.");
+      case "PROPOSE_A":
+        if (state.proposals.includes("A")) return reject(state, "Sender A already has a proposal in this arbitration.");
+        return observe({ ...state, proposals: [...state.proposals, "A"] }, "Admission proposed", "Sender A proposed one Resource message.");
+      case "PROPOSE_B":
+        if (state.proposals.includes("B")) return reject(state, "Sender B already has a proposal in this arbitration.");
+        return observe({ ...state, proposals: [...state.proposals, "B"] }, "Admission proposed", "Sender B proposed one Resource message.");
+      case "ARBITRATE": {
+        if (!state.proposals.length) return reject(state, "There are no proposals to arbitrate.");
+        if (state.mailbox.length) return observe({ ...state, proposals: [] }, "Mailbox Full", "All proposals lost; ownership stayed with each sender.");
+        const ordered = [...state.proposals].sort();
+        const winner = ordered[0];
+        const losers = ordered.slice(1);
+        let next = { ...state, proposals: [], mailbox: [`message-${winner}`], messageCustody: "Mailbox" };
+        next = observe(next, "Logical commit", `Sender ${winner} won by stable logical order; Mailbox now owns the message.`);
+        if (losers.length) next = observe(next, "Mailbox Full", `Sender ${losers.join(", ")} retained every rejected Resource.`, false);
+        return next;
+      }
+      case "ACCEPT_MESSAGE":
+        if (!state.mailbox.length || state.turn !== "Idle") return reject(state, "Message acceptance needs a resident message and an idle Actor.");
+        return observe({ ...state, mailbox: [], turn: "Running", messageCustody: "Actor Turn" }, "Message accepted", "The Actor Turn took complete ownership from the Mailbox.");
+      case "ADMIT_REQUEST":
+        if (state.reply !== "Absent") return reject(state, "A Reply already exists.");
+        return observe({ ...state, reply: "Waiting and reserved" }, "Request admitted", "Admission reserved the complete Reply path and response storage.");
+      case "CANCEL_WAITER":
+        if (state.reply !== "Waiting and reserved") return reject(state, "There is no open Reply waiter to cancel.");
+        return observe({ ...state, reply: "Closed" }, "Reply closed", "Waiting Group cancelled; later fulfillment must return the response Resource.");
+      case "FULFILL_REPLY":
+        if (state.reply === "Waiting and reserved") return observe({ ...state, reply: "Delivered", responseCustody: "Requester" }, "Reply fulfilled", "Reserved delivery succeeded without a capacity check.");
+        if (state.reply === "Closed") return observe({ ...state, reply: "ReplyClosed", responseCustody: "Receiver" }, "ReplyClosed", "The receiver retained ownership of the undelivered response.");
+        return reject(state, "No fulfillable Reply endpoint exists.");
+      case "OPEN_GROUP":
+        if (state.group !== "Closed") return reject(state, "The Group is already active or cancelling.");
+        return observe({ ...state, group: "Open", cleanups: ["release permit", "return item"], cleanupResult: [] }, "Group opened", "Two cleanup obligations were registered in source order.");
+      case "CANCEL_GROUP":
+        if (state.group !== "Open") return reject(state, "Only an open Group can begin cancellation.");
+        return observe({ ...state, group: "Cancelled after quiescence", cleanupResult: [...state.cleanups].reverse() }, "Group cancelled", "Admission closed, children quiesced, Resources returned, then cleanup ran in reverse order.");
+      case "PANIC":
+        return observe({ ...state, image: "Panicked", cleanupResult: [] }, "Panic", "The Image terminated immediately; no source cleanup or recoverable outcome was fabricated.");
+      default:
+        return reject(state, "Unknown action.");
+    }
+  }
+
+  return { initial, reduce };
+})();
+
+const candidates = {
+  machine: {
+    number: "01",
+    title: "One-shot state-machine bundle",
+    short: "Explicit Flow states are primary; resumes, proofs, demands, and model input travel together.",
+    authority: "Authority: Flow states and transitions",
+    interface: `flow::elaborate(FlowInput, Cancellation)\n  -> FlowOutcome<VerifiedFlowBundle>\n\nVerifiedFlowBundle\n  .resume_functions()\n  .demands()\n  .scheduler_model_input()\n  .inspection()\n  .receipt()`,
+    cards: [
+      ["Caller learns", ["One derivation operation", "One completed bundle", "ImagePlan remains final admission authority"]],
+      ["Verifier reconstructs", ["State reachability", "Suspension liveness", "Resource custody", "Frame coverage", "Logical order keys"]],
+      ["Pressure point", ["The bundle risks becoming a bag of sibling artifacts", "State machines can blur semantic, causal, and logical commit order"]]
+    ]
+  },
+  graph: {
+    number: "02",
+    title: "Obligation-first event graph",
+    short: "Semantic events, order edges, alternatives, and obligations are primary; states and resumes are derived.",
+    authority: "Authority: events, order, and obligations",
+    interface: `flow::derive(FlowInput, Cancellation)\n  -> FlowOutcome<VerifiedFlowProgram>\n\nVerifiedFlowProgram\n  .requirements()\n  .resume_functions()\n  .model_contract()\n  .inspection()\n  .receipt()`,
+    cards: [
+      ["Caller learns", ["One derivation operation", "Purpose-owned immutable projections", "No graph walker or public verifier runner"]],
+      ["Verifier reconstructs", ["Core-event coverage", "Program, causal, and commit order", "Linear ownership obligations", "Cleanup and Panic separation"]],
+      ["Pressure point", ["Largest internal implementation", "Closed event vocabulary must evolve with concurrency semantics"]]
+    ]
+  },
+  catalog: {
+    number: "03",
+    title: "Plan-oriented resume catalog",
+    short: "Each activation owns a ready-to-consume resume plan, static frame, generated Core function, and model action contract.",
+    authority: "Authority: activation resume plans",
+    interface: `flow::plan_resume_catalog(FlowInputs, Cancellation)\n  -> FlowPlanOutcome<VerifiedResumeCatalog>\n\nVerifiedResumeCatalog\n  .resume_functions()\n  .scheduler_model_input()\n  .demands()\n  .receipt()`,
+    cards: [
+      ["Caller learns", ["One planning operation", "Backend and scheduler model get ready inputs", "No downstream Flow interpretation"]],
+      ["Verifier reconstructs", ["Plan/Core correspondence", "Frame and custody dataflow", "Action identity agreement", "Model/runtime observation contract"]],
+      ["Pressure point", ["Generated projections risk becoming the authority", "Common-mode errors if model and Core come from one unchecked plan"]]
+    ]
+  }
+};
+
+const actions = [
+  ["Reset", "RESET", "primary"], ["Start Turn", "START_TURN"], ["Suspend", "SUSPEND_TURN"],
+  ["Resume", "RESUME_TURN"], ["Complete Turn", "COMPLETE_TURN"],
+  ["Propose send A", "PROPOSE_A"], ["Propose send B", "PROPOSE_B"], ["Arbitrate", "ARBITRATE"],
+  ["Accept message", "ACCEPT_MESSAGE"], ["Admit request", "ADMIT_REQUEST"],
+  ["Cancel waiter", "CANCEL_WAITER"], ["Fulfill Reply", "FULFILL_REPLY"],
+  ["Open Group", "OPEN_GROUP"], ["Cancel Group", "CANCEL_GROUP"], ["Panic", "PANIC", "danger"]
+];
+
+const walkthroughs = [
+  {
+    title: "Logical admission",
+    copy: "Two cross-core proposals contend for one Mailbox slot. Watch for one exact winner and ownership preservation for the loser.",
+    steps: [["Propose A", "PROPOSE_A"], ["Propose B", "PROPOSE_B"], ["Arbitrate once", "ARBITRATE"]]
+  },
+  {
+    title: "Non-reentrant Turn",
+    copy: "A Turn suspends while a message waits. The Actor must not begin another Turn until the original resumes and completes.",
+    steps: [["Start Turn", "START_TURN"], ["Suspend", "SUSPEND_TURN"], ["Attempt second Turn", "START_TURN"], ["Resume", "RESUME_TURN"], ["Complete", "COMPLETE_TURN"]]
+  },
+  {
+    title: "Reply closure",
+    copy: "A requester cancels after request admission. Later fulfillment must return ReplyClosed with the response still owned by the receiver.",
+    steps: [["Admit request", "ADMIT_REQUEST"], ["Cancel waiter", "CANCEL_WAITER"], ["Fulfill late", "FULFILL_REPLY"]]
+  },
+  {
+    title: "Cleanup vs Panic",
+    copy: "Compare recoverable Group cancellation with terminal Panic. Cancellation runs reverse cleanup after quiescence; Panic runs none.",
+    steps: [["Open Group", "OPEN_GROUP"], ["Cancel Group", "CANCEL_GROUP"], ["Reset", "RESET"], ["Open Group", "OPEN_GROUP"], ["Panic", "PANIC"]]
+  },
+  {
+    title: "Multi-suspend frame",
+    copy: "One Resource crosses two suspension points. Its target-neutral frame home must stay stable and ownership must never be copied.",
+    steps: [["Start Turn", "START_TURN"], ["Suspend once", "SUSPEND_TURN"], ["Resume", "RESUME_TURN"], ["Suspend twice", "SUSPEND_TURN"]]
+  }
+];
+
+let state = FlowPrototype.initial();
+let selected = "graph";
+let activeWalkthrough = 0;
+let walkthroughStep = 0;
+
+const $ = id => document.getElementById(id);
+
+function dispatch(type) {
+  state = FlowPrototype.reduce(state, { type });
+  render();
+}
+
+function selectCandidate(key) {
+  selected = key;
+  render();
+}
+
+function startWalkthrough(index) {
+  activeWalkthrough = index;
+  walkthroughStep = 0;
+  state = FlowPrototype.initial();
+  render();
+}
+
+function runWalkthroughStep(index) {
+  const step = walkthroughs[activeWalkthrough].steps[index];
+  state = FlowPrototype.reduce(state, { type: step[1] });
+  walkthroughStep = Math.max(walkthroughStep, index + 1);
+  render();
+}
+
+function artifactEvidence(event) {
+  if (!event) return ["No semantic event yet."];
+  if (selected === "machine") return [`Transition: ${event.kind}`, "Next state and custody ledger updated", "Resume edge remains explicit"];
+  if (selected === "graph") return [`Event: ${event.kind}`, "Causal/order edge added", "Ownership or terminal obligation checked"];
+  return [`FlowAction: ${event.kind}`, "Activation ResumePlan updated", "Core emission and model action must correspond"];
+}
+
+function renderCandidates() {
+  $("candidates").innerHTML = Object.entries(candidates).map(([key, candidate]) => `
+    <button class="candidate ${selected === key ? "selected" : ""}" onclick="selectCandidate('${key}')">
+      <span class="number">${candidate.number}</span>
+      <h2>${candidate.title}</h2>
+      <p>${candidate.short}</p>
+    </button>`).join("");
+}
+
+function renderActions() {
+  $("actions").innerHTML = actions.map(([label, type, cls = ""]) => `<button class="${cls}" onclick="dispatch('${type}')">${label}</button>`).join("");
+}
+
+function renderState() {
+  const rows = [
+    ["Image", state.image], ["Actor Turn", state.turn], ["Mailbox", state.mailbox.length ? state.mailbox.join(", ") : "Empty"],
+    ["Proposals", state.proposals.length ? state.proposals.join(", ") : "None"], ["Message custody", state.messageCustody],
+    ["Reply", state.reply], ["Response custody", state.responseCustody], ["Group", state.group],
+    ["Cleanup result", state.cleanupResult.length ? state.cleanupResult.join(" → ") : "None"],
+    ["Static frame", `${state.frame}${state.frameHome !== "—" ? ` · ${state.frameHome}` : ""}`],
+    ["Suspensions", String(state.suspensionCount)]
+  ];
+  $("state").innerHTML = rows.map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("");
+  $("verdict").textContent = state.image === "Panicked" ? "Terminal Panic" : "Semantically consistent";
+  $("verdict").style.background = state.image === "Panicked" ? "#f5dfe2" : "var(--accent-soft)";
+  $("verdict").style.color = state.image === "Panicked" ? "var(--bad)" : "#20563f";
+}
+
+function renderEvents() {
+  $("events").innerHTML = state.events.length ? [...state.events].reverse().map(event => `
+    <div class="event ${event.rejected ? "rejected" : ""}">
+      <strong>${event.sequence}. ${event.kind}</strong><br>${event.text}
+    </div>`).join("") : `<p class="empty">Choose an action or start a walkthrough.</p>`;
+}
+
+function renderInterface() {
+  const candidate = candidates[selected];
+  $("candidate-title").textContent = candidate.title;
+  $("candidate-authority").textContent = candidate.authority;
+  $("interface").textContent = candidate.interface;
+  const last = state.events[state.events.length - 1];
+  const cards = [...candidate.cards, ["Latest representation", artifactEvidence(last)]];
+  $("details").innerHTML = cards.map(([title, items]) => `<div class="evidence-card"><h3>${title}</h3><ul>${items.map(item => `<li>${item}</li>`).join("")}</ul></div>`).join("");
+}
+
+function renderWalkthroughs() {
+  $("tabs").innerHTML = walkthroughs.map((walkthrough, index) => `<button class="tab ${index === activeWalkthrough ? "active" : ""}" onclick="startWalkthrough(${index})">${walkthrough.title}</button>`).join("");
+  const walkthrough = walkthroughs[activeWalkthrough];
+  $("walkthrough-copy").textContent = walkthrough.copy;
+  $("steps").innerHTML = walkthrough.steps.map(([label], index) => `<button class="${index === walkthroughStep ? "primary" : ""}" ${index > walkthroughStep ? "disabled" : ""} onclick="runWalkthroughStep(${index})">${index + 1}. ${label}</button>`).join("") + `<span class="step-marker">${walkthroughStep}/${walkthrough.steps.length} steps explored</span>`;
+}
+
+function render() {
+  renderCandidates();
+  renderActions();
+  renderState();
+  renderEvents();
+  renderInterface();
+  renderWalkthroughs();
+}
+
+render();
+</script>
+</body>
+</html>

@@ -124,6 +124,19 @@ struct MachineFrame<'hir> {
     writebacks: Vec<(LocalId, Place)>,
 }
 
+/// One immutable registration-time plan. Captured values are owned here until
+/// the plan is consumed exactly once by recoverable scope unwinding.
+enum CleanupPlan<'hir> {
+    Expression(&'hir Expression),
+    Call {
+        target: &'hir CallTarget,
+        argument_expressions: &'hir [Expression],
+        callable: Option<Value>,
+        arguments: Vec<Value>,
+        site: &'hir SourceRange,
+    },
+}
+
 enum Control<'hir> {
     Expression(&'hir Expression),
     Constant(DefinitionId),
@@ -139,7 +152,7 @@ enum Control<'hir> {
         index: usize,
     },
     EndScope {
-        deferred: Vec<&'hir Expression>,
+        deferred: Vec<CleanupPlan<'hir>>,
     },
     Statement {
         function: &'hir HirFunction,
@@ -260,6 +273,12 @@ enum Control<'hir> {
         arguments: &'hir [Expression],
         site: &'hir SourceRange,
     },
+    FinishRegisterCleanup {
+        target: &'hir CallTarget,
+        arguments: &'hir [Expression],
+        site: &'hir SourceRange,
+    },
+    ExecuteCleanup(CleanupPlan<'hir>),
 }
 
 impl Control<'_> {
@@ -268,16 +287,18 @@ impl Control<'_> {
     }
 }
 
-fn deferred_expressions<'hir>(controls: &[Control<'hir>], start: usize) -> Vec<&'hir Expression> {
+fn take_deferred_actions<'hir>(
+    controls: &mut [Control<'hir>],
+    start: usize,
+) -> Vec<CleanupPlan<'hir>> {
     controls[start..]
-        .iter()
+        .iter_mut()
         .rev()
         .filter_map(|control| match control {
-            Control::EndScope { deferred } => Some(deferred.iter().rev()),
+            Control::EndScope { deferred } => Some(std::mem::take(deferred).into_iter().rev()),
             _ => None,
         })
         .flatten()
-        .copied()
         .collect()
 }
 
@@ -296,11 +317,10 @@ fn exited_locals(controls: &[Control<'_>], start: usize) -> Vec<LocalId> {
 
 fn push_deferred_controls<'hir>(
     controls: &mut Vec<Control<'hir>>,
-    deferred: Vec<&'hir Expression>,
+    deferred: Vec<CleanupPlan<'hir>>,
 ) {
-    for expression in deferred.into_iter().rev() {
-        controls.push(Control::Discard);
-        controls.push(Control::Expression(expression));
+    for action in deferred.into_iter().rev() {
+        controls.push(Control::ExecuteCleanup(action));
     }
 }
 
@@ -974,7 +994,7 @@ impl<'a> Engine<'a> {
                         Statement::Return {
                             value: Some(value), ..
                         } => {
-                            let deferred = deferred_expressions(controls, 0);
+                            let deferred = take_deferred_actions(controls, 0);
                             controls.clear();
                             controls.push(Control::FinishReturn {
                                 return_type: &function.return_type,
@@ -983,7 +1003,7 @@ impl<'a> Engine<'a> {
                             controls.push(Control::Expression(value));
                         }
                         Statement::Return { value: None, .. } => {
-                            let deferred = deferred_expressions(controls, 0);
+                            let deferred = take_deferred_actions(controls, 0);
                             controls.clear();
                             controls.push(Control::FinishUnitReturn);
                             push_deferred_controls(controls, deferred);
@@ -1098,7 +1118,7 @@ impl<'a> Engine<'a> {
                                     "verified break appeared outside a loop",
                                 )));
                             };
-                            let deferred = deferred_expressions(controls, index + 1);
+                            let deferred = take_deferred_actions(controls, index + 1);
                             let locals = exited_locals(controls, index + 1);
                             controls.truncate(index);
                             controls.push(Control::ClearLocals(locals));
@@ -1111,7 +1131,7 @@ impl<'a> Engine<'a> {
                                     "verified continue appeared outside a loop",
                                 )));
                             };
-                            let deferred = deferred_expressions(controls, index + 1);
+                            let deferred = take_deferred_actions(controls, index + 1);
                             let locals = exited_locals(controls, index + 1);
                             controls.truncate(index + 1);
                             controls.push(Control::ClearLocals(locals));
@@ -1122,6 +1142,18 @@ impl<'a> Engine<'a> {
                             controls.push(Control::Expression(value));
                         }
                         Statement::Defer { expression, .. } => {
+                            if let ExpressionKind::Call { target, arguments } = &expression.kind {
+                                controls.push(Control::FinishRegisterCleanup {
+                                    target,
+                                    arguments,
+                                    site: &expression.source,
+                                });
+                                controls.extend(arguments.iter().rev().map(Control::Expression));
+                                if let CallTarget::Callable { value } = target {
+                                    controls.push(Control::Expression(value));
+                                }
+                                continue;
+                            }
                             let Some(Control::EndScope { deferred }) = controls
                                 .iter_mut()
                                 .rev()
@@ -1131,7 +1163,7 @@ impl<'a> Engine<'a> {
                                     "verified defer appeared outside a lexical scope",
                                 )));
                             };
-                            deferred.push(expression);
+                            deferred.push(CleanupPlan::Expression(expression));
                         }
                         Statement::WithPool {
                             binding,
@@ -1159,11 +1191,46 @@ impl<'a> Engine<'a> {
                         .last_mut()
                         .expect("machine has current frame")
                         .controls;
-                    for expression in deferred {
+                    for action in deferred {
+                        controls.push(Control::ExecuteCleanup(action));
+                    }
+                }
+                Control::ExecuteCleanup(action) => match action {
+                    CleanupPlan::Expression(expression) => {
+                        let controls = &mut frames
+                            .last_mut()
+                            .expect("machine has current frame")
+                            .controls;
                         controls.push(Control::Discard);
                         controls.push(Control::Expression(expression));
                     }
-                }
+                    CleanupPlan::Call {
+                        target,
+                        argument_expressions,
+                        callable,
+                        arguments,
+                        site,
+                    } => {
+                        if let Some(callable) = callable {
+                            self.release(value_size(&callable))?;
+                            self.push_value(&mut frames, callable)?;
+                        }
+                        for argument in arguments {
+                            self.release(value_size(&argument))?;
+                            self.push_value(&mut frames, argument)?;
+                        }
+                        let controls = &mut frames
+                            .last_mut()
+                            .expect("machine has current frame")
+                            .controls;
+                        controls.push(Control::Discard);
+                        controls.push(Control::FinishCall {
+                            target,
+                            arguments: argument_expressions,
+                            site,
+                        });
+                    }
+                },
                 Control::FinishReturn { return_type } => {
                     let value = self.pop_value(&mut frames)?;
                     let value = coerce(value, return_type)
@@ -1794,7 +1861,7 @@ impl<'a> Engine<'a> {
                                     .last_mut()
                                     .expect("machine has current frame")
                                     .controls;
-                                let deferred = deferred_expressions(controls, 0);
+                                let deferred = take_deferred_actions(controls, 0);
                                 controls.clear();
                                 controls.push(Control::FinishReturn { return_type });
                                 push_deferred_controls(controls, deferred);
@@ -1820,6 +1887,43 @@ impl<'a> Engine<'a> {
                     let left = self.pop_value(&mut frames)?;
                     let value = apply_binary(operator, left, right, site)?;
                     self.push_value(&mut frames, value)?;
+                }
+                Control::FinishRegisterCleanup {
+                    target,
+                    arguments: argument_expressions,
+                    site,
+                } => {
+                    let arguments = self.pop_values(&mut frames, argument_expressions.len())?;
+                    let callable = if matches!(target, CallTarget::Callable { .. }) {
+                        Some(self.pop_value(&mut frames)?)
+                    } else {
+                        None
+                    };
+                    if let Some(callable) = &callable {
+                        self.retain(value_size(callable))?;
+                    }
+                    for argument in &arguments {
+                        self.retain(value_size(argument))?;
+                    }
+                    let Some(Control::EndScope { deferred }) = frames
+                        .last_mut()
+                        .expect("machine has current frame")
+                        .controls
+                        .iter_mut()
+                        .rev()
+                        .find(|control| matches!(control, Control::EndScope { .. }))
+                    else {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "verified cleanup registration has no lexical scope",
+                        )));
+                    };
+                    deferred.push(CleanupPlan::Call {
+                        target,
+                        argument_expressions,
+                        callable,
+                        arguments,
+                        site,
+                    });
                 }
                 Control::FinishCall {
                     target,

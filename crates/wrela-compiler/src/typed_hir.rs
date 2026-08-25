@@ -1167,6 +1167,8 @@ pub(crate) enum CreatorFailureKind {
     InvalidFunctionValue,
     ClosureCaptureRequiresData,
     DeferReturnsRecoverableError,
+    LoanAcrossCleanup,
+    CleanupResourceCaptureRequiresCall,
     UnreachableMatchCase,
     UnresolvedType,
     ResourceRequiresTake,
@@ -1216,6 +1218,10 @@ impl CreatorFailureKind {
             Self::InvalidFunctionValue => "semantic.invalid_function_value",
             Self::ClosureCaptureRequiresData => "semantic.closure_capture_requires_data",
             Self::DeferReturnsRecoverableError => "semantic.defer_returns_recoverable_error",
+            Self::LoanAcrossCleanup => "semantic.loan_across_cleanup",
+            Self::CleanupResourceCaptureRequiresCall => {
+                "semantic.cleanup_resource_capture_requires_call"
+            }
             Self::UnreachableMatchCase => "semantic.unreachable_match_case",
             Self::UnresolvedType => "semantic.unresolved_type",
             Self::ResourceRequiresTake => "semantic.resource_requires_take",
@@ -3477,6 +3483,22 @@ struct ArtifactVerificationAuthority<'a, 'catalog> {
     discharge_exempt: &'a BTreeSet<LocalId>,
 }
 
+fn artifact_expression_contains_resource_move(
+    expression: &Expression,
+    catalog: &ArtifactCatalog<'_>,
+) -> bool {
+    if expression.access == AccessMode::Move
+        && artifact_type_owns_resource(expression.type_id, &expression.type_, catalog)
+    {
+        return true;
+    }
+    let mut found = false;
+    expression.visit_children(&mut |child| {
+        found |= artifact_expression_contains_resource_move(child, catalog);
+    });
+    found
+}
+
 fn verify_statements(
     statements: &[Statement],
     return_type: &Type,
@@ -3534,6 +3556,26 @@ fn verify_statements(
                     || expression_contains_propagation(expression)
                 {
                     return defect("lowered defer may return a recoverable error");
+                }
+                if artifact_type_owns_resource(expression.type_id, &type_, catalog) {
+                    return defect("lowered cleanup action leaves a Resource result undisposed");
+                }
+                if !matches!(expression.kind, ExpressionKind::Call { .. })
+                    && artifact_expression_contains_resource_move(expression, catalog)
+                {
+                    return defect("lowered non-call cleanup expression captures Resource custody");
+                }
+                if let ExpressionKind::Call { arguments, .. } = &expression.kind
+                    && arguments.iter().any(|argument| {
+                        matches!(argument.access, AccessMode::Read | AccessMode::Mut)
+                            && artifact_type_owns_resource(
+                                argument.type_id,
+                                &argument.type_,
+                                catalog,
+                            )
+                    })
+                {
+                    return defect("lowered cleanup action retains a Resource loan");
                 }
             }
             Statement::Assert { condition, .. } | Statement::Expect { condition, .. } => {
@@ -6397,6 +6439,25 @@ impl<'a> Lowerer<'a> {
                     {
                         return creator(CreatorFailureKind::DeferReturnsRecoverableError, range);
                     }
+                    if self.type_owns_resource(&expression.type_) {
+                        return creator(CreatorFailureKind::MustUseValue, range);
+                    }
+                    if !matches!(expression.kind, ExpressionKind::Call { .. })
+                        && self.expression_contains_resource_move(&expression)
+                    {
+                        return creator(
+                            CreatorFailureKind::CleanupResourceCaptureRequiresCall,
+                            range,
+                        );
+                    }
+                    if let ExpressionKind::Call { arguments, .. } = &expression.kind
+                        && let Some(argument) = arguments.iter().find(|argument| {
+                            matches!(argument.access, AccessMode::Read | AccessMode::Mut)
+                                && self.type_owns_resource(&argument.type_)
+                        })
+                    {
+                        return creator(CreatorFailureKind::LoanAcrossCleanup, &argument.source);
+                    }
                     Statement::Defer {
                         expression,
                         source: range.clone(),
@@ -7725,6 +7786,17 @@ impl<'a> Lowerer<'a> {
 
     fn is_must_use(&self, type_: &Type) -> bool {
         self.type_owns_resource(type_) || matches!(type_, Type::Result { .. })
+    }
+
+    fn expression_contains_resource_move(&self, expression: &Expression) -> bool {
+        if expression.access == AccessMode::Move && self.type_owns_resource(&expression.type_) {
+            return true;
+        }
+        let mut found = false;
+        expression.visit_children(&mut |child| {
+            found |= self.expression_contains_resource_move(child);
+        });
+        found
     }
 
     fn validate_binary_capability(

@@ -2716,6 +2716,407 @@ fn defer_registration_is_lexical_and_execution_dependent() {
 }
 
 #[test]
+fn deferred_cleanup_captures_resource_custody_once_at_registration() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume_first(take ticket: Ticket):
+    if ticket.id != 1:
+        panic "defer captured the reinitialized Resource"
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn run():
+    ticket = Ticket(id=1)
+    defer consume_first(take ticket)
+    ticket = Ticket(id=2)
+    consume(take ticket)
+
+const VALUE: () = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "defer must own the first Ticket while its source place is reinitialized: {outcome:#?}"
+    );
+}
+
+#[test]
+fn return_executes_captured_resource_cleanup_once() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume_first(take ticket: Ticket):
+    if ticket.id != 1:
+        panic "return cleanup captured the wrong Resource"
+    panic "first return cleanup"
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn consume_second(take ticket: Ticket):
+    panic "second return cleanup"
+
+fn run() -> i64:
+    ticket = Ticket(id=1)
+    defer consume_first(take ticket)
+    ticket = Ticket(id=2)
+    consume(take ticket)
+    ticket = Ticket(id=3)
+    defer consume_second(take ticket)
+    return 7
+
+const VALUE: i64 = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("return must execute registered Resource cleanup");
+    };
+    let diagnostic = rejected
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.code() == "evaluation.panicked")
+        .expect("return cleanup Panic");
+    let expected = source
+        .windows(b"    panic \"second return cleanup\"".len())
+        .position(|window| window == b"    panic \"second return cleanup\"")
+        .expect("second return cleanup site");
+    assert_eq!(diagnostic.primary().start(), expected as u64);
+}
+
+#[test]
+fn propagation_executes_captured_resource_cleanup_once() {
+    let source = br#"enum Failure:
+    Failed
+
+resource struct Ticket:
+    id: i64
+
+fn fail() -> Result[i64, Failure]:
+    return Result.Err(Failure.Failed)
+
+fn consume_first(take ticket: Ticket):
+    if ticket.id != 1:
+        panic "propagation cleanup captured the wrong Resource"
+    panic "first propagation cleanup"
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn consume_second(take ticket: Ticket):
+    panic "second propagation cleanup"
+
+fn run() -> Result[i64, Failure]:
+    ticket = Ticket(id=1)
+    defer consume_first(take ticket)
+    ticket = Ticket(id=2)
+    consume(take ticket)
+    ticket = Ticket(id=3)
+    defer consume_second(take ticket)
+    return fail()?
+
+const VALUE: Result[i64, Failure] = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("propagation must execute registered Resource cleanup");
+    };
+    let diagnostic = rejected
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.code() == "evaluation.panicked")
+        .expect("propagation cleanup Panic");
+    let expected = source
+        .windows(b"    panic \"second propagation cleanup\"".len())
+        .position(|window| window == b"    panic \"second propagation cleanup\"")
+        .expect("second propagation cleanup site");
+    assert_eq!(diagnostic.primary().start(), expected as u64);
+}
+
+#[test]
+fn break_executes_captured_resource_cleanup_once() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume_first(take ticket: Ticket):
+    if ticket.id != 1:
+        panic "break cleanup captured the wrong Resource"
+    panic "first break cleanup"
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn consume_second(take ticket: Ticket):
+    panic "second break cleanup"
+
+fn run():
+    for value in [1]:
+        ticket = Ticket(id=value)
+        defer consume_first(take ticket)
+        ticket = Ticket(id=2)
+        consume(take ticket)
+        ticket = Ticket(id=3)
+        defer consume_second(take ticket)
+        break
+
+const VALUE: () = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("break must execute registered Resource cleanup");
+    };
+    let diagnostic = rejected
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.code() == "evaluation.panicked")
+        .expect("break cleanup Panic");
+    let expected = source
+        .windows(b"    panic \"second break cleanup\"".len())
+        .position(|window| window == b"    panic \"second break cleanup\"")
+        .expect("second break cleanup site");
+    assert_eq!(diagnostic.primary().start(), expected as u64);
+}
+
+#[test]
+fn continue_executes_captured_resource_cleanup_once() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume_first(take ticket: Ticket):
+    if ticket.id != 1:
+        panic "continue cleanup captured the wrong Resource"
+    panic "first continue cleanup"
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn consume_second(take ticket: Ticket):
+    panic "second continue cleanup"
+
+fn run():
+    for value in [1]:
+        ticket = Ticket(id=value)
+        defer consume_first(take ticket)
+        ticket = Ticket(id=2)
+        consume(take ticket)
+        ticket = Ticket(id=3)
+        defer consume_second(take ticket)
+        continue
+
+const VALUE: () = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("continue must execute registered Resource cleanup");
+    };
+    let diagnostic = rejected
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.code() == "evaluation.panicked")
+        .expect("continue cleanup Panic");
+    let expected = source
+        .windows(b"    panic \"second continue cleanup\"".len())
+        .position(|window| window == b"    panic \"second continue cleanup\"")
+        .expect("second continue cleanup site");
+    assert_eq!(diagnostic.primary().start(), expected as u64);
+}
+
+#[test]
+fn deferred_cleanup_composes_with_compiler_owned_pool_reclamation() {
+    let source = br#"from core import pool as pools
+
+resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn run():
+    with pools.scoped(capacity=1) as scratch:
+        ticket = Ticket(id=1)
+        defer consume(take ticket)
+
+const VALUE: () = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "deferred cleanup and authenticated Pool reclamation must each run once: {outcome:#?}"
+    );
+}
+
+#[test]
+fn deferred_cleanup_cannot_retain_a_resource_loan() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn inspect(read ticket: Ticket):
+    pass
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn broken():
+    ticket = Ticket(id=1)
+    defer inspect(ticket)
+    consume(take ticket)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("a Cleanup Action cannot retain a Resource loan until scope exit");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.loan_across_cleanup")
+    );
+}
+
+#[test]
+fn deferred_cleanup_must_discharge_its_captured_resource() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn broken():
+    ticket = Ticket(id=1)
+    defer take ticket
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("moving a Resource into cleanup without discharging it must reject");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.must_use_value")
+    );
+}
+
+#[test]
+fn deferred_resource_capture_requires_one_owned_cleanup_call() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn broken():
+    ticket = Ticket(id=1)
+    defer (consume(take ticket), ())
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("a Resource move cannot hide inside a late-bound cleanup expression");
+    };
+    assert!(rejected.diagnostics().iter().any(|diagnostic| {
+        diagnostic.code() == "semantic.cleanup_resource_capture_requires_call"
+    }));
+}
+
+#[test]
+fn cleanup_panic_does_not_hide_a_static_custody_defect() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn cleanup():
+    panic "cleanup failure"
+
+fn broken():
+    ticket = Ticket(id=1)
+    defer cleanup()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("the live Ticket must remain a Creator custody rejection");
+    };
+    assert_eq!(rejected.diagnostics().len(), 1);
+    assert_eq!(
+        rejected.diagnostics()[0].code(),
+        "semantic.resource_not_discharged"
+    );
+}
+
+#[test]
+fn terminal_panic_does_not_execute_captured_resource_cleanup() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn cleanup(take ticket: Ticket):
+    panic "source cleanup ran after Panic"
+
+fn run():
+    ticket = Ticket(id=1)
+    defer cleanup(take ticket)
+    panic "body panic"
+
+const VALUE: () = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("the body Panic must terminate evaluation");
+    };
+    let diagnostic = rejected
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.code() == "evaluation.panicked")
+        .expect("body Panic diagnostic");
+    let expected = source
+        .windows(b"    panic \"body panic\"".len())
+        .position(|window| window == b"    panic \"body panic\"")
+        .expect("body Panic site");
+    assert_eq!(diagnostic.primary().start(), expected as u64);
+}
+
+#[test]
 fn typed_hir_fingerprint_includes_literal_payloads_and_operations() {
     fn fingerprint(value: i32, operator: &str) -> u128 {
         let source = format!(

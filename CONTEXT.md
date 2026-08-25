@@ -188,6 +188,10 @@ _Avoid_: Symbol table, global registry, mutable compiler session
 One executable function or method body after every type, compile-time Data, and Pool argument has been fixed for the closed Image.
 _Avoid_: Generic instance, Actor instance, runtime object
 
+**Executable Demand**:
+The canonical closed set of reachable source Specializations and authenticated generated roles that must be realized exactly once for one Image.
+_Avoid_: Linker reachability, pass worklist, call count
+
 **Capability**:
 An unforgeable value granting narrowly scoped authority over an Image resource or privileged operation.
 _Avoid_: Permission flag, raw handle
@@ -227,6 +231,30 @@ _Avoid_: Plain old data
 **Resource**:
 A value with one owner that moves only through explicit `take` and must be reclaimed, consumed, or transferred on every recoverable path.
 _Avoid_: Object, implicitly moved value
+
+**Resource Custody**:
+The unique current owner or storage home of one Resource together with the obligation to consume, transfer, reclaim, or protect it on every recoverable path.
+_Avoid_: Reference lifetime, alias count, physical address
+
+**Custody Law**:
+A closed language rule describing how one semantic operation changes initialization, Resource Custody, loans, and discharge obligations while preserving recoverable ownership guarantees.
+_Avoid_: Borrow-checker heuristic, optimizer fact, cleanup convention
+
+**Discharge Law**:
+The verified rule attached to a Resource type that requires explicit discharge, permits one authenticated compiler reclaim operation, or composes obligations from owned Resource fields.
+_Avoid_: Destructor, finalizer, implicit drop
+
+**Cleanup Action**:
+A registered one-shot action that owns its captured Resources and discharges them in deterministic reverse registration order on recoverable scope exit.
+_Avoid_: Retained borrow, error handler, destructor
+
+**Transfer Commit**:
+The semantic point at which one Resource's Custody moves atomically from its source to exactly one destination; rejection before that point leaves complete Custody with the source.
+_Avoid_: In-transit state, partial move, transport acknowledgment
+
+**Suspension Home**:
+The statically identified async-frame slot or persistent owner that holds complete Resource Custody while an activation is suspended.
+_Avoid_: Hidden future, borrowed stack slot, runtime heap location
 
 **Nominal Error**:
 A named Wrela Data or Resource type carried as the error alternative of `Result`; a public function names it explicitly, while a private function may infer one such type but never an anonymous structural error union.
@@ -283,6 +311,22 @@ _Avoid_: Variable-length record, disk sector, allocation extent
 **Wire Layout**:
 A compiler-checked exact byte representation used by Event payloads and Store Snapshots. It has explicit endianness, offsets, and padding, and canonically encodes fixed-width integers, strict booleans, IEEE-754 floats, fixed arrays, and nested Wire Layouts.
 _Avoid_: Native struct layout, serializer option, implicit padding
+
+**Planning Requirement**:
+A verified provenance-bearing obligation exported by one semantic artifact for whole-Image planning to discharge or reject without becoming a second authority for that artifact's meaning.
+_Avoid_: Shared fact, optimizer hint, admission result
+
+**Admission Evidence**:
+The verified structured justification that one ImagePlan discharged every Planning Requirement, resource bound, service obligation, placement constraint, and Logical Image Layout constraint.
+_Avoid_: Build log, report prose, optimizer trace
+
+**Admission Rejection**:
+The canonical Creator-correctable explanation that whole-Image planning could not discharge one or more Planning Requirements, with their exact provenance and no partial ImagePlan.
+_Avoid_: Failed Admission Evidence, compiler Defect, partial plan
+
+**ImagePlan**:
+The complete verified target-neutral plan for one closed Image, binding its graph, Facility requirements, resource bounds, service obligations, logical placement, Logical Image Layout, and Admission Evidence.
+_Avoid_: Build manifest, backend plan, mutable planning state
 
 **Logical Image Layout**:
 The target-neutral bounded arrangement of an Image's Pools, Mailboxes, frames, buffers, Facility state, scheduler structures, and memory regions.

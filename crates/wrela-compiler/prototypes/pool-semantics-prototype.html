@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pool Semantics Prototype</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #1e2522;
+      --muted: #667069;
+      --paper: #f1efe7;
+      --panel: #fffef9;
+      --line: #d7d7cc;
+      --accent: #356454;
+      --accent-soft: #dfece5;
+      --blue: #385d87;
+      --warn: #9c5c28;
+      --bad: #963844;
+      --shadow: 0 12px 38px rgba(31, 45, 37, .08);
+    }
+
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.45; }
+    main { width: min(1220px, calc(100% - 32px)); margin: 0 auto; padding: 42px 0 72px; }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { max-width: 940px; font-size: clamp(2rem, 5vw, 4.35rem); line-height: .99; letter-spacing: -.052em; }
+    h2 { font-size: 1.22rem; letter-spacing: -.02em; }
+    h3 { font-size: .94rem; }
+    code { font: .92em ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    .eyebrow { color: var(--accent); font-size: .73rem; font-weight: 820; letter-spacing: .13em; text-transform: uppercase; }
+    .lede { max-width: 940px; color: #49534d; font-size: 1.04rem; }
+    .notice { display: inline-flex; padding: 7px 10px; border: 1px solid #c8a98d; border-radius: 999px; color: #754120; background: #fff3e5; font-size: .78rem; font-weight: 750; }
+    .grid { display: grid; gap: 16px; }
+    .two { grid-template-columns: 1fr 1fr; }
+    .three { grid-template-columns: repeat(3, 1fr); }
+    .panel { padding: 20px; border: 1px solid var(--line); border-radius: 16px; background: var(--panel); box-shadow: var(--shadow); }
+    .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .section-head p { margin: 0; color: var(--muted); font-size: .81rem; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .action-group + .action-group { margin-top: 16px; padding-top: 15px; border-top: 1px solid var(--line); }
+    .action-label { margin-bottom: 8px; color: var(--muted); font-size: .78rem; font-weight: 780; text-transform: uppercase; letter-spacing: .08em; }
+
+    button { border: 1px solid #bdc8c0; border-radius: 10px; padding: 9px 12px; color: var(--ink); background: #fff; font: inherit; font-size: .84rem; font-weight: 680; cursor: pointer; }
+    button:hover { border-color: var(--accent); }
+    button.primary { color: #fff; border-color: var(--accent); background: var(--accent); }
+    button.blue { color: #fff; border-color: var(--blue); background: var(--blue); }
+    button.danger { color: var(--bad); border-color: #d8aeb5; }
+    button[disabled] { opacity: .38; cursor: default; }
+
+    .pill { display: inline-flex; border-radius: 999px; padding: 3px 8px; background: var(--accent-soft); color: #235241; font-size: .74rem; font-weight: 760; }
+    .state-list { display: grid; grid-template-columns: 160px 1fr; gap: 9px 14px; margin: 0; }
+    .state-list dt { color: var(--muted); font-size: .79rem; }
+    .state-list dd { margin: 0; font-size: .86rem; font-weight: 650; }
+
+    .slots { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+    .slot { min-height: 124px; padding: 13px; border: 1px solid var(--line); border-radius: 12px; background: #fafaf5; }
+    .slot.allocated { border-color: #8db6a4; background: #eff8f3; }
+    .slot.reserved { border-color: #94aac4; background: #eff4fa; }
+    .slot.retired { border-color: #d1aeb3; background: #fbf0f1; }
+    .slot p { margin-bottom: 5px; color: var(--muted); font-size: .78rem; }
+    .slot strong { display: block; margin-bottom: 7px; }
+
+    .mini-list { display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; }
+    .mini-list li { padding: 8px 10px; border-radius: 9px; background: #f5f6f1; font-size: .8rem; }
+    .empty { color: var(--muted); font-size: .84rem; font-style: italic; }
+    .event-log { display: grid; gap: 7px; max-height: 360px; overflow: auto; padding-right: 4px; }
+    .event { padding: 7px 9px; border-left: 3px solid var(--accent); background: #f3f7f4; font-size: .8rem; }
+    .event.plan { border-left-color: var(--blue); background: #f1f5fa; }
+    .event.rejected { border-left-color: var(--warn); background: #fff7ed; }
+
+    .trace { display: grid; gap: 7px; max-height: 250px; overflow: auto; }
+    .trace-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; padding: 8px 10px; border-radius: 9px; background: #f4f6f8; font-size: .8rem; }
+    .trace-row.bad { background: #fff0ec; color: #793829; }
+    .formula { margin: 10px 0 0; padding: 11px; border-radius: 10px; background: #1f2b27; color: #f2faf5; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    .walkthroughs { margin-top: 16px; }
+    .tabs { display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 13px; }
+    .tab.active { border-color: var(--accent); background: var(--accent-soft); }
+    .walkthrough-copy { max-width: 840px; color: var(--muted); font-size: .87rem; }
+    .steps { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .step-marker { color: var(--muted); font-size: .77rem; }
+
+    .recommendation { margin-top: 16px; border-color: #93b5a6; background: #edf7f1; }
+    .recommendation ul { margin-bottom: 0; padding-left: 20px; color: #405048; font-size: .87rem; }
+    .recommendation li + li { margin-top: 5px; }
+
+    @media (max-width: 900px) {
+      .two, .three { grid-template-columns: 1fr; }
+      .state-list { grid-template-columns: 125px 1fr; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <p class="eyebrow">Wrela Layer 2 · logic prototype</p>
+  <h1>Can one Pool model preserve custody and prove capacity?</h1>
+  <p class="lede">This throwaway demo tests a Pool with two logical allocation slots. Drive fallible and proof-required allocation, copy and stale Keys, reclaim, one-shot Permits, cancellation release, and generation retirement. The runtime view and planning proof deliberately share the same commitment invariant.</p>
+  <span class="notice">Prototype only — do not merge into production</span>
+
+  <section class="panel" style="margin-top:28px">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Free play</p>
+        <h2>Push the Pool and its proof ledger</h2>
+      </div>
+      <p>Rejected actions preserve complete Resource Custody.</p>
+    </div>
+    <div class="action-group">
+      <div class="action-label">Runtime custody</div>
+      <div class="actions" id="runtime-actions"></div>
+    </div>
+    <div class="action-group">
+      <div class="action-label">Whole-Image proof trace</div>
+      <div class="actions" id="plan-actions"></div>
+    </div>
+  </section>
+
+  <section class="grid two" style="margin-top:16px">
+    <article class="panel">
+      <div class="section-head">
+        <h2>Runtime Pool state</h2>
+        <span class="pill" id="runtime-verdict"></span>
+      </div>
+      <dl class="state-list" id="runtime-state"></dl>
+      <div class="slots" id="slots" style="margin-top:16px"></div>
+    </article>
+    <article class="panel">
+      <div class="section-head">
+        <h2>Planning proof</h2>
+        <span class="pill" id="plan-verdict"></span>
+      </div>
+      <dl class="state-list" id="plan-state"></dl>
+      <div class="formula" id="formula"></div>
+      <div class="trace" id="trace" style="margin-top:12px"></div>
+    </article>
+  </section>
+
+  <section class="grid three" style="margin-top:16px">
+    <article class="panel"><h2>Caller values</h2><ul class="mini-list" id="values"></ul></article>
+    <article class="panel"><h2>Owning values and Permits</h2><ul class="mini-list" id="resources"></ul></article>
+    <article class="panel"><h2>Copied Keys</h2><ul class="mini-list" id="keys"></ul></article>
+  </section>
+
+  <section class="panel" style="margin-top:16px">
+    <div class="section-head"><h2>Semantic observations</h2><p>Newest first</p></div>
+    <div class="event-log" id="events"></div>
+  </section>
+
+  <section class="panel walkthroughs">
+    <div class="section-head">
+      <div><p class="eyebrow">Guided walkthroughs</p><h2>Cases that decide the model</h2></div>
+    </div>
+    <div class="tabs" id="tabs"></div>
+    <p class="walkthrough-copy" id="walkthrough-copy"></p>
+    <div class="steps" id="steps"></div>
+  </section>
+
+  <section class="panel recommendation">
+    <p class="eyebrow">Validated decision</p>
+    <h2>One commitment invariant, typed Permits, no generation wrap</h2>
+    <ul>
+      <li>Capacity is a logical allocation count: <code>live allocations + outstanding Permits ≤ usable slots ≤ declared capacity</code>.</li>
+      <li><code>try_allocate</code> commits only on success and returns <code>PoolFull[T]</code> with unchanged custody on failure.</li>
+      <li><code>allocate</code> and <code>reserve[P,T]</code> require Admission Evidence. A typed one-shot Permit reserves one exact future allocation; consuming it changes reserved custody into live custody without increasing commitment.</li>
+      <li><code>Key[P,T]</code> is copied Data, never grants custody, and succeeds only when Pool identity, slot, generation, and type all match a live allocation.</li>
+      <li>Reclaim consumes <code>own[P] T</code>, returns <code>T</code>, advances the generation, and never revives a stale Key. Exhausted generations retire rather than wrap.</li>
+      <li>Image planning uses path-sensitive live ranges, reservations, cleanup, cancellation, and concurrent activations—not static allocation-site counting. Proof success never changes source-visible types.</li>
+    </ul>
+  </section>
+</main>
+
+<script>
+const PoolPrototype = (() => {
+  const initialValues = () => [
+    { id: "amber", kind: "Data", custody: "Caller" },
+    { id: "blue", kind: "Data", custody: "Caller" },
+    { id: "copper", kind: "Data", custody: "Caller" },
+    { id: "reply-token", kind: "Resource", custody: "Caller" }
+  ];
+
+  const initial = () => ({
+    image: "Running",
+    poolOpen: true,
+    poolId: "scratch@scope.7",
+    declaredCapacity: 2,
+    maxGeneration: 2,
+    slots: [0, 1].map(id => ({ id, generation: 0, status: "Free", valueId: null, valueKind: null, ownerId: null, permitId: null })),
+    values: initialValues(),
+    owners: [],
+    permits: [],
+    keys: [],
+    nextOwner: 1,
+    nextPermit: 1,
+    nextKey: 1,
+    plan: { live: 0, reserved: 0, peak: 0, usable: 2, trace: [], violations: [], verdict: "Unverified", authorizedAllocate: 0, authorizedReserve: 0, usedAllocate: 0, usedReserve: 0 },
+    events: []
+  });
+
+  const observe = (state, kind, text, tone = "runtime") => ({ ...state, events: [...state.events, { sequence: state.events.length + 1, kind, text, tone }] });
+  const reject = (state, text, tone = "runtime") => observe(state, "Action rejected", text, "rejected");
+  const activeSlots = state => state.slots.filter(slot => slot.status === "Allocated").length;
+  const reservedSlots = state => state.slots.filter(slot => slot.status === "Reserved").length;
+  const usableSlots = state => state.slots.filter(slot => slot.status !== "Retired").length;
+  const freeSlotIndex = state => state.slots.findIndex(slot => slot.status === "Free");
+  const callerValueIndex = (state, kind = null) => state.values.findIndex(value => value.custody === "Caller" && (!kind || value.kind === kind));
+
+  function allocateInto(state, slotIndex, valueIndex, via) {
+    const slot = state.slots[slotIndex];
+    const value = state.values[valueIndex];
+    const ownerId = `owner-${state.nextOwner}`;
+    const keyId = `key-${state.nextKey}`;
+    const slots = state.slots.map((candidate, index) => index === slotIndex ? { ...candidate, status: "Allocated", valueId: value.id, valueKind: value.kind, ownerId, permitId: null } : candidate);
+    const values = state.values.map((candidate, index) => index === valueIndex ? { ...candidate, custody: ownerId } : candidate);
+    const owners = [...state.owners, { id: ownerId, slot: slot.id, generation: slot.generation, valueId: value.id, valueKind: value.kind, via }];
+    const keys = [...state.keys, { id: keyId, poolId: state.poolId, slot: slot.id, generation: slot.generation, valueKind: value.kind }];
+    return observe({ ...state, slots, values, owners, keys, nextOwner: state.nextOwner + 1, nextKey: state.nextKey + 1 }, "Transfer Commit", `${via} moved ${value.id} into slot ${slot.id}; ${ownerId} has custody and ${keyId} is copyable Data.`);
+  }
+
+  function tryAllocate(state, kind) {
+    if (!state.poolOpen || state.image !== "Running") return reject(state, "The Pool is not available in this Image state.");
+    const valueIndex = callerValueIndex(state, kind);
+    if (valueIndex < 0) return reject(state, `No caller-owned ${kind} value is available.`);
+    const slotIndex = freeSlotIndex(state);
+    if (slotIndex < 0) return observe(state, "PoolFull", `${state.values[valueIndex].id} stayed entirely with the caller; no Transfer Commit occurred.`);
+    return allocateInto(state, slotIndex, valueIndex, "try_allocate");
+  }
+
+  function requiredAllocate(state) {
+    if (state.plan.verdict !== "Admitted" || state.plan.usedAllocate >= state.plan.authorizedAllocate) return reject(state, "No unused Admission Evidence authorizes this proof-required allocate.");
+    const valueIndex = callerValueIndex(state, "Data");
+    if (valueIndex < 0) return reject(state, "No caller-owned Data value is available.");
+    const slotIndex = freeSlotIndex(state);
+    if (slotIndex < 0) return observe({ ...state, image: "Defect" }, "Verifier disagreement", "An admitted infallible allocate found no slot; the proof/runtime correspondence failed.", "rejected");
+    let next = allocateInto(state, slotIndex, valueIndex, "allocate");
+    next = { ...next, plan: { ...next.plan, usedAllocate: next.plan.usedAllocate + 1 } };
+    return next;
+  }
+
+  function reserve(state) {
+    if (state.plan.verdict !== "Admitted" || state.plan.usedReserve >= state.plan.authorizedReserve) return reject(state, "No unused Admission Evidence authorizes this typed reservation.");
+    const slotIndex = freeSlotIndex(state);
+    if (slotIndex < 0) return observe({ ...state, image: "Defect" }, "Verifier disagreement", "An admitted reserve found no slot; the proof/runtime correspondence failed.", "rejected");
+    const permitId = `permit-${state.nextPermit}`;
+    const slot = state.slots[slotIndex];
+    const slots = state.slots.map((candidate, index) => index === slotIndex ? { ...candidate, status: "Reserved", permitId } : candidate);
+    const permits = [...state.permits, { id: permitId, poolId: state.poolId, slot: slot.id, valueKind: "Data", status: "Held" }];
+    return observe({ ...state, slots, permits, nextPermit: state.nextPermit + 1, plan: { ...state.plan, usedReserve: state.plan.usedReserve + 1 } }, "Permit reserved", `${permitId} owns one slot for a future Data allocation.`);
+  }
+
+  function consumePermit(state) {
+    const permitIndex = state.permits.findIndex(permit => permit.status === "Held");
+    const valueIndex = callerValueIndex(state, "Data");
+    if (permitIndex < 0 || valueIndex < 0) return reject(state, "Consuming a Permit needs one held Permit and one caller-owned matching value.");
+    const permit = state.permits[permitIndex];
+    const slotIndex = state.slots.findIndex(slot => slot.id === permit.slot && slot.permitId === permit.id);
+    if (slotIndex < 0) return observe({ ...state, image: "Defect" }, "Permit mismatch", "The Permit no longer names its reserved slot.", "rejected");
+    const permits = state.permits.map((candidate, index) => index === permitIndex ? { ...candidate, status: "Consumed" } : candidate);
+    const cleared = { ...state, permits, slots: state.slots.map((slot, index) => index === slotIndex ? { ...slot, status: "Free", permitId: null } : slot) };
+    return allocateInto(cleared, slotIndex, valueIndex, "Permit consumption");
+  }
+
+  function releasePermit(state, reason = "explicit release") {
+    const permitIndex = state.permits.findIndex(permit => permit.status === "Held");
+    if (permitIndex < 0) return reject(state, "No held Permit is available to release.");
+    const permit = state.permits[permitIndex];
+    const permits = state.permits.map((candidate, index) => index === permitIndex ? { ...candidate, status: "Released" } : candidate);
+    const slots = state.slots.map(slot => slot.permitId === permit.id ? { ...slot, status: "Free", permitId: null } : slot);
+    return observe({ ...state, permits, slots }, "Permit discharged", `${permit.id} returned its reserved slot by ${reason}.`);
+  }
+
+  function reclaimOwner(state, which) {
+    const active = state.owners.filter(owner => owner.status !== "Reclaimed");
+    const owner = which === "first" ? active[0] : active[active.length - 1];
+    if (!owner) return reject(state, "No owning Pool value is available to reclaim.");
+    const slotIndex = state.slots.findIndex(slot => slot.id === owner.slot && slot.ownerId === owner.id);
+    if (slotIndex < 0) return observe({ ...state, image: "Defect" }, "Owner mismatch", "The owning value does not match its Pool slot.", "rejected");
+    const slot = state.slots[slotIndex];
+    const retire = slot.generation >= state.maxGeneration;
+    const slots = state.slots.map((candidate, index) => index === slotIndex ? { ...candidate, status: retire ? "Retired" : "Free", generation: retire ? candidate.generation : candidate.generation + 1, valueId: null, valueKind: null, ownerId: null, permitId: null } : candidate);
+    const owners = state.owners.map(candidate => candidate.id === owner.id ? { ...candidate, status: "Reclaimed" } : candidate);
+    const values = state.values.map(value => value.id === owner.valueId ? { ...value, custody: "Caller" } : value);
+    return observe({ ...state, slots, owners, values }, "Allocation reclaimed", `${owner.id} returned ${owner.valueId}; slot ${owner.slot} ${retire ? "retired instead of wrapping its generation" : `advanced to generation ${slot.generation + 1}`}.`);
+  }
+
+  function lookup(state, newest) {
+    const key = newest ? state.keys[state.keys.length - 1] : state.keys[0];
+    if (!key) return reject(state, "No Key has been copied yet.");
+    if (!state.poolOpen) return reject(state, "A scoped Key cannot be used after its Pool scope ends.");
+    if (key.valueKind !== "Data") return reject(state, `${key.id} names a Resource allocation; lookup is copy-only for Data.`);
+    const slot = state.slots.find(candidate => candidate.id === key.slot);
+    const hit = slot && slot.status === "Allocated" && slot.generation === key.generation && slot.valueKind === key.valueKind;
+    return observe(state, hit ? "Lookup Some" : "Lookup None", hit ? `${key.id} copied ${slot.valueId}; Resource Custody stayed with ${slot.ownerId}.` : `${key.id} is stale, retired, empty, wrong-generation, or otherwise nonmatching.`);
+  }
+
+  function planStep(state, kind, deltaLive, deltaReserved, detail) {
+    if (state.plan.verdict !== "Unverified") return reject(state, "Reset the proof trace before changing an admitted or rejected plan.", "plan");
+    const live = Math.max(0, state.plan.live + deltaLive);
+    const reserved = Math.max(0, state.plan.reserved + deltaReserved);
+    const committed = live + reserved;
+    const peak = Math.max(state.plan.peak, committed);
+    const violation = committed > state.plan.usable ? `${kind}: commitment ${committed} exceeds usable capacity ${state.plan.usable}` : null;
+    const trace = [...state.plan.trace, { kind, detail, committed, usable: state.plan.usable, violation }];
+    const plan = { ...state.plan, live, reserved, peak, trace, violations: violation ? [...state.plan.violations, violation] : state.plan.violations };
+    return observe({ ...state, plan }, "Plan event", `${kind}: ${detail} Commitment is ${committed}/${state.plan.usable}.`, "plan");
+  }
+
+  function reduce(state, action) {
+    if (action.type === "RESET") return initial();
+    if (action.type === "RESET_PLAN") return observe({ ...state, plan: initial().plan }, "Proof trace reset", "Runtime custody stayed unchanged.", "plan");
+    if (state.image === "Panicked" || state.image === "Defect") return reject(state, `${state.image} is terminal; reset starts a fresh demonstration.`);
+
+    switch (action.type) {
+      case "TRY_DATA": return tryAllocate(state, "Data");
+      case "TRY_RESOURCE": return tryAllocate(state, "Resource");
+      case "ALLOCATE": return requiredAllocate(state);
+      case "RESERVE": return reserve(state);
+      case "CONSUME_PERMIT": return consumePermit(state);
+      case "RELEASE_PERMIT": return releasePermit(state);
+      case "RECLAIM_FIRST": return reclaimOwner(state, "first");
+      case "RECLAIM_LAST": return reclaimOwner(state, "last");
+      case "LOOKUP_OLDEST": return lookup(state, false);
+      case "LOOKUP_NEWEST": return lookup(state, true);
+      case "ESCAPE_KEY": return reject(state, "Key[scratch, T] contains the scoped Pool identity and cannot escape its lexical scope.");
+      case "CANCEL": {
+        if (state.owners.some(owner => owner.status !== "Reclaimed" && owner.valueKind === "Resource")) return reject(state, "Cancellation needs an explicit Cleanup Action for the protocol Resource inside this allocation.");
+        let next = state;
+        while (next.permits.some(permit => permit.status === "Held")) next = releasePermit(next, "recoverable cancellation cleanup");
+        while (next.owners.some(owner => owner.status !== "Reclaimed")) next = reclaimOwner(next, "first");
+        return observe(next, "Cancelled", "All compiler-reclaimable owners and Permits discharged before cancellation became observable.");
+      }
+      case "END_SCOPE": {
+        if (state.owners.some(owner => owner.status !== "Reclaimed" && owner.valueKind === "Resource")) return reject(state, "The Pool cannot close while an owning value contains an undisposed protocol Resource.");
+        let next = state;
+        while (next.permits.some(permit => permit.status === "Held")) next = releasePermit(next, "scope cleanup");
+        while (next.owners.some(owner => owner.status !== "Reclaimed")) next = reclaimOwner(next, "first");
+        return observe({ ...next, poolOpen: false }, "Pool scope closed", "Owning values and Permits discharged; copied Keys became unusable with the scoped Pool identity.");
+      }
+      case "PANIC": return observe({ ...state, image: "Panicked" }, "Panic", "The Image ended immediately; no Permit release, reclaim, or generation advance ran.");
+      case "PLAN_TRY": return planStep(state, "try_allocate success path", 1, 0, "Optional pressure remains live on this path.");
+      case "PLAN_ALLOCATE": return planStep(state, "proof-required allocate", 1, 0, "One infallible allocation requires capacity on every admitted path.");
+      case "PLAN_RESERVE": return planStep(state, "proof-required reserve", 0, 1, "One typed Permit commits a future slot now.");
+      case "PLAN_CONSUME": {
+        if (state.plan.reserved < 1) return reject(state, "The proof trace has no outstanding Permit to consume.", "plan");
+        return planStep(state, "consume Permit", 1, -1, "Reserved capacity became live allocation with no commitment increase.");
+      }
+      case "PLAN_RECLAIM": {
+        if (state.plan.live < 1) return reject(state, "The proof trace has no live allocation to reclaim.", "plan");
+        return planStep(state, "reclaim", -1, 0, "One live allocation ended.");
+      }
+      case "PLAN_RELEASE": {
+        if (state.plan.reserved < 1) return reject(state, "The proof trace has no Permit to release.", "plan");
+        return planStep(state, "release Permit", 0, -1, "Recoverable cleanup returned the reservation.");
+      }
+      case "PLAN_RETIRE": {
+        if (state.plan.verdict !== "Unverified") return reject(state, "Reset the proof trace before changing usable slots.", "plan");
+        const usable = Math.max(0, state.plan.usable - 1);
+        const committed = state.plan.live + state.plan.reserved;
+        const violation = committed > usable ? `generation retirement leaves commitment ${committed} above usable capacity ${usable}` : null;
+        const plan = { ...state.plan, usable, trace: [...state.plan.trace, { kind: "generation retirement", detail: "One exhausted slot can never be reused.", committed, usable, violation }], violations: violation ? [...state.plan.violations, violation] : state.plan.violations };
+        return observe({ ...state, plan }, "Plan event", `Generation exhaustion reduced usable slots to ${usable}; stale Keys still cannot revive.`, "plan");
+      }
+      case "VERIFY_PLAN": {
+        if (!state.plan.trace.length) return reject(state, "Add at least one proof event before verification.", "plan");
+        const admitted = state.plan.violations.length === 0;
+        const authorizedAllocate = admitted ? state.plan.trace.filter(row => row.kind === "proof-required allocate").length : 0;
+        const authorizedReserve = admitted ? state.plan.trace.filter(row => row.kind === "proof-required reserve").length : 0;
+        const plan = { ...state.plan, verdict: admitted ? "Admitted" : "Admission Rejection", authorizedAllocate, authorizedReserve };
+        return observe({ ...state, plan }, admitted ? "Admission Evidence" : "Admission Rejection", admitted ? `Peak commitment ${plan.peak} fits usable capacity ${plan.usable}; required operations are authorized.` : state.plan.violations.join("; "), admitted ? "plan" : "rejected");
+      }
+      default: return reject(state, "Unknown action.");
+    }
+  }
+
+  return { initial, reduce, activeSlots, reservedSlots, usableSlots };
+})();
+
+const runtimeActions = [
+  ["Reset all", "RESET", "primary"], ["try_allocate Data", "TRY_DATA"], ["try_allocate Resource", "TRY_RESOURCE"],
+  ["Proof-required allocate", "ALLOCATE", "blue"], ["Reserve typed Permit", "RESERVE", "blue"], ["Consume Permit", "CONSUME_PERMIT"],
+  ["Release Permit", "RELEASE_PERMIT"], ["Reclaim first owner", "RECLAIM_FIRST"], ["Reclaim newest owner", "RECLAIM_LAST"],
+  ["Lookup oldest Key", "LOOKUP_OLDEST"], ["Lookup newest Key", "LOOKUP_NEWEST"], ["Try Key escape", "ESCAPE_KEY", "danger"],
+  ["Recoverable cancellation", "CANCEL"], ["Close Pool scope", "END_SCOPE"], ["Panic", "PANIC", "danger"]
+];
+
+const planActions = [
+  ["Reset proof trace", "RESET_PLAN", "primary"], ["Plan try success", "PLAN_TRY"], ["Plan required allocate", "PLAN_ALLOCATE"],
+  ["Plan reserve", "PLAN_RESERVE"], ["Plan consume Permit", "PLAN_CONSUME"], ["Plan reclaim", "PLAN_RECLAIM"],
+  ["Plan release Permit", "PLAN_RELEASE"], ["Plan slot retirement", "PLAN_RETIRE", "danger"], ["Verify plan", "VERIFY_PLAN", "blue"]
+];
+
+const walkthroughs = [
+  {
+    title: "Full preserves custody",
+    copy: "Fill both slots, then submit a protocol Resource. PoolFull must return the same Resource without any partial move.",
+    steps: [["Allocate amber", "TRY_DATA"], ["Allocate blue", "TRY_DATA"], ["Submit Resource", "TRY_RESOURCE"]]
+  },
+  {
+    title: "Stale Key",
+    copy: "A copied Key observes Data but never owns it. Reclaim advances the generation; reusing the slot cannot make the old Key valid again.",
+    steps: [["Allocate", "TRY_DATA"], ["Lookup current Key", "LOOKUP_NEWEST"], ["Reclaim", "RECLAIM_FIRST"], ["Lookup stale Key", "LOOKUP_OLDEST"], ["Reuse slot", "TRY_DATA"], ["Old Key remains stale", "LOOKUP_OLDEST"], ["New Key works", "LOOKUP_NEWEST"]]
+  },
+  {
+    title: "Permit guarantee",
+    copy: "Plan and admit one reservation plus optional pressure. At runtime the Permit holds one slot, pressure occupies the other, and consuming the Permit still succeeds.",
+    steps: [["Plan reserve", "PLAN_RESERVE"], ["Plan optional success", "PLAN_TRY"], ["Consume in plan", "PLAN_CONSUME"], ["Verify", "VERIFY_PLAN"], ["Reserve runtime", "RESERVE"], ["Optional allocation", "TRY_DATA"], ["Pressure gets Full", "TRY_DATA"], ["Consume Permit", "CONSUME_PERMIT"]]
+  },
+  {
+    title: "Admission rejection",
+    copy: "Two optional live allocations followed by a proof-required allocate need three simultaneous slots. The two-slot Pool must reject the Image instead of making allocate fallible.",
+    steps: [["Plan optional one", "PLAN_TRY"], ["Plan optional two", "PLAN_TRY"], ["Plan required allocate", "PLAN_ALLOCATE"], ["Verify", "VERIFY_PLAN"]]
+  },
+  {
+    title: "Permit cancellation",
+    copy: "A held Permit is a compiler-reclaimable Resource. Recoverable cancellation releases its reservation before Cancelled becomes visible.",
+    steps: [["Plan reserve", "PLAN_RESERVE"], ["Plan release", "PLAN_RELEASE"], ["Verify", "VERIFY_PLAN"], ["Reserve runtime", "RESERVE"], ["Cancel", "CANCEL"], ["Pressure can use slot", "TRY_DATA"]]
+  },
+  {
+    title: "Never wrap",
+    copy: "The demo uses a tiny generation ceiling so exhaustion is visible. After the final reclaim, the slot retires; stale Keys never alias a later allocation.",
+    steps: [["Allocate generation 0", "TRY_DATA"], ["Reclaim to 1", "RECLAIM_FIRST"], ["Allocate generation 1", "TRY_DATA"], ["Reclaim to 2", "RECLAIM_FIRST"], ["Allocate generation 2", "TRY_DATA"], ["Reclaim and retire", "RECLAIM_FIRST"], ["Old Key misses", "LOOKUP_OLDEST"]]
+  }
+];
+
+let state = PoolPrototype.initial();
+let activeWalkthrough = 0;
+let walkthroughStep = 0;
+const $ = id => document.getElementById(id);
+
+function dispatch(type) { state = PoolPrototype.reduce(state, { type }); render(); }
+function startWalkthrough(index) { activeWalkthrough = index; walkthroughStep = 0; state = PoolPrototype.initial(); render(); }
+function runWalkthroughStep(index) { const step = walkthroughs[activeWalkthrough].steps[index]; state = PoolPrototype.reduce(state, { type: step[1] }); walkthroughStep = Math.max(walkthroughStep, index + 1); render(); }
+
+function renderActions() {
+  $("runtime-actions").innerHTML = runtimeActions.map(([label, type, cls = ""]) => `<button class="${cls}" onclick="dispatch('${type}')">${label}</button>`).join("");
+  $("plan-actions").innerHTML = planActions.map(([label, type, cls = ""]) => `<button class="${cls}" onclick="dispatch('${type}')">${label}</button>`).join("");
+}
+
+function renderRuntime() {
+  const live = PoolPrototype.activeSlots(state);
+  const reserved = PoolPrototype.reservedSlots(state);
+  const usable = PoolPrototype.usableSlots(state);
+  const rows = [
+    ["Pool identity", state.poolId], ["Scope", state.poolOpen ? "Open" : "Closed"], ["Declared capacity", String(state.declaredCapacity)],
+    ["Usable slots", String(usable)], ["Live allocations", String(live)], ["Outstanding Permits", String(reserved)],
+    ["Committed", `${live + reserved}/${usable}`], ["Generation ceiling", String(state.maxGeneration)], ["Image", state.image]
+  ];
+  $("runtime-state").innerHTML = rows.map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("");
+  $("runtime-verdict").textContent = state.image === "Running" ? (state.poolOpen ? "Custody consistent" : "Scope discharged") : state.image;
+  $("runtime-verdict").style.background = state.image === "Running" ? "var(--accent-soft)" : "#f5dfe2";
+  $("runtime-verdict").style.color = state.image === "Running" ? "#235241" : "var(--bad)";
+  $("slots").innerHTML = state.slots.map(slot => `<div class="slot ${slot.status.toLowerCase()}"><strong>Slot ${slot.id} · ${slot.status}</strong><p>Generation ${slot.generation}</p><p>${slot.valueId ? `${slot.valueId} (${slot.valueKind})` : slot.permitId ? slot.permitId : "No allocation"}</p><p>${slot.ownerId ? `Custody: ${slot.ownerId}` : slot.permitId ? "Custody: Permit" : ""}</p></div>`).join("");
+}
+
+function renderPlan() {
+  const committed = state.plan.live + state.plan.reserved;
+  const rows = [
+    ["Live upper bound", String(state.plan.live)], ["Reserved upper bound", String(state.plan.reserved)], ["Current commitment", String(committed)],
+    ["Peak commitment", String(state.plan.peak)], ["Usable capacity", String(state.plan.usable)],
+    ["Authorized allocate", `${state.plan.usedAllocate}/${state.plan.authorizedAllocate} used`], ["Authorized reserve", `${state.plan.usedReserve}/${state.plan.authorizedReserve} used`]
+  ];
+  $("plan-state").innerHTML = rows.map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("");
+  $("plan-verdict").textContent = state.plan.verdict;
+  $("plan-verdict").style.background = state.plan.verdict === "Admitted" ? "var(--accent-soft)" : state.plan.verdict === "Admission Rejection" ? "#f5dfe2" : "#e7edf5";
+  $("plan-verdict").style.color = state.plan.verdict === "Admission Rejection" ? "var(--bad)" : state.plan.verdict === "Admitted" ? "#235241" : "#355474";
+  $("formula").textContent = `live ${state.plan.live} + reserved ${state.plan.reserved} = committed ${committed}\npeak ${state.plan.peak} ≤ usable ${state.plan.usable} ≤ declared ${state.declaredCapacity}`;
+  $("trace").innerHTML = state.plan.trace.length ? state.plan.trace.map((row, index) => `<div class="trace-row ${row.violation ? "bad" : ""}"><span>${index + 1}. <strong>${row.kind}</strong><br>${row.detail}</span><span>${row.committed}/${row.usable}</span></div>`).join("") : `<p class="empty">Add proof events, then verify the trace.</p>`;
+}
+
+function renderCollections() {
+  $("values").innerHTML = state.values.map(value => `<li><strong>${value.id}</strong> · ${value.kind}<br>Custody: ${value.custody}</li>`).join("");
+  const activeOwners = state.owners.filter(owner => owner.status !== "Reclaimed").map(owner => `<li><strong>${owner.id}</strong> · own[${state.poolId}] ${owner.valueKind}<br>slot ${owner.slot}, generation ${owner.generation}, value ${owner.valueId}</li>`);
+  const activePermits = state.permits.filter(permit => permit.status === "Held").map(permit => `<li><strong>${permit.id}</strong> · PoolPermit[${state.poolId}, ${permit.valueKind}]<br>reserves slot ${permit.slot}</li>`);
+  $("resources").innerHTML = [...activeOwners, ...activePermits].join("") || `<li class="empty">No live owning value or Permit.</li>`;
+  $("keys").innerHTML = state.keys.length ? state.keys.map(key => `<li><strong>${key.id}</strong> · Key[${key.poolId}, ${key.valueKind}]<br>slot ${key.slot}, generation ${key.generation}</li>`).join("") : `<li class="empty">No Keys copied yet.</li>`;
+}
+
+function renderEvents() {
+  $("events").innerHTML = state.events.length ? [...state.events].reverse().map(event => `<div class="event ${event.tone}"><strong>${event.sequence}. ${event.kind}</strong><br>${event.text}</div>`).join("") : `<p class="empty">Choose an action or start a walkthrough.</p>`;
+}
+
+function renderWalkthroughs() {
+  $("tabs").innerHTML = walkthroughs.map((walkthrough, index) => `<button class="tab ${index === activeWalkthrough ? "active" : ""}" onclick="startWalkthrough(${index})">${walkthrough.title}</button>`).join("");
+  const walkthrough = walkthroughs[activeWalkthrough];
+  $("walkthrough-copy").textContent = walkthrough.copy;
+  $("steps").innerHTML = walkthrough.steps.map(([label], index) => `<button class="${index === walkthroughStep ? "primary" : ""}" ${index > walkthroughStep ? "disabled" : ""} onclick="runWalkthroughStep(${index})">${index + 1}. ${label}</button>`).join("") + `<span class="step-marker">${walkthroughStep}/${walkthrough.steps.length} steps explored</span>`;
+}
+
+function render() { renderActions(); renderRuntime(); renderPlan(); renderCollections(); renderEvents(); renderWalkthroughs(); }
+render();
+</script>
+</body>
+</html>

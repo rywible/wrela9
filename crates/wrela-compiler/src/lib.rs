@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod architecture_planning;
 mod compiler;
 mod control_flow;
 mod distribution;
@@ -15,6 +16,7 @@ mod syntax;
 mod type_semantics;
 mod typed_hir;
 
+pub use architecture_planning::{ArchitecturePlanningObservation, ArchitectureProfile};
 pub use compiler::{
     AcceptedCompilation, Cancellation, CanonicalValue, CompilationOutcome, CompilationRequest,
     Compiler, CompilerInstallation, ConstructionKind, ConstructionObservation,

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use xxhash_rust::xxh3::Xxh3;
 
+use crate::architecture_planning::{ArchitecturePlanningModule, ContractContext};
 use crate::compiler::{CompilerInstallation, OpenError, ProjectFile, Root};
 use crate::identity::{self, IdentityCatalog, IdentityFailure};
 use crate::model::BuildKind;
@@ -46,6 +47,7 @@ pub(crate) struct CompilerDistribution {
     modules: Arc<[SealedModule]>,
     build_authority: BuildAuthority,
     pool_authority: PoolAuthority,
+    architecture_planning: ArchitecturePlanningModule,
     digest: u128,
 }
 
@@ -155,6 +157,7 @@ impl CompilerDistribution {
             modules: modules.into(),
             build_authority,
             pool_authority,
+            architecture_planning: ArchitecturePlanningModule::new(ContractContext::new(digest)),
             digest,
         })
     }
@@ -169,6 +172,10 @@ impl CompilerDistribution {
 
     pub(crate) const fn pool_authority(&self) -> &PoolAuthority {
         &self.pool_authority
+    }
+
+    pub(crate) const fn architecture_planning(&self) -> &ArchitecturePlanningModule {
+        &self.architecture_planning
     }
 
     pub(crate) const fn digest(&self) -> u128 {

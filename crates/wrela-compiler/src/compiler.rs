@@ -7,6 +7,10 @@ use std::sync::{
 
 use xxhash_rust::xxh3::Xxh3;
 
+use crate::architecture_planning::{
+    ArchitecturePlanningObservation, ArchitectureProfile, ContractFailure,
+    VerifiedArchitecturePlanningContract,
+};
 use crate::syntax;
 use crate::typed_hir::AuthorityContext;
 use crate::{
@@ -209,6 +213,7 @@ pub struct InspectSelection {
     evaluation: bool,
     construction: bool,
     tests: bool,
+    architecture_planning: bool,
 }
 
 impl InspectSelection {
@@ -222,6 +227,7 @@ impl InspectSelection {
             evaluation: false,
             construction: false,
             tests: false,
+            architecture_planning: false,
         }
     }
 
@@ -243,6 +249,7 @@ impl InspectSelection {
             evaluation: true,
             construction: true,
             tests: true,
+            architecture_planning: true,
         }
     }
 }
@@ -252,6 +259,7 @@ pub struct CompilationRequest {
     project: ProjectSnapshot,
     root: Root,
     inspection: InspectSelection,
+    architecture_profile: Option<ArchitectureProfile>,
 }
 
 impl CompilationRequest {
@@ -261,12 +269,19 @@ impl CompilationRequest {
             project,
             root,
             inspection: InspectSelection::none(),
+            architecture_profile: None,
         }
     }
 
     #[must_use]
     pub fn with_inspection(mut self, inspection: InspectSelection) -> Self {
         self.inspection = inspection;
+        self
+    }
+
+    #[must_use]
+    pub fn with_architecture_profile(mut self, profile: ArchitectureProfile) -> Self {
+        self.architecture_profile = Some(profile);
         self
     }
 }
@@ -937,6 +952,7 @@ pub struct Inspection {
     evaluations: Arc<[EvaluationObservation]>,
     constructions: Arc<[ConstructionObservation]>,
     test_plan: Arc<[TestApplicationObservation]>,
+    architecture_planning_contract: Option<ArchitecturePlanningObservation>,
 }
 
 impl Inspection {
@@ -1023,6 +1039,11 @@ impl Inspection {
     #[must_use]
     pub fn test_plan(&self) -> &[TestApplicationObservation] {
         &self.test_plan
+    }
+
+    #[must_use]
+    pub const fn architecture_planning_contract(&self) -> Option<&ArchitecturePlanningObservation> {
+        self.architecture_planning_contract.as_ref()
     }
 }
 
@@ -2311,6 +2332,32 @@ impl Compiler {
             }
         };
         diagnostics.extend(semantic_diagnostics);
+        let architecture_contract = if diagnostics.is_empty() {
+            match request.architecture_profile {
+                None => None,
+                Some(profile) => match self
+                    .distribution
+                    .architecture_planning()
+                    .authenticate(profile, cancellation)
+                {
+                    Ok(contract) => Some(contract),
+                    Err(ContractFailure::Cancelled) => return CompilationOutcome::Cancelled,
+                    Err(ContractFailure::UnsupportedProfile) => {
+                        diagnostics
+                            .push(unsupported_architecture_diagnostic(request.root, profile));
+                        None
+                    }
+                    Err(failure) => {
+                        return CompilationOutcome::Defect(Defect::new(
+                            "architecture planning contract",
+                            failure.evidence(),
+                        ));
+                    }
+                },
+            }
+        } else {
+            None
+        };
         diagnostics.sort_by(|left, right| {
             left.primary
                 .path
@@ -2378,6 +2425,10 @@ impl Compiler {
             evaluations: semantic_projection.evaluations,
             constructions: semantic_projection.constructions,
             test_plan: semantic_projection.test_plan,
+            architecture_planning_contract: architecture_observation(
+                architecture_contract.as_ref(),
+                request.inspection,
+            ),
         };
 
         if diagnostics.is_empty() {
@@ -2392,6 +2443,25 @@ impl Compiler {
             })
         }
     }
+}
+
+fn architecture_observation(
+    contract: Option<&VerifiedArchitecturePlanningContract>,
+    inspection: InspectSelection,
+) -> Option<ArchitecturePlanningObservation> {
+    inspection
+        .architecture_planning
+        .then(|| contract.map(VerifiedArchitecturePlanningContract::observation))
+        .flatten()
+}
+
+fn unsupported_architecture_diagnostic(root: Root, profile: ArchitectureProfile) -> Diagnostic {
+    Diagnostic::new(
+        "architecture.unsupported_profile",
+        SourceRange::new(root.path(), 0, 0),
+        RecoveryAction::None,
+    )
+    .with_parameter("profile", profile.canonical_name())
 }
 
 fn parse_unreachable_project_syntax(

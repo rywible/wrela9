@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Logical Image Layout Prototype</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink:#1f2927; --muted:#65716d; --paper:#f2f0e8; --panel:#fffef9;
+      --line:#d7d8cf; --accent:#216b61; --accent-soft:#dceee9;
+      --blue:#315f8a; --violet:#67528c; --warn:#9a6127; --bad:#9a3f49;
+      --shadow:0 12px 36px rgba(28,42,37,.08);
+    }
+    * { box-sizing:border-box }
+    body { margin:0; background:var(--paper); color:var(--ink); font:15px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif }
+    main { width:min(1260px,calc(100% - 32px)); margin:auto; padding:40px 0 72px }
+    h1,h2,h3,p { margin-top:0 } h1 { max-width:1000px; font-size:clamp(2.15rem,5vw,4.6rem); line-height:.98; letter-spacing:-.055em }
+    h2 { font-size:1.18rem; letter-spacing:-.02em } h3 { margin-bottom:6px; font-size:.9rem }
+    code { font:.92em ui-monospace,SFMono-Regular,Menlo,monospace }
+    .eyebrow { color:var(--accent); font-size:.72rem; font-weight:820; letter-spacing:.13em; text-transform:uppercase }
+    .lede { max-width:980px; color:#4d5854; font-size:1.03rem }
+    .notice { display:inline-flex; padding:7px 10px; border:1px solid #c8a98d; border-radius:999px; color:#754120; background:#fff3e5; font-size:.78rem; font-weight:760 }
+    .panel { padding:19px; border:1px solid var(--line); border-radius:16px; background:var(--panel); box-shadow:var(--shadow) }
+    .grid { display:grid; gap:16px }.two { grid-template-columns:1fr 1fr }.three { grid-template-columns:repeat(3,1fr) }
+    .section-head { display:flex; align-items:baseline; justify-content:space-between; gap:12px; margin-bottom:12px }.section-head p { margin:0; color:var(--muted); font-size:.8rem }
+    .actions { display:flex; flex-wrap:wrap; gap:8px }.action-group+.action-group { margin-top:14px; padding-top:14px; border-top:1px solid var(--line) }
+    .action-label { margin-bottom:8px; color:var(--muted); font-size:.75rem; font-weight:780; text-transform:uppercase; letter-spacing:.08em }
+    button { border:1px solid #bdc8c3; border-radius:10px; padding:9px 12px; background:#fff; color:var(--ink); font:inherit; font-size:.82rem; font-weight:690; cursor:pointer }
+    button:hover { border-color:var(--accent) } button.primary { color:#fff; border-color:var(--accent); background:var(--accent) } button.blue { color:#fff; border-color:var(--blue); background:var(--blue) } button.danger { color:var(--bad); border-color:#d9adb4 }
+    button[disabled] { opacity:.38; cursor:default }
+    .pill { display:inline-flex; padding:3px 8px; border-radius:999px; background:var(--accent-soft); color:#20574f; font-size:.73rem; font-weight:780 }.pill.bad { background:#f8e3e5; color:var(--bad) }.pill.warn { background:#fff0dc; color:var(--warn) }
+    dl.state { display:grid; grid-template-columns:155px 1fr; gap:8px 13px; margin:0 } dt { color:var(--muted); font-size:.78rem } dd { margin:0; font-size:.82rem; font-weight:670 }
+    .map-shell { overflow:hidden; border:1px solid var(--line); border-radius:12px; background:#f7f7f2 }
+    .map { display:flex; min-height:88px; width:100% }.region { min-width:5px; padding:9px 7px; border-right:1px solid rgba(255,255,255,.7); overflow:hidden; color:#18312d; font-size:.69rem }.region strong { display:block; white-space:nowrap }.region small { white-space:nowrap }
+    .boot{background:#e8dfc9}.code{background:#dce8f4}.immutable{background:#e8e2f2}.core{background:#dceee9}.shared{background:#e7ecd8}.dma{background:#f2dfd4}
+    .legend { display:flex; flex-wrap:wrap; gap:8px 14px; margin-top:9px; color:var(--muted); font-size:.73rem }.dot { display:inline-block; width:9px; height:9px; margin-right:4px; border-radius:2px }
+    .table-wrap { max-height:370px; overflow:auto; border:1px solid var(--line); border-radius:11px } table { width:100%; border-collapse:collapse; font-size:.76rem } th,td { padding:8px 9px; border-bottom:1px solid #e5e5dd; text-align:left; vertical-align:top } th { position:sticky; top:0; z-index:1; background:#f5f6f1; color:var(--muted); font-size:.69rem; text-transform:uppercase; letter-spacing:.05em } td.num,th.num { text-align:right; font-variant-numeric:tabular-nums }
+    .meter { height:10px; overflow:hidden; border-radius:999px; background:#e3e5df }.meter>span { display:block; height:100%; background:var(--accent) }.meter>span.over { background:var(--bad) }
+    .formula { padding:11px; border-radius:10px; background:#1f2b28; color:#f1faf6; font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace }
+    .events { display:grid; gap:7px; max-height:260px; overflow:auto }.event { padding:8px 10px; border-left:3px solid var(--accent); background:#f1f7f4; font-size:.79rem }.event.plan { border-color:var(--blue); background:#f0f5fa }.event.bad { border-color:var(--bad); background:#fff0f1 }
+    .tabs { display:flex; flex-wrap:wrap; gap:7px; margin-bottom:12px }.tab.active { border-color:var(--accent); background:var(--accent-soft) }.walk-copy { max-width:900px; color:var(--muted); font-size:.85rem }.steps { display:flex; flex-wrap:wrap; align-items:center; gap:8px }.step-mark { color:var(--muted); font-size:.74rem }
+    .recommendation { border-color:#91b7aa; background:#edf7f2 }.recommendation ul { margin-bottom:0; padding-left:19px; color:#40504a; font-size:.86rem }.recommendation li+li { margin-top:5px }
+    @media(max-width:920px){.two,.three{grid-template-columns:1fr}dl.state{grid-template-columns:125px 1fr}.region small{display:none}}
+  </style>
+</head>
+<body>
+<main>
+  <p class="eyebrow">Wrela Layer 2 · logic prototype</p>
+  <h1>Can a target-neutral layout reserve exact memory without knowing native layout?</h1>
+  <p class="lede">This throwaway demo tests whether one deep Layout Module can canonically pack profile-defined Storage Envelopes, prove non-overlap and fit, explain every byte, and leave native representation to Layer 3. Change requirements, reorder them, force rejection, tamper with a candidate, and try concrete ABI sizes.</p>
+  <span class="notice">Prototype only — never production input</span>
+
+  <section class="panel" style="margin-top:28px">
+    <div class="section-head"><div><p class="eyebrow">Free play</p><h2>Drive requirements, layout, and the Layer 3 fit check</h2></div><button class="primary" onclick="dispatch('RESET')">Reset all</button></div>
+    <div class="action-group"><div class="action-label">Planning Requirements</div><div class="actions" id="requirement-actions"></div></div>
+    <div class="action-group"><div class="action-label">Logical Image Layout</div><div class="actions" id="layout-actions"></div></div>
+    <div class="action-group"><div class="action-label">Later Target ABI check</div><div class="actions" id="abi-actions"></div></div>
+  </section>
+
+  <section class="grid three" style="margin-top:16px">
+    <article class="panel"><div class="section-head"><h2>Architecture Planning Contract</h2><span class="pill">verified input</span></div><dl class="state" id="contract-state"></dl></article>
+    <article class="panel"><div class="section-head"><h2>Planning closure</h2><span class="pill" id="requirements-pill"></span></div><dl class="state" id="requirements-state"></dl></article>
+    <article class="panel"><div class="section-head"><h2>Layout outcome</h2><span class="pill" id="verdict-pill"></span></div><dl class="state" id="layout-state"></dl><div class="meter" style="margin-top:13px"><span id="ram-meter"></span></div></article>
+  </section>
+
+  <section class="panel" style="margin-top:16px">
+    <div class="section-head"><div><p class="eyebrow">Exact admitted reservation</p><h2>Canonical logical RAM map</h2></div><p>Offsets are relative to profile RAM, never Creator-visible pointers.</p></div>
+    <div class="map-shell"><div class="map" id="memory-map"></div></div>
+    <div class="legend"><span><i class="dot boot"></i>Boot</span><span><i class="dot code"></i>Executable envelopes</span><span><i class="dot immutable"></i>Immutable</span><span><i class="dot core"></i>Per-core mutable</span><span><i class="dot shared"></i>Shared mutable</span><span><i class="dot dma"></i>DMA</span></div>
+  </section>
+
+  <section class="grid two" style="margin-top:16px">
+    <article class="panel"><div class="section-head"><h2>Explainable cost ledger</h2><p>Every byte has one cause.</p></div><div class="table-wrap"><table><thead><tr><th>Cause</th><th>Owner / provenance</th><th class="num">Count</th><th class="num">Bytes</th></tr></thead><tbody id="ledger"></tbody></table></div></article>
+    <article class="panel"><div class="section-head"><h2>Independent verification</h2><span class="pill" id="verify-pill"></span></div><div class="formula" id="invariants"></div><h3 style="margin-top:14px">Layer 3 Target ABI Layout</h3><dl class="state" id="abi-state"></dl></article>
+  </section>
+
+  <section class="panel" style="margin-top:16px"><div class="section-head"><h2>Observations</h2><p>Newest first</p></div><div class="events" id="events"></div></section>
+
+  <section class="panel" style="margin-top:16px">
+    <div class="section-head"><div><p class="eyebrow">Guided walkthroughs</p><h2>Cases that decide the model</h2></div></div>
+    <div class="tabs" id="tabs"></div><p class="walk-copy" id="walk-copy"></p><div class="steps" id="steps"></div>
+  </section>
+
+  <section class="panel recommendation" style="margin-top:16px">
+    <p class="eyebrow">Candidate decision</p><h2>Envelopes are exact reservations; native layouts are later proofs</h2>
+    <ul>
+      <li>The Layout Module consumes only the verified planning closure, canonical assignment, and Architecture Planning Contract. Its one meaningful result is a verified Logical Image Layout or layout conflict evidence returned to the enclosing Image Planning Module.</li>
+      <li>Each logical allocation has a stable identity, semantic owner, provenance, lifetime, protection class, placement, count, profile-defined byte envelope, and envelope alignment. It never carries a native type size or backend handle.</li>
+      <li>Canonical region order, stable allocation identity, alignment padding, guard reservations, and page rounding determine one layout independent of input traversal order. No best-fit heuristic or hidden optimization objective participates.</li>
+      <li>The cost ledger attributes payload, multiplicity, alignment padding, guard pages, and region rounding exactly once. Shared overhead is charged to the contract rule that caused it rather than guessed onto a nearby Creator declaration.</li>
+      <li>Layer 2 rejection means the verified envelopes cannot fit the planning contract. Layer 3 must prove every concrete Target ABI Layout fits its envelope; exceeding an admitted envelope is a Defect, never a new Creator rejection.</li>
+      <li>The verified layout exposes symbolic regions and relative offsets to trusted later Modules. Creator inspection receives cost and provenance observations, never pointers, native layout, candidate search state, or reusable planning artifacts.</li>
+    </ul>
+  </section>
+</main>
+
+<script>
+const LayoutPrototype = (() => {
+  const KiB = 1024;
+  const regionOrder = ["boot", "code", "immutable", "core-0", "core-1", "shared", "dma"];
+  const regionMeta = {
+    boot:{label:"Boot reservations",tone:"boot",protection:"sealed"}, code:{label:"Executable envelopes",tone:"code",protection:"RX"}, immutable:{label:"Immutable Data",tone:"immutable",protection:"RO/NX"},
+    "core-0":{label:"Primary core",tone:"core",protection:"RW/NX"}, "core-1":{label:"Secondary core",tone:"core",protection:"RW/NX"}, shared:{label:"Shared mutable",tone:"shared",protection:"RW/NX"}, dma:{label:"DMA-owned",tone:"dma",protection:"RW/NX + device"}
+  };
+  const contract = (small=false) => ({id:small?"planning/aarch64-virt-v1-small":"planning/aarch64-virt-v1",fingerprint:small?"apc:a64-v1-small:38d1":"apc:a64-v1:9bc2",page:4096,ramMaximum:(small?112:256)*KiB,cores:["core-0","core-1"],envelopeSchema:"storage-envelope/v1",regionOrder});
+  const req = (id,owner,region,count,bytes,align,provenance,label,lifetime="Image") => ({id,owner,region,count,bytes,align,provenance,label,lifetime,fingerprint:`${id}:${count}:${bytes}:${region}`});
+  const baseRequirements = () => [
+    req("infra/boot/reservation","Image kind","boot",1,12*KiB,4096,"Mandatory Image Infrastructure","Reset handoff and page roots"),
+    req("infra/null-guard","Architecture Planning Contract","boot",1,4*KiB,4096,"profile null-guard rule","Unmapped guard"),
+    req("exec/reachable-specializations","Core","code",6,2304,256,"Executable Demand closure","Specialization envelope"),
+    req("data/immutable","Core","immutable",1,3584,64,"reachable canonical Data","Immutable Data envelope"),
+    req("scheduler/core-0","Image kind","core-0",1,1536,64,"Service Plan core-0","Scheduler state"),
+    req("stack/normal/core-0","Image kind","core-0",1,8192,4096,"bounded call graph core-0","Normal stack envelope"),
+    req("stack/guard/core-0","Architecture Planning Contract","core-0",1,4096,4096,"profile stack-guard rule","Unmapped stack guard"),
+    req("scheduler/core-1","Image kind","core-1",1,1536,64,"Service Plan core-1","Scheduler state"),
+    req("stack/normal/core-1","Image kind","core-1",1,8192,4096,"bounded call graph core-1","Normal stack envelope"),
+    req("stack/guard/core-1","Architecture Planning Contract","core-1",1,4096,4096,"profile stack-guard rule","Unmapped stack guard"),
+    req("actor/archive/mailbox","Actor archive","shared",4,320,64,"Mailbox commitment","Mailbox slot envelope"),
+    req("actor/archive/turn-home","Actor archive","shared",2,1280,64,"simultaneous Turn bound","Suspension Home envelope"),
+    req("pool/scratch/slot","Pool scratch","shared",4,640,64,"Pool commitment","Pool slot envelope"),
+    req("infra/terminal/frame","Image kind","dma",3,1024,4096,"Terminal contract","Terminal DMA frame")
+  ];
+  const initial = () => ({contract:contract(false),requirements:baseRequirements(),layout:null,lastCanonical:null,abi:{mode:"Not checked",verdict:"—",detail:"Layer 3 has not supplied native sizes."},events:[]});
+  const event = (state,kind,text,tone="plan") => ({...state,events:[...state.events,{n:state.events.length+1,kind,text,tone}]});
+  const alignUp = (value,alignment) => Math.ceil(value/alignment)*alignment;
+  const bytes = n => n>=KiB?`${(n/KiB).toFixed(n%KiB?1:0)} KiB`:`${n} B`;
+  const stableSort = values => [...values].sort((a,b)=>a.id.localeCompare(b.id));
+
+  function expand(requirements){
+    return requirements.flatMap(r=>Array.from({length:r.count},(_,index)=>({...r,instance:index,id:`${r.id}/${String(index).padStart(3,"0")}`})));
+  }
+
+  function derive(state){
+    const page=state.contract.page, allocations=[], regions=[], ledger=[];
+    let cursor=0;
+    for(const regionId of state.contract.regionOrder){
+      const members=stableSort(expand(state.requirements.filter(r=>r.region===regionId)));
+      if(!members.length) continue;
+      const regionStart=alignUp(cursor,page);
+      if(regionStart>cursor) ledger.push({cause:`Before ${regionMeta[regionId].label}`,owner:"Architecture Planning Contract",count:1,bytes:regionStart-cursor,kind:"region alignment"});
+      cursor=regionStart;
+      for(const member of members){
+        const start=alignUp(cursor,member.align);
+        if(start>cursor) ledger.push({cause:`Align ${member.label}`,owner:member.provenance,count:1,bytes:start-cursor,kind:"alignment"});
+        const end=start+member.bytes;
+        allocations.push({id:member.id,requirementId:member.id.replace(/\/\d{3}$/,""),label:member.label,owner:member.owner,provenance:member.provenance,region:regionId,start,end,bytes:member.bytes,align:member.align,lifetime:member.lifetime});
+        ledger.push({cause:member.label,owner:`${member.owner} · ${member.provenance}`,count:1,bytes:member.bytes,kind:"envelope"});
+        cursor=end;
+      }
+      const regionEnd=alignUp(cursor,page);
+      if(regionEnd>cursor) ledger.push({cause:`Round ${regionMeta[regionId].label}`,owner:"Architecture Planning Contract",count:1,bytes:regionEnd-cursor,kind:"page rounding"});
+      regions.push({id:regionId,label:regionMeta[regionId].label,tone:regionMeta[regionId].tone,protection:regionMeta[regionId].protection,start:regionStart,end:regionEnd,bytes:regionEnd-regionStart});
+      cursor=regionEnd;
+    }
+    const requirementKey=stableSort(state.requirements).map(r=>`${r.id}|${r.fingerprint}`).join(";");
+    const layoutKey=regions.map(r=>`${r.id}:${r.start}:${r.end}`).join("|")+"//"+allocations.map(a=>`${a.id}:${a.start}:${a.end}`).join("|");
+    const fingerprint=hash(`${state.contract.fingerprint}//${requirementKey}//${layoutKey}`);
+    const candidate={schema:"logical-image-layout/v1",contractFingerprint:state.contract.fingerprint,regions,allocations,ledger,total:cursor,fingerprint:`lil:${fingerprint}`,inputKey:requirementKey};
+    const verification=verify(candidate,state.contract,state.requirements);
+    const admitted=verification.ok&&candidate.total<=state.contract.ramMaximum;
+    const outcome=admitted?"Verified":"Admission Rejection";
+    const repeat=state.lastCanonical?(state.lastCanonical===candidate.fingerprint?" The prior fingerprint was reproduced despite changed traversal order.":" The prior fingerprint changed."):"";
+    const detail=(admitted?`${bytes(candidate.total)} reserved with exact non-overlap evidence.`:`${bytes(candidate.total)} exceeds the ${bytes(state.contract.ramMaximum)} contract by ${bytes(candidate.total-state.contract.ramMaximum)}.`)+repeat;
+    return event({...state,layout:{...candidate,verification,verdict:outcome},lastCanonical:state.layout?.fingerprint||state.lastCanonical,abi:{mode:"Not checked",verdict:"—",detail:"A new logical layout invalidated the prior native fit check."}},outcome,detail,admitted?"plan":"bad");
+  }
+
+  function verify(layout,planningContract,requirements){
+    const failures=[];
+    if(layout.contractFingerprint!==planningContract.fingerprint) failures.push("planning-contract fingerprint mismatch");
+    const expected=new Set(expand(requirements).map(r=>r.id));
+    const observed=new Set(layout.allocations.map(a=>a.id));
+    for(const id of expected) if(!observed.has(id)) failures.push(`missing ${id}`);
+    for(const id of observed) if(!expected.has(id)) failures.push(`extra ${id}`);
+    const ordered=[...layout.allocations].sort((a,b)=>a.start-b.start||a.id.localeCompare(b.id));
+    for(let i=0;i<ordered.length;i++){
+      const a=ordered[i]; if(a.start%a.align) failures.push(`${a.id} violates envelope alignment`); if(a.end-a.start!==a.bytes) failures.push(`${a.id} changed envelope size`);
+      if(i&&ordered[i-1].end>a.start) failures.push(`${ordered[i-1].id} overlaps ${a.id}`);
+    }
+    const ledgerTotal=layout.ledger.reduce((sum,x)=>sum+x.bytes,0);
+    if(ledgerTotal!==layout.total) failures.push(`ledger ${ledgerTotal} does not equal reservation ${layout.total}`);
+    return {ok:failures.length===0,failures};
+  }
+
+  function targetAbi(state,mode){
+    if(!state.layout||state.layout.verdict!=="Verified") return event(state,"ABI check unavailable","Only an admitted verified Logical Image Layout can be lowered.","bad");
+    const violations=state.layout.allocations.filter(a=>{
+      const factor=mode==="Compact"?.62:mode==="Envelope edge"?1:(a.region==="code"&&a.id.endsWith("/000")?1.08:.8);
+      return Math.ceil(a.bytes*factor)>a.bytes;
+    }).map(a=>a.id);
+    const verdict=violations.length?"Defect":"Fits";
+    const detail=violations.length?`${violations.length} concrete native representations exceed their admitted Storage Envelopes. Planning is not reopened.`:`Every native representation fits its exact Storage Envelope; unused bytes remain reserved.`;
+    return event({...state,abi:{mode,verdict,detail}},`Target ABI ${verdict}`,detail,violations.length?"bad":"plan");
+  }
+
+  function addRequirement(state,kind){
+    if(kind==="ACTOR"){
+      if(state.requirements.some(r=>r.id==="actor/scout/mailbox")) return event(state,"No change","Scout Actor requirements already exist.");
+      return event({...state,requirements:[...state.requirements,req("actor/scout/mailbox","Actor scout","shared",8,320,64,"Mailbox commitment","Mailbox slot envelope"),req("actor/scout/turn-home","Actor scout","shared",3,1280,64,"Turn/Group concurrency","Suspension Home envelope")],layout:null},"Requirements added","Scout adds eight Mailbox homes and three Suspension Homes.");
+    }
+    if(kind==="DISPLAY"){
+      if(state.requirements.some(r=>r.id==="facility/display/framebuffer")) return event(state,"No change","Display requirements already exist.");
+      return event({...state,requirements:[...state.requirements,req("facility/display/state","Display Facility","shared",1,3072,64,"Display Facility Contract","Display state"),req("facility/display/framebuffer","Display Facility","dma",2,32*KiB,4096,"double-buffer requirement","Display framebuffer"),req("facility/display/queue","Display Facility","dma",2,4096,4096,"Virtio queue requirement","Display DMA queue")],layout:null},"Requirements added","Display adds state, two framebuffers, and two DMA queues.");
+    }
+    return state;
+  }
+
+  function tamper(state){
+    if(!state.layout||state.layout.allocations.length<2) return event(state,"Tamper unavailable","Derive a layout first.","bad");
+    const allocations=state.layout.allocations.map((a,i)=>i===1?{...a,start:state.layout.allocations[0].start,end:state.layout.allocations[0].start+a.bytes}:a);
+    const candidate={...state.layout,allocations};
+    const verification=verify(candidate,state.contract,state.requirements);
+    return event({...state,layout:{...candidate,verification,verdict:"Defect"}},"Verifier caught malformed candidate",verification.failures.join("; "),"bad");
+  }
+
+  function reduce(state,action){
+    switch(action.type){
+      case"RESET":return initial(); case"ADD_ACTOR":return addRequirement(state,"ACTOR"); case"ADD_DISPLAY":return addRequirement(state,"DISPLAY");
+      case"SHRINK_RAM":return event({...state,contract:contract(true),layout:null},"Planning contract changed","RAM maximum is now 112 KiB and the verified planning-contract fingerprint changed with it.");
+      case"REVERSE":return event({...state,requirements:[...state.requirements].reverse(),layout:null,lastCanonical:state.layout?.fingerprint||state.lastCanonical},"Input order reversed","Canonical layout must remain unchanged because traversal order has no authority.");
+      case"DERIVE":return derive(state); case"TAMPER":return tamper(state); case"ABI_COMPACT":return targetAbi(state,"Compact"); case"ABI_EDGE":return targetAbi(state,"Envelope edge"); case"ABI_OVERSIZE":return targetAbi(state,"Oversize"); default:return state;
+    }
+  }
+
+  function hash(text){ let h=2166136261; for(let i=0;i<text.length;i++){h^=text.charCodeAt(i);h=Math.imul(h,16777619)} return (h>>>0).toString(16).padStart(8,"0") }
+  return {initial,reduce,bytes};
+})();
+
+let state=LayoutPrototype.initial();
+const actions={
+  requirements:[{t:"ADD_ACTOR",l:"Add Scout Actor"},{t:"ADD_DISPLAY",l:"Select Display Facility"},{t:"SHRINK_RAM",l:"Use 112 KiB RAM profile"},{t:"REVERSE",l:"Reverse input order"}],
+  layout:[{t:"DERIVE",l:"Derive + verify layout",c:"primary"},{t:"TAMPER",l:"Tamper overlap",c:"danger"}],
+  abi:[{t:"ABI_COMPACT",l:"Compact native sizes",c:"blue"},{t:"ABI_EDGE",l:"Sizes at envelope edge",c:"blue"},{t:"ABI_OVERSIZE",l:"Oversize one ABI",c:"danger"}]
+};
+const walkthroughs=[
+  {name:"Exact fit",copy:"Derive the baseline. Watch stable region order, explicit padding, and a ledger total identical to reserved RAM.",steps:["DERIVE"]},
+  {name:"Explain change",copy:"Add another Actor, then derive again. Its Mailboxes and Suspension Homes appear as exact provenance-bearing costs; unrelated regions do not change.",steps:["ADD_ACTOR","DERIVE"]},
+  {name:"Display pressure",copy:"Select Display and derive. Double buffering and DMA queues dominate cost but stay symbolic—there is no BAR, BDF, IRQ, or native struct here.",steps:["ADD_DISPLAY","DERIVE"]},
+  {name:"Canonical order",copy:"Derive, reverse every input requirement, and derive again. The fingerprint must be identical because stable identities—not traversal—govern packing.",steps:["DERIVE","REVERSE","DERIVE"]},
+  {name:"RAM rejection",copy:"Display fits the normal contract but not the smaller one. Rejection happens from exact envelope evidence before native lowering.",steps:["ADD_DISPLAY","SHRINK_RAM","DERIVE"]},
+  {name:"ABI boundary",copy:"After admission, a compact native layout fits. An oversized Target ABI representation is a compiler/profile Defect and never reopens admission.",steps:["DERIVE","ABI_COMPACT","ABI_OVERSIZE"]},
+  {name:"Independent verifier",copy:"Derive a valid layout, then force two envelopes to overlap. The independent verifier classifies the malformed candidate as a Defect.",steps:["DERIVE","TAMPER"]}
+];
+let selected=0,stepIndex=0;
+function dispatch(type){ state=LayoutPrototype.reduce(state,{type}); stepIndex++; render(); }
+function beginWalkthrough(i){ selected=i; stepIndex=0; state=LayoutPrototype.initial(); render(); }
+function el(id){return document.getElementById(id)}
+function pill(node,text,tone=""){node.textContent=text;node.className=`pill ${tone}`}
+function dl(rows){return rows.map(([k,v])=>`<dt>${k}</dt><dd>${v}</dd>`).join("")}
+function renderActions(){ for(const [key,list] of Object.entries(actions)) el(`${key==='requirements'?'requirement':key}-actions`).innerHTML=list.map(a=>`<button class="${a.c||''}" onclick="dispatch('${a.t}')">${a.l}</button>`).join("") }
+function render(){
+  renderActions();
+  const c=state.contract,l=state.layout;
+  el("contract-state").innerHTML=dl([["Contract",c.id],["Fingerprint",c.fingerprint],["Logical cores",c.cores.join(", ")],["Page quantum",LayoutPrototype.bytes(c.page)],["RAM maximum",LayoutPrototype.bytes(c.ramMaximum)],["Envelope schema",c.envelopeSchema]]);
+  const envelopeCount=state.requirements.reduce((n,r)=>n+r.count,0);
+  el("requirements-state").innerHTML=dl([["Requirements",state.requirements.length],["Envelope instances",envelopeCount],["Semantic owners",new Set(state.requirements.map(r=>r.owner)).size],["Traversal order",state.requirements[0].id.startsWith("infra/")?"original":"changed"],["Native sizes","absent by contract"]]);
+  pill(el("requirements-pill"),`${envelopeCount} envelopes`);
+  const verdict=l?.verdict||"Not derived"; pill(el("verdict-pill"),verdict,verdict==="Admission Rejection"||verdict==="Defect"?"bad":"");
+  el("layout-state").innerHTML=dl([["Schema",l?.schema||"—"],["Fingerprint",l?.fingerprint||"—"],["Reserved RAM",l?LayoutPrototype.bytes(l.total):"—"],["Contract slack",l?LayoutPrototype.bytes(Math.max(0,c.ramMaximum-l.total)):"—"],["Published candidate",l?.verdict==="Verified"?"verified layout only":"none"]]);
+  const ratio=l?Math.min(100,l.total/c.ramMaximum*100):0; el("ram-meter").style.width=`${ratio}%`; el("ram-meter").className=l&&l.total>c.ramMaximum?"over":"";
+  el("memory-map").innerHTML=l?.regions.map(r=>`<div class="region ${r.tone}" style="flex:${r.bytes}"><strong>${r.label}</strong><small>${LayoutPrototype.bytes(r.bytes)} · RAM+0x${r.start.toString(16)}</small></div>`).join("")||`<div style="padding:28px;color:var(--muted)">Derive a layout to see the exact reservation.</div>`;
+  el("ledger").innerHTML=l?.ledger.map(x=>`<tr><td>${x.cause}<br><small>${x.kind}</small></td><td>${x.owner}</td><td class="num">${x.count}</td><td class="num">${LayoutPrototype.bytes(x.bytes)}</td></tr>`).join("")||`<tr><td colspan="4">No verified cost ledger yet.</td></tr>`;
+  const v=l?.verification; pill(el("verify-pill"),v?(v.ok?"structurally valid":"Defect detected"):"not run",v&&!v.ok?"bad":"");
+  el("invariants").textContent=v?(v.ok?`✓ exact requirement coverage\n✓ canonical stable-identity order\n✓ envelope alignment and size\n✓ no overlaps\n✓ ledger total = reserved RAM\n${l.total<=c.ramMaximum?"✓":"✗"} reserved RAM ≤ contract maximum`:v.failures.map(x=>`✗ ${x}`).join("\n")):"Verification has not run.";
+  el("abi-state").innerHTML=dl([["Mode",state.abi.mode],["Verdict",state.abi.verdict],["Meaning",state.abi.detail]]);
+  el("events").innerHTML=state.events.length?[...state.events].reverse().map(e=>`<div class="event ${e.tone}"><strong>${e.n}. ${e.kind}</strong><br>${e.text}</div>`).join(""):`<div class="event">No actions yet.</div>`;
+  el("tabs").innerHTML=walkthroughs.map((w,i)=>`<button class="tab ${i===selected?'active':''}" onclick="beginWalkthrough(${i})">${w.name}</button>`).join("");
+  const w=walkthroughs[selected]; el("walk-copy").textContent=w.copy; el("steps").innerHTML=w.steps.map((t,i)=>`${i?'<span class="step-mark">then</span>':''}<button class="${i===stepIndex?'primary':''}" ${i>stepIndex?'disabled':''} onclick="dispatch('${t}')">${actions.requirements.concat(actions.layout,actions.abi).find(a=>a.t===t).l}</button>`).join("");
+}
+render();
+</script>
+</body>
+</html>

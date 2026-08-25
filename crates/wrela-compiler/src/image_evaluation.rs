@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use crate::compiler::{
     ConstructionKind, ConstructionObservation, EvaluationOutcome, EvaluationReceipt,
@@ -21,8 +22,53 @@ pub(crate) enum ImageEvaluationStatus {
 }
 
 pub(crate) struct SealedImage {
-    pub(crate) constructions: Vec<ConstructionObservation>,
+    root: u128,
+    constructions: Vec<Construction>,
     pub(crate) test_applications: Vec<AppliedTest>,
+}
+
+impl SealedImage {
+    pub(crate) const fn root(&self) -> u128 {
+        self.root
+    }
+
+    pub(crate) fn constructions(&self) -> &[Construction] {
+        &self.constructions
+    }
+
+    pub(crate) fn observations(&self) -> Vec<ConstructionObservation> {
+        self.constructions
+            .iter()
+            .map(|construction| {
+                ConstructionObservation::new(
+                    construction.identity,
+                    match construction.kind {
+                        BuildKind::Image => ConstructionKind::Image,
+                        BuildKind::Test => ConstructionKind::Test,
+                        BuildKind::Node { type_identity, .. } => ConstructionKind::Node {
+                            type_identity: type_identity.0,
+                        },
+                    },
+                    construction.site.clone(),
+                    construction
+                        .operands
+                        .iter()
+                        .flat_map(|operand| operand.handles.iter().map(|handle| handle.identity))
+                        .collect(),
+                    construction
+                        .operands
+                        .iter()
+                        .map(|operand| {
+                            crate::ConstructionOperandObservation::new(
+                                Arc::clone(&operand.label),
+                                operand.value.clone(),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,34 +81,8 @@ pub(crate) fn finish(run: Run) -> FinishedImageEvaluation {
     let status = if matches!(run.outcome, EvaluationOutcome::Completed(_)) {
         match seal_construction_graph(run.root_handle, &run.constructions) {
             Ok(()) => ImageEvaluationStatus::Sealed(SealedImage {
-                constructions: run
-                    .constructions
-                    .into_iter()
-                    .map(|construction| {
-                        ConstructionObservation::new(
-                            construction.identity,
-                            match construction.kind {
-                                BuildKind::Image => ConstructionKind::Image,
-                                BuildKind::Test => ConstructionKind::Test,
-                                BuildKind::Node { type_identity, .. } => ConstructionKind::Node {
-                                    type_identity: type_identity.0,
-                                },
-                            },
-                            construction.site,
-                            construction.edges,
-                            construction
-                                .operands
-                                .into_iter()
-                                .map(|operand| {
-                                    crate::ConstructionOperandObservation::new(
-                                        operand.label,
-                                        operand.value,
-                                    )
-                                })
-                                .collect(),
-                        )
-                    })
-                    .collect(),
+                root: run.root_handle.expect("sealed graph has a root").1,
+                constructions: run.constructions,
                 test_applications: run.test_applications,
             }),
             Err(failure) => ImageEvaluationStatus::Invalid(failure),
@@ -100,7 +120,14 @@ fn seal_construction_graph(
     let mut graph = BTreeMap::new();
     for construction in constructions {
         if graph
-            .insert(construction.identity, construction.edges.as_slice())
+            .insert(
+                construction.identity,
+                construction
+                    .operands
+                    .iter()
+                    .flat_map(|operand| operand.handles.iter().map(|handle| handle.identity))
+                    .collect::<Vec<_>>(),
+            )
             .is_some()
         {
             return Err(GraphSealFailure::Defect(
@@ -141,6 +168,23 @@ fn seal_construction_graph(
 mod tests {
     use super::*;
     use crate::compiler::{EvaluationPolicy, EvaluationReceipt, SourceRange};
+    use crate::evaluator::{ConstructionHandle, ConstructionOperand};
+    use crate::typed_hir::AccessMode;
+
+    fn operand(edges: Vec<u128>) -> ConstructionOperand {
+        ConstructionOperand {
+            label: Arc::from("edge"),
+            ownership: AccessMode::Copy,
+            value: crate::CanonicalValue::Unit,
+            handles: edges
+                .into_iter()
+                .map(|identity| ConstructionHandle {
+                    kind: BuildKind::Test,
+                    identity,
+                })
+                .collect(),
+        }
+    }
 
     fn completed_run(
         root_handle: Option<(BuildKind, u128)>,
@@ -202,9 +246,9 @@ mod tests {
         let node = |identity, edges| Construction {
             identity,
             kind: BuildKind::Image,
+            owner: 1,
             site: site.clone(),
-            edges,
-            operands: Vec::new(),
+            operands: vec![operand(edges)],
         };
         assert!(matches!(
             finish(completed_run(
@@ -240,16 +284,16 @@ mod tests {
             Construction {
                 identity: 1,
                 kind: BuildKind::Image,
+                owner: 1,
                 site: site.clone(),
-                edges: vec![2],
-                operands: Vec::new(),
+                operands: vec![operand(vec![2])],
             },
             Construction {
                 identity: 2,
                 kind: BuildKind::Test,
+                owner: 1,
                 site: site.clone(),
-                edges: vec![1],
-                operands: Vec::new(),
+                operands: vec![operand(vec![1])],
             },
         ];
         assert!(matches!(
@@ -260,8 +304,8 @@ mod tests {
         unreachable.push(Construction {
             identity: 3,
             kind: BuildKind::Test,
+            owner: 1,
             site,
-            edges: Vec::new(),
             operands: Vec::new(),
         });
         assert!(matches!(

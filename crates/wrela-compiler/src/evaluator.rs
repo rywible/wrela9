@@ -11,9 +11,9 @@ use crate::model::{
     Type, VariantId,
 };
 use crate::typed_hir::{
-    BinaryOperator, CallTarget, CleanupAction, ClosureId, Expression, ExpressionKind, HirClosure,
-    HirFunction, HirMatchCase, HirMatchPattern, Literal, LocalId, Place, PlaceProjection,
-    Statement, VerifiedProgram, root_place,
+    AccessMode, BinaryOperator, CallTarget, CleanupAction, ClosureId, Expression, ExpressionKind,
+    HirClosure, HirFunction, HirMatchCase, HirMatchPattern, Literal, LocalId, Place,
+    PlaceProjection, Statement, VerifiedProgram, root_place,
 };
 use crate::{
     Cancellation, CanonicalValue, EvaluationContributorObservation, EvaluationFrameObservation,
@@ -354,6 +354,7 @@ pub(crate) struct Engine<'a> {
     construction_coordinates: BTreeMap<Arc<[u8]>, u64>,
     test_applications: Vec<AppliedTest>,
     call_stack: Vec<(u128, String, SourceRange)>,
+    semantic_owner_stack: Vec<u128>,
     evaluation_policy: EvaluationPolicy,
     evaluation_root: u128,
     evaluation_provenance: Option<SourceRange>,
@@ -369,22 +370,30 @@ pub(crate) struct Run {
     pub(crate) root_handle: Option<(BuildKind, u128)>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Construction {
     pub(crate) identity: u128,
     pub(crate) kind: BuildKind,
+    pub(crate) owner: u128,
     pub(crate) site: SourceRange,
-    pub(crate) edges: Vec<u128>,
     pub(crate) operands: Vec<ConstructionOperand>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ConstructionOperand {
     pub(crate) label: Arc<str>,
+    pub(crate) ownership: AccessMode,
     pub(crate) value: CanonicalValue,
+    pub(crate) handles: Vec<ConstructionHandle>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConstructionHandle {
+    pub(crate) kind: BuildKind,
+    pub(crate) identity: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AppliedTest {
     pub(crate) id: TestId,
     pub(crate) payload: Vec<CanonicalValue>,
@@ -407,6 +416,7 @@ impl<'a> Engine<'a> {
             construction_coordinates: BTreeMap::new(),
             test_applications: Vec::new(),
             call_stack: Vec::new(),
+            semantic_owner_stack: Vec::new(),
             evaluation_policy: EvaluationPolicy::Constant,
             evaluation_root: 0,
             evaluation_provenance: None,
@@ -442,6 +452,7 @@ impl<'a> Engine<'a> {
         self.construction_coordinates.clear();
         self.test_applications.clear();
         self.call_stack.clear();
+        self.semantic_owner_stack.clear();
         self.evaluating_constants.clear();
         self.root_dependencies.clear();
         self.evaluation_provenance = None;
@@ -619,11 +630,10 @@ impl<'a> Engine<'a> {
             }
             RootWork::Expression(expression) => {
                 self.evaluation_policy = EvaluationPolicy::ComptimeAssertion;
-                let mut key = b"wrela.comptime-root\0\x01".to_vec();
-                key.extend_from_slice(expression.source.path().as_bytes());
-                key.extend_from_slice(&expression.source.start().to_be_bytes());
-                key.extend_from_slice(&expression.source.end().to_be_bytes());
-                self.evaluation_root = xxh3_128(&key);
+                self.evaluation_root = program
+                    .comptime_root(expression)
+                    .expect("verified comptime expression carries its typed root")
+                    .0;
                 self.evaluation_provenance = Some(expression.source.clone());
                 self.retain(64)?;
                 frames.push(MachineFrame {
@@ -650,7 +660,14 @@ impl<'a> Engine<'a> {
                     .map(|function| &function.source)
                     .ok_or(EvalFailure::Creator(RejectKind::UnresolvedCall))?;
                 self.evaluation_provenance = Some(site.clone());
-                self.push_function_frame(&mut frames, function, Vec::new(), Vec::new(), site)?;
+                self.push_function_frame(
+                    &mut frames,
+                    function,
+                    specialization,
+                    Vec::new(),
+                    Vec::new(),
+                    site,
+                )?;
             }
         }
 
@@ -1962,6 +1979,7 @@ impl<'a> Engine<'a> {
                                 self.push_function_frame(
                                     &mut frames,
                                     function,
+                                    specialization,
                                     arguments,
                                     writebacks,
                                     site,
@@ -2001,6 +2019,7 @@ impl<'a> Engine<'a> {
                             self.push_function_frame(
                                 &mut frames,
                                 function,
+                                *specialization,
                                 reorder_values(arguments, argument_order)?,
                                 function_writebacks(
                                     function,
@@ -2039,6 +2058,7 @@ impl<'a> Engine<'a> {
                             self.push_function_frame(
                                 &mut frames,
                                 function,
+                                *specialization,
                                 reorder_values(arguments, argument_order)?,
                                 function_writebacks(
                                     function,
@@ -2049,7 +2069,17 @@ impl<'a> Engine<'a> {
                             )?;
                         }
                         CallTarget::Build { primitive, labels } => {
-                            let value = self.construct(primitive.kind, &arguments, labels, site)?;
+                            let ownership = argument_expressions
+                                .iter()
+                                .map(|argument| argument.access)
+                                .collect::<Vec<_>>();
+                            let value = self.construct(
+                                primitive.kind,
+                                &arguments,
+                                labels,
+                                &ownership,
+                                site,
+                            )?;
                             self.push_value(&mut frames, value)?;
                         }
                         CallTarget::BuiltinVariant(variant) => {
@@ -2136,6 +2166,7 @@ impl<'a> Engine<'a> {
         &mut self,
         frames: &mut Vec<MachineFrame<'hir>>,
         function: &'hir HirFunction,
+        specialization: SpecializationId,
         arguments: Vec<Value>,
         writebacks: Vec<(LocalId, Place)>,
         call_site: &SourceRange,
@@ -2167,6 +2198,7 @@ impl<'a> Engine<'a> {
         }
         self.call_stack
             .push((function.id.0, function.name.clone(), call_site.clone()));
+        self.semantic_owner_stack.push(specialization.0);
         frames.push(MachineFrame {
             kind: FrameKind::Function(function),
             controls: vec![
@@ -2359,6 +2391,11 @@ impl<'a> Engine<'a> {
                 self.call_stack.pop().ok_or_else(|| {
                     EvalFailure::Defect(Arc::from("call frame had no call-stack entry"))
                 })?;
+                if matches!(frame.kind, FrameKind::Function(_)) {
+                    self.semantic_owner_stack.pop().ok_or_else(|| {
+                        EvalFailure::Defect(Arc::from("function frame had no semantic-owner entry"))
+                    })?;
+                }
                 value
             }
             FrameKind::Constant {
@@ -2427,6 +2464,7 @@ impl<'a> Engine<'a> {
         kind: BuildKind,
         arguments: &[Value],
         labels: &[Arc<str>],
+        ownership: &[AccessMode],
         site: &SourceRange,
     ) -> Result<Value, EvalFailure> {
         self.charge(3)?;
@@ -2464,33 +2502,44 @@ impl<'a> Engine<'a> {
             )));
         }
         self.construction_keys.insert(identity, key);
-        if labels.len() != arguments.len() {
+        if labels.len() != arguments.len() || ownership.len() != arguments.len() {
             return Err(EvalFailure::Defect(Arc::from(
                 "verified Build call label count disagrees with operands",
             )));
         }
-        let mut edges = Vec::new();
         let mut operands = Vec::with_capacity(arguments.len());
-        for (label, argument) in labels.iter().zip(arguments) {
-            collect_construction_edges(argument, &mut edges);
+        for ((label, argument), ownership) in labels.iter().zip(arguments).zip(ownership) {
+            let mut handles = Vec::new();
+            collect_construction_handles(argument, &mut handles);
             if kind == BuildKind::Test {
                 collect_test_applications(argument, &mut self.test_applications);
             }
             operands.push(ConstructionOperand {
                 label: Arc::clone(label),
+                ownership: *ownership,
                 value: canonical(argument.clone()),
+                handles,
             });
         }
+        let edge_count = operands
+            .iter()
+            .map(|operand| operand.handles.len())
+            .sum::<usize>();
         let construction_memory = 64_u64.saturating_add(
-            u64::try_from(edges.len())
+            u64::try_from(edge_count)
                 .unwrap_or(u64::MAX)
                 .saturating_mul(16),
         );
+        let owner = self
+            .semantic_owner_stack
+            .last()
+            .copied()
+            .unwrap_or(self.evaluation_root);
         self.constructions.push(Construction {
             identity,
             kind,
+            owner,
             site: site.clone(),
-            edges,
             operands,
         });
         self.retain(construction_memory)?;
@@ -2605,9 +2654,12 @@ fn value_size(value: &Value) -> u64 {
     }
 }
 
-fn collect_construction_edges(value: &Value, edges: &mut Vec<u128>) {
+fn collect_construction_handles(value: &Value, handles: &mut Vec<ConstructionHandle>) {
     match value {
-        Value::SymbolicHandle { identity, .. } => edges.push(*identity),
+        Value::SymbolicHandle { kind, identity } => handles.push(ConstructionHandle {
+            kind: *kind,
+            identity: *identity,
+        }),
         Value::Array(values)
         | Value::Tuple(values)
         | Value::BuiltinVariant {
@@ -2620,12 +2672,12 @@ fn collect_construction_edges(value: &Value, edges: &mut Vec<u128>) {
             payload: values, ..
         } => {
             for value in &**values {
-                collect_construction_edges(value, edges);
+                collect_construction_handles(value, handles);
             }
         }
         Value::Struct { fields, .. } => {
             for (_, value) in &**fields {
-                collect_construction_edges(value, edges);
+                collect_construction_handles(value, handles);
             }
         }
         Value::Unavailable
@@ -2639,7 +2691,7 @@ fn collect_construction_edges(value: &Value, edges: &mut Vec<u128>) {
         | Value::Bytes(_) => {}
         Value::Closure { captures, .. } => {
             for (_, value) in &**captures {
-                collect_construction_edges(value, edges);
+                collect_construction_handles(value, handles);
             }
         }
     }

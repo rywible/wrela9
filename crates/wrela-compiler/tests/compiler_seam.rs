@@ -854,6 +854,120 @@ fn one_compiler_and_reopened_compiler_produce_identical_outcomes() {
     assert_eq!(first, reopened);
 }
 
+fn completed_semantic_request(selection: InspectSelection) -> CompilationRequest {
+    CompilationRequest::new(
+        ProjectSnapshot::new(vec![ProjectFile::new(
+            "src/image.wr",
+            b"const VALUE: i64 = 6 * 7\n\n@image\nfn build() -> Image:\n    return Image.new(value=VALUE)\n",
+        )]),
+        Root::Image,
+    )
+    .with_inspection(selection)
+}
+
+#[test]
+fn accepted_compile_publishes_one_completed_semantic_program_observation() {
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let CompilationOutcome::Accepted(accepted) = compiler.compile(
+        completed_semantic_request(InspectSelection::all()),
+        &Cancellation::new(),
+    ) else {
+        panic!("completed semantic fixture must compile");
+    };
+
+    let completed = accepted
+        .inspection()
+        .completed_semantic_program()
+        .expect("semantic inspection publishes the completed handoff");
+    assert_eq!(
+        accepted.semantic_program_fingerprint(),
+        completed.fingerprint()
+    );
+    assert_ne!(completed.context_identity(), 0);
+    assert_ne!(completed.typed_program_fingerprint(), 0);
+    assert_ne!(completed.identity_catalog_revision(), 0);
+    assert_ne!(completed.construction_graph_fingerprint(), 0);
+    assert_ne!(completed.executable_demand_fingerprint(), 0);
+    assert_eq!(
+        completed.phase_schema(),
+        "wrela.completed-semantic-program.v1"
+    );
+    assert!(completed.executable_count() >= 1);
+}
+
+#[test]
+fn inspection_selection_cannot_change_completed_semantic_program_identity() {
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let CompilationOutcome::Accepted(without) = compiler.compile(
+        completed_semantic_request(InspectSelection::none()),
+        &Cancellation::new(),
+    ) else {
+        panic!("fixture accepts without inspection");
+    };
+    let CompilationOutcome::Accepted(with) = compiler.compile(
+        completed_semantic_request(InspectSelection::all()),
+        &Cancellation::new(),
+    ) else {
+        panic!("fixture accepts with inspection");
+    };
+
+    assert_eq!(
+        without.semantic_program_fingerprint(),
+        with.semantic_program_fingerprint()
+    );
+    assert!(without.inspection().completed_semantic_program().is_none());
+    assert_eq!(
+        with.inspection()
+            .completed_semantic_program()
+            .expect("selected observation")
+            .fingerprint(),
+        with.semantic_program_fingerprint()
+    );
+}
+
+#[test]
+fn repeated_compiler_use_cannot_change_completed_semantic_program_identity() {
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let fingerprints = (0..3)
+        .map(|_| {
+            let CompilationOutcome::Accepted(accepted) = compiler.compile(
+                completed_semantic_request(InspectSelection::all()),
+                &Cancellation::new(),
+            ) else {
+                panic!("fixture accepts repeatedly");
+            };
+            accepted.semantic_program_fingerprint()
+        })
+        .collect::<Vec<_>>();
+    assert!(fingerprints.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[test]
+fn rejected_and_cancelled_compiles_publish_no_completed_semantic_handoff() {
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let CompilationOutcome::Rejected(rejected) = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", b"fn broken(\n")]),
+            Root::Image,
+        )
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    ) else {
+        panic!("malformed source must reject");
+    };
+    assert!(rejected.inspection().completed_semantic_program().is_none());
+
+    let cancellation = Cancellation::new();
+    cancellation.cancel();
+    assert!(matches!(
+        compiler.compile(
+            completed_semantic_request(InspectSelection::all()),
+            &cancellation
+        ),
+        CompilationOutcome::Cancelled
+    ));
+}
+
 #[test]
 fn invalid_encoding_inside_a_literal_remains_one_invalid_literal() {
     let source =

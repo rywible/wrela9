@@ -27,11 +27,13 @@ pub(crate) struct FunctionFacts {
     pub(crate) specialization_calls: BTreeMap<SpecializationId, u64>,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct RecursionFacts {
     pub(crate) proven: BTreeMap<DefinitionId, u64>,
     pub(crate) unproven: Vec<SourceRange>,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct SolvedSemanticFacts {
     pub(crate) definitions: BTreeMap<DefinitionId, FunctionFacts>,
     pub(crate) specializations: BTreeMap<SpecializationId, FunctionFacts>,
@@ -74,6 +76,26 @@ pub(crate) fn solve(program: &VerifiedProgram, cancellation: &Cancellation) -> S
         inferred_errors,
         diagnostics,
     }
+}
+
+pub(crate) fn test_specialization_demands(
+    program: &VerifiedProgram,
+    test: crate::model::TestId,
+) -> Option<BTreeSet<SpecializationId>> {
+    let mut facts = FunctionFacts {
+        pure: true,
+        may_panic: false,
+        suspends: false,
+        evaluator_eligible: true,
+        ownership_transfer: false,
+        bounded: true,
+        logical_cost: 0,
+        constructs: BTreeSet::new(),
+        calls: BTreeMap::new(),
+        specialization_calls: BTreeMap::new(),
+    };
+    visit_statements(program.test_body(test)?, &mut facts);
+    Some(facts.specialization_calls.into_keys().collect())
 }
 
 pub(crate) fn infer_error_signatures(

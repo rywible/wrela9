@@ -39,6 +39,7 @@ pub(crate) struct SemanticRevision {
     defect: Option<Defect>,
     cancelled: bool,
     selection_value: Option<bool>,
+    completed: Option<Arc<crate::completed_semantic::CompletedSemanticProgram>>,
 }
 
 #[derive(Default)]
@@ -52,6 +53,24 @@ struct SemanticObservations {
     evaluations: Vec<EvaluationObservation>,
     constructions: Vec<ConstructionObservation>,
     test_plan: Vec<TestApplicationObservation>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AnalysisContext<'a> {
+    authorities: AuthorityContext<'a>,
+    completion: Option<crate::completed_semantic::ContextInput>,
+}
+
+impl<'a> AnalysisContext<'a> {
+    pub(crate) const fn new(
+        authorities: AuthorityContext<'a>,
+        completion: Option<crate::completed_semantic::ContextInput>,
+    ) -> Self {
+        Self {
+            authorities,
+            completion,
+        }
+    }
 }
 
 pub(crate) struct SemanticProjection {
@@ -71,6 +90,12 @@ pub(crate) enum SemanticFailure {
     Defect(Defect),
 }
 
+pub(crate) struct FinalizedSemanticRevision {
+    pub(crate) diagnostics: Vec<Diagnostic>,
+    pub(crate) projection: SemanticProjection,
+    pub(crate) completed: Option<Arc<crate::completed_semantic::CompletedSemanticProgram>>,
+}
+
 impl SemanticRevision {
     pub(crate) fn finalize(
         self,
@@ -78,7 +103,7 @@ impl SemanticRevision {
         evaluation: bool,
         construction: bool,
         tests: bool,
-    ) -> Result<(Vec<Diagnostic>, SemanticProjection), SemanticFailure> {
+    ) -> Result<FinalizedSemanticRevision, SemanticFailure> {
         if self.cancelled {
             return Err(SemanticFailure::Cancelled);
         }
@@ -86,9 +111,9 @@ impl SemanticRevision {
             return Err(SemanticFailure::Defect(defect));
         }
         let observations = self.observations;
-        Ok((
-            self.diagnostics,
-            SemanticProjection {
+        Ok(FinalizedSemanticRevision {
+            diagnostics: self.diagnostics,
+            projection: SemanticProjection {
                 resolutions: project_observations(semantics, observations.resolutions),
                 function_facts: project_observations(semantics, observations.function_facts),
                 types: project_observations(semantics, observations.types),
@@ -99,7 +124,8 @@ impl SemanticRevision {
                 constructions: project_observations(construction, observations.constructions),
                 test_plan: project_observations(tests, observations.test_plan),
             },
-        ))
+            completed: self.completed,
+        })
     }
 }
 
@@ -171,7 +197,10 @@ pub(crate) fn select_comptime_declarations<'a>(
                     root,
                     cancellation,
                     false,
-                    AuthorityContext::new(build_authority, pool_authority),
+                    AnalysisContext::new(
+                        AuthorityContext::new(build_authority, pool_authority),
+                        None,
+                    ),
                     Some((&path, condition)),
                 );
                 if analysis.cancelled {
@@ -596,7 +625,7 @@ fn evaluate_nested_condition<'a>(
         root,
         cancellation,
         false,
-        AuthorityContext::new(build_authority, pool_authority),
+        AnalysisContext::new(AuthorityContext::new(build_authority, pool_authority), None),
         Some((path, condition)),
     );
     if analysis.cancelled {
@@ -713,7 +742,7 @@ pub(crate) fn analyze<'a>(
     root: Root,
     cancellation: &Cancellation,
     executable_allowed: bool,
-    authorities: AuthorityContext<'_>,
+    context: AnalysisContext<'_>,
 ) -> SemanticRevision {
     analyze_with_probe(
         parsed_sources,
@@ -721,7 +750,7 @@ pub(crate) fn analyze<'a>(
         root,
         cancellation,
         executable_allowed,
-        authorities,
+        context,
         None,
     )
 }
@@ -732,11 +761,12 @@ fn analyze_with_probe(
     root: Root,
     cancellation: &Cancellation,
     executable_allowed: bool,
-    authorities: AuthorityContext<'_>,
+    context: AnalysisContext<'_>,
     selection_probe: Option<(&str, &crate::syntax::ExpressionSyntax)>,
 ) -> SemanticRevision {
-    let build_authority = authorities.build();
-    let pool_authority = authorities.pool();
+    let build_authority = context.authorities.build();
+    let pool_authority = context.authorities.pool();
+    let completion_context = context.completion;
     let mut diagnostics = Vec::new();
     let modules = parsed_sources
         .keys()
@@ -2226,7 +2256,7 @@ fn analyze_with_probe(
         identity_catalog,
         cancellation,
     ) {
-        Ok(program) => Some(program),
+        Ok(program) => Some(Arc::new(program)),
         Err(typed_hir::VerificationFailure::Defect { evidence }) => {
             return defect("typed HIR verification", evidence);
         }
@@ -2302,18 +2332,21 @@ fn analyze_with_probe(
     let mut evaluations = Vec::new();
     let mut constructions = Vec::new();
     let mut test_plan = Vec::new();
+    let mut completion_facts = None;
+    let mut sealed_image = None;
     if let Some(program) = &program {
         resolutions = resolution_observations(program);
-        let solved_facts = crate::semantic_facts::solve(program, cancellation);
-        let facts = solved_facts.definitions;
-        let concrete_facts = solved_facts.specializations;
-        let recursion = solved_facts.recursion;
-        inferred_errors = solved_facts.inferred_errors;
-        diagnostics.extend(solved_facts.diagnostics);
+        let solved_facts = Arc::new(crate::semantic_facts::solve(program, cancellation));
+        let facts = &solved_facts.definitions;
+        let concrete_facts = &solved_facts.specializations;
+        let recursion = &solved_facts.recursion;
+        inferred_errors = solved_facts.inferred_errors.clone();
+        diagnostics.extend(solved_facts.diagnostics.iter().cloned());
+        completion_facts = Some(Arc::clone(&solved_facts));
         if cancellation.is_cancelled() {
             return cancelled();
         }
-        for (id, facts) in &facts {
+        for (id, facts) in facts {
             let function = &program.functions()[id];
             if facts.suspends && function.modifier != crate::syntax::FunctionModifier::Async {
                 diagnostics.push(Diagnostic::new(
@@ -2330,7 +2363,7 @@ fn analyze_with_probe(
                 ));
             }
         }
-        for (id, facts) in &concrete_facts {
+        for (id, facts) in concrete_facts {
             let specialization = &program.specializations()[id];
             let function = &program.functions()[&specialization.definition];
             function_facts.push(FunctionFactsObservation::new(
@@ -2379,7 +2412,7 @@ fn analyze_with_probe(
                     ));
                 }
             }
-            for (id, facts) in &facts {
+            for (id, facts) in facts {
                 if !facts.constructs.is_empty() && !image_reachable.contains(id) {
                     diagnostics.push(Diagnostic::new(
                         "semantic.build_constructor_outside_image",
@@ -2389,10 +2422,10 @@ fn analyze_with_probe(
                 }
             }
         }
-        for range in recursion.unproven {
+        for range in &recursion.unproven {
             diagnostics.push(Diagnostic::new(
                 "semantic.unproven_recursive_bound",
-                range,
+                range.clone(),
                 RecoveryAction::None,
             ));
         }
@@ -2512,7 +2545,8 @@ fn analyze_with_probe(
                                 &mut diagnostics,
                             );
                         }
-                        constructions.extend(sealed.constructions);
+                        constructions.extend(sealed.observations());
+                        sealed_image = Some(sealed);
                     }
                     ImageEvaluationStatus::Invalid(GraphSealFailure::Creator(kind)) => diagnostics
                         .push(
@@ -2552,6 +2586,46 @@ fn analyze_with_probe(
             .then(left.name().cmp(right.name()))
     });
     specialization_observations.sort_by_key(SpecializationObservation::identity);
+    let completed = if diagnostics.is_empty() && executable_allowed {
+        let (Some(context), Some(program), Some(facts), Some(image), Some((image_definition, _))) = (
+            completion_context,
+            program,
+            completion_facts,
+            sealed_image,
+            image_functions.first(),
+        ) else {
+            return defect(
+                "semantic completion",
+                Arc::from("accepted semantic prefix omitted a required completion authority"),
+            );
+        };
+        let Some(image_specialization) = program.default_specialization(*image_definition) else {
+            return defect(
+                "semantic completion",
+                Arc::from("Image Constructor has no concrete Specialization"),
+            );
+        };
+        match crate::completed_semantic::complete(
+            crate::completed_semantic::CompletionInput {
+                context,
+                identity_catalog: Arc::new(identity_catalog.clone()),
+                program,
+                facts,
+                evaluations: evaluations.clone(),
+                image,
+                image_specialization,
+            },
+            cancellation,
+        ) {
+            Ok(completed) => Some(Arc::new(completed)),
+            Err(crate::completed_semantic::CompletionFailure::Cancelled) => return cancelled(),
+            Err(crate::completed_semantic::CompletionFailure::Defect(evidence)) => {
+                return defect("semantic completion verification", evidence);
+            }
+        }
+    } else {
+        None
+    };
     SemanticRevision {
         diagnostics,
         observations: SemanticObservations {
@@ -2568,6 +2642,7 @@ fn analyze_with_probe(
         defect: None,
         cancelled: false,
         selection_value: None,
+        completed,
     }
 }
 
@@ -3755,6 +3830,7 @@ fn cancelled() -> SemanticRevision {
         defect: None,
         cancelled: true,
         selection_value: None,
+        completed: None,
     }
 }
 
@@ -3765,6 +3841,7 @@ fn defect(phase: &'static str, evidence: Arc<str>) -> SemanticRevision {
         defect: Some(Defect::new(phase, evidence)),
         cancelled: false,
         selection_value: None,
+        completed: None,
     }
 }
 
@@ -3778,6 +3855,7 @@ fn selection_analysis(
         defect: None,
         cancelled: false,
         selection_value,
+        completed: None,
     }
 }
 

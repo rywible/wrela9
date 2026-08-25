@@ -66,6 +66,38 @@ fn build() -> Image:
 }
 
 #[test]
+fn completed_semantic_demand_includes_only_specializations_reachable_from_applied_tests() {
+    let source = br#"pure fn used_by_test() -> i64:
+    return 42
+
+pure fn unreachable() -> i64:
+    return 0
+
+pub suite behavior:
+    test observes_helper():
+        expect used_by_test() == 42
+
+@image
+fn build() -> Image:
+    tests = Test.new(cases=[behavior.observes_helper()])
+    return Image.new(tests=tests)
+"#;
+    let outcome = compile(vec![ProjectFile::new("src/test.wr", source)], Root::Test);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("complete Test Image must compile: {outcome:#?}");
+    };
+    assert_eq!(
+        accepted
+            .inspection()
+            .completed_semantic_program()
+            .expect("semantic completion observation")
+            .executable_count(),
+        2,
+        "the Image Constructor and applied Test helper are demanded; the unrelated function is not"
+    );
+}
+
+#[test]
 fn nested_comptime_statements_select_test_bodies_before_test_semantics() {
     let source = br#"const ENABLED: bool = false
 

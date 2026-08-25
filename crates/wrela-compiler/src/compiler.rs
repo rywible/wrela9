@@ -953,6 +953,7 @@ pub struct Inspection {
     constructions: Arc<[ConstructionObservation]>,
     test_plan: Arc<[TestApplicationObservation]>,
     architecture_planning_contract: Option<ArchitecturePlanningObservation>,
+    completed_semantic_program: Option<CompletedSemanticProgramObservation>,
 }
 
 impl Inspection {
@@ -1045,6 +1046,107 @@ impl Inspection {
     pub const fn architecture_planning_contract(&self) -> Option<&ArchitecturePlanningObservation> {
         self.architecture_planning_contract.as_ref()
     }
+
+    #[must_use]
+    pub const fn completed_semantic_program(&self) -> Option<&CompletedSemanticProgramObservation> {
+        self.completed_semantic_program.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedSemanticProgramObservation {
+    fingerprint: u128,
+    context_identity: u128,
+    typed_program_fingerprint: u128,
+    identity_catalog_revision: u128,
+    custody_fingerprint: u128,
+    construction_graph_fingerprint: u128,
+    executable_demand_fingerprint: u128,
+    solved_specialization_count: usize,
+    evaluation_count: usize,
+    construction_count: usize,
+    executable_count: usize,
+}
+
+impl CompletedSemanticProgramObservation {
+    pub(crate) const fn new(values: CompletedSemanticProgramValues) -> Self {
+        Self {
+            fingerprint: values.fingerprint,
+            context_identity: values.context_identity,
+            typed_program_fingerprint: values.typed_program_fingerprint,
+            identity_catalog_revision: values.identity_catalog_revision,
+            custody_fingerprint: values.custody_fingerprint,
+            construction_graph_fingerprint: values.construction_graph_fingerprint,
+            executable_demand_fingerprint: values.executable_demand_fingerprint,
+            solved_specialization_count: values.solved_specialization_count,
+            evaluation_count: values.evaluation_count,
+            construction_count: values.construction_count,
+            executable_count: values.executable_count,
+        }
+    }
+
+    #[must_use]
+    pub const fn fingerprint(&self) -> u128 {
+        self.fingerprint
+    }
+    #[must_use]
+    pub const fn context_identity(&self) -> u128 {
+        self.context_identity
+    }
+    #[must_use]
+    pub const fn typed_program_fingerprint(&self) -> u128 {
+        self.typed_program_fingerprint
+    }
+    #[must_use]
+    pub const fn identity_catalog_revision(&self) -> u128 {
+        self.identity_catalog_revision
+    }
+    #[must_use]
+    pub const fn custody_fingerprint(&self) -> u128 {
+        self.custody_fingerprint
+    }
+    #[must_use]
+    pub const fn construction_graph_fingerprint(&self) -> u128 {
+        self.construction_graph_fingerprint
+    }
+    #[must_use]
+    pub const fn executable_demand_fingerprint(&self) -> u128 {
+        self.executable_demand_fingerprint
+    }
+    #[must_use]
+    pub const fn solved_specialization_count(&self) -> usize {
+        self.solved_specialization_count
+    }
+    #[must_use]
+    pub const fn evaluation_count(&self) -> usize {
+        self.evaluation_count
+    }
+    #[must_use]
+    pub const fn construction_count(&self) -> usize {
+        self.construction_count
+    }
+    #[must_use]
+    pub const fn executable_count(&self) -> usize {
+        self.executable_count
+    }
+    #[must_use]
+    pub const fn phase_schema(&self) -> &'static str {
+        crate::completed_semantic::PHASE_SCHEMA
+    }
+}
+
+pub(crate) struct CompletedSemanticProgramValues {
+    pub(crate) fingerprint: u128,
+    pub(crate) context_identity: u128,
+    pub(crate) typed_program_fingerprint: u128,
+    pub(crate) identity_catalog_revision: u128,
+    pub(crate) custody_fingerprint: u128,
+    pub(crate) construction_graph_fingerprint: u128,
+    pub(crate) executable_demand_fingerprint: u128,
+    pub(crate) solved_specialization_count: usize,
+    pub(crate) evaluation_count: usize,
+    pub(crate) construction_count: usize,
+    pub(crate) executable_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1960,6 +2062,7 @@ impl IdentityObservation {
 pub struct AcceptedCompilation {
     diagnostics: Arc<[Diagnostic]>,
     inspection: Inspection,
+    completed_semantic_program: Arc<crate::completed_semantic::CompletedSemanticProgram>,
 }
 
 impl AcceptedCompilation {
@@ -1971,6 +2074,18 @@ impl AcceptedCompilation {
     #[must_use]
     pub fn inspection(&self) -> &Inspection {
         &self.inspection
+    }
+
+    #[must_use]
+    pub fn semantic_program_fingerprint(&self) -> u128 {
+        self.completed_semantic_program.fingerprint()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn completed_semantic_program(
+        &self,
+    ) -> &crate::completed_semantic::CompletedSemanticProgram {
+        &self.completed_semantic_program
     }
 }
 
@@ -2314,12 +2429,19 @@ impl Compiler {
             request.root,
             cancellation,
             front_end_clean,
-            AuthorityContext::new(
-                self.distribution.build_authority(),
-                self.distribution.pool_authority(),
+            semantic::AnalysisContext::new(
+                AuthorityContext::new(
+                    self.distribution.build_authority(),
+                    self.distribution.pool_authority(),
+                ),
+                Some(crate::completed_semantic::ContextInput {
+                    distribution_digest: self.distribution.digest(),
+                    semantic_closure_digest,
+                    root: request.root,
+                }),
             ),
         );
-        let (semantic_diagnostics, semantic_projection) = match revision.finalize(
+        let finalized = match revision.finalize(
             request.inspection.semantics,
             request.inspection.evaluation,
             request.inspection.construction,
@@ -2331,7 +2453,9 @@ impl Compiler {
                 return CompilationOutcome::Defect(defect);
             }
         };
-        diagnostics.extend(semantic_diagnostics);
+        diagnostics.extend(finalized.diagnostics);
+        let semantic_projection = finalized.projection;
+        let completed_semantic_program = finalized.completed;
         let architecture_contract = if diagnostics.is_empty() {
             match request.architecture_profile {
                 None => None,
@@ -2431,12 +2555,26 @@ impl Compiler {
                 architecture_contract.as_ref(),
                 request.inspection,
             ),
+            completed_semantic_program: if diagnostics.is_empty() && request.inspection.semantics {
+                completed_semantic_program
+                    .as_ref()
+                    .map(|completed| completed.observation())
+            } else {
+                None
+            },
         };
 
         if diagnostics.is_empty() {
+            let Some(completed_semantic_program) = completed_semantic_program else {
+                return CompilationOutcome::Defect(Defect::new(
+                    "semantic completion",
+                    "accepted compilation omitted Completed Semantic Program",
+                ));
+            };
             CompilationOutcome::Accepted(AcceptedCompilation {
                 diagnostics: Arc::from([]),
                 inspection,
+                completed_semantic_program,
             })
         } else {
             CompilationOutcome::Rejected(RejectedCompilation {

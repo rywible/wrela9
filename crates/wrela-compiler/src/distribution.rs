@@ -120,9 +120,12 @@ impl CompilerDistribution {
             Root::Image,
             &cancellation,
             false,
-            AuthorityContext::new(&build_authority, &pool_authority),
+            semantic::AnalysisContext::new(
+                AuthorityContext::new(&build_authority, &pool_authority),
+                None,
+            ),
         );
-        let (diagnostics, _) = match revision.finalize(false, false, false, false) {
+        let finalized = match revision.finalize(false, false, false, false) {
             Ok(revision) => revision,
             Err(semantic::SemanticFailure::Defect(defect)) => {
                 return Err(OpenError::AuthenticatedModuleDefect {
@@ -134,7 +137,7 @@ impl CompilerDistribution {
                 unreachable!("fresh cancellation is not cancelled")
             }
         };
-        if let Some(diagnostic) = diagnostics.first() {
+        if let Some(diagnostic) = finalized.diagnostics.first() {
             return Err(OpenError::InvalidAuthenticatedModule {
                 path: Arc::from(diagnostic.primary().path()),
                 code: Arc::from(diagnostic.code()),

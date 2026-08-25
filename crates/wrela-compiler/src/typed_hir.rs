@@ -744,11 +744,46 @@ pub(crate) struct VerifiedProgram {
     tests: BTreeMap<TestId, ResolvedTest>,
     _test_bodies: BTreeMap<TestId, HirTest>,
     specializations: BTreeMap<SpecializationId, SpecializationRecord>,
-    comptime_expressions: BTreeMap<SourceRange, Expression>,
+    comptime_expressions: BTreeMap<SourceRange, ComptimeExpression>,
     closures: BTreeMap<ClosureId, Arc<HirClosure>>,
     _discharge_laws: VerifiedDischargeLaws,
     fingerprint: u128,
+    identity_catalog_revision: u128,
     _verified: Verified,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ConditionSiteId(pub(crate) u128);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum EvaluationRoot {
+    Constant(DefinitionId),
+    Condition(ConditionSiteId),
+    Image(SpecializationId),
+}
+
+impl EvaluationRoot {
+    pub(crate) const fn identity(self) -> u128 {
+        match self {
+            Self::Constant(identity) => identity.0,
+            Self::Condition(identity) => identity.0,
+            Self::Image(identity) => identity.0,
+        }
+    }
+
+    pub(crate) const fn tag(self) -> u8 {
+        match self {
+            Self::Constant(_) => 1,
+            Self::Condition(_) => 2,
+            Self::Image(_) => 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ComptimeExpression {
+    root: ConditionSiteId,
+    expression: Expression,
 }
 
 #[derive(Clone, Debug)]
@@ -1457,17 +1492,86 @@ impl VerifiedProgram {
         self.fingerprint
     }
 
+    pub(crate) const fn identity_catalog_revision(&self) -> u128 {
+        self.identity_catalog_revision
+    }
+
+    pub(crate) fn test_body(&self, id: TestId) -> Option<&[Statement]> {
+        self._test_bodies.get(&id).map(|test| test.body.as_ref())
+    }
+
+    pub(crate) fn expected_evaluation_roots(
+        &self,
+        image: SpecializationId,
+    ) -> BTreeSet<EvaluationRoot> {
+        let mut roots = self
+            .constants
+            .keys()
+            .copied()
+            .map(EvaluationRoot::Constant)
+            .collect::<BTreeSet<_>>();
+        roots.extend(
+            self.comptime_expressions
+                .values()
+                .map(|expression| EvaluationRoot::Condition(expression.root)),
+        );
+        roots.insert(EvaluationRoot::Image(image));
+        roots
+    }
+
+    pub(crate) fn evaluation_root(
+        &self,
+        policy: crate::EvaluationPolicy,
+        identity: u128,
+        image: SpecializationId,
+    ) -> Option<EvaluationRoot> {
+        let root = match policy {
+            crate::EvaluationPolicy::Constant => EvaluationRoot::Constant(DefinitionId(identity)),
+            crate::EvaluationPolicy::ComptimeAssertion => {
+                EvaluationRoot::Condition(ConditionSiteId(identity))
+            }
+            crate::EvaluationPolicy::ImageConstructor => EvaluationRoot::Image(image),
+        };
+        (root.identity() == identity && self.expected_evaluation_roots(image).contains(&root))
+            .then_some(root)
+    }
+
+    pub(crate) fn comptime_root(&self, expression: &Expression) -> Option<ConditionSiteId> {
+        self.comptime_expressions
+            .get(&expression.source)
+            .map(|root| root.root)
+    }
+
+    pub(crate) fn custody_fingerprint(&self) -> u128 {
+        let mut canonical = Xxh3::new();
+        canonical.extend_from_slice(b"wrela.resource-custody-authority\0\x01");
+        for (type_id, law) in &self._discharge_laws.laws {
+            canonical.extend_from_slice(&type_id.0.to_be_bytes());
+            append_discharge_law(&mut canonical, law);
+        }
+        canonical.digest128()
+    }
+
     pub(crate) fn verify_expression(
         &self,
         syntax: &ExpressionSyntax,
     ) -> Result<Expression, VerificationFailure> {
         self.comptime_expressions
             .get(&syntax.range)
-            .cloned()
+            .map(|root| root.expression.clone())
             .ok_or_else(|| VerificationFailure::Defect {
                 evidence: Arc::from("comptime expression was not included in concrete demand"),
             })
     }
+}
+
+fn condition_site_identity(module: ModuleId, source: &SourceRange) -> ConditionSiteId {
+    let mut canonical = Xxh3::new();
+    canonical.extend_from_slice(b"wrela.condition-site\0\x01");
+    canonical.extend_from_slice(&module.0.to_be_bytes());
+    canonical.extend_from_slice(&source.start().to_be_bytes());
+    canonical.extend_from_slice(&source.end().to_be_bytes());
+    ConditionSiteId(canonical.digest128())
 }
 
 pub(crate) fn verify(
@@ -1535,7 +1639,13 @@ pub(crate) fn verify(
             true,
         )
         .expression(root)?;
-        comptime_expressions.insert(root.range.clone(), expression);
+        comptime_expressions.insert(
+            root.range.clone(),
+            ComptimeExpression {
+                root: condition_site_identity(*module, &root.range),
+                expression,
+            },
+        );
     }
 
     let mut functions = BTreeMap::new();
@@ -1739,7 +1849,7 @@ pub(crate) fn verify(
         collect_statement_closures(&test.body, &mut closures)?;
     }
     for expression in comptime_expressions.values() {
-        collect_expression_closures(expression, &mut closures)?;
+        collect_expression_closures(&expression.expression, &mut closures)?;
     }
 
     let mut canonical = Xxh3::new();
@@ -1809,7 +1919,8 @@ pub(crate) fn verify(
     append_collection_header(&mut canonical, 7, comptime_expressions.len());
     for (source, expression) in &comptime_expressions {
         append_range(&mut canonical, source);
-        append_expression(&mut canonical, expression);
+        canonical.extend_from_slice(&expression.root.0.to_be_bytes());
+        append_expression(&mut canonical, &expression.expression);
     }
     append_collection_header(&mut canonical, 8, input.variants.len());
     for (id, variant) in &input.variants {
@@ -1850,6 +1961,7 @@ pub(crate) fn verify(
         closures,
         _discharge_laws: discharge_laws,
         fingerprint: canonical.digest128(),
+        identity_catalog_revision: identity_catalog.revision_fingerprint(),
         _verified: Verified,
     })
 }
@@ -2060,10 +2172,17 @@ fn verify_comptime_condition_with_values(
         tests: BTreeMap::new(),
         _test_bodies: BTreeMap::new(),
         specializations,
-        comptime_expressions: BTreeMap::from([(condition.range.clone(), expression.clone())]),
+        comptime_expressions: BTreeMap::from([(
+            condition.range.clone(),
+            ComptimeExpression {
+                root: condition_site_identity(module, &condition.range),
+                expression: expression.clone(),
+            },
+        )]),
         closures,
         _discharge_laws: discharge_laws,
         fingerprint: 0,
+        identity_catalog_revision: identity_catalog.revision_fingerprint(),
         _verified: Verified,
     };
     Ok((program, expression))

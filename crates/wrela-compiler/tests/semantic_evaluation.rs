@@ -3175,6 +3175,27 @@ fn build() -> Image:
 }
 
 #[test]
+fn take_parameter_is_an_explicit_consuming_discharge_interface() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+@image
+fn build() -> Image:
+    ticket = Ticket(id=1)
+    consume(take ticket)
+    return Image.new()
+"#;
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "a take parameter is the callee's explicit consuming boundary: {outcome:#?}"
+    );
+}
+
+#[test]
 fn a_live_protocol_resource_must_be_explicitly_discharged_on_fallthrough() {
     let source = br#"resource struct Ticket:
     id: i64
@@ -3544,6 +3565,120 @@ fn build() -> Image:
             ("subject_identity", IdentityDomain::Definition, "Ticket"),
             ("owner_identity", IdentityDomain::Definition, "broken"),
         ],
+    );
+}
+
+#[test]
+fn nested_take_patterns_preserve_component_discharge_obligations() {
+    let fully_consumed = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn valid():
+    pair = (Ticket(id=1), Ticket(id=2))
+    match pair:
+        case (take left, take right):
+            consume(take left)
+            consume(take right)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(fully_consumed);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "consuming every nested take binding must discharge the aggregate: {outcome:#?}"
+    );
+
+    let missing_sibling = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn broken():
+    pair = (Ticket(id=1), Ticket(id=2))
+    match pair:
+        case (take left, _):
+            consume(take left)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(missing_sibling) else {
+        panic!("an unconsumed nested sibling must be a Creator rejection");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        missing_sibling,
+        "semantic.resource_not_discharged",
+        (b"pair", 0),
+        &[],
+        &[("subject", "pair[1]"), ("state", "live_undischarged")],
+        &[
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
+        ],
+    );
+}
+
+#[test]
+fn with_scope_reports_live_project_resource_as_a_creator_diagnostic() {
+    let source = br#"from core import pool as pools
+
+resource struct Ticket:
+    id: i64
+
+@image
+fn build() -> Image:
+    with pools.scoped(capacity=1) as scratch:
+        ticket = Ticket(id=1)
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("a live Resource leaving with must be a Creator rejection");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.resource_not_discharged",
+        (b"ticket", 0),
+        &[],
+        &[("subject", "ticket"), ("state", "live_undischarged")],
+        &[
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "build"),
+        ],
+    );
+}
+
+#[test]
+fn read_pattern_bindings_do_not_create_a_second_custodian() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn valid():
+    ticket = Ticket(id=1)
+    match ticket:
+        case borrowed:
+            borrowed.id
+    consume(take ticket)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "a read-pattern loan cannot become another discharge obligation: {outcome:#?}"
     );
 }
 

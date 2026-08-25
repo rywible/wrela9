@@ -13,7 +13,7 @@ use crate::model::{
 use crate::typed_hir::{
     BinaryOperator, CallTarget, ClosureId, Expression, ExpressionKind, HirClosure, HirFunction,
     HirMatchCase, HirMatchPattern, Literal, LocalId, Place, PlaceProjection, Statement,
-    VerifiedProgram,
+    VerifiedProgram, root_place,
 };
 use crate::{
     Cancellation, CanonicalValue, EvaluationContributorObservation, EvaluationFrameObservation,
@@ -177,12 +177,14 @@ enum Control<'hir> {
     SelectPatternBranch {
         function: &'hir HirFunction,
         pattern: &'hir HirMatchPattern,
+        source: Option<Place>,
         then_branch: &'hir [Statement],
         else_branch: &'hir [Statement],
     },
     FinishFor {
         function: &'hir HirFunction,
         pattern: &'hir HirMatchPattern,
+        source: Option<Place>,
         body: &'hir [Statement],
     },
     FinishMatch {
@@ -207,6 +209,7 @@ enum Control<'hir> {
     ForNext {
         function: &'hir HirFunction,
         pattern: &'hir HirMatchPattern,
+        source: Option<Place>,
         body: &'hir [Statement],
         values: Arc<[Value]>,
         index: usize,
@@ -1057,6 +1060,7 @@ impl<'a> Engine<'a> {
                             controls.push(Control::SelectPatternBranch {
                                 function,
                                 pattern,
+                                source: root_place(value),
                                 then_branch,
                                 else_branch,
                             });
@@ -1071,6 +1075,7 @@ impl<'a> Engine<'a> {
                             controls.push(Control::FinishFor {
                                 function,
                                 pattern,
+                                source: root_place(iterable),
                                 body,
                             });
                             controls.push(Control::Expression(iterable));
@@ -1283,11 +1288,13 @@ impl<'a> Engine<'a> {
                 Control::SelectPatternBranch {
                     function,
                     pattern,
+                    source,
                     then_branch,
                     else_branch,
                 } => {
-                    let value = self.pop_value(&mut frames)?;
-                    let Some(bindings) = pattern_bindings(&value, pattern) else {
+                    let mut value = self.pop_value(&mut frames)?;
+                    let mut probe = value.clone();
+                    if pattern_bindings(&mut probe, pattern, false).is_none() {
                         frames
                             .last_mut()
                             .expect("machine has current frame")
@@ -1298,7 +1305,26 @@ impl<'a> Engine<'a> {
                                 index: 0,
                             });
                         continue;
-                    };
+                    }
+                    let bindings =
+                        if let Some(source) = source.filter(|place| place.projections.is_empty()) {
+                            let root = frames
+                                .last_mut()
+                                .and_then(|frame| frame.locals.get_mut(source.local.0 as usize))
+                                .and_then(Option::as_mut)
+                                .ok_or(EvalFailure::Creator(RejectKind::MissingLocal))?;
+                            pattern_bindings(root, pattern, true).ok_or_else(|| {
+                                EvalFailure::Defect(Arc::from(
+                                    "verified conditional pattern disagrees with its source place",
+                                ))
+                            })?
+                        } else {
+                            pattern_bindings(&mut value, pattern, true).ok_or_else(|| {
+                                EvalFailure::Defect(Arc::from(
+                                    "verified conditional pattern changed after matching",
+                                ))
+                            })?
+                        };
                     let binding_locals =
                         bindings.iter().map(|(local, _)| *local).collect::<Vec<_>>();
                     for (local, binding) in bindings {
@@ -1328,6 +1354,7 @@ impl<'a> Engine<'a> {
                 Control::FinishFor {
                     function,
                     pattern,
+                    source,
                     body,
                 } => {
                     let Value::Array(values) = self.pop_value(&mut frames)? else {
@@ -1342,6 +1369,7 @@ impl<'a> Engine<'a> {
                         .push(Control::ForNext {
                             function,
                             pattern,
+                            source,
                             body,
                             values,
                             index: 0,
@@ -1350,18 +1378,44 @@ impl<'a> Engine<'a> {
                 Control::ForNext {
                     function,
                     pattern,
+                    source,
                     body,
                     values,
                     index,
                 } => {
-                    let Some(value) = values.get(index).cloned() else {
+                    let Some(mut value) = values.get(index).cloned() else {
                         continue;
                     };
-                    let bindings = pattern_bindings(&value, pattern).ok_or_else(|| {
-                        EvalFailure::Defect(Arc::from(
-                            "verified irrefutable for pattern did not match",
-                        ))
-                    })?;
+                    let bindings = if let Some(source) =
+                        source.as_ref().filter(|place| place.projections.is_empty())
+                    {
+                        let root = frames
+                            .last_mut()
+                            .and_then(|frame| frame.locals.get_mut(source.local.0 as usize))
+                            .and_then(Option::as_mut)
+                            .ok_or(EvalFailure::Creator(RejectKind::MissingLocal))?;
+                        let Value::Array(elements) = root else {
+                            return Err(EvalFailure::Defect(Arc::from(
+                                "verified for source place is not an array",
+                            )));
+                        };
+                        let element = Arc::make_mut(elements).get_mut(index).ok_or_else(|| {
+                            EvalFailure::Defect(Arc::from(
+                                "verified for source place lost an exact element",
+                            ))
+                        })?;
+                        pattern_bindings(element, pattern, true).ok_or_else(|| {
+                            EvalFailure::Defect(Arc::from(
+                                "verified irrefutable for pattern did not match its source",
+                            ))
+                        })?
+                    } else {
+                        pattern_bindings(&mut value, pattern, true).ok_or_else(|| {
+                            EvalFailure::Defect(Arc::from(
+                                "verified irrefutable for pattern did not match",
+                            ))
+                        })?
+                    };
                     let binding_locals =
                         bindings.iter().map(|(local, _)| *local).collect::<Vec<_>>();
                     for (local, binding) in bindings {
@@ -1384,6 +1438,7 @@ impl<'a> Engine<'a> {
                     controls.push(Control::ForNext {
                         function,
                         pattern,
+                        source,
                         body,
                         values,
                         index: index + 1,
@@ -1472,9 +1527,10 @@ impl<'a> Engine<'a> {
                             "verified exhaustive match selected no case",
                         )));
                     };
+                    let mut pattern_value = value.clone();
                     let Some(bindings) = case.pattern.as_ref().map_or_else(
                         || Some(Vec::new()),
-                        |pattern| pattern_bindings(&value, pattern),
+                        |pattern| pattern_bindings(&mut pattern_value, pattern, false),
                     ) else {
                         frames
                             .last_mut()
@@ -1753,10 +1809,10 @@ impl<'a> Engine<'a> {
                     }
                 }
                 Control::FinishIs { pattern } => {
-                    let value = self.pop_value(&mut frames)?;
+                    let mut value = self.pop_value(&mut frames)?;
                     self.push_value(
                         &mut frames,
-                        Value::Bool(pattern_bindings(&value, pattern).is_some()),
+                        Value::Bool(pattern_bindings(&mut value, pattern, false).is_some()),
                     )?;
                 }
                 Control::FinishBinary { operator, site } => {
@@ -2761,7 +2817,11 @@ fn compare_values(left: &Value, right: &Value) -> Result<Option<Ordering>, EvalF
     }))
 }
 
-fn pattern_bindings(value: &Value, pattern: &HirMatchPattern) -> Option<Vec<(LocalId, Value)>> {
+fn pattern_bindings(
+    value: &mut Value,
+    pattern: &HirMatchPattern,
+    transfer: bool,
+) -> Option<Vec<(LocalId, Value)>> {
     match pattern {
         HirMatchPattern::Variant {
             id: expected,
@@ -2774,8 +2834,11 @@ fn pattern_bindings(value: &Value, pattern: &HirMatchPattern) -> Option<Vec<(Loc
                 return None;
             }
             let mut bindings = Vec::new();
-            for (value, pattern) in payload.iter().zip(expected_payload.iter()) {
-                bindings.extend(pattern_bindings(value, pattern)?);
+            for (value, pattern) in Arc::make_mut(payload)
+                .iter_mut()
+                .zip(expected_payload.iter())
+            {
+                bindings.extend(pattern_bindings(value, pattern, transfer)?);
             }
             Some(bindings)
         }
@@ -2793,8 +2856,10 @@ fn pattern_bindings(value: &Value, pattern: &HirMatchPattern) -> Option<Vec<(Loc
                 return None;
             }
             let mut bindings = Vec::new();
-            for ((_, value), pattern) in fields.iter().zip(expected_fields.iter()) {
-                bindings.extend(pattern_bindings(value, pattern)?);
+            for ((_, value), pattern) in
+                Arc::make_mut(fields).iter_mut().zip(expected_fields.iter())
+            {
+                bindings.extend(pattern_bindings(value, pattern, transfer)?);
             }
             Some(bindings)
         }
@@ -2802,19 +2867,29 @@ fn pattern_bindings(value: &Value, pattern: &HirMatchPattern) -> Option<Vec<(Loc
             let Value::Tuple(values) = value else {
                 return None;
             };
-            sequence_pattern_bindings(values, expected)
+            sequence_pattern_bindings(Arc::make_mut(values), expected, transfer)
         }
         HirMatchPattern::FixedArray(expected) => {
             let Value::Array(values) = value else {
                 return None;
             };
-            sequence_pattern_bindings(values, expected)
+            sequence_pattern_bindings(Arc::make_mut(values), expected, transfer)
         }
-        HirMatchPattern::Or(alternatives) => alternatives
-            .iter()
-            .find_map(|alternative| pattern_bindings(value, alternative)),
+        HirMatchPattern::Or(alternatives) => alternatives.iter().find_map(|alternative| {
+            let mut probe = value.clone();
+            pattern_bindings(&mut probe, alternative, false)?;
+            pattern_bindings(value, alternative, transfer)
+        }),
         HirMatchPattern::Literal(literal) => literal_matches(value, literal).then(Vec::new),
-        HirMatchPattern::Binding { local, .. } => Some(vec![(*local, value.clone())]),
+        HirMatchPattern::Binding { local, access, .. } => {
+            let binding = if transfer && *access == crate::typed_hir::AccessMode::Move {
+                let unavailable = unavailable_shape(value);
+                std::mem::replace(value, unavailable)
+            } else {
+                value.clone()
+            };
+            Some(vec![(*local, binding)])
+        }
         HirMatchPattern::Wildcard => Some(Vec::new()),
     }
 }
@@ -3088,15 +3163,16 @@ fn store_projected_value(
 }
 
 fn sequence_pattern_bindings(
-    values: &[Value],
+    values: &mut [Value],
     patterns: &[HirMatchPattern],
+    transfer: bool,
 ) -> Option<Vec<(LocalId, Value)>> {
     if values.len() != patterns.len() {
         return None;
     }
     let mut bindings = Vec::new();
-    for (value, pattern) in values.iter().zip(patterns) {
-        bindings.extend(pattern_bindings(value, pattern)?);
+    for (value, pattern) in values.iter_mut().zip(patterns) {
+        bindings.extend(pattern_bindings(value, pattern, transfer)?);
     }
     Some(bindings)
 }
@@ -3449,6 +3525,26 @@ mod tests {
             .expect("verified projection extracts");
         assert_eq!(extracted, Value::Bool(true));
         assert!(read_projected_value(&root, &[projection], &[]).is_err());
+    }
+
+    #[test]
+    fn take_pattern_bindings_extract_the_selected_for_element() {
+        let local = LocalId(7);
+        let pattern = HirMatchPattern::Binding {
+            local,
+            type_id: crate::model::TypeId(1),
+            type_: Type::Bool,
+            access: crate::typed_hir::AccessMode::Move,
+        };
+        let mut source = Value::Array(Arc::from([Value::Bool(true)]));
+        let Value::Array(elements) = &mut source else {
+            unreachable!("test source is an array");
+        };
+        let bindings = pattern_bindings(&mut Arc::make_mut(elements)[0], &pattern, true)
+            .expect("irrefutable take pattern transfers its element");
+
+        assert_eq!(bindings, vec![(local, Value::Bool(true))]);
+        assert_eq!(elements[0], Value::Unavailable);
     }
 
     #[test]

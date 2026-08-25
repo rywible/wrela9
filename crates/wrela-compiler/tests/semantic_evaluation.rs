@@ -3683,6 +3683,149 @@ fn build() -> Image:
 }
 
 #[test]
+fn conditional_take_patterns_move_custody_from_the_matched_place() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn broken() -> i64:
+    ticket = Ticket(id=1)
+    if ticket is take moved:
+        consume(take moved)
+        consume(take ticket)
+        return 1
+    return 0
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("a conditional take pattern cannot leave custody at the matched place");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.read_after_move",
+        (b"ticket", 3),
+        &[(b"    if ticket is take moved:", 0, "related")],
+        &[("subject", "ticket"), ("state", "moved")],
+        &[
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
+        ],
+    );
+
+    let refutable_component = br#"resource struct Ticket:
+    id: i64
+
+resource struct Envelope:
+    ticket: Ticket
+    tag: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn valid() -> i64:
+    envelope = Envelope(ticket=Ticket(id=1), tag=0)
+    if envelope is Envelope(ticket=take moved, tag=1):
+        consume(take moved)
+        return 1
+    consume(take envelope.ticket)
+    return 0
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(refutable_component);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "a refutable take transfers only along its successful path: {outcome:#?}"
+    );
+}
+
+#[test]
+fn for_take_patterns_move_resource_elements_instead_of_cloning_them() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn broken():
+    tickets = [Ticket(id=1)]
+    for take ticket in tickets:
+        consume(take ticket)
+    consume(take tickets[0])
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("a for take pattern cannot clone Resource element custody");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.read_after_move",
+        (b"tickets", 2),
+        &[(b"    for take ticket in tickets:", 0, "related")],
+        &[("subject", "tickets"), ("state", "moved")],
+        &[("owner_identity", IdentityDomain::Definition, "broken")],
+    );
+
+    let evaluated = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+@image
+fn build() -> Image:
+    tickets = [Ticket(id=1), Ticket(id=2)]
+    mut total = 0
+    for take ticket in tickets:
+        total = total + ticket.id
+        consume(take ticket)
+    return Image.new(value=total)
+"#;
+    let outcome = compile(evaluated);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "evaluation extracts each exact for element once: {outcome:#?}"
+    );
+}
+
+#[test]
+fn outer_resource_custody_survives_an_inner_with_scope() {
+    let source = br#"from core import pool as pools
+
+resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+@image
+fn build() -> Image:
+    ticket = Ticket(id=1)
+    with pools.scoped(capacity=1) as scratch:
+        pass
+    consume(take ticket)
+    return Image.new()
+"#;
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "an inner with scope cannot discharge its outer custodian: {outcome:#?}"
+    );
+}
+
+#[test]
 fn resource_replacement_requires_prior_transfer_and_reinitializes_the_place() {
     let invalid = br#"resource struct Ticket:
     id: i64

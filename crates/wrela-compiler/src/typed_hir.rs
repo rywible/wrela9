@@ -3647,6 +3647,20 @@ fn verify_statements(
                 let mut then_excluded = visible.clone();
                 then_excluded.extend(pattern_non_custodial_locals(pattern));
                 let mut then_moved = moved.clone();
+                if let Some(place) = root_place(value) {
+                    for moved_place in artifact_pattern_move_keys(
+                        pattern,
+                        &matched,
+                        &PlaceKey::from_place(&place),
+                        catalog,
+                    )? {
+                        if !then_moved.move_key(moved_place) {
+                            return defect(
+                                "lowered conditional take pattern moves an unreadable component",
+                            );
+                        }
+                    }
+                }
                 verify_statements(
                     then_branch,
                     return_type,
@@ -3711,6 +3725,34 @@ fn verify_statements(
                 let body_falls_through = verified_statements_fall_through(body);
                 let visible = locals.keys().copied().collect::<BTreeSet<_>>();
                 verify_match_pattern_artifact(pattern, &element, locals, catalog)?;
+                let iteration_transfers = match (exact_iterations, root_place(iterable)) {
+                    (Some(iterations), Some(place)) => (0..iterations)
+                        .map(|index| {
+                            let mut projections = PlaceKey::from_place(&place).projections.to_vec();
+                            projections.push(ProjectionKey::Index(Some(i128::from(index))));
+                            artifact_pattern_move_keys(
+                                pattern,
+                                &element,
+                                &PlaceKey {
+                                    local: place.local,
+                                    projections: projections.into(),
+                                },
+                                catalog,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    _ => Vec::new(),
+                };
+                if let Some(first) = iteration_transfers.first() {
+                    for moved_place in first {
+                        if !moved.move_key(moved_place.clone()) {
+                            return defect(
+                                "lowered for take pattern moves an unreadable component",
+                            );
+                        }
+                    }
+                }
+                let iteration_entry_moved = moved.clone();
                 let mut scope_exclusions = visible.clone();
                 scope_exclusions.extend(pattern_non_custodial_locals(pattern));
                 loop_custody.push(LoopCustodyEdges {
@@ -3747,18 +3789,23 @@ fn verify_statements(
                 }
                 if exact_iterations.is_none_or(|iterations| iterations > 1) {
                     for state in &continuing {
-                        verify_custody_join(moved_before.clone(), state.clone())?;
+                        verify_custody_join(iteration_entry_moved.clone(), state.clone())?;
+                    }
+                }
+                for state in &mut continuing {
+                    for moved_place in iteration_transfers.iter().skip(1).flatten() {
+                        if !state.move_key(moved_place.clone()) {
+                            return defect(
+                                "lowered exact for repeats a Resource component transfer",
+                            );
+                        }
                     }
                 }
                 let mut exits = edges.breaks;
                 match exact_iterations {
                     Some(0) => exits.push(moved_before.clone()),
                     Some(1) => exits.extend(continuing),
-                    Some(_) => {
-                        if !continuing.is_empty() {
-                            exits.push(moved_before.clone());
-                        }
-                    }
+                    Some(_) => exits.extend(continuing),
                     None => exits.push(moved_before.clone()),
                 }
                 *moved = verify_reachable_custody(exits)?.unwrap_or(moved_before);
@@ -3926,6 +3973,7 @@ fn verify_statements(
                 body,
                 ..
             } => {
+                let mut scope_exclusions = locals.keys().copied().collect::<BTreeSet<_>>();
                 let scope_type = verify_expression_artifact(scope, locals, moved, catalog, source)?;
                 if !catalog.identities.type_matches(scope.type_id, &scope_type)
                     || !matches!(
@@ -3951,6 +3999,7 @@ fn verify_statements(
                 {
                     return defect("lowered Pool scope repeats a LocalId");
                 }
+                scope_exclusions.insert(binding.local);
                 verify_statements(
                     body,
                     return_type,
@@ -3961,14 +4010,7 @@ fn verify_statements(
                     previous_source_start,
                 )?;
                 if verified_statements_fall_through(body) {
-                    let mut authenticated_exclusions = authority.discharge_exempt.clone();
-                    authenticated_exclusions.insert(binding.local);
-                    verify_artifact_scope_discharged(
-                        locals,
-                        moved,
-                        &authenticated_exclusions,
-                        catalog,
-                    )?;
+                    verify_artifact_scope_discharged(locals, moved, &scope_exclusions, catalog)?;
                 }
                 locals.remove(&binding.local);
                 moved.restore_place(binding);
@@ -5929,6 +5971,15 @@ impl<'a> Lowerer<'a> {
                             .ok_or_else(|| {
                                 creator_value(CreatorFailureKind::InvalidMatchPattern, range)
                             })?;
+                        if let Some(place) = root_place(&value) {
+                            for moved in self.pattern_move_keys(
+                                &pattern,
+                                &value.type_,
+                                &PlaceKey::from_place(&place),
+                            )? {
+                                self.moved.move_key_at(moved, range);
+                            }
+                        }
                         let then_terminates = !syntax_statements_fall_through(then_branch);
                         let else_terminates = !syntax_statements_fall_through(else_branch);
                         let then_branch = self.statements(then_branch, return_type)?;
@@ -6049,6 +6100,38 @@ impl<'a> Lowerer<'a> {
                     if !self.pattern_irrefutable(&pattern, element) {
                         return creator(CreatorFailureKind::InvalidMatchPattern, range);
                     }
+                    let iteration_transfers = match (exact_iterations, root_place(&iterable)) {
+                        (Some(iterations), Some(place)) => (0..iterations)
+                            .map(|index| {
+                                let mut projections =
+                                    PlaceKey::from_place(&place).projections.to_vec();
+                                projections.push(ProjectionKey::Index(Some(i128::from(index))));
+                                self.pattern_move_keys(
+                                    &pattern,
+                                    element,
+                                    &PlaceKey {
+                                        local: place.local,
+                                        projections: projections.into(),
+                                    },
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                        _ => Vec::new(),
+                    };
+                    if let Some(first) = iteration_transfers.first() {
+                        for moved in first {
+                            if !self.moved.move_key_at(moved.clone(), range) {
+                                return Err(self.custody_failure(
+                                    CreatorFailureKind::ReadAfterMove,
+                                    range,
+                                    moved,
+                                    CustodyDiagnosticState::Moved,
+                                    None,
+                                ));
+                            }
+                        }
+                    }
+                    let iteration_entry_moved = self.moved.clone();
                     let binding_places = match_pattern_binding_signature(&pattern)
                         .keys()
                         .copied()
@@ -6084,18 +6167,23 @@ impl<'a> Lowerer<'a> {
                     }
                     if exact_iterations.is_none_or(|iterations| iterations > 1) {
                         for state in &continuing {
-                            self.join_custody(moved_before.clone(), state.clone(), range)?;
+                            self.join_custody(iteration_entry_moved.clone(), state.clone(), range)?;
+                        }
+                    }
+                    for state in &mut continuing {
+                        for moved in iteration_transfers.iter().skip(1).flatten() {
+                            if !state.move_key(moved.clone()) {
+                                return defect(
+                                    "exact for transfer repeats an unavailable Resource place",
+                                );
+                            }
                         }
                     }
                     let mut exits = edges.breaks;
                     match exact_iterations {
                         Some(0) => exits.push(moved_before.clone()),
                         Some(1) => exits.extend(continuing),
-                        Some(_) => {
-                            if !continuing.is_empty() {
-                                exits.push(moved_before.clone());
-                            }
-                        }
+                        Some(_) => exits.extend(continuing),
                         None => exits.push(moved_before.clone()),
                     }
                     self.moved = self
@@ -6340,14 +6428,18 @@ impl<'a> Lowerer<'a> {
                     }
                     self.discharge_laws.authenticate_reclaim(scope.type_id)?;
                     let visible = self.locals.keys().cloned().collect::<BTreeSet<_>>();
+                    let mut scope_exclusions = self
+                        .locals
+                        .values()
+                        .map(|(local, _, _)| *local)
+                        .collect::<BTreeSet<_>>();
                     let binding_place =
                         self.bind_source_local(binding, scope.type_.clone(), true, range)?;
+                    scope_exclusions.insert(binding_place);
                     let body_falls_through = syntax_statements_fall_through(body);
                     let body = self.statements(body, return_type)?;
                     if body_falls_through {
-                        let mut authenticated_exclusions = self.parameter_locals.clone();
-                        authenticated_exclusions.insert(binding_place);
-                        self.check_recoverable_exit_excluding(&authenticated_exclusions)?;
+                        self.check_recoverable_exit_excluding(&scope_exclusions)?;
                     }
                     self.locals.retain(|name, _| visible.contains(name));
                     self.moved.restore_local(binding_place);
@@ -9414,7 +9506,7 @@ fn expression_integer_value(expression: &Expression) -> Option<i128> {
     }
 }
 
-fn root_place(expression: &Expression) -> Option<Place> {
+pub(crate) fn root_place(expression: &Expression) -> Option<Place> {
     match &expression.kind {
         ExpressionKind::Read(place) => Some(place.clone()),
         ExpressionKind::Index { value, index } => {

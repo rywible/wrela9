@@ -33,8 +33,10 @@ impl ArchitectureProfile {
 pub struct ArchitecturePlanningObservation {
     profile: ArchitectureProfile,
     identity: u128,
+    contract_schema_version: u16,
     contract_version: u16,
     fingerprint: u128,
+    distribution_input_receipt: u128,
     symbolic_core_count: u16,
     page_quantum_bytes: u64,
     minimum_ram_bytes: u64,
@@ -53,6 +55,11 @@ impl ArchitecturePlanningObservation {
     }
 
     #[must_use]
+    pub const fn contract_schema_version(&self) -> u16 {
+        self.contract_schema_version
+    }
+
+    #[must_use]
     pub const fn contract_version(&self) -> u16 {
         self.contract_version
     }
@@ -60,6 +67,11 @@ impl ArchitecturePlanningObservation {
     #[must_use]
     pub const fn fingerprint(&self) -> u128 {
         self.fingerprint
+    }
+
+    #[must_use]
+    pub const fn distribution_input_receipt(&self) -> u128 {
+        self.distribution_input_receipt
     }
 
     #[must_use]
@@ -85,12 +97,14 @@ impl ArchitecturePlanningObservation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ContractContext {
+    distribution_version: &'static str,
     distribution_digest: u128,
 }
 
 impl ContractContext {
-    pub(crate) const fn new(distribution_digest: u128) -> Self {
+    pub(crate) const fn new(distribution_version: &'static str, distribution_digest: u128) -> Self {
         Self {
+            distribution_version,
             distribution_digest,
         }
     }
@@ -112,7 +126,11 @@ impl ArchitecturePlanningModule {
         cancellation: &Cancellation,
     ) -> Result<VerifiedArchitecturePlanningContract, ContractFailure> {
         if cancellation.is_cancelled() {
-            return Err(ContractFailure::Cancelled);
+            return Err(ContractFailure::for_selection(
+                ContractFailureKind::Cancelled,
+                profile,
+                self.context,
+            ));
         }
         match profile {
             ArchitectureProfile::CurrentAarch64 => verify(
@@ -120,39 +138,245 @@ impl ArchitecturePlanningModule {
                 self.context,
                 cancellation,
             ),
-            ArchitectureProfile::X86_64 => Err(ContractFailure::UnsupportedProfile),
+            ArchitectureProfile::X86_64 => Err(ContractFailure::for_selection(
+                ContractFailureKind::UnsupportedProfile,
+                profile,
+                self.context,
+            )),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ContractFailure {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContractFailureKind {
     UnsupportedProfile,
     UnsupportedVersion,
     Unauthenticated,
     MixedContext,
     IdentityMismatch,
+    InputReceiptMismatch,
     FingerprintMismatch,
     AuthenticationMismatch,
-    Malformed(&'static str),
+    MalformedFacts,
     Cancelled,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContractFailure {
+    kind: ContractFailureKind,
+    reproduction: Box<ContractReproduction>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContractReproduction {
+    profile: ArchitectureProfile,
+    expected_schema_version: u16,
+    actual_schema_version: u16,
+    expected_contract_version: u16,
+    actual_contract_version: u16,
+    identity: u128,
+    fingerprint: u128,
+    expected_context_receipt: u128,
+    actual_context_receipt: u128,
+    expected_input_receipt: u128,
+    actual_input_receipt: u128,
+    detail: &'static str,
+}
+
 impl ContractFailure {
-    pub(crate) const fn evidence(&self) -> &'static str {
+    pub(crate) const fn kind(&self) -> ContractFailureKind {
+        self.kind
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reproduction(&self) -> &ContractReproduction {
+        &self.reproduction
+    }
+
+    pub(crate) fn bounded_evidence(&self) -> String {
+        format!(
+            "kind={} profile={} expected_schema={} actual_schema={} expected_contract={} actual_contract={} identity={:032x} fingerprint={:032x} expected_context={:032x} actual_context={:032x} expected_input={:032x} actual_input={:032x} detail={}",
+            self.kind.canonical_name(),
+            self.reproduction.profile.canonical_name(),
+            self.reproduction.expected_schema_version,
+            self.reproduction.actual_schema_version,
+            self.reproduction.expected_contract_version,
+            self.reproduction.actual_contract_version,
+            self.reproduction.identity,
+            self.reproduction.fingerprint,
+            self.reproduction.expected_context_receipt,
+            self.reproduction.actual_context_receipt,
+            self.reproduction.expected_input_receipt,
+            self.reproduction.actual_input_receipt,
+            self.reproduction.detail,
+        )
+    }
+
+    fn for_selection(
+        kind: ContractFailureKind,
+        profile: ArchitectureProfile,
+        context: ContractContext,
+    ) -> Self {
+        let identity = canonical_identity(profile, CURRENT_AARCH64_CONTRACT_VERSION);
+        let context_receipt = canonical_context_receipt(context);
+        let input_receipt = canonical_distribution_input_receipt(context, CONTRACT_SCHEMA_VERSION);
+        Self {
+            kind,
+            reproduction: Box::new(ContractReproduction {
+                profile,
+                expected_schema_version: CONTRACT_SCHEMA_VERSION,
+                actual_schema_version: CONTRACT_SCHEMA_VERSION,
+                expected_contract_version: CURRENT_AARCH64_CONTRACT_VERSION,
+                actual_contract_version: CURRENT_AARCH64_CONTRACT_VERSION,
+                identity,
+                fingerprint: 0,
+                expected_context_receipt: context_receipt,
+                actual_context_receipt: context_receipt,
+                expected_input_receipt: input_receipt,
+                actual_input_receipt: input_receipt,
+                detail: kind.default_detail(),
+            }),
+        }
+    }
+
+    fn for_candidate(
+        kind: ContractFailureKind,
+        detail: &'static str,
+        candidate: &RawContract,
+        expected_context: ContractContext,
+    ) -> Self {
+        Self {
+            kind,
+            reproduction: Box::new(ContractReproduction {
+                profile: candidate.profile,
+                expected_schema_version: CONTRACT_SCHEMA_VERSION,
+                actual_schema_version: candidate.schema_version,
+                expected_contract_version: CURRENT_AARCH64_CONTRACT_VERSION,
+                actual_contract_version: candidate.version,
+                identity: candidate.identity,
+                fingerprint: candidate.fingerprint,
+                expected_context_receipt: canonical_context_receipt(expected_context),
+                actual_context_receipt: canonical_context_receipt(candidate.context),
+                expected_input_receipt: canonical_distribution_input_receipt(
+                    expected_context,
+                    CONTRACT_SCHEMA_VERSION,
+                ),
+                actual_input_receipt: candidate.distribution_input_receipt,
+                detail,
+            }),
+        }
+    }
+
+    fn malformed(detail: &'static str) -> Self {
+        Self::unbound(ContractFailureKind::MalformedFacts, detail)
+    }
+
+    fn cancelled() -> Self {
+        Self::unbound(
+            ContractFailureKind::Cancelled,
+            ContractFailureKind::Cancelled.default_detail(),
+        )
+    }
+
+    fn unbound(kind: ContractFailureKind, detail: &'static str) -> Self {
+        let context = ContractContext::new("unbound-private-verifier", 0);
+        let mut failure = Self::for_selection(kind, ArchitectureProfile::CurrentAarch64, context);
+        failure.reproduction.detail = detail;
+        failure
+    }
+
+    fn bind_candidate(
+        mut self,
+        candidate: &RawContract,
+        expected_context: ContractContext,
+    ) -> Self {
+        self.reproduction = Self::for_candidate(
+            self.kind,
+            self.reproduction.detail,
+            candidate,
+            expected_context,
+        )
+        .reproduction;
+        self
+    }
+}
+
+impl ContractFailureKind {
+    const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::UnsupportedProfile => "unsupported_profile",
+            Self::UnsupportedVersion => "unsupported_version",
+            Self::Unauthenticated => "unauthenticated",
+            Self::MixedContext => "mixed_context",
+            Self::IdentityMismatch => "identity_mismatch",
+            Self::InputReceiptMismatch => "input_receipt_mismatch",
+            Self::FingerprintMismatch => "fingerprint_mismatch",
+            Self::AuthenticationMismatch => "authentication_mismatch",
+            Self::MalformedFacts => "malformed_facts",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    const fn default_detail(self) -> &'static str {
         match self {
             Self::UnsupportedProfile => "unsupported architecture profile",
             Self::UnsupportedVersion => "unsupported architecture planning contract version",
             Self::Unauthenticated => "architecture planning contract is unauthenticated",
             Self::MixedContext => "architecture planning contract belongs to another context",
             Self::IdentityMismatch => "architecture planning contract identity mismatch",
+            Self::InputReceiptMismatch => {
+                "architecture planning contract distribution input receipt mismatch"
+            }
             Self::FingerprintMismatch => "architecture planning contract fingerprint mismatch",
             Self::AuthenticationMismatch => {
                 "architecture planning contract authentication mismatch"
             }
-            Self::Malformed(evidence) => evidence,
+            Self::MalformedFacts => "architecture planning contract facts are malformed",
             Self::Cancelled => "architecture planning contract verification cancelled",
         }
+    }
+}
+
+#[cfg(test)]
+impl ContractReproduction {
+    pub(crate) const fn profile(&self) -> ArchitectureProfile {
+        self.profile
+    }
+
+    pub(crate) const fn expected_schema_version(&self) -> u16 {
+        self.expected_schema_version
+    }
+
+    pub(crate) const fn actual_schema_version(&self) -> u16 {
+        self.actual_schema_version
+    }
+
+    pub(crate) const fn expected_contract_version(&self) -> u16 {
+        self.expected_contract_version
+    }
+
+    pub(crate) const fn actual_contract_version(&self) -> u16 {
+        self.actual_contract_version
+    }
+
+    pub(crate) const fn expected_context_receipt(&self) -> u128 {
+        self.expected_context_receipt
+    }
+
+    pub(crate) const fn actual_context_receipt(&self) -> u128 {
+        self.actual_context_receipt
+    }
+
+    pub(crate) const fn expected_input_receipt(&self) -> u128 {
+        self.expected_input_receipt
+    }
+
+    pub(crate) const fn actual_input_receipt(&self) -> u128 {
+        self.actual_input_receipt
+    }
+
+    pub(crate) const fn detail(&self) -> &'static str {
+        self.detail
     }
 }
 
@@ -160,9 +384,10 @@ impl ContractFailure {
 pub(crate) struct VerifiedArchitecturePlanningContract {
     profile: ArchitectureProfile,
     identity: u128,
+    schema_version: u16,
     version: u16,
     fingerprint: u128,
-    context: ContractContext,
+    distribution_input_receipt: u128,
     facts: ContractFacts,
     _verified: Verified,
 }
@@ -170,23 +395,125 @@ pub(crate) struct VerifiedArchitecturePlanningContract {
 #[derive(Clone, Debug)]
 struct Verified;
 
+#[allow(dead_code)]
 impl VerifiedArchitecturePlanningContract {
     pub(crate) fn observation(&self) -> ArchitecturePlanningObservation {
-        debug_assert_ne!(
-            authentication_tag(self.context, self.identity, self.fingerprint),
-            0
-        );
         ArchitecturePlanningObservation {
             profile: self.profile,
             identity: self.identity,
+            contract_schema_version: self.schema_version,
             contract_version: self.version,
             fingerprint: self.fingerprint,
+            distribution_input_receipt: self.distribution_input_receipt,
             symbolic_core_count: u16::try_from(self.facts.cores.len())
                 .expect("verified symbolic core count fits its contract width"),
             page_quantum_bytes: self.facts.page.quantum_bytes,
             minimum_ram_bytes: self.facts.capacity.minimum_ram_bytes,
             maximum_ram_bytes: self.facts.capacity.maximum_ram_bytes,
         }
+    }
+
+    pub(crate) const fn for_admission(&self) -> AdmissionArchitecture<'_> {
+        AdmissionArchitecture { facts: &self.facts }
+    }
+
+    pub(crate) const fn for_service_analysis(&self) -> ServiceArchitecture<'_> {
+        ServiceArchitecture { facts: &self.facts }
+    }
+
+    pub(crate) const fn for_logical_layout(&self) -> LogicalLayoutArchitecture<'_> {
+        LogicalLayoutArchitecture { facts: &self.facts }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AdmissionArchitecture<'a> {
+    facts: &'a ContractFacts,
+}
+
+#[allow(dead_code)]
+impl AdmissionArchitecture<'_> {
+    pub(crate) fn capabilities(&self) -> &[VmAbiCapability] {
+        &self.facts.capabilities
+    }
+
+    pub(crate) const fn capacity(&self) -> CapacityRules {
+        self.facts.capacity
+    }
+
+    pub(crate) fn device_slots(&self) -> &[DeviceSlot] {
+        &self.facts.device_slots
+    }
+
+    pub(crate) fn binding_slots(&self) -> &[BindingSlot] {
+        &self.facts.binding_slots
+    }
+
+    pub(crate) const fn interrupts(&self) -> InterruptRules {
+        self.facts.interrupts
+    }
+
+    pub(crate) const fn dma(&self) -> DmaRules {
+        self.facts.dma
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ServiceArchitecture<'a> {
+    facts: &'a ContractFacts,
+}
+
+#[allow(dead_code)]
+impl ServiceArchitecture<'_> {
+    pub(crate) fn cores(&self) -> &[SymbolicCore] {
+        &self.facts.cores
+    }
+
+    pub(crate) const fn costs(&self) -> ServiceCostBaseline {
+        self.facts.service
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LogicalLayoutArchitecture<'a> {
+    facts: &'a ContractFacts,
+}
+
+#[allow(dead_code)]
+impl LogicalLayoutArchitecture<'_> {
+    pub(crate) const fn capacity(&self) -> CapacityRules {
+        self.facts.capacity
+    }
+
+    pub(crate) const fn alignment(&self) -> AlignmentRules {
+        self.facts.alignment
+    }
+
+    pub(crate) const fn page(&self) -> PageRules {
+        self.facts.page
+    }
+
+    pub(crate) const fn guards(&self) -> GuardRules {
+        self.facts.guards
+    }
+
+    pub(crate) fn reservations(&self) -> &[ReservationRule] {
+        &self.facts.reservations
+    }
+
+    pub(crate) fn envelopes(&self) -> &[EnvelopeRule] {
+        &self.facts.envelopes
+    }
+
+    pub(crate) fn regions(&self) -> &[RegionRule] {
+        &self.facts.regions
+    }
+
+    pub(crate) const fn dma(&self) -> DmaRules {
+        self.facts.dma
     }
 }
 
@@ -198,6 +525,7 @@ struct RawContract {
     identity: u128,
     fingerprint: u128,
     context: ContractContext,
+    distribution_input_receipt: u128,
     authentication: Option<u128>,
     facts: ContractFacts,
 }
@@ -221,20 +549,20 @@ struct ContractFacts {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct SymbolicCore {
-    ordinal: u16,
-    role: CoreRole,
-    maximum_service_units: u32,
+pub(crate) struct SymbolicCore {
+    pub(crate) ordinal: u16,
+    pub(crate) role: CoreRole,
+    pub(crate) maximum_service_units: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum CoreRole {
+pub(crate) enum CoreRole {
     Primary,
     Secondary,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum VmAbiCapability {
+pub(crate) enum VmAbiCapability {
     TypedTerminalLifecycle,
     PanicPulse,
     GuestShutdownPulse,
@@ -246,49 +574,81 @@ enum VmAbiCapability {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CapacityRules {
-    minimum_ram_bytes: u64,
-    maximum_ram_bytes: u64,
-    maximum_requirements: u32,
-    maximum_allocations: u32,
-    maximum_generated_roles: u32,
-    maximum_activation_homes: u32,
+pub(crate) struct CapacityRules {
+    pub(crate) minimum_ram_bytes: u64,
+    pub(crate) maximum_ram_bytes: u64,
+    pub(crate) maximum_requirements: u32,
+    pub(crate) maximum_allocations: u32,
+    pub(crate) maximum_generated_roles: u32,
+    pub(crate) maximum_activation_homes: u32,
+}
+
+#[allow(dead_code)]
+impl CapacityRules {
+    pub(crate) const fn minimum_ram_bytes(self) -> u64 {
+        self.minimum_ram_bytes
+    }
+
+    pub(crate) const fn maximum_requirements(self) -> u32 {
+        self.maximum_requirements
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct AlignmentRules {
-    allocation_bytes: u64,
-    region_bytes: u64,
-    dma_bytes: u64,
-    maximum_envelope_bytes: u64,
+pub(crate) struct AlignmentRules {
+    pub(crate) allocation_bytes: u64,
+    pub(crate) region_bytes: u64,
+    pub(crate) dma_bytes: u64,
+    pub(crate) maximum_envelope_bytes: u64,
+}
+
+#[allow(dead_code)]
+impl AlignmentRules {
+    pub(crate) const fn region_bytes(self) -> u64 {
+        self.region_bytes
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PageRules {
-    quantum_bytes: u64,
-    round_each_region_once: bool,
+pub(crate) struct PageRules {
+    pub(crate) quantum_bytes: u64,
+    pub(crate) round_each_region_once: bool,
+}
+
+#[allow(dead_code)]
+impl PageRules {
+    pub(crate) const fn quantum_bytes(self) -> u64 {
+        self.quantum_bytes
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct GuardRules {
-    null_pages: u16,
-    normal_stack_before_pages: u16,
-    normal_stack_after_pages: u16,
-    interrupt_stack_before_pages: u16,
-    interrupt_stack_after_pages: u16,
+pub(crate) struct GuardRules {
+    pub(crate) null_pages: u16,
+    pub(crate) normal_stack_before_pages: u16,
+    pub(crate) normal_stack_after_pages: u16,
+    pub(crate) interrupt_stack_before_pages: u16,
+    pub(crate) interrupt_stack_after_pages: u16,
+}
+
+#[allow(dead_code)]
+impl GuardRules {
+    pub(crate) const fn normal_stack_before_pages(self) -> u16 {
+        self.normal_stack_before_pages
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ReservationRule {
-    kind: ReservationKind,
-    region: RegionKind,
-    bytes: u64,
-    alignment: u64,
-    multiplicity: ReservationMultiplicity,
+pub(crate) struct ReservationRule {
+    pub(crate) kind: ReservationKind,
+    pub(crate) region: RegionKind,
+    pub(crate) bytes: u64,
+    pub(crate) alignment: u64,
+    pub(crate) multiplicity: ReservationMultiplicity,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum ReservationKind {
+pub(crate) enum ReservationKind {
     DtbExclusion,
     BootState,
     PageTables,
@@ -298,23 +658,23 @@ enum ReservationKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum ReservationMultiplicity {
+pub(crate) enum ReservationMultiplicity {
     Once,
     PerCore,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct EnvelopeRule {
-    kind: EnvelopeKind,
-    region: RegionKind,
-    maximum_bytes: u64,
-    alignment: u64,
-    protection: ProtectionClass,
-    dma_owned: bool,
+pub(crate) struct EnvelopeRule {
+    pub(crate) kind: EnvelopeKind,
+    pub(crate) region: RegionKind,
+    pub(crate) maximum_bytes: u64,
+    pub(crate) alignment: u64,
+    pub(crate) protection: ProtectionClass,
+    pub(crate) dma_owned: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum EnvelopeKind {
+pub(crate) enum EnvelopeKind {
     Executable,
     ImmutableData,
     PerCoreState,
@@ -326,16 +686,16 @@ enum EnvelopeKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct RegionRule {
-    kind: RegionKind,
-    order: u8,
-    protection: ProtectionClass,
-    alignment: u64,
-    page_rounded: bool,
+pub(crate) struct RegionRule {
+    pub(crate) kind: RegionKind,
+    pub(crate) order: u8,
+    pub(crate) protection: ProtectionClass,
+    pub(crate) alignment: u64,
+    pub(crate) page_rounded: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum RegionKind {
+pub(crate) enum RegionKind {
     BootReservation,
     Executable,
     ImmutableData,
@@ -345,7 +705,7 @@ enum RegionKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum ProtectionClass {
+pub(crate) enum ProtectionClass {
     Reserved,
     ReadExecute,
     ReadOnly,
@@ -354,18 +714,18 @@ enum ProtectionClass {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct DeviceSlot {
-    ordinal: u8,
+pub(crate) struct DeviceSlot {
+    pub(crate) ordinal: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct BindingSlot {
-    ordinal: u8,
-    kind: BindingKind,
+pub(crate) struct BindingSlot {
+    pub(crate) ordinal: u8,
+    pub(crate) kind: BindingKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum BindingKind {
+pub(crate) enum BindingKind {
     Display,
     Input,
     EventStore,
@@ -377,32 +737,65 @@ enum BindingKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct InterruptRules {
-    route_slots: u8,
-    maximum_sources_per_route: u8,
-    maximum_causes_per_service: u16,
+pub(crate) struct InterruptRules {
+    pub(crate) route_slots: u8,
+    pub(crate) maximum_sources_per_route: u8,
+    pub(crate) maximum_causes_per_service: u16,
+}
+
+#[allow(dead_code)]
+impl InterruptRules {
+    pub(crate) const fn route_slots(self) -> u8 {
+        self.route_slots
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DmaRules {
-    maximum_total_bytes: u64,
-    maximum_buffer_bytes: u64,
-    required_alignment: u64,
-    maximum_in_flight: u16,
+pub(crate) struct DmaRules {
+    pub(crate) maximum_total_bytes: u64,
+    pub(crate) maximum_buffer_bytes: u64,
+    pub(crate) required_alignment: u64,
+    pub(crate) maximum_in_flight: u16,
+}
+
+#[allow(dead_code)]
+impl DmaRules {
+    pub(crate) const fn required_alignment(self) -> u64 {
+        self.required_alignment
+    }
+
+    pub(crate) const fn maximum_in_flight(self) -> u16 {
+        self.maximum_in_flight
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ServiceCostBaseline {
-    schema_version: u16,
-    ingress_units: u32,
-    actor_turn_units: u32,
-    group_child_units: u32,
-    driver_units: u32,
-    cleanup_units: u32,
-    cross_core_units: u32,
-    cancellation_checkpoint_units: u32,
-    maximum_cycle_units: u32,
-    maximum_cancellation_delay_units: u32,
+pub(crate) struct ServiceCostBaseline {
+    pub(crate) schema_version: u16,
+    pub(crate) ingress_units: u32,
+    pub(crate) actor_turn_units: u32,
+    pub(crate) group_child_units: u32,
+    pub(crate) driver_units: u32,
+    pub(crate) cleanup_units: u32,
+    pub(crate) cross_core_units: u32,
+    pub(crate) cancellation_checkpoint_units: u32,
+    pub(crate) maximum_cycle_units: u32,
+    pub(crate) maximum_cancellation_delay_units: u32,
+}
+
+#[allow(dead_code)]
+impl ServiceCostBaseline {
+    pub(crate) const fn schema_version(self) -> u16 {
+        self.schema_version
+    }
+
+    pub(crate) const fn maximum_cycle_units(self) -> u32 {
+        self.maximum_cycle_units
+    }
+
+    pub(crate) const fn maximum_cancellation_delay_units(self) -> u32 {
+        self.maximum_cancellation_delay_units
+    }
 }
 
 fn current_aarch64_candidate(context: ContractContext) -> RawContract {
@@ -418,6 +811,8 @@ fn current_aarch64_candidate(context: ContractContext) -> RawContract {
         identity,
         &facts,
     );
+    let distribution_input_receipt =
+        canonical_distribution_input_receipt(context, CONTRACT_SCHEMA_VERSION);
     RawContract {
         profile: ArchitectureProfile::CurrentAarch64,
         schema_version: CONTRACT_SCHEMA_VERSION,
@@ -425,7 +820,12 @@ fn current_aarch64_candidate(context: ContractContext) -> RawContract {
         identity,
         fingerprint,
         context,
-        authentication: Some(authentication_tag(context, identity, fingerprint)),
+        distribution_input_receipt,
+        authentication: Some(authentication_tag(
+            distribution_input_receipt,
+            identity,
+            fingerprint,
+        )),
         facts,
     }
 }
@@ -1020,31 +1420,75 @@ fn verify(
     cancellation: &Cancellation,
 ) -> Result<VerifiedArchitecturePlanningContract, ContractFailure> {
     if cancellation.is_cancelled() {
-        return Err(ContractFailure::Cancelled);
+        return Err(ContractFailure::for_candidate(
+            ContractFailureKind::Cancelled,
+            ContractFailureKind::Cancelled.default_detail(),
+            &candidate,
+            context,
+        ));
     }
     let Some(authentication) = candidate.authentication else {
-        return Err(ContractFailure::Unauthenticated);
+        return Err(ContractFailure::for_candidate(
+            ContractFailureKind::Unauthenticated,
+            ContractFailureKind::Unauthenticated.default_detail(),
+            &candidate,
+            context,
+        ));
     };
     if candidate.context != context {
-        return Err(ContractFailure::MixedContext);
+        return Err(ContractFailure::for_candidate(
+            ContractFailureKind::MixedContext,
+            ContractFailureKind::MixedContext.default_detail(),
+            &candidate,
+            context,
+        ));
     }
     if candidate.profile != ArchitectureProfile::CurrentAarch64 {
-        return Err(ContractFailure::UnsupportedProfile);
+        return Err(ContractFailure::for_candidate(
+            ContractFailureKind::UnsupportedProfile,
+            ContractFailureKind::UnsupportedProfile.default_detail(),
+            &candidate,
+            context,
+        ));
     }
     if candidate.schema_version != CONTRACT_SCHEMA_VERSION
         || candidate.version != CURRENT_AARCH64_CONTRACT_VERSION
     {
-        return Err(ContractFailure::UnsupportedVersion);
+        return Err(ContractFailure::for_candidate(
+            ContractFailureKind::UnsupportedVersion,
+            ContractFailureKind::UnsupportedVersion.default_detail(),
+            &candidate,
+            context,
+        ));
     }
     let expected_identity = canonical_identity(candidate.profile, candidate.version);
     if candidate.identity != expected_identity {
-        return Err(ContractFailure::IdentityMismatch);
+        return Err(ContractFailure::for_candidate(
+            ContractFailureKind::IdentityMismatch,
+            ContractFailureKind::IdentityMismatch.default_detail(),
+            &candidate,
+            context,
+        ));
     }
-    let facts = reconstruct_and_validate(&candidate.facts, cancellation)?;
+    let expected_input_receipt =
+        canonical_distribution_input_receipt(context, candidate.schema_version);
+    if candidate.distribution_input_receipt != expected_input_receipt {
+        return Err(ContractFailure::for_candidate(
+            ContractFailureKind::InputReceiptMismatch,
+            ContractFailureKind::InputReceiptMismatch.default_detail(),
+            &candidate,
+            context,
+        ));
+    }
+    let facts = reconstruct_and_validate(&candidate.facts, cancellation)
+        .map_err(|failure| failure.bind_candidate(&candidate, context))?;
     let expected = verifier_current_aarch64_facts();
     if facts != expected {
-        return Err(ContractFailure::Malformed(
+        return Err(ContractFailure::for_candidate(
+            ContractFailureKind::MalformedFacts,
             "current AArch64 architecture planning facts differ from the authenticated contract",
+            &candidate,
+            context,
         ));
     }
     let expected_fingerprint = canonical_fingerprint(
@@ -1055,17 +1499,34 @@ fn verify(
         &facts,
     );
     if candidate.fingerprint != expected_fingerprint {
-        return Err(ContractFailure::FingerprintMismatch);
+        return Err(ContractFailure::for_candidate(
+            ContractFailureKind::FingerprintMismatch,
+            ContractFailureKind::FingerprintMismatch.default_detail(),
+            &candidate,
+            context,
+        ));
     }
-    if authentication != authentication_tag(context, expected_identity, expected_fingerprint) {
-        return Err(ContractFailure::AuthenticationMismatch);
+    if authentication
+        != authentication_tag(
+            expected_input_receipt,
+            expected_identity,
+            expected_fingerprint,
+        )
+    {
+        return Err(ContractFailure::for_candidate(
+            ContractFailureKind::AuthenticationMismatch,
+            ContractFailureKind::AuthenticationMismatch.default_detail(),
+            &candidate,
+            context,
+        ));
     }
     Ok(VerifiedArchitecturePlanningContract {
         profile: candidate.profile,
         identity: expected_identity,
+        schema_version: candidate.schema_version,
         version: candidate.version,
         fingerprint: expected_fingerprint,
-        context,
+        distribution_input_receipt: expected_input_receipt,
         facts,
         _verified: Verified,
     })
@@ -1076,21 +1537,21 @@ fn reconstruct_and_validate(
     cancellation: &Cancellation,
 ) -> Result<ContractFacts, ContractFailure> {
     if source.cores.is_empty() || source.cores[0].role != CoreRole::Primary {
-        return Err(ContractFailure::Malformed(
+        return Err(ContractFailure::malformed(
             "symbolic cores require one primary",
         ));
     }
     for (ordinal, core) in source.cores.iter().enumerate() {
         if cancellation.is_cancelled() {
-            return Err(ContractFailure::Cancelled);
+            return Err(ContractFailure::cancelled());
         }
         if usize::from(core.ordinal) != ordinal || core.maximum_service_units == 0 {
-            return Err(ContractFailure::Malformed(
+            return Err(ContractFailure::malformed(
                 "symbolic core order or capacity is invalid",
             ));
         }
         if ordinal > 0 && core.role != CoreRole::Secondary {
-            return Err(ContractFailure::Malformed("only core zero may be primary"));
+            return Err(ContractFailure::malformed("only core zero may be primary"));
         }
     }
     if source.capabilities.is_empty()
@@ -1099,7 +1560,7 @@ fn reconstruct_and_validate(
             .windows(2)
             .any(|pair| pair[0] >= pair[1])
     {
-        return Err(ContractFailure::Malformed(
+        return Err(ContractFailure::malformed(
             "VM ABI capabilities are not canonical",
         ));
     }
@@ -1110,7 +1571,7 @@ fn reconstruct_and_validate(
         || source.capacity.maximum_generated_roles == 0
         || source.capacity.maximum_activation_homes == 0
     {
-        return Err(ContractFailure::Malformed("capacity bounds are invalid"));
+        return Err(ContractFailure::malformed("capacity bounds are invalid"));
     }
     for alignment in [
         source.alignment.allocation_bytes,
@@ -1119,13 +1580,13 @@ fn reconstruct_and_validate(
         source.alignment.maximum_envelope_bytes,
     ] {
         if !alignment.is_power_of_two() {
-            return Err(ContractFailure::Malformed(
+            return Err(ContractFailure::malformed(
                 "alignment rule is not a power of two",
             ));
         }
     }
     if !source.page.quantum_bytes.is_power_of_two() || !source.page.round_each_region_once {
-        return Err(ContractFailure::Malformed("page rules are invalid"));
+        return Err(ContractFailure::malformed("page rules are invalid"));
     }
     if source.guards.null_pages == 0
         || source.guards.normal_stack_before_pages == 0
@@ -1133,7 +1594,7 @@ fn reconstruct_and_validate(
         || source.guards.interrupt_stack_before_pages == 0
         || source.guards.interrupt_stack_after_pages == 0
     {
-        return Err(ContractFailure::Malformed("guard rules are incomplete"));
+        return Err(ContractFailure::malformed("guard rules are incomplete"));
     }
     if source.reservations.is_empty()
         || source
@@ -1146,7 +1607,7 @@ fn reconstruct_and_validate(
                 || rule.alignment > source.alignment.maximum_envelope_bytes
         })
     {
-        return Err(ContractFailure::Malformed("reservation rules are invalid"));
+        return Err(ContractFailure::malformed("reservation rules are invalid"));
     }
     if source.envelopes.is_empty()
         || source
@@ -1161,7 +1622,7 @@ fn reconstruct_and_validate(
                 || rule.dma_owned != (rule.protection == ProtectionClass::DeviceOwned)
         })
     {
-        return Err(ContractFailure::Malformed(
+        return Err(ContractFailure::malformed(
             "Storage Envelope rules are invalid",
         ));
     }
@@ -1175,7 +1636,7 @@ fn reconstruct_and_validate(
                     .any(|earlier| earlier.kind == region.kind)
         })
     {
-        return Err(ContractFailure::Malformed(
+        return Err(ContractFailure::malformed(
             "logical region rules are invalid",
         ));
     }
@@ -1197,7 +1658,7 @@ fn reconstruct_and_validate(
                         .any(|earlier| earlier.kind == slot.kind)
             })
     {
-        return Err(ContractFailure::Malformed(
+        return Err(ContractFailure::malformed(
             "device or binding slots are invalid",
         ));
     }
@@ -1205,7 +1666,7 @@ fn reconstruct_and_validate(
         || source.interrupts.maximum_sources_per_route == 0
         || source.interrupts.maximum_causes_per_service == 0
     {
-        return Err(ContractFailure::Malformed("interrupt limits are invalid"));
+        return Err(ContractFailure::malformed("interrupt limits are invalid"));
     }
     if source.dma.maximum_total_bytes == 0
         || source.dma.maximum_buffer_bytes == 0
@@ -1214,7 +1675,7 @@ fn reconstruct_and_validate(
         || source.dma.required_alignment < source.alignment.dma_bytes
         || source.dma.maximum_in_flight == 0
     {
-        return Err(ContractFailure::Malformed("DMA limits are invalid"));
+        return Err(ContractFailure::malformed("DMA limits are invalid"));
     }
     let service = source.service;
     if service.schema_version == 0
@@ -1237,7 +1698,7 @@ fn reconstruct_and_validate(
             .sum::<u128>()
             > u128::from(service.maximum_cycle_units)
     {
-        return Err(ContractFailure::Malformed(
+        return Err(ContractFailure::malformed(
             "scheduling-cost baseline is invalid",
         ));
     }
@@ -1393,10 +1854,30 @@ fn canonical_fingerprint(
     hasher.digest128()
 }
 
-fn authentication_tag(context: ContractContext, identity: u128, fingerprint: u128) -> u128 {
+fn canonical_distribution_input_receipt(
+    context: ContractContext,
+    contract_schema_version: u16,
+) -> u128 {
+    let mut hasher = Xxh3::new();
+    hasher.update(b"wrela.architecture-planning-contract.distribution-input\0\x01");
+    hash_bytes(&mut hasher, context.distribution_version.as_bytes());
+    hasher.update(&context.distribution_digest.to_be_bytes());
+    hasher.update(&contract_schema_version.to_be_bytes());
+    hasher.digest128()
+}
+
+fn canonical_context_receipt(context: ContractContext) -> u128 {
+    let mut hasher = Xxh3::new();
+    hasher.update(b"wrela.architecture-planning-contract.context\0\x01");
+    hash_bytes(&mut hasher, context.distribution_version.as_bytes());
+    hasher.update(&context.distribution_digest.to_be_bytes());
+    hasher.digest128()
+}
+
+fn authentication_tag(distribution_input_receipt: u128, identity: u128, fingerprint: u128) -> u128 {
     let mut hasher = Xxh3::new();
     hasher.update(b"wrela.compiler-distribution.architecture-planning-authentication\0\x01");
-    hasher.update(&context.distribution_digest.to_be_bytes());
+    hasher.update(&distribution_input_receipt.to_be_bytes());
     hasher.update(&identity.to_be_bytes());
     hasher.update(&fingerprint.to_be_bytes());
     hasher.digest128()
@@ -1481,15 +1962,23 @@ const fn binding_tag(value: BindingKind) -> u8 {
 mod tests {
     use super::*;
 
+    fn context(digest: u128) -> ContractContext {
+        ContractContext::new("test-distribution-v1", digest)
+    }
+
     fn candidate() -> RawContract {
-        current_aarch64_candidate(ContractContext::new(7))
+        current_aarch64_candidate(context(7))
     }
 
     #[test]
     fn current_contract_is_complete_and_canonically_verified() {
-        let verified = verify(candidate(), ContractContext::new(7), &Cancellation::new())
-            .expect("current contract verifies");
+        let candidate = candidate();
+        let expected_receipt = candidate.distribution_input_receipt;
+        let verified =
+            verify(candidate, context(7), &Cancellation::new()).expect("current contract verifies");
         let _: &Verified = &verified._verified;
+        assert_eq!(verified.schema_version, CONTRACT_SCHEMA_VERSION);
+        assert_eq!(verified.distribution_input_receipt, expected_receipt);
         assert_eq!(verified.facts.cores.len(), 4);
         assert_eq!(verified.facts.capabilities.len(), 8);
         assert_eq!(verified.facts.reservations.len(), 6);
@@ -1510,57 +1999,89 @@ mod tests {
     }
 
     #[test]
+    fn authentication_and_observation_use_the_same_verified_receipt_in_all_builds() {
+        let candidate = candidate();
+        let expected_authentication = authentication_tag(
+            candidate.distribution_input_receipt,
+            candidate.identity,
+            candidate.fingerprint,
+        );
+        assert_eq!(candidate.authentication, Some(expected_authentication));
+
+        let verified = verify(candidate, context(7), &Cancellation::new())
+            .expect("the producer and verifier agree on authentication inputs");
+        let observation = verified.observation();
+        assert_eq!(
+            observation.distribution_input_receipt(),
+            verified.distribution_input_receipt
+        );
+        assert_eq!(
+            observation.contract_schema_version(),
+            verified.schema_version
+        );
+    }
+
+    #[test]
     fn malformed_contract_is_rejected_deterministically() {
         let mut raw = candidate();
         raw.facts.page.quantum_bytes = 0;
-        let failure = verify(raw, ContractContext::new(7), &Cancellation::new());
-        assert_eq!(
-            failure.unwrap_err(),
-            ContractFailure::Malformed("page rules are invalid")
-        );
+        let failure = verify(raw, context(7), &Cancellation::new());
+        let failure = failure.unwrap_err();
+        assert_eq!(failure.kind(), ContractFailureKind::MalformedFacts);
+        assert_eq!(failure.reproduction().detail(), "page rules are invalid");
     }
 
     #[test]
     fn unsupported_version_is_rejected_before_fingerprinting() {
         let mut raw = candidate();
         raw.version += 1;
-        let failure = verify(raw, ContractContext::new(7), &Cancellation::new());
-        assert_eq!(failure.unwrap_err(), ContractFailure::UnsupportedVersion);
+        let failure = verify(raw, context(7), &Cancellation::new());
+        assert_eq!(
+            failure.unwrap_err().kind(),
+            ContractFailureKind::UnsupportedVersion
+        );
     }
 
     #[test]
     fn mixed_context_contract_is_rejected() {
-        let failure = verify(candidate(), ContractContext::new(8), &Cancellation::new());
-        assert_eq!(failure.unwrap_err(), ContractFailure::MixedContext);
+        let failure = verify(candidate(), context(8), &Cancellation::new());
+        assert_eq!(
+            failure.unwrap_err().kind(),
+            ContractFailureKind::MixedContext
+        );
     }
 
     #[test]
     fn unauthenticated_contract_is_rejected() {
         let mut raw = candidate();
         raw.authentication = None;
-        let failure = verify(raw, ContractContext::new(7), &Cancellation::new());
-        assert_eq!(failure.unwrap_err(), ContractFailure::Unauthenticated);
+        let failure = verify(raw, context(7), &Cancellation::new());
+        assert_eq!(
+            failure.unwrap_err().kind(),
+            ContractFailureKind::Unauthenticated
+        );
     }
 
     #[test]
     fn falsely_authenticated_contract_is_rejected() {
         let mut raw = candidate();
         raw.authentication = raw.authentication.map(|authentication| authentication ^ 1);
-        let failure = verify(raw, ContractContext::new(7), &Cancellation::new());
+        let failure = verify(raw, context(7), &Cancellation::new());
         assert_eq!(
-            failure.unwrap_err(),
-            ContractFailure::AuthenticationMismatch
+            failure.unwrap_err().kind(),
+            ContractFailureKind::AuthenticationMismatch
         );
     }
 
     #[test]
     fn unsupported_profile_has_no_verified_contract() {
-        let module = ArchitecturePlanningModule::new(ContractContext::new(7));
+        let module = ArchitecturePlanningModule::new(context(7));
         assert_eq!(
             module
                 .authenticate(ArchitectureProfile::X86_64, &Cancellation::new())
-                .unwrap_err(),
-            ContractFailure::UnsupportedProfile
+                .unwrap_err()
+                .kind(),
+            ContractFailureKind::UnsupportedProfile
         );
     }
 
@@ -1569,15 +2090,19 @@ mod tests {
         let mut identity = candidate();
         identity.identity ^= 1;
         assert_eq!(
-            verify(identity, ContractContext::new(7), &Cancellation::new()).unwrap_err(),
-            ContractFailure::IdentityMismatch
+            verify(identity, context(7), &Cancellation::new())
+                .unwrap_err()
+                .kind(),
+            ContractFailureKind::IdentityMismatch
         );
 
         let mut fingerprint = candidate();
         fingerprint.fingerprint ^= 1;
         assert_eq!(
-            verify(fingerprint, ContractContext::new(7), &Cancellation::new()).unwrap_err(),
-            ContractFailure::FingerprintMismatch
+            verify(fingerprint, context(7), &Cancellation::new())
+                .unwrap_err()
+                .kind(),
+            ContractFailureKind::FingerprintMismatch
         );
     }
 
@@ -1586,8 +2111,10 @@ mod tests {
         let cancellation = Cancellation::new();
         cancellation.cancel();
         assert_eq!(
-            verify(candidate(), ContractContext::new(7), &cancellation).unwrap_err(),
-            ContractFailure::Cancelled
+            verify(candidate(), context(7), &cancellation)
+                .unwrap_err()
+                .kind(),
+            ContractFailureKind::Cancelled
         );
     }
 
@@ -1617,9 +2144,11 @@ mod tests {
     fn profile_neutral_verification_rejects_duplicate_rule_kinds() {
         let mut facts = producer_current_aarch64_facts();
         Arc::make_mut(&mut facts.reservations)[2].kind = ReservationKind::BootState;
+        let failure = reconstruct_and_validate(&facts, &Cancellation::new()).unwrap_err();
+        assert_eq!(failure.kind(), ContractFailureKind::MalformedFacts);
         assert_eq!(
-            reconstruct_and_validate(&facts, &Cancellation::new()).unwrap_err(),
-            ContractFailure::Malformed("reservation rules are invalid")
+            failure.reproduction().detail(),
+            "reservation rules are invalid"
         );
     }
 
@@ -1629,9 +2158,64 @@ mod tests {
         for core in Arc::make_mut(&mut facts.cores) {
             core.maximum_service_units = u32::MAX;
         }
+        let failure = reconstruct_and_validate(&facts, &Cancellation::new()).unwrap_err();
+        assert_eq!(failure.kind(), ContractFailureKind::MalformedFacts);
         assert_eq!(
-            reconstruct_and_validate(&facts, &Cancellation::new()).unwrap_err(),
-            ContractFailure::Malformed("scheduling-cost baseline is invalid")
+            failure.reproduction().detail(),
+            "scheduling-cost baseline is invalid"
         );
+    }
+
+    #[test]
+    fn contract_failures_preserve_bounded_reproduction_metadata() {
+        fn assert_common(failure: &ContractFailure, kind: ContractFailureKind) {
+            assert_eq!(failure.kind(), kind);
+            let reproduction = failure.reproduction();
+            assert_eq!(reproduction.profile(), ArchitectureProfile::CurrentAarch64);
+            assert_eq!(reproduction.expected_schema_version(), 1);
+            assert_eq!(reproduction.actual_schema_version(), 1);
+            assert_ne!(reproduction.expected_context_receipt(), 0);
+            assert_ne!(reproduction.actual_context_receipt(), 0);
+            assert_ne!(reproduction.expected_input_receipt(), 0);
+            assert_ne!(reproduction.actual_input_receipt(), 0);
+            assert!(failure.bounded_evidence().len() < 768);
+        }
+
+        let mixed = verify(candidate(), context(8), &Cancellation::new()).unwrap_err();
+        assert_common(&mixed, ContractFailureKind::MixedContext);
+        assert_ne!(
+            mixed.reproduction().expected_context_receipt(),
+            mixed.reproduction().actual_context_receipt()
+        );
+
+        let mut identity = candidate();
+        identity.identity ^= 1;
+        let identity = verify(identity, context(7), &Cancellation::new()).unwrap_err();
+        assert_common(&identity, ContractFailureKind::IdentityMismatch);
+
+        let mut version = candidate();
+        version.version = 2;
+        let version = verify(version, context(7), &Cancellation::new()).unwrap_err();
+        assert_common(&version, ContractFailureKind::UnsupportedVersion);
+        assert_eq!(version.reproduction().expected_contract_version(), 1);
+        assert_eq!(version.reproduction().actual_contract_version(), 2);
+
+        let mut fingerprint = candidate();
+        fingerprint.fingerprint ^= 1;
+        let fingerprint = verify(fingerprint, context(7), &Cancellation::new()).unwrap_err();
+        assert_common(&fingerprint, ContractFailureKind::FingerprintMismatch);
+
+        let mut authentication = candidate();
+        authentication.authentication = authentication
+            .authentication
+            .map(|authentication| authentication ^ 1);
+        let authentication = verify(authentication, context(7), &Cancellation::new()).unwrap_err();
+        assert_common(&authentication, ContractFailureKind::AuthenticationMismatch);
+
+        let mut malformed = candidate();
+        malformed.facts.page.quantum_bytes = 0;
+        let malformed = verify(malformed, context(7), &Cancellation::new()).unwrap_err();
+        assert_common(&malformed, ContractFailureKind::MalformedFacts);
+        assert_eq!(malformed.reproduction().detail(), "page rules are invalid");
     }
 }

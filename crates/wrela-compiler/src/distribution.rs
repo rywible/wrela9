@@ -14,7 +14,7 @@ use crate::syntax::{DeclarationKind, DeclarationSyntax, FunctionModifier, TypeSy
 use crate::typed_hir::{AuthorityContext, BuildAuthority, PoolAuthority};
 use crate::{Cancellation, syntax};
 
-const DISTRIBUTION_VERSION: &str = "wrela9-layer1-v1";
+const DISTRIBUTION_VERSION: &str = "wrela9-layer2-architecture-v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum ModuleRole {
@@ -157,7 +157,10 @@ impl CompilerDistribution {
             modules: modules.into(),
             build_authority,
             pool_authority,
-            architecture_planning: ArchitecturePlanningModule::new(ContractContext::new(digest)),
+            architecture_planning: ArchitecturePlanningModule::new(ContractContext::new(
+                DISTRIBUTION_VERSION,
+                digest,
+            )),
             digest,
         })
     }

@@ -59,8 +59,17 @@ fn current_aarch64_selection_authenticates_the_planning_contract() {
         .architecture_planning_contract()
         .expect("selected contract is inspected");
 
+    assert_eq!(
+        accepted.inspection().distribution_version(),
+        "wrela9-layer2-architecture-v1"
+    );
     assert_eq!(contract.profile(), ArchitectureProfile::CurrentAarch64);
+    assert_eq!(contract.contract_schema_version(), 1);
     assert_eq!(contract.contract_version(), 1);
+    assert_eq!(
+        contract.distribution_input_receipt(),
+        144_696_432_844_050_407_796_973_414_362_719_389_025
+    );
     assert_eq!(
         contract.identity(),
         82_368_861_742_248_649_671_883_035_618_079_068_922

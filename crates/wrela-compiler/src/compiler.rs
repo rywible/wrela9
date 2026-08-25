@@ -8,7 +8,7 @@ use std::sync::{
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::architecture_planning::{
-    ArchitecturePlanningObservation, ArchitectureProfile, ContractFailure,
+    ArchitecturePlanningObservation, ArchitectureProfile, ContractFailureKind,
     VerifiedArchitecturePlanningContract,
 };
 use crate::syntax;
@@ -2341,8 +2341,10 @@ impl Compiler {
                     .authenticate(profile, cancellation)
                 {
                     Ok(contract) => Some(contract),
-                    Err(ContractFailure::Cancelled) => return CompilationOutcome::Cancelled,
-                    Err(ContractFailure::UnsupportedProfile) => {
+                    Err(failure) if failure.kind() == ContractFailureKind::Cancelled => {
+                        return CompilationOutcome::Cancelled;
+                    }
+                    Err(failure) if failure.kind() == ContractFailureKind::UnsupportedProfile => {
                         diagnostics
                             .push(unsupported_architecture_diagnostic(request.root, profile));
                         None
@@ -2350,7 +2352,7 @@ impl Compiler {
                     Err(failure) => {
                         return CompilationOutcome::Defect(Defect::new(
                             "architecture planning contract",
-                            failure.evidence(),
+                            failure.bounded_evidence(),
                         ));
                     }
                 },

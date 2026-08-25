@@ -565,7 +565,14 @@ fn compiler_open_seals_validated_versioned_distribution_content() {
     let first = receipt(&first);
     let same = receipt(&same);
     let changed = receipt(&changed);
-    assert_eq!(first.distribution_version(), "wrela9-layer1-v1");
+    assert_eq!(
+        first.distribution_version(),
+        "wrela9-layer2-architecture-v1"
+    );
+    assert_eq!(
+        first.distribution_digest(),
+        189_222_410_145_518_808_200_614_287_292_213_537_731
+    );
     assert_eq!(first.distribution_digest(), same.distribution_digest());
     assert_ne!(first.distribution_digest(), changed.distribution_digest());
 }

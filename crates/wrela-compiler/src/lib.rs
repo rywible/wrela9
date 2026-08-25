@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 mod architecture_planning;
+#[cfg(test)]
+mod architecture_planning_consumer_tests;
 mod compiler;
 mod control_flow;
 mod distribution;

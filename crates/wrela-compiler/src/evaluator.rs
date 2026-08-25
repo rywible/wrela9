@@ -11,9 +11,9 @@ use crate::model::{
     Type, VariantId,
 };
 use crate::typed_hir::{
-    BinaryOperator, CallTarget, CleanupAction, CleanupOperandMode, ClosureId, Expression,
-    ExpressionKind, HirClosure, HirFunction, HirMatchCase, HirMatchPattern, Literal, LocalId,
-    Place, PlaceProjection, Statement, VerifiedProgram, root_place,
+    BinaryOperator, CallTarget, CleanupAction, ClosureId, Expression, ExpressionKind, HirClosure,
+    HirFunction, HirMatchCase, HirMatchPattern, Literal, LocalId, Place, PlaceProjection,
+    Statement, VerifiedProgram, root_place,
 };
 use crate::{
     Cancellation, CanonicalValue, EvaluationContributorObservation, EvaluationFrameObservation,
@@ -122,13 +122,14 @@ struct MachineFrame<'hir> {
     values: Vec<Value>,
     locals: Vec<Option<Value>>,
     writebacks: Vec<(LocalId, Place)>,
+    cleanup_captures: Option<Vec<Option<Value>>>,
 }
 
 /// One registered instance of an immutable typed-HIR Cleanup Action. Only the
-/// operands whose verified mode transfers Resource custody are captured here.
+/// Resource moves normalized into the verified action's slots are captured here.
 struct CleanupPlan<'hir> {
     action: &'hir CleanupAction,
-    captured_arguments: Vec<Option<Value>>,
+    captured: Vec<Option<Value>>,
 }
 
 enum Control<'hir> {
@@ -271,7 +272,7 @@ enum Control<'hir> {
     FinishRegisterCleanup {
         action: &'hir CleanupAction,
     },
-    PushCapturedCleanupOperand(Value),
+    FinishCleanupAction,
     ExecuteCleanup(CleanupPlan<'hir>),
 }
 
@@ -613,6 +614,7 @@ impl<'a> Engine<'a> {
                     values: Vec::new(),
                     locals: Vec::new(),
                     writebacks: Vec::new(),
+                    cleanup_captures: None,
                 });
             }
             RootWork::Expression(expression) => {
@@ -630,6 +632,7 @@ impl<'a> Engine<'a> {
                     values: Vec::new(),
                     locals: Vec::new(),
                     writebacks: Vec::new(),
+                    cleanup_captures: None,
                 });
             }
             RootWork::Function(id) => {
@@ -764,6 +767,20 @@ impl<'a> Engine<'a> {
                                     captures: captures.into(),
                                 },
                             )?;
+                        }
+                        ExpressionKind::CleanupCapture(ordinal) => {
+                            let value = frames
+                                .last_mut()
+                                .and_then(|frame| frame.cleanup_captures.as_mut())
+                                .and_then(|captures| captures.get_mut(ordinal.0 as usize))
+                                .and_then(Option::take)
+                                .ok_or_else(|| {
+                                    EvalFailure::Defect(Arc::from(
+                                        "cleanup capture slot is missing or consumed twice",
+                                    ))
+                                })?;
+                            self.release(value_size(&value))?;
+                            self.push_value(&mut frames, value)?;
                         }
                         ExpressionKind::Array(values) => {
                             let controls = &mut frames
@@ -931,6 +948,7 @@ impl<'a> Engine<'a> {
                         values: Vec::new(),
                         locals: Vec::new(),
                         writebacks: Vec::new(),
+                        cleanup_captures: None,
                     });
                 }
                 Control::FinishRoot | Control::FinishConstant => {
@@ -1165,30 +1183,13 @@ impl<'a> Engine<'a> {
                         }
                         Statement::Defer { action, .. } => {
                             controls.push(Control::FinishRegisterCleanup { action });
-                            if let CleanupAction::Call {
-                                expression,
-                                argument_modes,
-                                ..
-                            } = action
-                            {
-                                let ExpressionKind::Call { arguments, .. } = &expression.kind
-                                else {
-                                    return Err(EvalFailure::Defect(Arc::from(
-                                        "verified cleanup call plan names a non-call expression",
-                                    )));
-                                };
-                                controls.extend(
-                                    arguments
-                                        .iter()
-                                        .zip(argument_modes.iter())
-                                        .rev()
-                                        .filter_map(|(argument, mode)| {
-                                            (*mode
-                                                == CleanupOperandMode::CaptureResourceAtRegistration)
-                                                .then_some(Control::Expression(argument))
-                                        }),
-                                );
-                            }
+                            controls.extend(
+                                action
+                                    .captures
+                                    .iter()
+                                    .rev()
+                                    .map(|capture| Control::Expression(&capture.expression)),
+                            );
                         }
                         Statement::WithPool {
                             binding,
@@ -1220,71 +1221,35 @@ impl<'a> Engine<'a> {
                         controls.push(Control::ExecuteCleanup(action));
                     }
                 }
-                Control::ExecuteCleanup(plan) => match plan.action {
-                    CleanupAction::Expression(expression) => {
-                        let controls = &mut frames
-                            .last_mut()
-                            .expect("machine has current frame")
-                            .controls;
-                        controls.push(Control::Discard);
-                        controls.push(Control::Expression(expression));
+                Control::ExecuteCleanup(plan) => {
+                    let frame = frames.last_mut().expect("machine has current frame");
+                    if frame.cleanup_captures.replace(plan.captured).is_some() {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "cleanup capture environment overlaps another action",
+                        )));
                     }
-                    CleanupAction::Call {
-                        expression,
-                        callable_mode,
-                        argument_modes,
-                    } => {
-                        let ExpressionKind::Call { target, arguments } = &expression.kind else {
-                            return Err(EvalFailure::Defect(Arc::from(
-                                "verified cleanup call plan names a non-call expression",
-                            )));
-                        };
-                        let controls = &mut frames
-                            .last_mut()
-                            .expect("machine has current frame")
-                            .controls;
-                        controls.push(Control::Discard);
-                        controls.push(Control::FinishCall {
-                            target,
-                            arguments,
-                            site: &expression.source,
-                        });
-                        for ((argument, mode), captured) in arguments
-                            .iter()
-                            .zip(argument_modes.iter())
-                            .zip(plan.captured_arguments)
-                            .rev()
-                        {
-                            controls.push(match mode {
-                                CleanupOperandMode::EvaluateAtExit => Control::Expression(argument),
-                                CleanupOperandMode::CaptureResourceAtRegistration => {
-                                    Control::PushCapturedCleanupOperand(captured.ok_or_else(
-                                        || {
-                                            EvalFailure::Defect(Arc::from(
-                                                "verified captured cleanup operand is missing",
-                                            ))
-                                        },
-                                    )?)
-                                }
-                            });
-                        }
-                        match (callable_mode, target) {
-                            (
-                                Some(CleanupOperandMode::EvaluateAtExit),
-                                CallTarget::Callable { value },
-                            ) => controls.push(Control::Expression(value)),
-                            (None, CallTarget::Callable { .. }) | (Some(_), _) => {
-                                return Err(EvalFailure::Defect(Arc::from(
-                                    "verified cleanup callable timing disagrees with its target",
-                                )));
-                            }
-                            (None, _) => {}
-                        }
+                    frame.controls.push(Control::FinishCleanupAction);
+                    frame.controls.push(Control::Discard);
+                    frame
+                        .controls
+                        .push(Control::Expression(&plan.action.expression));
+                }
+                Control::FinishCleanupAction => {
+                    let captures = frames
+                        .last_mut()
+                        .expect("machine has current frame")
+                        .cleanup_captures
+                        .take()
+                        .ok_or_else(|| {
+                            EvalFailure::Defect(Arc::from(
+                                "cleanup action finished without a capture environment",
+                            ))
+                        })?;
+                    if captures.iter().any(Option::is_some) {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "cleanup action did not consume every captured Resource exactly once",
+                        )));
                     }
-                },
-                Control::PushCapturedCleanupOperand(value) => {
-                    self.release(value_size(&value))?;
-                    self.push_value(&mut frames, value)?;
                 }
                 Control::FinishReturn { return_type } => {
                     let value = self.pop_value(&mut frames)?;
@@ -1949,19 +1914,16 @@ impl<'a> Engine<'a> {
                     self.push_value(&mut frames, value)?;
                 }
                 Control::FinishRegisterCleanup { action } => {
-                    let mut captured_arguments = match action {
-                        CleanupAction::Expression(_) => Vec::new(),
-                        CleanupAction::Call { argument_modes, .. } => {
-                            vec![None; argument_modes.len()]
-                        }
-                    };
-                    if let CleanupAction::Call { argument_modes, .. } = action {
-                        for (index, mode) in argument_modes.iter().enumerate().rev() {
-                            if *mode == CleanupOperandMode::CaptureResourceAtRegistration {
-                                let value = self.pop_value(&mut frames)?;
-                                self.retain(value_size(&value))?;
-                                captured_arguments[index] = Some(value);
-                            }
+                    let captured = self.pop_values(&mut frames, action.captures.len())?;
+                    for value in &captured {
+                        self.retain(value_size(value))?;
+                    }
+                    let captured = captured.into_iter().map(Some).collect();
+                    for (expected, capture) in action.captures.iter().enumerate() {
+                        if usize::try_from(capture.ordinal.0).ok() != Some(expected) {
+                            return Err(EvalFailure::Defect(Arc::from(
+                                "verified cleanup capture ordinals are not canonical",
+                            )));
                         }
                     }
                     let Some(Control::EndScope { deferred }) = frames
@@ -1976,10 +1938,7 @@ impl<'a> Engine<'a> {
                             "verified cleanup registration has no lexical scope",
                         )));
                     };
-                    deferred.push(CleanupPlan {
-                        action,
-                        captured_arguments,
-                    });
+                    deferred.push(CleanupPlan { action, captured });
                 }
                 Control::FinishCall {
                     target,
@@ -2221,6 +2180,7 @@ impl<'a> Engine<'a> {
             values: Vec::new(),
             locals,
             writebacks,
+            cleanup_captures: None,
         });
         Ok(())
     }
@@ -2285,6 +2245,7 @@ impl<'a> Engine<'a> {
             values: Vec::new(),
             locals,
             writebacks: Vec::new(),
+            cleanup_captures: None,
         });
         Ok(())
     }
@@ -3847,6 +3808,7 @@ mod tests {
             values: Vec::new(),
             locals: vec![Some(value)],
             writebacks: Vec::new(),
+            cleanup_captures: None,
         }];
 
         engine
@@ -3860,18 +3822,21 @@ mod tests {
 
     #[test]
     fn registered_cleanup_is_transferred_out_of_its_scope_once() {
-        let action = CleanupAction::Expression(Expression {
-            kind: ExpressionKind::Literal(Literal::Unit),
-            type_id: crate::model::TypeId(1),
-            type_: Type::Unit,
-            coerced_from: None,
-            access: crate::typed_hir::AccessMode::Copy,
-            source: SourceRange::from_u64("src/image.wr", 0, 1),
-        });
+        let action = CleanupAction {
+            expression: Expression {
+                kind: ExpressionKind::Literal(Literal::Unit),
+                type_id: crate::model::TypeId(1),
+                type_: Type::Unit,
+                coerced_from: None,
+                access: crate::typed_hir::AccessMode::Copy,
+                source: SourceRange::from_u64("src/image.wr", 0, 1),
+            },
+            captures: Arc::from([]),
+        };
         let mut controls = vec![Control::EndScope {
             deferred: vec![CleanupPlan {
                 action: &action,
-                captured_arguments: Vec::new(),
+                captured: Vec::new(),
             }],
         }];
 

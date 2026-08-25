@@ -277,7 +277,9 @@ fn visit_statements(statements: &[Statement], facts: &mut FunctionFacts) {
             Statement::Initialize { value, .. }
             | Statement::Assign { value, .. }
             | Statement::Evaluate(value) => visit_expression(value, facts),
-            Statement::Defer { action, .. } => visit_expression(action.expression(), facts),
+            Statement::Defer { action, .. } => {
+                action.visit_expressions(&mut |expression| visit_expression(expression, facts));
+            }
             Statement::If {
                 condition: value,
                 then_branch,
@@ -535,7 +537,11 @@ fn recursive_calls_decrease(
             expression_decreases(value, caller_measure, members, measures)
         }
         Statement::Defer { action, .. } => {
-            expression_decreases(action.expression(), caller_measure, members, measures)
+            let mut decreases = true;
+            action.visit_expressions(&mut |expression| {
+                decreases &= expression_decreases(expression, caller_measure, members, measures);
+            });
+            decreases
         }
         Statement::If {
             condition: value,

@@ -3540,7 +3540,9 @@ fn resolution_observations(program: &VerifiedProgram) -> Vec<ResolutionObservati
                 | Statement::Initialize { value, .. }
                 | Statement::Assign { value, .. }
                 | Statement::Evaluate(value) => expression(value, observations),
-                Statement::Defer { action, .. } => expression(action.expression(), observations),
+                Statement::Defer { action, .. } => {
+                    action.visit_expressions(&mut |value| expression(value, observations));
+                }
                 Statement::Assert { condition, .. } | Statement::Expect { condition, .. } => {
                     expression(condition, observations);
                 }

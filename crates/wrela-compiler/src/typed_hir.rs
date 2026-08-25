@@ -876,34 +876,33 @@ pub(crate) enum Statement {
     Pass(SourceRange),
 }
 
-/// The verified, immutable execution plan for one deferred cleanup action.
-///
-/// Resource-owning operands transfer custody when the action is registered;
-/// Data operands (including a callable target) retain ordinary expression
-/// timing and are evaluated only when a recoverable exit executes the action.
 #[derive(Clone, Debug)]
-pub(crate) enum CleanupAction {
-    Expression(Expression),
-    Call {
-        expression: Expression,
-        callable_mode: Option<CleanupOperandMode>,
-        argument_modes: Arc<[CleanupOperandMode]>,
-    },
+pub(crate) struct CleanupAction {
+    pub(crate) expression: Expression,
+    pub(crate) captures: Arc<[CleanupCapture]>,
 }
 
 impl CleanupAction {
     pub(crate) fn expression(&self) -> &Expression {
-        match self {
-            Self::Expression(expression) | Self::Call { expression, .. } => expression,
+        &self.expression
+    }
+
+    pub(crate) fn visit_expressions(&self, visitor: &mut impl FnMut(&Expression)) {
+        for capture in self.captures.iter() {
+            visitor(&capture.expression);
         }
+        visitor(&self.expression);
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CleanupOperandMode {
-    EvaluateAtExit,
-    CaptureResourceAtRegistration,
+#[derive(Clone, Debug)]
+pub(crate) struct CleanupCapture {
+    pub(crate) ordinal: CleanupCaptureOrdinal,
+    pub(crate) expression: Expression,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CleanupCaptureOrdinal(pub(crate) u32);
 
 #[derive(Clone, Debug)]
 pub(crate) struct HirMatchCase {
@@ -983,7 +982,8 @@ impl Expression {
             }
             ExpressionKind::Literal(_)
             | ExpressionKind::Constant(_)
-            | ExpressionKind::FunctionValue { .. } => {}
+            | ExpressionKind::FunctionValue { .. }
+            | ExpressionKind::CleanupCapture(_) => {}
             ExpressionKind::Is { value, .. } => visitor(value),
             ExpressionKind::Closure(closure) => visitor(&closure.body),
         }
@@ -1000,6 +1000,7 @@ pub(crate) enum ExpressionKind {
         specialization: Option<SpecializationId>,
     },
     Closure(Arc<HirClosure>),
+    CleanupCapture(CleanupCaptureOrdinal),
     Call {
         target: CallTarget,
         arguments: Arc<[Expression]>,
@@ -2159,6 +2160,9 @@ fn collect_statement_demands(
             }
             Statement::Defer { action, .. } => {
                 collect_expression_demands(action.expression(), constants, functions);
+                for capture in action.captures.iter() {
+                    collect_expression_demands(&capture.expression, constants, functions);
+                }
             }
             Statement::Assert { condition, .. } | Statement::Expect { condition, .. } => {
                 collect_expression_demands(condition, constants, functions);
@@ -2267,7 +2271,9 @@ fn collect_expression_demands(
         ExpressionKind::Closure(closure) => {
             collect_expression_demands(&closure.body, constants, functions);
         }
-        ExpressionKind::Literal(_) | ExpressionKind::Read(_) => {}
+        ExpressionKind::Literal(_)
+        | ExpressionKind::Read(_)
+        | ExpressionKind::CleanupCapture(_) => {}
     }
 }
 
@@ -3145,7 +3151,13 @@ fn statements_have_placeholder(statements: &[Statement]) -> bool {
         | Statement::Initialize { value, .. }
         | Statement::Assign { value, .. }
         | Statement::Evaluate(value) => expression_has_placeholder(value),
-        Statement::Defer { action, .. } => expression_has_placeholder(action.expression()),
+        Statement::Defer { action, .. } => {
+            let mut found = false;
+            action.visit_expressions(&mut |expression| {
+                found |= expression_has_placeholder(expression);
+            });
+            found
+        }
         Statement::If {
             condition: value,
             then_branch,
@@ -3204,7 +3216,13 @@ fn collect_statement_closures(
             | Statement::Assign { value, .. }
             | Statement::Evaluate(value) => collect_expression_closures(value, closures)?,
             Statement::Defer { action, .. } => {
-                collect_expression_closures(action.expression(), closures)?
+                let mut result = Ok(());
+                action.visit_expressions(&mut |expression| {
+                    if result.is_ok() {
+                        result = collect_expression_closures(expression, closures);
+                    }
+                });
+                result?
             }
             Statement::If {
                 condition: value,
@@ -3338,7 +3356,13 @@ fn statements_suspend(statements: &[Statement]) -> bool {
         | Statement::Initialize { value, .. }
         | Statement::Assign { value, .. }
         | Statement::Evaluate(value) => expression_suspends(value),
-        Statement::Defer { action, .. } => expression_suspends(action.expression()),
+        Statement::Defer { action, .. } => {
+            let mut suspends = false;
+            action.visit_expressions(&mut |expression| {
+                suspends |= expression_suspends(expression);
+            });
+            suspends
+        }
         Statement::If {
             condition: value,
             then_branch,
@@ -3512,6 +3536,9 @@ fn artifact_expression_contains_resource_move(
     expression: &Expression,
     catalog: &ArtifactCatalog<'_>,
 ) -> bool {
+    if matches!(expression.kind, ExpressionKind::CleanupCapture(_)) {
+        return false;
+    }
     if expression.access == AccessMode::Move
         && artifact_type_owns_resource(expression.type_id, &expression.type_, catalog)
     {
@@ -3520,6 +3547,61 @@ fn artifact_expression_contains_resource_move(
     let mut found = false;
     expression.visit_children(&mut |child| {
         found |= artifact_expression_contains_resource_move(child, catalog);
+    });
+    found
+}
+
+fn artifact_expression_contains_resource_loan(
+    expression: &Expression,
+    catalog: &ArtifactCatalog<'_>,
+) -> bool {
+    if matches!(expression.access, AccessMode::Read | AccessMode::Mut)
+        && artifact_type_owns_resource(expression.type_id, &expression.type_, catalog)
+    {
+        return true;
+    }
+    if matches!(expression.kind, ExpressionKind::Closure(_)) {
+        return false;
+    }
+    let mut found = false;
+    expression.visit_children(&mut |child| {
+        found |= artifact_expression_contains_resource_loan(child, catalog);
+    });
+    found
+}
+
+fn collect_cleanup_capture_references(expression: &Expression, references: &mut Vec<Expression>) {
+    if matches!(expression.kind, ExpressionKind::CleanupCapture(_)) {
+        references.push(expression.clone());
+        return;
+    }
+    if matches!(expression.kind, ExpressionKind::Closure(_)) {
+        return;
+    }
+    expression.visit_children(&mut |child| {
+        collect_cleanup_capture_references(child, references);
+    });
+}
+
+fn cleanup_has_conditional_capture_reference(expression: &Expression) -> bool {
+    if let ExpressionKind::Binary {
+        operator: BinaryOperator::And | BinaryOperator::Or,
+        left,
+        right,
+    } = &expression.kind
+    {
+        let mut right_references = Vec::new();
+        collect_cleanup_capture_references(right, &mut right_references);
+        return !right_references.is_empty()
+            || cleanup_has_conditional_capture_reference(left)
+            || cleanup_has_conditional_capture_reference(right);
+    }
+    if matches!(expression.kind, ExpressionKind::Closure(_)) {
+        return false;
+    }
+    let mut found = false;
+    expression.visit_children(&mut |child| {
+        found |= cleanup_has_conditional_capture_reference(child);
     });
     found
 }
@@ -3577,9 +3659,91 @@ fn verify_statements(
             }
             Statement::Defer { action, .. } => {
                 let expression = action.expression();
-                let type_ = verify_expression_artifact(expression, locals, moved, catalog, source)?;
+                let mut captures = BTreeMap::new();
+                for (expected, capture) in action.captures.iter().enumerate() {
+                    if usize::try_from(capture.ordinal.0).ok() != Some(expected) {
+                        return defect("lowered cleanup capture ordinals are not canonical");
+                    }
+                    if captures.insert(capture.ordinal, capture).is_some() {
+                        return defect("lowered cleanup capture ordinal appears more than once");
+                    }
+                    let captured_type = verify_expression_artifact(
+                        &capture.expression,
+                        locals,
+                        moved,
+                        catalog,
+                        source,
+                    )?;
+                    if capture.expression.access != AccessMode::Move
+                        || !artifact_type_owns_resource(
+                            capture.expression.type_id,
+                            &captured_type,
+                            catalog,
+                        )
+                    {
+                        return defect(
+                            "lowered cleanup registration captures a non-Resource expression",
+                        );
+                    }
+                }
+                let mut references = Vec::new();
+                collect_cleanup_capture_references(expression, &mut references);
+                if references.len() != action.captures.len() {
+                    return defect(
+                        "lowered cleanup capture coverage has missing or extra references",
+                    );
+                }
+                for (expected, (reference, capture)) in
+                    references.iter().zip(action.captures.iter()).enumerate()
+                {
+                    let ExpressionKind::CleanupCapture(ordinal) = reference.kind else {
+                        unreachable!("collector returns only cleanup capture references");
+                    };
+                    if usize::try_from(ordinal.0).ok() != Some(expected)
+                        || ordinal != capture.ordinal
+                    {
+                        return defect(
+                            "lowered cleanup capture references are not in canonical order",
+                        );
+                    }
+                    if reference.type_id != capture.expression.type_id
+                        || reference.type_ != capture.expression.type_
+                        || reference.coerced_from != capture.expression.coerced_from
+                        || reference.access != capture.expression.access
+                        || reference.source != capture.expression.source
+                    {
+                        return defect("cleanup capture substitution metadata is inconsistent");
+                    }
+                }
+                if cleanup_has_conditional_capture_reference(expression) {
+                    return defect(
+                        "lowered cleanup capture reference is not unconditionally evaluated",
+                    );
+                }
+                let mut has_uncaptured_move = false;
+                expression.visit_children(&mut |child| {
+                    has_uncaptured_move |=
+                        artifact_expression_contains_resource_move(child, catalog);
+                });
+                if has_uncaptured_move {
+                    return defect(
+                        "lowered cleanup expression retains an uncaptured Resource move",
+                    );
+                }
+                let type_ = verify_expression_artifact_with_cleanup(
+                    expression,
+                    locals,
+                    moved,
+                    catalog,
+                    source,
+                    Some(&captures),
+                )?;
                 if matches!(type_, Type::Result { .. })
                     || expression_contains_propagation(expression)
+                    || action
+                        .captures
+                        .iter()
+                        .any(|capture| expression_contains_propagation(&capture.expression))
                 {
                     return defect("lowered defer may return a recoverable error");
                 }
@@ -3587,68 +3751,12 @@ fn verify_statements(
                     return defect("lowered cleanup action leaves a Resource result undisposed");
                 }
                 if !matches!(expression.kind, ExpressionKind::Call { .. })
-                    && artifact_expression_contains_resource_move(expression, catalog)
+                    && !action.captures.is_empty()
                 {
                     return defect("lowered non-call cleanup expression captures Resource custody");
                 }
-                if let ExpressionKind::Call { arguments, .. } = &expression.kind
-                    && arguments.iter().any(|argument| {
-                        matches!(argument.access, AccessMode::Read | AccessMode::Mut)
-                            && artifact_type_owns_resource(
-                                argument.type_id,
-                                &argument.type_,
-                                catalog,
-                            )
-                    })
-                {
+                if artifact_expression_contains_resource_loan(expression, catalog) {
                     return defect("lowered cleanup action retains a Resource loan");
-                }
-                match (action, &expression.kind) {
-                    (CleanupAction::Expression(_), ExpressionKind::Call { .. }) => {
-                        return defect("lowered cleanup call omits its operand execution plan");
-                    }
-                    (
-                        CleanupAction::Call {
-                            callable_mode,
-                            argument_modes,
-                            ..
-                        },
-                        ExpressionKind::Call { target, arguments },
-                    ) => {
-                        let expected_callable = matches!(target, CallTarget::Callable { .. })
-                            .then_some(CleanupOperandMode::EvaluateAtExit);
-                        if *callable_mode != expected_callable {
-                            return defect(
-                                "lowered cleanup callable timing disagrees with its call target",
-                            );
-                        }
-                        if argument_modes.len() != arguments.len() {
-                            return defect(
-                                "lowered cleanup operand plan disagrees with its call arity",
-                            );
-                        }
-                        for (mode, argument) in argument_modes.iter().zip(arguments.iter()) {
-                            let expected = if argument.access == AccessMode::Move
-                                && artifact_type_owns_resource(
-                                    argument.type_id,
-                                    &argument.type_,
-                                    catalog,
-                                ) {
-                                CleanupOperandMode::CaptureResourceAtRegistration
-                            } else {
-                                CleanupOperandMode::EvaluateAtExit
-                            };
-                            if *mode != expected {
-                                return defect(
-                                    "lowered cleanup operand timing disagrees with custody",
-                                );
-                            }
-                        }
-                    }
-                    (CleanupAction::Call { .. }, _) => {
-                        return defect("lowered cleanup call plan names a non-call expression");
-                    }
-                    (CleanupAction::Expression(_), _) => {}
                 }
             }
             Statement::Assert { condition, .. } | Statement::Expect { condition, .. } => {
@@ -4456,6 +4564,17 @@ fn verify_place_artifact(
     catalog: &ArtifactCatalog<'_>,
     source: &SourceRange,
 ) -> Result<Type, VerificationFailure> {
+    verify_place_artifact_with_cleanup(place, locals, moved, catalog, source, None)
+}
+
+fn verify_place_artifact_with_cleanup(
+    place: &Place,
+    locals: &BTreeMap<LocalId, ArtifactLocalType>,
+    moved: &mut MoveState,
+    catalog: &ArtifactCatalog<'_>,
+    source: &SourceRange,
+    cleanup_captures: Option<&BTreeMap<CleanupCaptureOrdinal, &CleanupCapture>>,
+) -> Result<Type, VerificationFailure> {
     let mut type_ = locals
         .get(&place.local)
         .map(|local| local.type_.clone())
@@ -4504,7 +4623,14 @@ fn verify_place_artifact(
                 index,
                 type_: recorded_type,
             } => {
-                let index_type = verify_expression_artifact(index, locals, moved, catalog, source)?;
+                let index_type = verify_expression_artifact_with_cleanup(
+                    index,
+                    locals,
+                    moved,
+                    catalog,
+                    source,
+                    cleanup_captures,
+                )?;
                 if !matches!(index_type, Type::Integer(_)) {
                     return defect("lowered index place uses a non-integer index");
                 }
@@ -4528,6 +4654,24 @@ fn verify_expression_artifact(
     moved: &mut MoveState,
     catalog: &ArtifactCatalog<'_>,
     provenance_owner: &SourceRange,
+) -> Result<Type, VerificationFailure> {
+    verify_expression_artifact_with_cleanup(
+        expression,
+        locals,
+        moved,
+        catalog,
+        provenance_owner,
+        None,
+    )
+}
+
+fn verify_expression_artifact_with_cleanup(
+    expression: &Expression,
+    locals: &BTreeMap<LocalId, ArtifactLocalType>,
+    moved: &mut MoveState,
+    catalog: &ArtifactCatalog<'_>,
+    provenance_owner: &SourceRange,
+    cleanup_captures: Option<&BTreeMap<CleanupCaptureOrdinal, &CleanupCapture>>,
 ) -> Result<Type, VerificationFailure> {
     if expression.source.start() > expression.source.end()
         || expression.source.path() != provenance_owner.path()
@@ -4568,7 +4712,14 @@ fn verify_expression_artifact(
             Literal::Bytes(_) => Type::Bytes,
         },
         ExpressionKind::Read(place) => {
-            let type_ = verify_place_artifact(place, locals, moved, catalog, &expression.source)?;
+            let type_ = verify_place_artifact_with_cleanup(
+                place,
+                locals,
+                moved,
+                catalog,
+                &expression.source,
+                cleanup_captures,
+            )?;
             if moved.is_unreadable(place) {
                 return defect("lowered read uses a LocalId after it was moved");
             }
@@ -4696,15 +4847,34 @@ fn verify_expression_artifact(
             }
             expression.type_.clone()
         }
+        ExpressionKind::CleanupCapture(ordinal) => {
+            let capture = cleanup_captures
+                .and_then(|captures| captures.get(ordinal))
+                .ok_or_else(|| VerificationFailure::Defect {
+                    evidence: Arc::from(
+                        "cleanup capture reference appears outside its verified action",
+                    ),
+                })?;
+            if expression.type_id != capture.expression.type_id
+                || expression.type_ != capture.expression.type_
+                || expression.coerced_from != capture.expression.coerced_from
+                || expression.access != capture.expression.access
+                || expression.source != capture.expression.source
+            {
+                return defect("cleanup capture substitution metadata is inconsistent");
+            }
+            capture.expression.type_.clone()
+        }
         ExpressionKind::Call { target, arguments } => {
             verify_artifact_call_custody(arguments)?;
             let callable_type = if let CallTarget::Callable { value } = target {
-                Some(verify_expression_artifact(
+                Some(verify_expression_artifact_with_cleanup(
                     value,
                     locals,
                     moved,
                     catalog,
                     &expression.source,
+                    cleanup_captures,
                 )?)
             } else {
                 None
@@ -4712,7 +4882,14 @@ fn verify_expression_artifact(
             let argument_types = arguments
                 .iter()
                 .map(|argument| {
-                    verify_expression_artifact(argument, locals, moved, catalog, &expression.source)
+                    verify_expression_artifact_with_cleanup(
+                        argument,
+                        locals,
+                        moved,
+                        catalog,
+                        &expression.source,
+                        cleanup_captures,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             match target {
@@ -5035,8 +5212,14 @@ fn verify_expression_artifact(
                 return defect("array literal length disagrees with its fixed-array type");
             }
             for value in &**values {
-                let actual =
-                    verify_expression_artifact(value, locals, moved, catalog, &expression.source)?;
+                let actual = verify_expression_artifact_with_cleanup(
+                    value,
+                    locals,
+                    moved,
+                    catalog,
+                    &expression.source,
+                    cleanup_captures,
+                )?;
                 if actual != **element {
                     return defect("array element disagrees with aggregate type");
                 }
@@ -5054,8 +5237,14 @@ fn verify_expression_artifact(
             if Some(*length) != type_length.value() {
                 return defect("repeated array length disagrees with its fixed-array type");
             }
-            let actual =
-                verify_expression_artifact(value, locals, moved, catalog, &expression.source)?;
+            let actual = verify_expression_artifact_with_cleanup(
+                value,
+                locals,
+                moved,
+                catalog,
+                &expression.source,
+                cleanup_captures,
+            )?;
             if actual != **element {
                 return defect("repeated array element disagrees with aggregate type");
             }
@@ -5065,16 +5254,35 @@ fn verify_expression_artifact(
             values
                 .iter()
                 .map(|value| {
-                    verify_expression_artifact(value, locals, moved, catalog, &expression.source)
+                    verify_expression_artifact_with_cleanup(
+                        value,
+                        locals,
+                        moved,
+                        catalog,
+                        &expression.source,
+                        cleanup_captures,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?
                 .into(),
         ),
         ExpressionKind::Index { value, index } => {
-            let value_type =
-                verify_expression_artifact(value, locals, moved, catalog, &expression.source)?;
-            let index_type =
-                verify_expression_artifact(index, locals, moved, catalog, &expression.source)?;
+            let value_type = verify_expression_artifact_with_cleanup(
+                value,
+                locals,
+                moved,
+                catalog,
+                &expression.source,
+                cleanup_captures,
+            )?;
+            let index_type = verify_expression_artifact_with_cleanup(
+                index,
+                locals,
+                moved,
+                catalog,
+                &expression.source,
+                cleanup_captures,
+            )?;
             if !matches!(index_type, Type::Integer(_)) {
                 return defect("array index is not an integer");
             }
@@ -5085,16 +5293,28 @@ fn verify_expression_artifact(
             (*element).clone()
         }
         ExpressionKind::Positive(value) => {
-            let type_ =
-                verify_expression_artifact(value, locals, moved, catalog, &expression.source)?;
+            let type_ = verify_expression_artifact_with_cleanup(
+                value,
+                locals,
+                moved,
+                catalog,
+                &expression.source,
+                cleanup_captures,
+            )?;
             if !type_.is_numeric() {
                 return defect("positive operand is not numeric");
             }
             type_
         }
         ExpressionKind::Negate(value) => {
-            let type_ =
-                verify_expression_artifact(value, locals, moved, catalog, &expression.source)?;
+            let type_ = verify_expression_artifact_with_cleanup(
+                value,
+                locals,
+                moved,
+                catalog,
+                &expression.source,
+                cleanup_captures,
+            )?;
             if !matches!(
                 &type_,
                 Type::Integer(kind) if kind.is_signed()
@@ -5105,16 +5325,28 @@ fn verify_expression_artifact(
             type_
         }
         ExpressionKind::BitNot(value) => {
-            let type_ =
-                verify_expression_artifact(value, locals, moved, catalog, &expression.source)?;
+            let type_ = verify_expression_artifact_with_cleanup(
+                value,
+                locals,
+                moved,
+                catalog,
+                &expression.source,
+                cleanup_captures,
+            )?;
             if !matches!(type_, Type::Integer(_)) {
                 return defect("bitwise-not operand is not an integer");
             }
             type_
         }
         ExpressionKind::Not(value) => {
-            let type_ =
-                verify_expression_artifact(value, locals, moved, catalog, &expression.source)?;
+            let type_ = verify_expression_artifact_with_cleanup(
+                value,
+                locals,
+                moved,
+                catalog,
+                &expression.source,
+                cleanup_captures,
+            )?;
             if type_ != Type::Bool {
                 return defect("not operand is not Bool");
             }
@@ -5124,11 +5356,24 @@ fn verify_expression_artifact(
             if call_loan(value).is_some() {
                 return defect("lowered await holds a Resource loan across suspension");
             }
-            verify_expression_artifact(value, locals, moved, catalog, &expression.source)?
+            verify_expression_artifact_with_cleanup(
+                value,
+                locals,
+                moved,
+                catalog,
+                &expression.source,
+                cleanup_captures,
+            )?
         }
         ExpressionKind::Propagate(value) => {
-            let propagated =
-                verify_expression_artifact(value, locals, moved, catalog, &expression.source)?;
+            let propagated = verify_expression_artifact_with_cleanup(
+                value,
+                locals,
+                moved,
+                catalog,
+                &expression.source,
+                cleanup_captures,
+            )?;
             let success = match propagated {
                 Type::Result { success, .. } | Type::Option(success) => success,
                 _ => return defect("lowered propagation operand is not Result or Option"),
@@ -5136,8 +5381,14 @@ fn verify_expression_artifact(
             (*success).clone()
         }
         ExpressionKind::Is { value, pattern } => {
-            let value =
-                verify_expression_artifact(value, locals, moved, catalog, &expression.source)?;
+            let value = verify_expression_artifact_with_cleanup(
+                value,
+                locals,
+                moved,
+                catalog,
+                &expression.source,
+                cleanup_captures,
+            )?;
             let mut pattern_locals = locals.clone();
             verify_match_pattern_artifact(pattern, &value, &mut pattern_locals, catalog)?;
             if !match_pattern_binding_signature(pattern).is_empty() {
@@ -5150,10 +5401,22 @@ fn verify_expression_artifact(
             left,
             right,
         } => {
-            let left =
-                verify_expression_artifact(left, locals, moved, catalog, &expression.source)?;
-            let right =
-                verify_expression_artifact(right, locals, moved, catalog, &expression.source)?;
+            let left = verify_expression_artifact_with_cleanup(
+                left,
+                locals,
+                moved,
+                catalog,
+                &expression.source,
+                cleanup_captures,
+            )?;
+            let right = verify_expression_artifact_with_cleanup(
+                right,
+                locals,
+                moved,
+                catalog,
+                &expression.source,
+                cleanup_captures,
+            )?;
             binary_type(*operator, &left, &right).ok_or_else(|| VerificationFailure::Defect {
                 evidence: Arc::from("binary operation operands are not well typed"),
             })?
@@ -6523,13 +6786,14 @@ impl<'a> Lowerer<'a> {
                             range,
                         );
                     }
-                    if let ExpressionKind::Call { arguments, .. } = &expression.kind
-                        && let Some(argument) = arguments.iter().find(|argument| {
-                            matches!(argument.access, AccessMode::Read | AccessMode::Mut)
-                                && self.type_owns_resource(&argument.type_)
-                        })
-                    {
-                        let place = root_place(argument).ok_or_else(|| {
+                    if self.cleanup_has_conditional_resource_move(&expression) {
+                        return creator(
+                            CreatorFailureKind::CleanupResourceCaptureRequiresCall,
+                            range,
+                        );
+                    }
+                    if let Some(argument) = self.cleanup_resource_loan(&expression) {
+                        let place = root_place(&argument).ok_or_else(|| {
                             creator_value(CreatorFailureKind::LoanAcrossCleanup, &argument.source)
                         })?;
                         return Err(self.custody_failure(
@@ -6540,25 +6804,12 @@ impl<'a> Lowerer<'a> {
                             Some(argument.source.clone()),
                         ));
                     }
-                    let action = match &expression.kind {
-                        ExpressionKind::Call { target, arguments } => CleanupAction::Call {
-                            callable_mode: matches!(target, CallTarget::Callable { .. })
-                                .then_some(CleanupOperandMode::EvaluateAtExit),
-                            argument_modes: arguments
-                                .iter()
-                                .map(|argument| {
-                                    if argument.access == AccessMode::Move
-                                        && self.type_owns_resource(&argument.type_)
-                                    {
-                                        CleanupOperandMode::CaptureResourceAtRegistration
-                                    } else {
-                                        CleanupOperandMode::EvaluateAtExit
-                                    }
-                                })
-                                .collect(),
-                            expression,
-                        },
-                        _ => CleanupAction::Expression(expression),
+                    let mut captures = Vec::new();
+                    let expression =
+                        self.normalize_cleanup_expression(expression, &mut captures)?;
+                    let action = CleanupAction {
+                        expression,
+                        captures: captures.into(),
                     };
                     Statement::Defer {
                         action,
@@ -7899,6 +8150,182 @@ impl<'a> Lowerer<'a> {
             found |= self.expression_contains_resource_move(child);
         });
         found
+    }
+
+    fn cleanup_resource_loan(&self, expression: &Expression) -> Option<Expression> {
+        if matches!(expression.access, AccessMode::Read | AccessMode::Mut)
+            && self.type_owns_resource(&expression.type_)
+        {
+            return Some(expression.clone());
+        }
+        if matches!(expression.kind, ExpressionKind::Closure(_)) {
+            return None;
+        }
+        let mut found = None;
+        expression.visit_children(&mut |child| {
+            if found.is_none() {
+                found = self.cleanup_resource_loan(child);
+            }
+        });
+        found
+    }
+
+    fn cleanup_has_conditional_resource_move(&self, expression: &Expression) -> bool {
+        if let ExpressionKind::Binary {
+            operator: BinaryOperator::And | BinaryOperator::Or,
+            left,
+            right,
+        } = &expression.kind
+        {
+            return self.expression_contains_resource_move(right)
+                || self.cleanup_has_conditional_resource_move(left)
+                || self.cleanup_has_conditional_resource_move(right);
+        }
+        if matches!(expression.kind, ExpressionKind::Closure(_)) {
+            return false;
+        }
+        let mut found = false;
+        expression.visit_children(&mut |child| {
+            found |= self.cleanup_has_conditional_resource_move(child);
+        });
+        found
+    }
+
+    fn normalize_cleanup_expression(
+        &self,
+        expression: Expression,
+        captures: &mut Vec<CleanupCapture>,
+    ) -> Result<Expression, VerificationFailure> {
+        if expression.access == AccessMode::Move && self.type_owns_resource(&expression.type_) {
+            let ordinal = CleanupCaptureOrdinal(u32::try_from(captures.len()).map_err(|_| {
+                VerificationFailure::Defect {
+                    evidence: Arc::from("cleanup capture ordinal exceeds artifact limits"),
+                }
+            })?);
+            let replacement = Expression {
+                kind: ExpressionKind::CleanupCapture(ordinal),
+                type_id: expression.type_id,
+                type_: expression.type_.clone(),
+                coerced_from: expression.coerced_from.clone(),
+                access: expression.access,
+                source: expression.source.clone(),
+            };
+            captures.push(CleanupCapture {
+                ordinal,
+                expression,
+            });
+            return Ok(replacement);
+        }
+
+        let Expression {
+            kind,
+            type_id,
+            type_,
+            coerced_from,
+            access,
+            source,
+        } = expression;
+        let kind = match kind {
+            ExpressionKind::Read(mut place) => {
+                place.projections = place
+                    .projections
+                    .iter()
+                    .cloned()
+                    .map(|projection| match projection {
+                        PlaceProjection::Index { index, type_ } => Ok(PlaceProjection::Index {
+                            index: Box::new(self.normalize_cleanup_expression(*index, captures)?),
+                            type_,
+                        }),
+                        projection => Ok(projection),
+                    })
+                    .collect::<Result<Vec<_>, VerificationFailure>>()?
+                    .into();
+                ExpressionKind::Read(place)
+            }
+            ExpressionKind::Call { target, arguments } => {
+                let target = match target {
+                    CallTarget::Callable { value } => CallTarget::Callable {
+                        value: Box::new(self.normalize_cleanup_expression(*value, captures)?),
+                    },
+                    target => target,
+                };
+                let arguments = arguments
+                    .iter()
+                    .cloned()
+                    .map(|argument| self.normalize_cleanup_expression(argument, captures))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into();
+                ExpressionKind::Call { target, arguments }
+            }
+            ExpressionKind::Array(values) => ExpressionKind::Array(
+                values
+                    .iter()
+                    .cloned()
+                    .map(|value| self.normalize_cleanup_expression(value, captures))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into(),
+            ),
+            ExpressionKind::Tuple(values) => ExpressionKind::Tuple(
+                values
+                    .iter()
+                    .cloned()
+                    .map(|value| self.normalize_cleanup_expression(value, captures))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into(),
+            ),
+            ExpressionKind::RepeatedArray { value, length } => ExpressionKind::RepeatedArray {
+                value: Box::new(self.normalize_cleanup_expression(*value, captures)?),
+                length,
+            },
+            ExpressionKind::Index { value, index } => ExpressionKind::Index {
+                value: Box::new(self.normalize_cleanup_expression(*value, captures)?),
+                index: Box::new(self.normalize_cleanup_expression(*index, captures)?),
+            },
+            ExpressionKind::Positive(value) => ExpressionKind::Positive(Box::new(
+                self.normalize_cleanup_expression(*value, captures)?,
+            )),
+            ExpressionKind::Negate(value) => ExpressionKind::Negate(Box::new(
+                self.normalize_cleanup_expression(*value, captures)?,
+            )),
+            ExpressionKind::BitNot(value) => ExpressionKind::BitNot(Box::new(
+                self.normalize_cleanup_expression(*value, captures)?,
+            )),
+            ExpressionKind::Not(value) => ExpressionKind::Not(Box::new(
+                self.normalize_cleanup_expression(*value, captures)?,
+            )),
+            ExpressionKind::Await(value) => ExpressionKind::Await(Box::new(
+                self.normalize_cleanup_expression(*value, captures)?,
+            )),
+            ExpressionKind::Propagate(value) => ExpressionKind::Propagate(Box::new(
+                self.normalize_cleanup_expression(*value, captures)?,
+            )),
+            ExpressionKind::Is { value, pattern } => ExpressionKind::Is {
+                value: Box::new(self.normalize_cleanup_expression(*value, captures)?),
+                pattern,
+            },
+            ExpressionKind::Binary {
+                operator,
+                left,
+                right,
+            } => ExpressionKind::Binary {
+                operator,
+                left: Box::new(self.normalize_cleanup_expression(*left, captures)?),
+                right: Box::new(self.normalize_cleanup_expression(*right, captures)?),
+            },
+            kind @ (ExpressionKind::Literal(_)
+            | ExpressionKind::Constant(_)
+            | ExpressionKind::FunctionValue { .. }
+            | ExpressionKind::Closure(_)
+            | ExpressionKind::CleanupCapture(_)) => kind,
+        };
+        Ok(Expression {
+            kind,
+            type_id,
+            type_,
+            coerced_from,
+            access,
+            source,
+        })
     }
 
     fn validate_binary_capability(
@@ -10945,31 +11372,14 @@ fn append_statements(bytes: &mut impl ByteSink, statements: &[Statement]) {
                 bytes.push(15);
                 append_range(bytes, source);
                 append_expression(bytes, action.expression());
-                match action {
-                    CleanupAction::Expression(_) => bytes.push(0),
-                    CleanupAction::Call {
-                        callable_mode,
-                        argument_modes,
-                        ..
-                    } => {
-                        bytes.push(1);
-                        bytes.push(match callable_mode {
-                            None => 0,
-                            Some(CleanupOperandMode::EvaluateAtExit) => 1,
-                            Some(CleanupOperandMode::CaptureResourceAtRegistration) => 2,
-                        });
-                        bytes.extend_from_slice(
-                            &u64::try_from(argument_modes.len())
-                                .unwrap_or(u64::MAX)
-                                .to_be_bytes(),
-                        );
-                        for mode in argument_modes.iter() {
-                            bytes.push(match mode {
-                                CleanupOperandMode::EvaluateAtExit => 0,
-                                CleanupOperandMode::CaptureResourceAtRegistration => 1,
-                            });
-                        }
-                    }
+                bytes.extend_from_slice(
+                    &u64::try_from(action.captures.len())
+                        .unwrap_or(u64::MAX)
+                        .to_be_bytes(),
+                );
+                for capture in action.captures.iter() {
+                    bytes.extend_from_slice(&capture.ordinal.0.to_be_bytes());
+                    append_expression(bytes, &capture.expression);
                 }
             }
             Statement::WithPool {
@@ -11086,6 +11496,10 @@ fn append_expression(bytes: &mut impl ByteSink, expression: &Expression) {
             }
             append_part(bytes, &closure.return_type.canonical_key());
             append_expression(bytes, &closure.body);
+        }
+        ExpressionKind::CleanupCapture(ordinal) => {
+            bytes.push(19);
+            bytes.extend_from_slice(&ordinal.0.to_be_bytes());
         }
         ExpressionKind::Call { target, arguments } => {
             bytes.push(3);
@@ -12156,14 +12570,20 @@ mod tests {
         let owner = SourceRange::from_u64("src/image.wr", 0, 10);
         let source = SourceRange::from_u64("src/image.wr", 1, 2);
         let local = LocalId(1);
+        let second_local = LocalId(4);
         let resource = pool_owned_bool();
         let mut identities = crate::identity::IdentityCatalog::empty();
         let resource_id = identities
             .intern_type(&resource)
             .expect("Resource-owning type interns");
         let unit_id = identities.intern_type(&Type::Unit).expect("Unit interns");
+        let bool_id = identities.intern_type(&Type::Bool).expect("Bool interns");
         let tuple_type = Type::Tuple(Arc::from([Type::Unit, Type::Unit]));
         let tuple_id = identities.intern_type(&tuple_type).expect("tuple interns");
+        let resource_tuple_type = Type::Tuple(Arc::from([resource.clone(), resource.clone()]));
+        let resource_tuple_id = identities
+            .intern_type(&resource_tuple_type)
+            .expect("Resource tuple interns");
         let callable_local = LocalId(3);
         let callable_type = Type::Function {
             parameters: Arc::from([]),
@@ -12237,7 +12657,7 @@ mod tests {
             interfaces: &interfaces,
             discharge_laws: None,
         };
-        let read = |access| Expression {
+        let read_from = |local, access| Expression {
             kind: ExpressionKind::Read(Place::local(local)),
             type_id: resource_id,
             type_: resource.clone(),
@@ -12245,6 +12665,7 @@ mod tests {
             access,
             source: source.clone(),
         };
+        let read = |access| read_from(local, access);
         let call = |index: usize, argument: Expression| {
             let type_ = returns[index].clone();
             let type_id = if type_ == Type::Unit {
@@ -12296,6 +12717,13 @@ mod tests {
                             type_: callable_type.clone(),
                         },
                     ),
+                    (
+                        second_local,
+                        ArtifactLocalType {
+                            type_id: resource_id,
+                            type_: resource.clone(),
+                        },
+                    ),
                 ]),
                 &mut MoveState::default(),
                 &mut Vec::new(),
@@ -12311,84 +12739,208 @@ mod tests {
             Err(VerificationFailure::Defect { evidence }) => evidence,
             other => panic!("expected a contained verifier defect, got {other:?}"),
         };
+        let slot = |capture: &Expression, ordinal| Expression {
+            kind: ExpressionKind::CleanupCapture(CleanupCaptureOrdinal(ordinal)),
+            type_id: capture.type_id,
+            type_: capture.type_.clone(),
+            coerced_from: capture.coerced_from.clone(),
+            access: capture.access,
+            source: capture.source.clone(),
+        };
+        let capture = |ordinal, expression| CleanupCapture {
+            ordinal: CleanupCaptureOrdinal(ordinal),
+            expression,
+        };
 
+        let resource_result = read(AccessMode::Move);
         assert_eq!(
-            evidence(verify_action(CleanupAction::Call {
-                expression: call(2, read(AccessMode::Move)),
-                callable_mode: None,
-                argument_modes: Arc::from([CleanupOperandMode::CaptureResourceAtRegistration,]),
+            evidence(verify_action(CleanupAction {
+                expression: call(2, slot(&resource_result, 0)),
+                captures: Arc::from([capture(0, resource_result)]),
             }))
             .as_ref(),
             "lowered cleanup action leaves a Resource result undisposed"
         );
-        let hidden_call = call(0, read(AccessMode::Move));
+        let hidden_resource = read(AccessMode::Move);
+        let hidden_call = call(0, slot(&hidden_resource, 0));
         assert_eq!(
-            evidence(verify_action(CleanupAction::Expression(Expression {
-                kind: ExpressionKind::Tuple(Arc::from([
-                    hidden_call,
-                    Expression {
-                        kind: ExpressionKind::Literal(Literal::Unit),
-                        type_id: unit_id,
-                        type_: Type::Unit,
-                        coerced_from: None,
-                        access: AccessMode::Copy,
-                        source: source.clone(),
-                    },
-                ])),
-                type_id: tuple_id,
-                type_: tuple_type,
-                coerced_from: None,
-                access: AccessMode::Copy,
-                source: source.clone(),
-            })))
+            evidence(verify_action(CleanupAction {
+                expression: Expression {
+                    kind: ExpressionKind::Tuple(Arc::from([
+                        hidden_call,
+                        Expression {
+                            kind: ExpressionKind::Literal(Literal::Unit),
+                            type_id: unit_id,
+                            type_: Type::Unit,
+                            coerced_from: None,
+                            access: AccessMode::Copy,
+                            source: source.clone(),
+                        },
+                    ])),
+                    type_id: tuple_id,
+                    type_: tuple_type.clone(),
+                    coerced_from: None,
+                    access: AccessMode::Copy,
+                    source: source.clone(),
+                },
+                captures: Arc::from([capture(0, hidden_resource)]),
+            }))
             .as_ref(),
             "lowered non-call cleanup expression captures Resource custody"
         );
         assert_eq!(
-            evidence(verify_action(CleanupAction::Call {
+            evidence(verify_action(CleanupAction {
                 expression: call(1, read(AccessMode::Read)),
-                callable_mode: None,
-                argument_modes: Arc::from([CleanupOperandMode::EvaluateAtExit]),
+                captures: Arc::from([]),
             }))
             .as_ref(),
             "lowered cleanup action retains a Resource loan"
         );
+
+        let missing = read(AccessMode::Move);
         assert_eq!(
-            evidence(verify_action(CleanupAction::Call {
-                expression: call(0, read(AccessMode::Move)),
-                callable_mode: None,
-                argument_modes: Arc::from([CleanupOperandMode::EvaluateAtExit]),
-            }))
-            .as_ref(),
-            "lowered cleanup operand timing disagrees with custody"
-        );
-        assert_eq!(
-            evidence(verify_action(CleanupAction::Call {
+            evidence(verify_action(CleanupAction {
                 expression: Expression {
-                    kind: ExpressionKind::Call {
-                        target: CallTarget::Callable {
-                            value: Box::new(Expression {
-                                kind: ExpressionKind::Read(Place::local(callable_local)),
-                                type_id: callable_id,
-                                type_: callable_type.clone(),
-                                coerced_from: None,
-                                access: AccessMode::Copy,
-                                source: source.clone(),
-                            }),
-                        },
-                        arguments: Arc::from([]),
-                    },
+                    kind: ExpressionKind::Literal(Literal::Unit),
                     type_id: unit_id,
                     type_: Type::Unit,
                     coerced_from: None,
                     access: AccessMode::Copy,
                     source: source.clone(),
                 },
-                callable_mode: Some(CleanupOperandMode::CaptureResourceAtRegistration),
-                argument_modes: Arc::from([]),
+                captures: Arc::from([capture(0, missing)]),
             }))
             .as_ref(),
-            "lowered cleanup callable timing disagrees with its call target"
+            "lowered cleanup capture coverage has missing or extra references"
+        );
+
+        let extra = read(AccessMode::Move);
+        assert_eq!(
+            evidence(verify_action(CleanupAction {
+                expression: slot(&extra, 0),
+                captures: Arc::from([]),
+            }))
+            .as_ref(),
+            "lowered cleanup capture coverage has missing or extra references"
+        );
+
+        let first = read_from(local, AccessMode::Move);
+        let second = read_from(second_local, AccessMode::Move);
+        assert_eq!(
+            evidence(verify_action(CleanupAction {
+                expression: Expression {
+                    kind: ExpressionKind::Tuple(Arc::from([slot(&first, 0), slot(&second, 0),])),
+                    type_id: resource_tuple_id,
+                    type_: resource_tuple_type,
+                    coerced_from: None,
+                    access: AccessMode::Move,
+                    source: source.clone(),
+                },
+                captures: Arc::from([capture(0, first), capture(1, second)]),
+            }))
+            .as_ref(),
+            "lowered cleanup capture references are not in canonical order"
+        );
+
+        let noncanonical = read(AccessMode::Move);
+        assert_eq!(
+            evidence(verify_action(CleanupAction {
+                expression: slot(&noncanonical, 1),
+                captures: Arc::from([capture(1, noncanonical)]),
+            }))
+            .as_ref(),
+            "lowered cleanup capture ordinals are not canonical"
+        );
+
+        let data_capture = Expression {
+            kind: ExpressionKind::Literal(Literal::Unit),
+            type_id: unit_id,
+            type_: Type::Unit,
+            coerced_from: None,
+            access: AccessMode::Copy,
+            source: source.clone(),
+        };
+        assert_eq!(
+            evidence(verify_action(CleanupAction {
+                expression: slot(&data_capture, 0),
+                captures: Arc::from([capture(0, data_capture)]),
+            }))
+            .as_ref(),
+            "lowered cleanup registration captures a non-Resource expression"
+        );
+
+        let metadata_capture = read(AccessMode::Move);
+        let mut wrong_metadata = slot(&metadata_capture, 0);
+        wrong_metadata.access = AccessMode::Copy;
+        assert_eq!(
+            evidence(verify_action(CleanupAction {
+                expression: wrong_metadata,
+                captures: Arc::from([capture(0, metadata_capture)]),
+            }))
+            .as_ref(),
+            "cleanup capture substitution metadata is inconsistent"
+        );
+
+        let type_capture = read(AccessMode::Move);
+        let mut wrong_type = slot(&type_capture, 0);
+        wrong_type.type_id = bool_id;
+        wrong_type.type_ = Type::Bool;
+        assert_eq!(
+            evidence(verify_action(CleanupAction {
+                expression: wrong_type,
+                captures: Arc::from([capture(0, type_capture)]),
+            }))
+            .as_ref(),
+            "cleanup capture substitution metadata is inconsistent"
+        );
+
+        let provenance_capture = read(AccessMode::Move);
+        let mut wrong_provenance = slot(&provenance_capture, 0);
+        wrong_provenance.source = SourceRange::from_u64("src/image.wr", 2, 3);
+        assert_eq!(
+            evidence(verify_action(CleanupAction {
+                expression: wrong_provenance,
+                captures: Arc::from([capture(0, provenance_capture)]),
+            }))
+            .as_ref(),
+            "cleanup capture substitution metadata is inconsistent"
+        );
+
+        assert_eq!(
+            evidence(verify_action(CleanupAction {
+                expression: call(0, read(AccessMode::Move)),
+                captures: Arc::from([]),
+            }))
+            .as_ref(),
+            "lowered cleanup expression retains an uncaptured Resource move"
+        );
+
+        let conditional = read(AccessMode::Move);
+        assert_eq!(
+            evidence(verify_action(CleanupAction {
+                expression: Expression {
+                    kind: ExpressionKind::Binary {
+                        operator: BinaryOperator::And,
+                        left: Box::new(Expression {
+                            kind: ExpressionKind::Literal(Literal::Bool(false)),
+                            type_id: bool_id,
+                            type_: Type::Bool,
+                            coerced_from: None,
+                            access: AccessMode::Copy,
+                            source: source.clone(),
+                        }),
+                        right: Box::new(slot(&conditional, 0)),
+                    },
+                    type_id: bool_id,
+                    type_: Type::Bool,
+                    coerced_from: None,
+                    access: AccessMode::Copy,
+                    source: source.clone(),
+                },
+                captures: Arc::from([capture(0, conditional)]),
+            }))
+            .as_ref(),
+            "lowered cleanup capture reference is not unconditionally evaluated"
         );
     }
 }

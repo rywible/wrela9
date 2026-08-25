@@ -3331,6 +3331,133 @@ fn build() -> Image:
 }
 
 #[test]
+fn deferred_cleanup_captures_a_resource_nested_inside_a_data_operand() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn into_id(take ticket: Ticket) -> i64:
+    id = ticket.id
+    consume(take ticket)
+    return id
+
+fn cleanup(value: i64):
+    if value != 1:
+        panic "cleanup observed the reinitialized Resource"
+
+fn run():
+    ticket = Ticket(id=1)
+    defer cleanup(into_id(take ticket))
+    ticket = Ticket(id=2)
+    consume(take ticket)
+
+const VALUE: () = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "nested Resource custody must be captured before exit-time Data evaluation: {outcome:#?}"
+    );
+}
+
+#[test]
+fn deferred_cleanup_captures_multiple_nested_resources_in_source_order() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn into_id(take ticket: Ticket) -> i64:
+    id = ticket.id
+    consume(take ticket)
+    return id
+
+fn cleanup(first: i64, second: i64):
+    if first != 1:
+        panic "first nested capture used the wrong slot"
+    if second != 2:
+        panic "second nested capture used the wrong slot"
+
+fn run():
+    first = Ticket(id=1)
+    second = Ticket(id=2)
+    defer cleanup(into_id(take first), into_id(take second))
+    first = Ticket(id=3)
+    second = Ticket(id=4)
+    consume(take first)
+    consume(take second)
+
+const VALUE: () = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "nested captures must retain distinct source-ordered slots: {outcome:#?}"
+    );
+}
+
+#[test]
+fn nested_resource_capture_failures_follow_left_to_right_registration_order() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn first() -> Ticket:
+    panic "first registration capture"
+
+fn second() -> Ticket:
+    panic "second registration capture"
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn into_id(take ticket: Ticket) -> i64:
+    id = ticket.id
+    consume(take ticket)
+    return id
+
+fn cleanup(first: i64, second: i64):
+    pass
+
+fn run():
+    defer cleanup(into_id(first()), into_id(second()))
+    panic "body panic"
+
+const VALUE: () = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("the first registration capture must Panic");
+    };
+    let diagnostic = rejected
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.code() == "evaluation.panicked")
+        .expect("registration capture Panic diagnostic");
+    let expected = source
+        .windows(b"    panic \"first registration capture\"".len())
+        .position(|window| window == b"    panic \"first registration capture\"")
+        .expect("first registration capture site");
+    assert_eq!(diagnostic.primary().start(), expected as u64);
+}
+
+#[test]
 fn typed_hir_fingerprint_includes_literal_payloads_and_operations() {
     fn fingerprint(value: i32, operator: &str) -> u128 {
         let source = format!(

@@ -143,7 +143,9 @@ fn scan_definition(statements: &[Statement]) -> DefinitionFlowFacts {
                 }
                 | Statement::Evaluate(value) => visit_expression(value, facts, locals),
                 Statement::Defer { action, .. } => {
-                    visit_expression(action.expression(), facts, locals)
+                    action.visit_expressions(&mut |expression| {
+                        visit_expression(expression, facts, locals);
+                    });
                 }
                 Statement::Initialize { place, value, .. }
                 | Statement::Assign { place, value, .. } => {
@@ -441,7 +443,9 @@ fn walk_statements(statements: &[Statement], facts: &mut FlowFacts) {
             | Statement::Initialize { value, .. }
             | Statement::Assign { value, .. }
             | Statement::Evaluate(value) => walk_expression(value, facts),
-            Statement::Defer { action, .. } => walk_expression(action.expression(), facts),
+            Statement::Defer { action, .. } => {
+                action.visit_expressions(&mut |expression| walk_expression(expression, facts));
+            }
             Statement::If {
                 condition: value,
                 then_branch,

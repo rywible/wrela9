@@ -90,11 +90,32 @@ impl PlaceKey {
                 _ => false,
             })
     }
+
+    fn covers(&self, other: &Self) -> bool {
+        self.local == other.local
+            && self.projections.len() <= other.projections.len()
+            && self
+                .projections
+                .iter()
+                .zip(other.projections.iter())
+                .all(|(left, right)| match (left, right) {
+                    (
+                        ProjectionKey::Field(left_owner, left),
+                        ProjectionKey::Field(right_owner, right),
+                    ) => left_owner == right_owner && left == right,
+                    (ProjectionKey::Index(Some(left)), ProjectionKey::Index(Some(right))) => {
+                        left == right
+                    }
+                    (ProjectionKey::Index(_), ProjectionKey::Index(_)) => true,
+                    _ => false,
+                })
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 struct MoveState {
     places: BTreeSet<PlaceKey>,
+    origins: BTreeMap<PlaceKey, SourceRange>,
 }
 
 impl MoveState {
@@ -110,10 +131,32 @@ impl MoveState {
         self.places.insert(PlaceKey::from_place(place))
     }
 
+    fn move_place_at(&mut self, place: &Place, source: &SourceRange) -> bool {
+        if !self.move_place(place) {
+            return false;
+        }
+        self.origins
+            .insert(PlaceKey::from_place(place), source.clone());
+        true
+    }
+
+    fn origin(&self, place: &Place) -> Option<&SourceRange> {
+        let place = PlaceKey::from_place(place);
+        self.origins
+            .iter()
+            .find_map(|(moved, source)| moved.conflicts(&place).then_some(source))
+    }
+
+    fn is_uninitialized(&self, place: &Place) -> bool {
+        let place = PlaceKey::from_place(place);
+        self.places.iter().any(|moved| moved.covers(&place))
+    }
+
     fn restore_place(&mut self, place: &Place) -> bool {
         let place = PlaceKey::from_place(place);
         let before = self.places.len();
         self.places.retain(|moved| !moved.conflicts(&place));
+        self.origins.retain(|moved, _| !moved.conflicts(&place));
         before != self.places.len()
     }
 
@@ -127,6 +170,23 @@ impl MoveState {
 
     fn extend(&mut self, other: Self) {
         self.places.extend(other.places);
+        for (place, source) in other.origins {
+            self.origins.entry(place).or_insert(source);
+        }
+    }
+
+    fn mismatch(&self, other: &Self) -> Option<(PlaceKey, Option<SourceRange>)> {
+        let place = self
+            .places
+            .symmetric_difference(&other.places)
+            .next()?
+            .clone();
+        let origin = self
+            .origins
+            .get(&place)
+            .or_else(|| other.origins.get(&place))
+            .cloned();
+        Some((place, origin))
     }
 }
 
@@ -797,6 +857,9 @@ pub(crate) enum CreatorFailureKind {
     InvalidIntegerLiteral,
     InvalidFloatLiteral,
     ReadAfterMove,
+    LoanConflict,
+    LoanAcrossSuspension,
+    CustodyJoinMismatch,
     ImmutableReassignment,
     DuplicateLocal,
     AwaitRequiresAsync,
@@ -815,6 +878,7 @@ pub(crate) enum CreatorFailureKind {
     UnreachableMatchCase,
     UnresolvedType,
     ResourceRequiresTake,
+    ResourceReplacementRequiresDischarge,
     MustUseValue,
 }
 
@@ -841,6 +905,9 @@ impl CreatorFailureKind {
             Self::InvalidIntegerLiteral => "semantic.invalid_integer_literal",
             Self::InvalidFloatLiteral => "semantic.invalid_float_literal",
             Self::ReadAfterMove => "semantic.read_after_move",
+            Self::LoanConflict => "semantic.loan_conflict",
+            Self::LoanAcrossSuspension => "semantic.loan_across_suspension",
+            Self::CustodyJoinMismatch => "semantic.custody_join_mismatch",
             Self::ImmutableReassignment => "semantic.immutable_reassignment",
             Self::DuplicateLocal => "semantic.duplicate_local",
             Self::AwaitRequiresAsync => "semantic.await_requires_async",
@@ -859,6 +926,9 @@ impl CreatorFailureKind {
             Self::UnreachableMatchCase => "semantic.unreachable_match_case",
             Self::UnresolvedType => "semantic.unresolved_type",
             Self::ResourceRequiresTake => "semantic.resource_requires_take",
+            Self::ResourceReplacementRequiresDischarge => {
+                "semantic.resource_replacement_requires_discharge"
+            }
             Self::MustUseValue => "semantic.must_use_value",
         }
     }
@@ -869,6 +939,13 @@ pub(crate) enum VerificationFailure {
     Creator {
         kind: CreatorFailureKind,
         site: SourceRange,
+    },
+    Custody {
+        kind: CreatorFailureKind,
+        site: SourceRange,
+        subject: Arc<str>,
+        state: Arc<str>,
+        related: Option<SourceRange>,
     },
     Defect {
         evidence: Arc<str>,
@@ -4059,7 +4136,13 @@ impl<'a> Lowerer<'a> {
                         (operator, lowered_place.as_ref())
                     {
                         if self.moved.is_unreadable(place) {
-                            return creator(CreatorFailureKind::ReadAfterMove, range);
+                            return Err(custody_value(
+                                CreatorFailureKind::ReadAfterMove,
+                                range,
+                                self.place_subject(place),
+                                "moved",
+                                self.moved.origin(place).cloned(),
+                            ));
                         }
                         let left = self.finish_expression(
                             ExpressionKind::Read(place.clone()),
@@ -4108,9 +4191,20 @@ impl<'a> Lowerer<'a> {
                         if !can_initialize(&value.type_, &type_) {
                             return creator(CreatorFailureKind::ArgumentTypeMismatch, range);
                         }
-                        if !writable && !self.moved.restore_place(&place) {
+                        let uninitialized = self.moved.is_uninitialized(&place);
+                        if self.type_owns_resource(&type_) && !uninitialized {
+                            return Err(custody_value(
+                                CreatorFailureKind::ResourceReplacementRequiresDischarge,
+                                range,
+                                self.place_subject(&place),
+                                "initialized",
+                                None,
+                            ));
+                        }
+                        if !writable && !uninitialized {
                             return creator(CreatorFailureKind::ImmutableReassignment, range);
                         }
+                        self.moved.restore_place(&place);
                         if place.projections.is_empty() {
                             if let Some(value) = known_integer {
                                 self.known_integers.insert(place.local, value);
@@ -4181,19 +4275,18 @@ impl<'a> Lowerer<'a> {
                         let else_moved = self.moved.clone();
                         let else_known = self.known_integers.clone();
                         self.locals = before;
-                        self.moved = moved_before;
                         self.known_integers = match (then_terminates, else_terminates) {
                             (false, false) => join_known_integers(&[then_known, else_known]),
                             (false, true) => then_known,
                             (true, false) => else_known,
                             (true, true) => known_before,
                         };
-                        if !then_terminates {
-                            self.moved.extend(then_moved);
-                        }
-                        if !else_terminates {
-                            self.moved.extend(else_moved);
-                        }
+                        self.moved = match (then_terminates, else_terminates) {
+                            (false, false) => self.join_custody(then_moved, else_moved, range)?,
+                            (false, true) => then_moved,
+                            (true, false) => else_moved,
+                            (true, true) => moved_before,
+                        };
                         Statement::IfPattern {
                             value,
                             pattern,
@@ -4223,19 +4316,18 @@ impl<'a> Lowerer<'a> {
                         let else_moved = self.moved.clone();
                         let else_known = self.known_integers.clone();
                         self.locals = before;
-                        self.moved = moved_before;
                         self.known_integers = match (then_terminates, else_terminates) {
                             (false, false) => join_known_integers(&[then_known, else_known]),
                             (false, true) => then_known,
                             (true, false) => else_known,
                             (true, true) => known_before,
                         };
-                        if !then_terminates {
-                            self.moved.extend(then_moved);
-                        }
-                        if !else_terminates {
-                            self.moved.extend(else_moved);
-                        }
+                        self.moved = match (then_terminates, else_terminates) {
+                            (false, false) => self.join_custody(then_moved, else_moved, range)?,
+                            (false, true) => then_moved,
+                            (true, false) => else_moved,
+                            (true, true) => moved_before,
+                        };
                         Statement::If {
                             condition,
                             then_branch: then_branch.into(),
@@ -4251,6 +4343,11 @@ impl<'a> Lowerer<'a> {
                     range,
                 } => {
                     let iterable = self.expression(iterable)?;
+                    let moved_before = self.moved.clone();
+                    let exact_iterations = match &iterable.type_ {
+                        Type::FixedArray { length, .. } => length.value(),
+                        _ => None,
+                    };
                     let element = match &iterable.type_ {
                         Type::Array(element) | Type::FixedArray { element, .. } => element,
                         _ => return creator(CreatorFailureKind::ArgumentTypeMismatch, range),
@@ -4276,6 +4373,13 @@ impl<'a> Lowerer<'a> {
                     for binding in &binding_places {
                         self.moved.restore_place(binding);
                     }
+                    self.moved = match exact_iterations {
+                        Some(0) => moved_before,
+                        Some(1) => self.moved.clone(),
+                        Some(_) | None => {
+                            self.join_custody(moved_before, self.moved.clone(), range)?
+                        }
+                    };
                     self.known_integers =
                         join_known_integers(&[known_before, self.known_integers.clone()]);
                     for binding in &binding_places {
@@ -4300,11 +4404,13 @@ impl<'a> Lowerer<'a> {
                     if condition.type_ != Type::Bool {
                         return creator(CreatorFailureKind::IfConditionRequiresBool, range);
                     }
+                    let moved_before = self.moved.clone();
                     let known_before = self.known_integers.clone();
                     self.loop_depth += 1;
                     let body = self.statements(body, return_type);
                     self.loop_depth -= 1;
                     let body = body?;
+                    self.moved = self.join_custody(moved_before, self.moved.clone(), range)?;
                     self.known_integers =
                         join_known_integers(&[known_before, self.known_integers.clone()]);
                     Statement::While {
@@ -4336,7 +4442,7 @@ impl<'a> Lowerer<'a> {
                     let moved_before = self.moved.clone();
                     let known_before = self.known_integers.clone();
                     let mut lowered = Vec::new();
-                    let mut joined_moved = MoveState::default();
+                    let mut continuing_custody = Vec::new();
                     let mut continuing_known = Vec::new();
                     let mut pattern_keys = BTreeSet::new();
                     for (index, case) in cases.iter().enumerate() {
@@ -4355,7 +4461,7 @@ impl<'a> Lowerer<'a> {
                         if pattern.as_ref().is_some_and(pattern_moves_value)
                             && let Some(place) = root_place(&value)
                         {
-                            self.moved.move_place(&place);
+                            self.moved.move_place_at(&place, &case.pattern.range);
                         }
                         if let Some(pattern) = &pattern
                             && case.guard.is_none()
@@ -4379,7 +4485,7 @@ impl<'a> Lowerer<'a> {
                         }
                         let body = self.statements(&case.body, return_type)?;
                         if !crate::control_flow::syntax_statements_terminate(&case.body) {
-                            joined_moved.extend(self.moved.clone());
+                            continuing_custody.push(self.moved.clone());
                             continuing_known.push(self.known_integers.clone());
                         }
                         lowered.push(HirMatchCase {
@@ -4394,8 +4500,16 @@ impl<'a> Lowerer<'a> {
                         return creator(CreatorFailureKind::NonExhaustiveMatch, range);
                     }
                     self.locals = before;
-                    self.moved = moved_before;
-                    self.moved.extend(joined_moved);
+                    self.moved = if let Some(first) = continuing_custody.first().cloned() {
+                        continuing_custody
+                            .into_iter()
+                            .skip(1)
+                            .try_fold(first, |joined, branch| {
+                                self.join_custody(joined, branch, range)
+                            })?
+                    } else {
+                        moved_before
+                    };
                     self.known_integers = if continuing_known.is_empty() {
                         known_before
                     } else {
@@ -4861,6 +4975,7 @@ impl<'a> Lowerer<'a> {
                         self.require_owned_transfer(argument)?;
                     }
                 }
+                self.validate_call_custody(&lowered)?;
                 if let CallTarget::Test { .. } = &target
                     && self.test_application_context == 0
                 {
@@ -5010,6 +5125,18 @@ impl<'a> Lowerer<'a> {
             }
             ExpressionSyntaxKind::Await(value) => {
                 let value = self.expression(value)?;
+                if let Some(loan) = call_loan(&value) {
+                    let place = root_place(loan).ok_or_else(|| VerificationFailure::Defect {
+                        evidence: Arc::from("lowered Resource loan has no source place"),
+                    })?;
+                    return Err(custody_value(
+                        CreatorFailureKind::LoanAcrossSuspension,
+                        &syntax.range,
+                        self.place_subject(&place),
+                        "loaned",
+                        Some(loan.source.clone()),
+                    ));
+                }
                 let type_ = value.type_.clone();
                 (ExpressionKind::Await(Box::new(value)), type_)
             }
@@ -5379,11 +5506,58 @@ impl<'a> Lowerer<'a> {
             return Ok(());
         }
         if let Some(place) = root_place(expression)
-            && !self.moved.move_place(&place)
+            && !self.moved.move_place_at(&place, &expression.source)
         {
-            return creator(CreatorFailureKind::ReadAfterMove, &expression.source);
+            return Err(custody_value(
+                CreatorFailureKind::ReadAfterMove,
+                &expression.source,
+                self.place_subject(&place),
+                "moved",
+                self.moved.origin(&place).cloned(),
+            ));
         }
         Ok(())
+    }
+
+    fn place_subject(&self, place: &Place) -> Arc<str> {
+        self.place_key_subject(&PlaceKey::from_place(place))
+    }
+
+    fn place_key_subject(&self, place: &PlaceKey) -> Arc<str> {
+        let root = self
+            .locals
+            .iter()
+            .find_map(|(name, (local, _, _))| (*local == place.local).then_some(name.as_str()))
+            .unwrap_or("<local>");
+        let mut subject = root.to_owned();
+        for projection in place.projections.iter() {
+            match projection {
+                ProjectionKey::Field(_, name) => {
+                    subject.push('.');
+                    subject.push_str(name);
+                }
+                ProjectionKey::Index(_) => subject.push_str("[]"),
+            }
+        }
+        Arc::from(subject)
+    }
+
+    fn join_custody(
+        &self,
+        left: MoveState,
+        right: MoveState,
+        site: &SourceRange,
+    ) -> Result<MoveState, VerificationFailure> {
+        if let Some((place, related)) = left.mismatch(&right) {
+            return Err(custody_value(
+                CreatorFailureKind::CustodyJoinMismatch,
+                site,
+                self.place_key_subject(&place),
+                "path_dependent",
+                related,
+            ));
+        }
+        Ok(left)
     }
 
     fn type_owns_resource(&self, type_: &Type) -> bool {
@@ -6127,7 +6301,13 @@ impl<'a> Lowerer<'a> {
                 projections: projections.into(),
             };
             if self.moved.is_unreadable(&place) {
-                return creator(CreatorFailureKind::ReadAfterMove, &syntax.range);
+                return Err(custody_value(
+                    CreatorFailureKind::ReadAfterMove,
+                    &syntax.range,
+                    self.place_subject(&place),
+                    "moved",
+                    self.moved.origin(&place).cloned(),
+                ));
             }
             return self.finish_expression(
                 ExpressionKind::Read(place),
@@ -6139,7 +6319,14 @@ impl<'a> Lowerer<'a> {
             && let Some((id, type_, _)) = self.locals.get(local)
         {
             if self.moved.contains_local(*id) {
-                return creator(CreatorFailureKind::ReadAfterMove, &syntax.range);
+                let place = Place::local(*id);
+                return Err(custody_value(
+                    CreatorFailureKind::ReadAfterMove,
+                    &syntax.range,
+                    self.place_subject(&place),
+                    "moved",
+                    self.moved.origin(&place).cloned(),
+                ));
             }
             return self.finish_expression(
                 ExpressionKind::Read(Place::local(*id)),
@@ -6349,6 +6536,37 @@ impl<'a> Lowerer<'a> {
                 &argument.source,
             ),
         }
+    }
+
+    fn validate_call_custody(&self, arguments: &[Expression]) -> Result<(), VerificationFailure> {
+        let mut active: Vec<(PlaceKey, AccessMode, SourceRange)> = Vec::new();
+        for argument in arguments {
+            let Some(place) = root_place(argument).map(|place| PlaceKey::from_place(&place)) else {
+                continue;
+            };
+            let access = argument.access;
+            if !matches!(
+                access,
+                AccessMode::Read | AccessMode::Mut | AccessMode::Move
+            ) {
+                continue;
+            }
+            if let Some((_, _, related)) = active.iter().find(|(other, other_access, _)| {
+                other.conflicts(&place)
+                    && !matches!((other_access, access), (AccessMode::Read, AccessMode::Read))
+            }) {
+                let place = root_place(argument).expect("loan place was resolved above");
+                return Err(custody_value(
+                    CreatorFailureKind::LoanConflict,
+                    &argument.source,
+                    self.place_subject(&place),
+                    "conflicting_loan",
+                    Some(related.clone()),
+                ));
+            }
+            active.push((place, access, argument.source.clone()));
+        }
+        Ok(())
     }
 
     fn call(
@@ -7016,6 +7234,15 @@ fn root_place(expression: &Expression) -> Option<Place> {
         }
         _ => None,
     }
+}
+
+fn call_loan(expression: &Expression) -> Option<&Expression> {
+    let ExpressionKind::Call { arguments, .. } = &expression.kind else {
+        return None;
+    };
+    arguments
+        .iter()
+        .find(|argument| matches!(argument.access, AccessMode::Read | AccessMode::Mut))
 }
 
 fn collect_required_locals(expression: &Expression, output: &mut BTreeSet<LocalId>) {
@@ -7884,6 +8111,21 @@ fn creator_value(kind: CreatorFailureKind, site: &SourceRange) -> VerificationFa
     VerificationFailure::Creator {
         kind,
         site: site.clone(),
+    }
+}
+fn custody_value(
+    kind: CreatorFailureKind,
+    site: &SourceRange,
+    subject: Arc<str>,
+    state: &'static str,
+    related: Option<SourceRange>,
+) -> VerificationFailure {
+    VerificationFailure::Custody {
+        kind,
+        site: site.clone(),
+        subject,
+        state: Arc::from(state),
+        related,
     }
 }
 fn defect<T>(evidence: &'static str) -> Result<T, VerificationFailure> {

@@ -1967,7 +1967,10 @@ fn analyze_with_probe(
             Err(typed_hir::VerificationFailure::Defect { evidence }) => {
                 return defect("error-signature inference", evidence);
             }
-            Err(typed_hir::VerificationFailure::Creator { .. }) => None,
+            Err(
+                typed_hir::VerificationFailure::Creator { .. }
+                | typed_hir::VerificationFailure::Custody { .. },
+            ) => None,
             Err(typed_hir::VerificationFailure::Cancelled) => return cancelled(),
         }
     } else {
@@ -2174,7 +2177,10 @@ fn analyze_with_probe(
             Err(typed_hir::VerificationFailure::Defect { evidence }) => {
                 return defect("compile-time selection verification", evidence);
             }
-            Err(typed_hir::VerificationFailure::Creator { .. }) => {
+            Err(
+                typed_hir::VerificationFailure::Creator { .. }
+                | typed_hir::VerificationFailure::Custody { .. },
+            ) => {
                 return selection_analysis(
                     vec![Diagnostic::new(
                         "semantic.invalid_comptime_expression",
@@ -2244,6 +2250,23 @@ fn analyze_with_probe(
                     RecoveryAction::None,
                 ));
             }
+            None
+        }
+        Err(typed_hir::VerificationFailure::Custody {
+            kind,
+            site,
+            subject,
+            state,
+            related,
+        }) => {
+            let mut diagnostic =
+                Diagnostic::new(kind.diagnostic_code(), site, RecoveryAction::None)
+                    .with_parameter("subject", subject)
+                    .with_parameter("state", state);
+            if let Some(related) = related {
+                diagnostic = diagnostic.with_label(related, DiagnosticLabelRole::Related);
+            }
+            diagnostics.push(diagnostic);
             None
         }
         Err(typed_hir::VerificationFailure::Cancelled) => return cancelled(),

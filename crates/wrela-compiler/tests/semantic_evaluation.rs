@@ -3089,11 +3089,169 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = outcome else {
         panic!("ordinary source ownership misuse must be rejected: {outcome:#?}");
     };
+    let diagnostic = rejected
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.code() == "semantic.read_after_move")
+        .expect("use-after-move has one stable custody diagnostic");
+    assert_eq!(diagnostic.primary().path(), "src/image.wr");
+    assert_eq!(diagnostic.labels().len(), 1);
+    assert_eq!(diagnostic.labels()[0].role(), "related");
+    assert_eq!(
+        diagnostic.typed_parameters(),
+        [
+            (
+                Arc::from("subject"),
+                DiagnosticValue::Text(Arc::from("value.id")),
+            ),
+            (
+                Arc::from("state"),
+                DiagnosticValue::Text(Arc::from("moved"))
+            ),
+        ]
+    );
+}
+
+#[test]
+fn resource_replacement_requires_prior_transfer_and_reinitializes_the_place() {
+    let invalid = br#"resource struct Ticket:
+    id: i64
+
+fn broken() -> i64:
+    mut ticket = Ticket(id=1)
+    ticket = Ticket(id=2)
+    return ticket.id
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(invalid) else {
+        panic!("replacing live Resource custody must be rejected");
+    };
+    assert!(rejected.diagnostics().iter().any(|diagnostic| {
+        diagnostic.code() == "semantic.resource_replacement_requires_discharge"
+    }));
+
+    let valid = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take value: Ticket):
+    pass
+
+fn replace_after_transfer() -> i64:
+    mut ticket = Ticket(id=1)
+    consume(take ticket)
+    ticket = Ticket(id=2)
+    return ticket.id
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(valid);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "a moved Resource place may be explicitly reinitialized: {outcome:#?}"
+    );
+}
+
+#[test]
+fn call_scoped_resource_loans_enforce_exclusivity_and_restore_custody() {
+    let overlapping = br#"resource struct Ticket:
+    mut id: i64
+
+fn inspect(read left: Ticket, read right: Ticket) -> i64:
+    return left.id + right.id
+
+fn edit_and_inspect(mut left: Ticket, read right: Ticket):
+    left.id = right.id
+
+fn broken(take ticket: Ticket):
+    edit_and_inspect(mut ticket, ticket)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(overlapping) else {
+        panic!("a mutable loan cannot overlap a read loan of the same Resource");
+    };
     assert!(
         rejected
             .diagnostics()
             .iter()
-            .any(|diagnostic| diagnostic.code() == "semantic.read_after_move")
+            .any(|diagnostic| diagnostic.code() == "semantic.loan_conflict")
+    );
+
+    let valid = br#"resource struct Ticket:
+    mut id: i64
+
+fn inspect(read left: Ticket, read right: Ticket) -> i64:
+    return left.id + right.id
+
+fn edit(mut ticket: Ticket):
+    ticket.id = 9
+
+fn use_loans(take ticket: Ticket) -> i64:
+    before = inspect(ticket, ticket)
+    edit(mut ticket)
+    return before + ticket.id
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(valid);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "read loans may overlap and call-scoped loans must return custody: {outcome:#?}"
+    );
+}
+
+#[test]
+fn resource_loans_cannot_cross_suspension() {
+    let invalid = br#"resource struct Ticket:
+    id: i64
+
+async fn inspect(read ticket: Ticket) -> i64:
+    return ticket.id
+
+async fn broken(take ticket: Ticket) -> i64:
+    return await inspect(ticket)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(invalid) else {
+        panic!("an awaited call cannot retain a Resource loan");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.loan_across_suspension")
+    );
+
+    let valid = br#"resource struct Ticket:
+    id: i64
+
+async fn answer() -> i64:
+    return 1
+
+async fn after_resume(take ticket: Ticket) -> i64:
+    value = await answer()
+    return ticket.id + value
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(valid);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "owned custody may remain live and be re-read after suspension: {outcome:#?}"
     );
 }
 
@@ -3174,7 +3332,128 @@ fn build() -> Image:
         rejected
             .diagnostics()
             .iter()
-            .any(|diagnostic| { diagnostic.code() == "semantic.read_after_move" })
+            .any(|diagnostic| { diagnostic.code() == "semantic.custody_join_mismatch" })
+    );
+}
+
+#[test]
+fn continuing_branches_must_agree_on_resource_custody() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn broken(flag: bool, take ticket: Ticket):
+    if flag:
+        consume(take ticket)
+    pass
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("continuing branches cannot disagree about the Resource custodian");
+    };
+    let diagnostic = rejected
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.code() == "semantic.custody_join_mismatch")
+        .expect("the control-flow join reports one custody mismatch");
+    assert_eq!(
+        diagnostic.typed_parameters(),
+        [
+            (
+                Arc::from("subject"),
+                DiagnosticValue::Text(Arc::from("ticket")),
+            ),
+            (
+                Arc::from("state"),
+                DiagnosticValue::Text(Arc::from("path_dependent")),
+            ),
+        ]
+    );
+    assert_eq!(diagnostic.labels().len(), 1);
+}
+
+#[test]
+fn continuing_match_arms_must_agree_on_resource_custody() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn broken(flag: bool, take ticket: Ticket):
+    match flag:
+        case true:
+            consume(take ticket)
+        case false:
+            pass
+    pass
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("continuing match arms cannot disagree about Resource custody");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.custody_join_mismatch")
+    );
+}
+
+#[test]
+fn loop_back_edges_must_restore_resource_custody() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn broken(take ticket: Ticket):
+    for flag in [true, false]:
+        consume(take ticket)
+    pass
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("a loop back-edge must restore the entering Resource custodian");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.custody_join_mismatch")
+    );
+
+    let one_iteration = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn valid(take ticket: Ticket):
+    for flag in [true]:
+        consume(take ticket)
+    pass
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(one_iteration);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "one exact iteration has one unambiguous post-loop custodian: {outcome:#?}"
     );
 }
 

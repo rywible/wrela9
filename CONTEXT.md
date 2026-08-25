@@ -32,21 +32,45 @@ _Avoid_: Host-native code, generated machine code, Creator code only
 The single `@image` function reachable from one Image root, evaluated as effect-free ordinary Wrela during the build to select Image Facilities, declare bounded resources, create graph structure, and return that root's closed Image graph.
 _Avoid_: Configuration file, macro language, runtime entry point
 
+**Construction Identity**:
+The revision-scoped identity of one symbolic Image graph node, preserving its ownership, wiring, and provenance through planning without claiming persistence across source refactors.
+_Avoid_: Runtime object ID, Facility kind, Store Identity
+
 **Build Constructor**:
 A sealed pure operation available during Image construction that creates one typed symbolic declaration for the returned Image graph without performing a runtime or ambient host effect.
 _Avoid_: Compiler Primitive, Facility planner, mutable compiler callback
 
 **Image Facility**:
-A high-level Image declaration such as Input, Display, or Event Store that expands into its sealed Drivers, Actors, Pools, interrupts, and Device Manifest entries.
+A high-level authenticated capability kind such as Input, Display, or Event Store, with closed construction, cardinality, failure, and planning rules.
 _Avoid_: Raw transport, manually assembled kernel service, host plugin
+
+**Facility Instance**:
+One Image-lifetime occurrence of an Image Facility with its own Construction Identity, configuration, exported authority, and failure policy; it is distinct from the Facility kind, its internal Actors or Drivers, and any external binding.
+_Avoid_: Facility kind, Driver instance, device binding
+
+**Facility Contract**:
+The authenticated closed per-kind rules governing a Facility's allowed Images, instance and endpoint cardinality, ownership, Generated Roles, semantic capacities, external bindings, and failure policy.
+_Avoid_: Plugin interface, generic property map, device template
+
+**Mandatory Image Infrastructure**:
+Image-lifetime machinery required independently of selected Image Facilities, including boot, scheduling, terminal control, and Panic and Shutdown coordination.
+_Avoid_: Implicit Facility, boot Actor, global service
 
 **VM ABI**:
 The versioned interface jointly implemented by an Image and its virtual machine monitor, covering boot, memory handoff, device enumeration, interrupt delivery, Panic, and shutdown.
 _Avoid_: Machine, Platform, Target
 
 **Architecture Profile**:
-The compiler-known native-code selection of ISA, CPU-feature baseline, calling convention, backend settings, and trusted architecture stubs used to build one Image.
+The compiler-known versioned description of one Image's planning limits and native-code selection, exposing separate verified Architecture Planning and Target ABI contracts.
 _Avoid_: Target Profile, Machine, Platform
+
+**Architecture Planning Contract**:
+The Layer 2 projection of an Architecture Profile exposing symbolic cores, Storage Envelopes, VM ABI features, device and binding slots, interrupt and DMA limits, and the scheduling-cost baseline without exposing Target ABI Layout.
+_Avoid_: Target ABI, host probe, backend settings
+
+**Target ABI Contract**:
+The Layer 3 projection of an Architecture Profile selecting ISA and CPU features, calling convention, code and object model, link rules, and trusted architecture stubs.
+_Avoid_: Architecture Planning Contract, Logical Image Layout, host ABI
 
 **Boot Contract**:
 The sealed architecture-independent entry state that every primary and secondary core receives after its Architecture Profile has normalized reset and startup mechanics.
@@ -192,6 +216,10 @@ _Avoid_: Generic instance, Actor instance, runtime object
 The canonical closed set of reachable source Specializations and authenticated generated roles that must be realized exactly once for one Image.
 _Avoid_: Linker reachability, pass worklist, call count
 
+**Generated Role**:
+One authenticated compiler-demanded role identified by its generator, semantic owner, closed role, and deterministic local key, and realized exactly once without becoming a source declaration.
+_Avoid_: Generated source, helper symbol, planner callback
+
 **Capability**:
 An unforgeable value granting narrowly scoped authority over an Image resource or privileged operation.
 _Avoid_: Permission flag, raw handle
@@ -223,6 +251,26 @@ _Avoid_: Parsed logs, stdout transcript, timing dashboard
 **Evidence Bundle**:
 A canonical host-side artifact keyed by Image digest that relates compact Image diagnostic identities to Project-relative source spans, symbols, layouts, plans, and compiler receipts.
 _Avoid_: Embedded source archive, text build log, host-path dump
+
+**Observation Contract**:
+The closed mapping from one semantic authority's accepted facts and events into typed canonically ordered observations for inspection and comparison without creating reusable compiler input or a competing authority.
+_Avoid_: Phase dump, public IR, second semantic authority
+
+**Inspect Archive**:
+The ephemeral compiler-version-specific compilation output that binds one shared compilation context to the requested Inspect Projections without becoming reusable compiler input.
+_Avoid_: Persisted phase artifact, compiler cache, Evidence Bundle
+
+**Inspect Projection**:
+An output-only compiler-version-specific summary of one verified artifact, resolved through its Inspect Archive's shared compilation context and owning artifact fingerprint.
+_Avoid_: Serialized phase artifact, compiler input, private IR dump
+
+**Semantic Trace Record**:
+One typed execution observation identified by its Observation Contract, closed event kind, stable subjects, authoritative logical coordinate, payload or outcome, and relevant Resource Custody transition.
+_Avoid_: Log line, host-timed event, scheduler debug trace
+
+**Differential Oracle**:
+An independently implemented evaluator, model, or bounded enumerator compared with another implementation through an Observation Contract and never consumed as production compiler input.
+_Avoid_: Second production implementation, phase authority, snapshot generator
 
 **Data**:
 A value that copies implicitly; the build report exposes copies whose cost may matter.
@@ -313,27 +361,51 @@ A compiler-checked exact byte representation used by Event payloads and Store Sn
 _Avoid_: Native struct layout, serializer option, implicit padding
 
 **Planning Requirement**:
-A verified provenance-bearing obligation exported by one semantic artifact for whole-Image planning to discharge or reject without becoming a second authority for that artifact's meaning.
+A stable, verified, provenance-bearing obligation in the closed cross-domain planning algebra, exported by one semantic artifact for whole-Image planning to discharge or reject without becoming a second authority for that artifact's meaning.
 _Avoid_: Shared fact, optimizer hint, admission result
 
+**Planning Requirement Identity**:
+The domain-separated identity tying one Planning Requirement to its semantic owner, role, subjects, and source or generated site independently from the fingerprint of its current bound.
+_Avoid_: Requirement index, reusable proof token, diagnostic code
+
+**Domain Plan**:
+An immutable verified artifact preserving one semantic domain's planned meaning while exporting its Generated Roles and Planning Requirements without mutating the sealed Image graph.
+_Avoid_: Shared planning state, property bag, partial ImagePlan
+
+**Service Plan**:
+The verified deterministic per-core cyclic allocation of ingress, Actor Turn, Group-child, Driver, and cleanup work, including each admitted maximum service and cancellation-observation delay.
+_Avoid_: Dynamic priority queue, host scheduler policy, runtime load balancer
+
 **Admission Evidence**:
-The verified structured justification that one ImagePlan discharged every Planning Requirement, resource bound, service obligation, placement constraint, and Logical Image Layout constraint.
+The compact verified binding from every exact Planning Requirement reference to its discharge in one ImagePlan; together with the plan's bound inputs, it is the satisfaction certificate.
 _Avoid_: Build log, report prose, optimizer trace
 
 **Admission Rejection**:
-The canonical Creator-correctable explanation that whole-Image planning could not discharge one or more Planning Requirements, with their exact provenance and no partial ImagePlan.
+The independently verified canonical Creator-correctable explanation that post-seal whole-Image planning could not discharge its primary Admission Conflict, with no partial ImagePlan.
 _Avoid_: Failed Admission Evidence, compiler Defect, partial plan
 
+**Admission Conflict**:
+An inclusion-minimal set of Planning Requirements that cannot coexist under one Architecture Profile and forms one verified root cause inside an Admission Rejection.
+_Avoid_: Diagnostic cascade, solver trace, failed Admission Evidence
+
 **ImagePlan**:
-The complete verified target-neutral plan for one closed Image, binding its graph, Facility requirements, resource bounds, service obligations, logical placement, Logical Image Layout, and Admission Evidence.
+The complete verified Architecture-Profile-bound but Target-ABI-neutral plan for one closed Image, binding its graph, Planning Requirements, logical placement, Logical Image Layout, and Admission Evidence.
 _Avoid_: Build manifest, backend plan, mutable planning state
 
 **Logical Image Layout**:
-The target-neutral bounded arrangement of an Image's Pools, Mailboxes, frames, buffers, Facility state, scheduler structures, and memory regions.
+The Architecture-Planning-Contract-bound but Target-ABI-neutral bounded arrangement of an Image's Pools, Mailboxes, frames, buffers, Facility state, scheduler structures, and Storage Envelopes.
 _Avoid_: Native struct layout, linker address map, Wire Layout
 
+**Storage Envelope**:
+A conservative Architecture-Profile-defined byte reservation for one logical planned object or region that every later concrete Target ABI Layout must fit.
+_Avoid_: Native layout, heap allocation, size estimate
+
+**Layout Cost Ledger**:
+The deterministically derived exact provenance-bearing partition of reserved Logical Image Layout bytes into Storage Envelope payload, multiplicity, alignment, guards, and contract-owned region rounding.
+_Avoid_: Backend size report, heap profile, optimizer trace
+
 **Target ABI Layout**:
-The target-specific calling, alignment, relocation, stack, register, and machine representation used after Logical Image planning.
+The target-specific calling, alignment, relocation, stack, register, and machine representation used after Logical Image planning and proven to fit every admitted Storage Envelope.
 _Avoid_: Wire Layout, Event schema, generic Image capacity plan
 
 **Event Transaction**:

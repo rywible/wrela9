@@ -12,7 +12,7 @@ Work the ticket frontier until empty:
 4. Independently review that ticket’s committed diff against its starting commit using the two-axis `code-review`.
 5. Validate every finding. Send confirmed findings back to the worker, require Regression Cases for behavioral defects, and rerun `./check`.
 6. Perform at most one targeted re-review after fixes, then post concise evidence and close the ticket.
-7. Recalculate the frontier and continue. If one ticket is blocked, work another unblocked ticket.
+7. Recalculate the frontier and work the next unblocked ticket.
 
 After all tickets close, run milestone-wide fresh-context reviews for:
 

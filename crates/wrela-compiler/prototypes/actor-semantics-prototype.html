@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Actor Semantics Prototype</title>
+  <style>
+    :root {
+      --paper:#f7f3ea; --ink:#17211d; --muted:#657069; --line:#d8d1c3;
+      --forest:#1f5c49; --forest-soft:#dcebe4; --blue:#2d5672; --blue-soft:#e3edf3;
+      --amber:#a76421; --amber-soft:#f4e6d5; --bad:#9c3843; --bad-soft:#f3dfe1;
+      --panel:#fffdf8; --shadow:0 12px 36px rgba(28,38,33,.08);
+    }
+    * { box-sizing:border-box }
+    body { margin:0; color:var(--ink); background:radial-gradient(circle at top left,#fff 0,var(--paper) 42%); font:15px/1.45 Inter,ui-sans-serif,system-ui,sans-serif }
+    main { width:min(1480px,calc(100% - 32px)); margin:0 auto; padding:38px 0 64px }
+    h1,h2,h3,p { margin-top:0 } h1 { max-width:950px; font:700 clamp(34px,5vw,64px)/1.02 Georgia,serif; letter-spacing:-.035em; margin-bottom:16px }
+    h2 { font-size:19px; margin-bottom:12px } h3 { font-size:14px; margin-bottom:7px }
+    .lede { max-width:930px; color:var(--muted); font-size:18px }
+    .eyebrow { color:var(--forest); font-size:12px; font-weight:800; letter-spacing:.13em; text-transform:uppercase; margin-bottom:8px }
+    .notice { display:inline-flex; padding:7px 11px; border:1px solid #e1c390; border-radius:999px; color:#774613; background:#fbefd9; font-size:12px; font-weight:700 }
+    .panel { background:rgba(255,253,248,.94); border:1px solid var(--line); border-radius:18px; box-shadow:var(--shadow); padding:18px }
+    .controls { margin-top:22px } .control-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px }
+    .control-group { padding:14px; border:1px solid var(--line); border-radius:14px; background:#fff }
+    .control-group h3 { color:var(--muted); text-transform:uppercase; letter-spacing:.08em }
+    .actions,.tabs,.steps { display:flex; flex-wrap:wrap; gap:8px }
+    button { border:1px solid #c9c3b7; border-radius:10px; background:#fff; color:var(--ink); padding:8px 10px; font:inherit; font-size:13px; cursor:pointer }
+    button:hover:not(:disabled) { border-color:var(--forest); transform:translateY(-1px) }
+    button:disabled { opacity:.36; cursor:not-allowed }
+    button.primary,.tab.active { color:#fff; background:var(--forest); border-color:var(--forest) }
+    button.blue { color:#fff; background:var(--blue); border-color:var(--blue) }
+    button.danger { color:var(--bad); border-color:#d8aeb2; background:#fff8f8 }
+    .grid { display:grid; gap:16px }.two { grid-template-columns:1.05fr .95fr }.three { grid-template-columns:repeat(3,minmax(0,1fr)) }
+    .section-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px }
+    .section-head p { color:var(--muted); font-size:12px }
+    .pill { display:inline-flex; padding:5px 9px; border-radius:999px; background:var(--blue-soft); color:var(--blue); font-size:12px; font-weight:800 }
+    dl.state-list { display:grid; grid-template-columns:1fr auto; gap:6px 14px; margin:0 } dt { color:var(--muted) } dd { margin:0; font-weight:750; text-align:right }
+    .mailbox { display:grid; gap:8px; margin-top:14px }.message,.resource,.reply,.child,.requirement,.event,.trace-row { border:1px solid var(--line); border-radius:11px; padding:10px; background:#fff }
+    .message strong,.resource strong,.reply strong,.child strong { display:block }.message p,.resource p,.reply p,.child p { margin:3px 0 0; color:var(--muted); font-size:12px }
+    .turn { margin-top:10px; border:1px solid #9cc3b1; background:var(--forest-soft); border-radius:12px; padding:12px }
+    .turn.empty { color:var(--muted); border-color:var(--line); background:#faf8f2 }
+    .lists { display:grid; gap:8px }.empty { color:var(--muted); font-style:italic }
+    .formula { white-space:pre-line; margin-top:12px; border-radius:12px; background:#17211d; color:#f8f4e8; padding:13px; font:13px/1.55 ui-monospace,SFMono-Regular,monospace }
+    .trace { display:grid; gap:7px }.trace-row { display:flex; justify-content:space-between; gap:12px; font-size:12px }.trace-row.bad { border-color:#d6a2a8; background:var(--bad-soft) }
+    .event-log { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px }.event { font-size:13px }.event.plan { border-left:4px solid var(--blue) }.event.runtime { border-left:4px solid var(--forest) }.event.rejected { border-left:4px solid var(--bad); background:#fff8f8 }.event.panic { border-left:4px solid #29181b; background:#eee8e6 }
+    .walkthroughs { margin-top:16px }.tabs { margin-bottom:12px }.tab { border-radius:999px }.walkthrough-copy { color:var(--muted); max-width:1000px }.step-marker { align-self:center; color:var(--muted); font-size:12px }
+    .recommendation { margin-top:16px; border-top:5px solid var(--forest) }.recommendation ul { margin-bottom:0 }.recommendation li+li { margin-top:8px } code { background:#eeeae0; padding:2px 5px; border-radius:5px }
+    @media(max-width:1050px){.control-grid{grid-template-columns:repeat(2,1fr)}.two,.three{grid-template-columns:1fr}}
+    @media(max-width:650px){main{width:min(100% - 18px,1480px);padding-top:22px}.control-grid,.event-log{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+<main>
+  <p class="eyebrow">Wrela Layer 2 · logic prototype</p>
+  <h1>Can one Actor model make concurrency deterministic and custody-safe?</h1>
+  <p class="lede">This throwaway model follows messages from proposal through logical admission, Mailbox custody, a non-reentrant Turn, Replies, Group cancellation, cleanup, and terminal Panic. Host arrival and completion order are shown but never trusted as semantic order.</p>
+  <span class="notice">Prototype only — do not merge into production</span>
+
+  <section class="panel controls">
+    <div class="section-head"><div><p class="eyebrow">Free play</p><h2>Drive the scheduler state</h2></div><button class="primary" onclick="dispatch('RESET')">Reset all</button></div>
+    <div class="control-grid">
+      <div class="control-group"><h3>Admission and Turns</h3><div class="actions" id="admission-actions"></div></div>
+      <div class="control-group"><h3>Messages and Replies</h3><div class="actions" id="reply-actions"></div></div>
+      <div class="control-group"><h3>Group lifecycle</h3><div class="actions" id="group-actions"></div></div>
+      <div class="control-group"><h3>Whole-Image proof</h3><div class="actions" id="plan-actions"></div></div>
+    </div>
+  </section>
+
+  <section class="grid two" style="margin-top:16px">
+    <article class="panel">
+      <div class="section-head"><h2>Actor and Mailbox</h2><span class="pill" id="runtime-verdict"></span></div>
+      <dl class="state-list" id="runtime-state"></dl>
+      <div class="turn empty" id="turn"></div>
+      <div class="mailbox" id="mailbox"></div>
+    </article>
+    <article class="panel">
+      <div class="section-head"><h2>Planning proof</h2><span class="pill" id="plan-verdict"></span></div>
+      <dl class="state-list" id="plan-state"></dl>
+      <div class="formula" id="formula"></div>
+      <div class="trace" id="trace" style="margin-top:10px"></div>
+    </article>
+  </section>
+
+  <section class="grid three" style="margin-top:16px">
+    <article class="panel"><h2>Admission proposals</h2><div class="lists" id="proposals"></div></article>
+    <article class="panel"><h2>Replies and Resources</h2><div class="lists" id="resources"></div></article>
+    <article class="panel"><h2>Group and cleanup</h2><div class="lists" id="group"></div></article>
+  </section>
+
+  <section class="panel" style="margin-top:16px">
+    <div class="section-head"><h2>Semantic observations</h2><p>Newest first</p></div>
+    <div class="event-log" id="events"></div>
+  </section>
+
+  <section class="panel walkthroughs">
+    <div class="section-head"><div><p class="eyebrow">Guided walkthroughs</p><h2>Cases that decide the model</h2></div></div>
+    <div class="tabs" id="tabs"></div>
+    <p class="walkthrough-copy" id="walkthrough-copy"></p>
+    <div class="steps" id="steps"></div>
+  </section>
+
+  <section class="panel recommendation">
+    <p class="eyebrow">Validated decision</p>
+    <h2>One verified transition authority, several purpose-owned projections</h2>
+    <ul>
+      <li><strong>Semantic authority:</strong> one immutable Flow obligation/event graph models messages, logical admission commits, Turn leases, Suspension Homes, Replies, Groups, cleanup, deadlines, and Panic. Runtime tables and scheduler actions are derived projections.</li>
+      <li><strong>Deterministic admission:</strong> each proposal carries stable destination, sender Actor, sender Turn sequence, and send ordinal. A scheduled ingress arbitration orders the eligible set canonically; host arrival never breaks ties or adds capacity.</li>
+      <li><strong>Custody boundary:</strong> before Mailbox Transfer Commit, a waiting proposal owns moved arguments and returns them on <code>Full</code> or pre-admission cancellation. After commit, cancellation of the sender cannot retract the message.</li>
+      <li><strong>Non-reentrant Turns:</strong> an Actor holds one Turn lease from message acceptance through completion or Panic. Suspension moves live state into a static Suspension Home but retains that lease.</li>
+      <li><strong>Replies:</strong> request admission reserves the one-shot return path and response storage. Fulfillment cannot fail for capacity; a closed waiter produces <code>ReplyClosed</code> with undelivered ownership. Reply-wait cycles held across Turns are rejected.</li>
+      <li><strong>Structured cancellation:</strong> a Group closes admission, quiesces children at bounded checkpoints, returns moved Resources, and runs Cleanup Actions in reverse logical registration order before cancellation becomes observable. Panic runs none of that cleanup.</li>
+      <li><strong>Planning Requirements:</strong> Flow exports provenance-bearing bounds for Mailbox commitment, proposal transport, return paths, response storage, static frames, Group activations, cleanup homes, fixed placement, service delay, cancellation latency, deadline class, and deterministic ordering. <code>ImagePlan</code> remains final admission authority.</li>
+    </ul>
+  </section>
+</main>
+
+<script>
+const ActorPrototype = (() => {
+  const initialResources = () => [
+    { id:"map-shard", kind:"Resource", home:"Scout caller" },
+    { id:"reply-payload", kind:"Resource", home:"Responder" },
+    { id:"child-buffer-a", kind:"Resource", home:"Group owner" },
+    { id:"child-buffer-b", kind:"Resource", home:"Group owner" }
+  ];
+  const initial = () => ({
+    image:"Running", epoch:7,
+    actor:{ id:"archive", core:1, mailboxCapacity:2, queue:[], activeTurn:null, nextTurn:1, nextAdmission:1 },
+    proposals:[], replies:[], resources:initialResources(),
+    group:{ id:"group-1", phase:"Open", admissionOpen:true, deadline:"None", outcome:null, children:[], cleanup:[], cancellationVisible:false },
+    plan:{ mailboxPeak:0, mailboxCapacity:2, replyPaths:0, replyStorage:0, framesRequired:0, framesAvailable:0, cleanupRequired:0, cleanupHomes:0, maxServiceDelay:null, deadlineSlack:null, checkpointLatency:null, orderLaw:false, waitEdges:[], trace:[], verdict:"Unverified", violations:[] },
+    events:[], hostArrival:0
+  });
+  const event = (state, kind, text, tone="runtime") => ({...state,events:[...state.events,{n:state.events.length+1,kind,text,tone}]});
+  const reject = (state,text,tone="runtime") => event(state,"Action rejected",text,"rejected");
+  const updateResource = (state,id,home) => ({...state,resources:state.resources.map(r=>r.id===id?{...r,home}:r)});
+  const orderKey = p => `${p.sender}/T${String(p.turn).padStart(4,"0")}/S${String(p.ordinal).padStart(3,"0")}`;
+  const invariant = state => {
+    const failures=[];
+    if(state.actor.queue.length>state.actor.mailboxCapacity) failures.push("Mailbox over capacity");
+    if(state.group.cancellationVisible&&(state.group.children.some(c=>c.state!=="Quiesced")||state.group.cleanup.length)) failures.push("Cancellation visible before discharge");
+    if(state.actor.activeTurn&&state.actor.activeTurn.actorId!==state.actor.id) failures.push("Turn lease on wrong Actor");
+    return failures;
+  };
+  function propose(state,sender,turn,ordinal){
+    if(state.proposals.some(p=>p.sender===sender&&p.turn===turn&&p.ordinal===ordinal)) return reject(state,"That stable send identity already has a proposal.");
+    const hostArrival=state.hostArrival+1;
+    const proposal={id:`proposal-${sender}`,messageId:`message-${sender}`,sender,turn,ordinal,hostArrival,state:"Current arbitration",mode:"try_send"};
+    return event({...state,hostArrival,proposals:[...state.proposals,proposal]},"Proposal observed",`${sender} arrived at the host as #${hostArrival}; semantic key is ${orderKey(proposal)}.`);
+  }
+  function arbitrate(state){
+    const current=state.proposals.filter(p=>p.state==="Current arbitration").sort((a,b)=>orderKey(a).localeCompare(orderKey(b)));
+    if(!current.length) return reject(state,"No current proposals await arbitration.");
+    let queue=[...state.actor.queue], nextAdmission=state.actor.nextAdmission, accepted=[], proposals=[...state.proposals];
+    for(const proposal of current){
+      if(queue.length>=state.actor.mailboxCapacity){ proposals=proposals.map(p=>p.id===proposal.id?{...p,state:"Full"}:p); continue; }
+      const admitted={id:proposal.messageId,sender:proposal.sender,logicalKey:orderKey(proposal),admission:nextAdmission++,kind:"Data message"};
+      queue.push(admitted); accepted.push(admitted);
+      proposals=proposals.map(p=>p.id===proposal.id?{...p,state:"Admitted",admission:admitted.admission}:p);
+    }
+    const rejected=current.length-accepted.length;
+    return event({...state,proposals,actor:{...state.actor,queue,nextAdmission}},"Logical arbitration",`${accepted.map(m=>m.sender).join(" then ")||"No proposal"} committed in canonical order; ${rejected} resolved Full. Host arrival was ignored.`);
+  }
+  function admitTwo(state){
+    if(state.actor.queue.length||state.actor.activeTurn) return reject(state,"Reset before loading the two-message Turn scenario.");
+    const queue=[{id:"message-one",sender:"alpha",logicalKey:"alpha/T8/S0",admission:1,kind:"Data message"},{id:"message-two",sender:"beta",logicalKey:"beta/T4/S0",admission:2,kind:"Data message"}];
+    return event({...state,actor:{...state.actor,queue,nextAdmission:3}},"Messages admitted","Two FIFO messages now wait for one non-reentrant Actor.");
+  }
+  function startTurn(state){
+    if(state.actor.activeTurn) return reject(state,`${state.actor.activeTurn.id} still owns the Actor Turn lease; the next Mailbox message cannot start.`);
+    if(!state.actor.queue.length) return reject(state,"No admitted message is ready.");
+    const [message,...queue]=state.actor.queue;
+    const turn={id:`archive/T${state.actor.nextTurn}`,actorId:state.actor.id,messageId:message.id,state:"Running",suspensionHome:null};
+    return event({...state,actor:{...state.actor,queue,activeTurn:turn,nextTurn:state.actor.nextTurn+1}},"Turn started",`${turn.id} accepted ${message.id}; its Mailbox slot is now free.`);
+  }
+  function suspendTurn(state){
+    const turn=state.actor.activeTurn;
+    if(!turn||turn.state!=="Running") return reject(state,"A running Turn is required to suspend.");
+    const activeTurn={...turn,state:"Suspended",suspensionHome:`frame[${turn.id}]`};
+    return event({...state,actor:{...state.actor,activeTurn}},"Turn suspended",`${turn.id} moved live state into ${activeTurn.suspensionHome} and retained the exclusive Turn lease.`);
+  }
+  function resumeTurn(state){
+    const turn=state.actor.activeTurn;
+    if(!turn||turn.state!=="Suspended") return reject(state,"No suspended Turn is ready to resume.");
+    return event({...state,actor:{...state.actor,activeTurn:{...turn,state:"Running",suspensionHome:null}}},"Turn resumed",`${turn.id} resumed from its static Suspension Home at a planned service slot.`);
+  }
+  function completeTurn(state){
+    const turn=state.actor.activeTurn;
+    if(!turn||turn.state!=="Running") return reject(state,"A running Turn is required to complete.");
+    return event({...state,actor:{...state.actor,activeTurn:null}},"Turn completed",`${turn.id} released the Actor Turn lease.`);
+  }
+  function fillMailbox(state){
+    if(state.actor.queue.length||state.actor.activeTurn) return reject(state,"Reset before filling the Mailbox.");
+    const queue=[{id:"resident-1",sender:"system",logicalKey:"system/T1/S0",admission:1,kind:"Data message"},{id:"resident-2",sender:"system",logicalKey:"system/T1/S1",admission:2,kind:"Data message"}];
+    return event({...state,actor:{...state.actor,queue,nextAdmission:3}},"Mailbox filled","Two committed residents consume the complete global logical capacity.");
+  }
+  function waitingSend(state){
+    if(state.resources.find(r=>r.id==="map-shard").home!=="Scout caller") return reject(state,"The map-shard is not available at the sender.");
+    if(state.proposals.some(p=>p.id==="waiting-map")) return reject(state,"The waiting send already exists.");
+    let next=updateResource(state,"map-shard","waiting proposal waiting-map");
+    const proposal={id:"waiting-map",messageId:"map-update",sender:"scout",turn:3,ordinal:0,hostArrival:next.hostArrival+1,state:"Waiting for capacity",mode:"send",resourceId:"map-shard"};
+    next={...next,hostArrival:proposal.hostArrival,proposals:[...next.proposals,proposal]};
+    return event(next,"Waiting send","send moved map-shard into a proposal Suspension Home; no Mailbox Transfer Commit occurred.");
+  }
+  function cancelSender(state){
+    const proposal=state.proposals.find(p=>p.id==="waiting-map");
+    if(!proposal||proposal.state!=="Waiting for capacity") return reject(state,"No pre-admission waiting send can be cancelled.");
+    let next=updateResource(state,"map-shard","Scout continuation");
+    next={...next,proposals:next.proposals.map(p=>p.id===proposal.id?{...p,state:"Cancelled before admission"}:p)};
+    return event(next,"Pre-admission cancellation","Admission closed for waiting-map; map-shard returned intact to the sender continuation.");
+  }
+  function tryResourceSend(state){
+    if(state.resources.find(r=>r.id==="map-shard").home!=="Scout caller") return reject(state,"map-shard is not at the sender.");
+    if(state.actor.queue.length>=state.actor.mailboxCapacity) return event(state,"Full","try_send performed current arbitration only; map-shard remained with Scout and no Transfer Commit occurred.");
+    const message={id:"map-update",sender:"scout",logicalKey:"scout/T0003/S000",admission:state.actor.nextAdmission,kind:"Resource message",resourceId:"map-shard"};
+    let next=updateResource(state,"map-shard","Mailbox message map-update");
+    next={...next,actor:{...next.actor,queue:[...next.actor.queue,message],nextAdmission:next.actor.nextAdmission+1}};
+    return event(next,"Mailbox Transfer Commit","try_send admitted map-update; the Mailbox now owns map-shard and delivery is guaranteed unless the Image Panics.");
+  }
+  function cancelAfterAdmission(state){
+    const committed=state.actor.queue.some(m=>m.id==="map-update")||state.actor.activeTurn?.messageId==="map-update";
+    if(!committed) return reject(state,"No admitted map-update exists.");
+    return event(state,"Sender cancelled after commit","map-update remained admitted and map-shard stayed with its Mailbox or Turn home; sender cancellation could not retract it.");
+  }
+  function admitRequest(state){
+    if(state.actor.queue.length>=state.actor.mailboxCapacity) return reject(state,"No capacity exists for the request.");
+    if(state.replies.length) return reject(state,"The request Reply already exists.");
+    const message={id:"request-1",sender:"client",logicalKey:"client/T2/S0",admission:state.actor.nextAdmission,kind:"Request + fulfillment endpoint"};
+    const reply={id:"reply-1",waiter:"Open in client Group",fulfiller:"Mailbox message request-1",returnPath:"Reserved",state:"Pending"};
+    return event({...state,actor:{...state.actor,queue:[...state.actor.queue,message],nextAdmission:state.actor.nextAdmission+1},replies:[reply]},"Request admitted","Mailbox commit reserved reply-1's complete return path and response storage.");
+  }
+  function startRequest(state){
+    let next=startTurn(state);
+    if(next.events[next.events.length-1]?.kind==="Action rejected") return next;
+    if(next.actor.activeTurn.messageId!=="request-1") return reject(next,"The started message was not request-1; reset the scenario.");
+    next={...next,replies:next.replies.map(r=>({...r,fulfiller:`active ${next.actor.activeTurn.id}`}))};
+    return event(next,"Reply custody moved",`reply-1's fulfillment endpoint entered ${next.actor.activeTurn.id}.`);
+  }
+  function cancelWaiter(state){
+    if(!state.replies.length||state.replies[0].state!=="Pending") return reject(state,"No open Reply waiter can be cancelled.");
+    return event({...state,replies:state.replies.map(r=>({...r,waiter:"Closed by client Group",state:"Waiter closed"}))},"Reply waiter closed","The client Group cancelled; request-1 remained admitted and its receiving Turn remained responsible for the fulfillment endpoint.");
+  }
+  function fulfillReply(state){
+    const reply=state.replies[0];
+    if(!reply||!(reply.state==="Pending"||reply.state==="Waiter closed")) return reject(state,"No live fulfillment endpoint is available.");
+    if(reply.state==="Waiter closed"){
+      let next=updateResource(state,"reply-payload","Responder after ReplyClosed");
+      next={...next,replies:next.replies.map(r=>({...r,fulfiller:"Consumed",returnPath:"Released",state:"ReplyClosed"}))};
+      return event(next,"ReplyClosed","Fulfillment consumed the endpoint but returned undelivered reply-payload ownership to the responder; capacity could not fail.");
+    }
+    let next=updateResource(state,"reply-payload","Client continuation");
+    next={...next,replies:next.replies.map(r=>({...r,fulfiller:"Consumed",waiter:"Fulfilled",returnPath:"Consumed",state:"Delivered"}))};
+    return event(next,"Reply delivered","The reserved return path delivered reply-payload without capacity arbitration.");
+  }
+  function registerCleanup(state,label){
+    if(state.group.phase!=="Open") return reject(state,"Cleanup registration is closed after cancellation begins.");
+    if(state.group.cleanup.includes(label)) return reject(state,"That Cleanup Action is already registered.");
+    return event({...state,group:{...state.group,cleanup:[...state.group.cleanup,label]}},"Cleanup registered",`${label} registered at logical position ${state.group.cleanup.length+1}.`);
+  }
+  function spawnChildren(state){
+    if(!state.group.admissionOpen) return reject(state,"The Group no longer admits child activations.");
+    if(state.group.children.length) return reject(state,"The bounded child set already exists.");
+    let next=updateResource(state,"child-buffer-a","child site A"); next=updateResource(next,"child-buffer-b","child site B");
+    next={...next,group:{...next.group,children:[{id:"child-A",state:"Running",resource:"child-buffer-a"},{id:"child-B",state:"Suspended",resource:"child-buffer-b"}]}};
+    return event(next,"Children activated","Two statically bounded children received moved Resources and fixed frame homes.");
+  }
+  function requestCancel(state){
+    if(state.group.phase!=="Open") return reject(state,"Cancellation has already started.");
+    return event({...state,group:{...state.group,phase:"Closing admission",admissionOpen:false}},"Cancellation requested","Child admission closed before any cancellation outcome became observable.");
+  }
+  function quiesce(state){
+    if(state.group.phase!=="Closing admission") return reject(state,"Cancellation must close admission before children quiesce.");
+    let next=state;
+    for(const child of state.group.children) next=updateResource(next,child.resource,"Group owner after child return");
+    next={...next,group:{...next.group,phase:"Reverse cleanup",children:next.group.children.map(c=>({...c,state:"Quiesced"}))}};
+    return event(next,"Children quiesced","Every child observed cancellation at a bounded checkpoint and returned moved Resources in logical child order.");
+  }
+  function runCleanup(state){
+    if(state.group.phase!=="Reverse cleanup"||!state.group.cleanup.length) return reject(state,"No Cleanup Action is ready.");
+    const cleanup=[...state.group.cleanup], label=cleanup.pop();
+    return event({...state,group:{...state.group,cleanup}},"Cleanup executed",`${label} ran next by reverse logical registration order.`);
+  }
+  function publishCancelled(state){
+    if(state.group.children.some(c=>c.state!=="Quiesced")||state.group.cleanup.length) return reject(state,"Cancelled cannot become visible until children quiesce, moved Resources return, and cleanup finishes.");
+    if(state.group.phase==="Open") return reject(state,"Cancellation was not requested.");
+    return event({...state,group:{...state.group,phase:"Cancelled",outcome:"Cancelled",cancellationVisible:true}},"Cancelled visible","The recoverable Group outcome crossed its boundary only after complete discharge.");
+  }
+  function startDeadlineChild(state){
+    if(state.group.children.length||state.group.phase!=="Open") return reject(state,"Reset before starting the deadline scenario.");
+    let next=updateResource(state,"child-buffer-a","deadline child-A");
+    next={...next,group:{...next.group,deadline:"logical epoch 8",children:[{id:"child-A",state:"Running",resource:"child-buffer-a"}]}};
+    return event(next,"Deadline work admitted","child-A began under logical epoch 8; the deadline did not create runtime priority.");
+  }
+  function advanceEpoch(state){
+    const epoch=state.epoch+1;
+    return event({...state,epoch},epoch>=8?"Deadline reached":"Logical epoch advanced",epoch>=8?"Logical epoch 8 arrived; work continues only until the next compiler-bounded cancellation checkpoint.":`Logical epoch is now ${epoch}.`);
+  }
+  function observeDeadline(state){
+    if(state.epoch<8) return reject(state,"The logical deadline has not arrived.");
+    const child=state.group.children.find(c=>c.id==="child-A");
+    if(!child||child.state==="Quiesced") return reject(state,"No running deadline child can observe expiration.");
+    let next=updateResource(state,"child-buffer-a","Group owner after deadline return");
+    next={...next,group:{...next.group,phase:"DeadlineExceeded",admissionOpen:false,outcome:"DeadlineExceeded",children:next.group.children.map(c=>c.id==="child-A"?{...c,state:"Quiesced"}:c)}};
+    return event(next,"DeadlineExceeded","child-A observed the logical deadline at its bounded checkpoint, returned custody, and published the recoverable outcome without reprioritization.");
+  }
+  function panic(state){ return event({...state,image:"Panicked"},"Panic","The complete Image ended immediately. Pending source cleanup and Group discharge did not run.","panic"); }
+  function planEvent(state,kind,detail,patch){
+    if(state.plan.verdict!=="Unverified") return reject(state,"Reset the proof before changing a decided plan.","plan");
+    const plan={...state.plan,...patch,trace:[...state.plan.trace,{kind,detail}]};
+    return event({...state,plan},"Planning Requirement",`${kind}: ${detail}`,"plan");
+  }
+  function verify(state){
+    if(!state.plan.trace.length) return reject(state,"Add at least one Planning Requirement before verification.","plan");
+    const p=state.plan, violations=[];
+    if(!p.orderLaw) violations.push("logical ordering law is absent");
+    if(p.mailboxPeak>p.mailboxCapacity) violations.push(`Mailbox commitment ${p.mailboxPeak} exceeds ${p.mailboxCapacity}`);
+    if(p.replyPaths>p.replyStorage) violations.push(`Reply return paths ${p.replyPaths} exceed response homes ${p.replyStorage}`);
+    if(p.framesRequired>p.framesAvailable) violations.push(`static frames ${p.framesRequired} exceed ${p.framesAvailable}`);
+    if(p.cleanupRequired>p.cleanupHomes) violations.push(`Cleanup Actions ${p.cleanupRequired} exceed homes ${p.cleanupHomes}`);
+    if(p.maxServiceDelay!==null&&p.deadlineSlack!==null&&p.maxServiceDelay>p.deadlineSlack) violations.push(`service delay ${p.maxServiceDelay} exceeds deadline slack ${p.deadlineSlack}`);
+    if(p.checkpointLatency!==null&&p.deadlineSlack!==null&&p.checkpointLatency>p.deadlineSlack) violations.push(`cancellation latency ${p.checkpointLatency} exceeds deadline slack ${p.deadlineSlack}`);
+    const edgeSet=new Set(p.waitEdges.map(e=>e.join("->")));
+    if(edgeSet.has("archive->index")&&edgeSet.has("index->archive")) violations.push("Reply wait cycle archive -> index -> archive holds two non-reentrant Turns");
+    const verdict=violations.length?"Admission Rejection":"Admitted";
+    return event({...state,plan:{...p,verdict,violations}},verdict,violations.length?violations.join("; "):"All typed Actor Planning Requirements are discharged; ImagePlan may authorize this projection.",violations.length?"rejected":"plan");
+  }
+  function reduce(state,action){
+    if(action.type==="RESET") return initial();
+    if(action.type==="RESET_PLAN") return event({...state,plan:initial().plan},"Proof reset","Runtime semantic state stayed unchanged.","plan");
+    if(state.image==="Panicked") return reject(state,"Panic is terminal; reset begins a fresh Image model.");
+    switch(action.type){
+      case"PROPOSE_BETA":return propose(state,"beta",4,0); case"PROPOSE_ALPHA":return propose(state,"alpha",8,0); case"ARBITRATE":return arbitrate(state);
+      case"ADMIT_TWO":return admitTwo(state); case"START_TURN":return startTurn(state); case"SUSPEND":return suspendTurn(state); case"RESUME":return resumeTurn(state); case"COMPLETE":return completeTurn(state);
+      case"FILL_MAILBOX":return fillMailbox(state); case"WAIT_SEND":return waitingSend(state); case"CANCEL_SENDER":return cancelSender(state); case"TRY_RESOURCE_SEND":return tryResourceSend(state); case"CANCEL_AFTER_ADMIT":return cancelAfterAdmission(state);
+      case"ADMIT_REQUEST":return admitRequest(state); case"START_REQUEST":return startRequest(state); case"CANCEL_WAITER":return cancelWaiter(state); case"FULFILL":return fulfillReply(state);
+      case"CLEANUP_A":return registerCleanup(state,"release cache Permit"); case"CLEANUP_B":return registerCleanup(state,"return device receipt"); case"SPAWN":return spawnChildren(state);
+      case"REQUEST_CANCEL":return requestCancel(state); case"QUIESCE":return quiesce(state); case"RUN_CLEANUP":return runCleanup(state); case"PUBLISH_CANCEL":return publishCancelled(state); case"START_DEADLINE":return startDeadlineChild(state); case"ADVANCE_EPOCH":return advanceEpoch(state); case"OBSERVE_DEADLINE":return observeDeadline(state); case"PANIC":return panic(state);
+      case"PLAN_ORDER":return planEvent(state,"LogicalOrderLaw","Stable sender, Turn, and send ordinals govern each ingress arbitration.",{orderLaw:true});
+      case"PLAN_MAILBOX":return planEvent(state,"MailboxCommitment","Peak resident plus admitted/reserved commitment is 2 of 2.",{mailboxPeak:2});
+      case"PLAN_REPLY":return planEvent(state,"ReplyReturnHomes","One admitted request reserves one return path and one response home.",{replyPaths:1,replyStorage:1});
+      case"PLAN_FRAMES":return planEvent(state,"StaticActivationHomes","Three simultaneous Turn/child frames require three planned homes.",{framesRequired:3,framesAvailable:3});
+      case"PLAN_CLEANUP":return planEvent(state,"CleanupHomes","Two registered Cleanup Actions require two static records.",{cleanupRequired:2,cleanupHomes:2});
+      case"PLAN_SERVICE":return planEvent(state,"ServiceAndDeadline","Maximum service delay 2 and cancellation latency 1 fit logical slack 3.",{maxServiceDelay:2,deadlineSlack:3,checkpointLatency:1});
+      case"PLAN_BAD_DEADLINE":return planEvent(state,"ServiceAndDeadline","Maximum service delay 4 cannot meet logical slack 2; reject before admission.",{maxServiceDelay:4,deadlineSlack:2,checkpointLatency:3});
+      case"PLAN_WAIT_AB":return planEvent(state,"ReplyWaitEdge","archive Turn waits on index.",{waitEdges:[...state.plan.waitEdges,["archive","index"]]});
+      case"PLAN_WAIT_BA":return planEvent(state,"ReplyWaitEdge","index Turn waits on archive.",{waitEdges:[...state.plan.waitEdges,["index","archive"]]});
+      case"VERIFY":return verify(state); default:return reject(state,"Unknown action.");
+    }
+  }
+  return {initial,reduce,invariant};
+})();
+
+const admissionActions=[["Beta proposal (arrives first)","PROPOSE_BETA"],["Alpha proposal (arrives second)","PROPOSE_ALPHA"],["Arbitrate current set","ARBITRATE","blue"],["Load two FIFO messages","ADMIT_TWO"],["Start next Turn","START_TURN"],["Suspend active Turn","SUSPEND"],["Resume active Turn","RESUME"],["Complete active Turn","COMPLETE"]];
+const replyActions=[["Fill Mailbox","FILL_MAILBOX"],["try_send map-shard","TRY_RESOURCE_SEND"],["Cancel after commit","CANCEL_AFTER_ADMIT"],["Begin waiting send Resource","WAIT_SEND"],["Cancel before admission","CANCEL_SENDER"],["Admit request + Reply","ADMIT_REQUEST"],["Start request Turn","START_REQUEST"],["Cancel Reply waiter","CANCEL_WAITER"],["Fulfill Reply","FULFILL"]];
+const groupActions=[["Register cache cleanup","CLEANUP_A"],["Register receipt cleanup","CLEANUP_B"],["Spawn two children","SPAWN"],["Request cancellation","REQUEST_CANCEL"],["Quiesce children","QUIESCE"],["Run next cleanup","RUN_CLEANUP"],["Publish Cancelled","PUBLISH_CANCEL","blue"],["Start deadline child","START_DEADLINE"],["Advance logical epoch","ADVANCE_EPOCH"],["Observe deadline checkpoint","OBSERVE_DEADLINE"],["Panic","PANIC","danger"]];
+const planActions=[["Reset proof","RESET_PLAN","primary"],["Require stable order","PLAN_ORDER"],["Require Mailbox 2/2","PLAN_MAILBOX"],["Reserve Reply path","PLAN_REPLY"],["Require three frames","PLAN_FRAMES"],["Require two cleanup homes","PLAN_CLEANUP"],["Feasible service","PLAN_SERVICE"],["Impossible deadline","PLAN_BAD_DEADLINE","danger"],["archive waits index","PLAN_WAIT_AB"],["index waits archive","PLAN_WAIT_BA","danger"],["Verify plan","VERIFY","blue"]];
+
+const walkthroughs=[
+  {title:"Host order loses",copy:"Beta reaches the host first, but Alpha has the earlier canonical sender identity. One scheduled arbitration must commit Alpha then Beta.",steps:[["Beta arrives first","PROPOSE_BETA"],["Alpha arrives second","PROPOSE_ALPHA"],["Arbitrate","ARBITRATE"]]},
+  {title:"Suspension is not re-entry",copy:"Two messages are admitted. The first Turn suspends, but its lease remains active, so the second message cannot begin until the original Turn resumes and completes.",steps:[["Load two messages","ADMIT_TWO"],["Start first Turn","START_TURN"],["Suspend first Turn","SUSPEND"],["Try starting second","START_TURN"],["Resume first","RESUME"],["Complete first","COMPLETE"],["Start second","START_TURN"]]},
+  {title:"Cancel before admission",copy:"A full Mailbox makes send wait. The moved Resource lives in the proposal home and returns intact when its Group cancels before Transfer Commit.",steps:[["Fill Mailbox","FILL_MAILBOX"],["Wait with map-shard","WAIT_SEND"],["Cancel sender Group","CANCEL_SENDER"]]},
+  {title:"Commit is the boundary",copy:"try_send against a full Mailbox returns Full without moving custody. After a Turn frees capacity, a successful commit moves custody permanently; later sender cancellation cannot retract it.",steps:[["Fill Mailbox","FILL_MAILBOX"],["try_send gets Full","TRY_RESOURCE_SEND"],["Start resident Turn","START_TURN"],["try_send commits","TRY_RESOURCE_SEND"],["Cancel sender after commit","CANCEL_AFTER_ADMIT"]]},
+  {title:"Reply closes safely",copy:"Request admission reserves the return path. Cancelling the waiter does not retract the request; late fulfillment yields ReplyClosed with response ownership.",steps:[["Admit request","ADMIT_REQUEST"],["Start receiver Turn","START_REQUEST"],["Cancel waiter","CANCEL_WAITER"],["Fulfill late","FULFILL"]]},
+  {title:"Cancellation waits",copy:"Cancellation closes admission first, quiesces bounded children, returns moved Resources, and runs cleanup in reverse registration order before Cancelled is visible.",steps:[["Register cache first","CLEANUP_A"],["Register receipt second","CLEANUP_B"],["Spawn children","SPAWN"],["Request cancel","REQUEST_CANCEL"],["Try publish early","PUBLISH_CANCEL"],["Quiesce children","QUIESCE"],["Run receipt cleanup","RUN_CLEANUP"],["Run cache cleanup","RUN_CLEANUP"],["Publish Cancelled","PUBLISH_CANCEL"]]},
+  {title:"Admitted whole-Image plan",copy:"The plan records ordering, Mailbox commitment, Reply storage, static frames, cleanup homes, and feasible service. ImagePlan admits only the complete closure.",steps:[["Stable order","PLAN_ORDER"],["Mailbox bound","PLAN_MAILBOX"],["Reply path","PLAN_REPLY"],["Static frames","PLAN_FRAMES"],["Cleanup homes","PLAN_CLEANUP"],["Service bound","PLAN_SERVICE"],["Verify","VERIFY"]]},
+  {title:"Reply cycle rejected",copy:"Two non-reentrant Turns cannot each retain their lease while awaiting the other. The cycle is a Creator rejection, not a runtime deadlock detector.",steps:[["Stable order","PLAN_ORDER"],["archive waits index","PLAN_WAIT_AB"],["index waits archive","PLAN_WAIT_BA"],["Verify","VERIFY"]]},
+  {title:"Deadline unmeetable",copy:"Deadline classes constrain admission instead of changing runtime priority. If planned service and cancellation latency exceed current slack, work is rejected before admission.",steps:[["Stable order","PLAN_ORDER"],["Add impossible deadline","PLAN_BAD_DEADLINE"],["Verify","VERIFY"]]},
+  {title:"Deadline exceeded",copy:"Admitted work is not dynamically reprioritized when its logical deadline arrives. It observes DeadlineExceeded at a compiler-bounded checkpoint, returns custody, then exposes the recoverable outcome.",steps:[["Start deadline child","START_DEADLINE"],["Reach logical deadline","ADVANCE_EPOCH"],["Observe checkpoint","OBSERVE_DEADLINE"]]},
+  {title:"Panic is terminal",copy:"Panic is not cancellation. It ends the Image immediately and does not run registered cleanup or return child Resources through recoverable paths.",steps:[["Register cleanup","CLEANUP_A"],["Spawn children","SPAWN"],["Panic","PANIC"]]}
+];
+
+let state=ActorPrototype.initial(), activeWalkthrough=0, walkthroughStep=0;
+const $=id=>document.getElementById(id);
+function dispatch(type){state=ActorPrototype.reduce(state,{type});render()}
+function startWalkthrough(index){activeWalkthrough=index;walkthroughStep=0;state=ActorPrototype.initial();render()}
+function runWalkthroughStep(index){const step=walkthroughs[activeWalkthrough].steps[index];state=ActorPrototype.reduce(state,{type:step[1]});walkthroughStep=Math.max(walkthroughStep,index+1);render()}
+function buttons(actions){return actions.map(([label,type,cls=""])=>`<button class="${cls}" onclick="dispatch('${type}')">${label}</button>`).join("")}
+function renderActions(){$("admission-actions").innerHTML=buttons(admissionActions);$("reply-actions").innerHTML=buttons(replyActions);$("group-actions").innerHTML=buttons(groupActions);$("plan-actions").innerHTML=buttons(planActions)}
+function renderRuntime(){
+  const failures=ActorPrototype.invariant(state),a=state.actor,g=state.group;
+  $("runtime-verdict").textContent=state.image==="Panicked"?"Panic terminal":failures.length?"Invariant broken":"Invariants hold";
+  $("runtime-verdict").style.background=state.image==="Panicked"||failures.length?"var(--bad-soft)":"var(--forest-soft)";
+  $("runtime-verdict").style.color=state.image==="Panicked"||failures.length?"var(--bad)":"var(--forest)";
+  const rows=[["Image",state.image],["Logical epoch",String(state.epoch)],["Actor",a.id],["Permanent core",String(a.core)],["Mailbox",`${a.queue.length}/${a.mailboxCapacity}`],["Active Turn",a.activeTurn?.id||"None"],["Turn lease",a.activeTurn?"Held":"Free"],["Group phase",g.phase],["Group deadline",g.deadline],["Group outcome",g.outcome||"None"]];
+  $("runtime-state").innerHTML=rows.map(([k,v])=>`<dt>${k}</dt><dd>${v}</dd>`).join("");
+  $("turn").className=`turn ${a.activeTurn?"":"empty"}`;$("turn").innerHTML=a.activeTurn?`<strong>${a.activeTurn.id} · ${a.activeTurn.state}</strong><br>Message ${a.activeTurn.messageId}${a.activeTurn.suspensionHome?`<br>Home: ${a.activeTurn.suspensionHome}`:""}`:"No active Turn lease.";
+  $("mailbox").innerHTML=a.queue.length?a.queue.map(m=>`<div class="message"><strong>#${m.admission} · ${m.id}</strong><p>from ${m.sender} · ${m.logicalKey}</p><p>${m.kind}</p></div>`).join(""):`<p class="empty">Mailbox empty.</p>`;
+}
+function renderPlan(){
+  const p=state.plan,rows=[["Mailbox peak",`${p.mailboxPeak}/${p.mailboxCapacity}`],["Reply paths / homes",`${p.replyPaths}/${p.replyStorage}`],["Static frames",`${p.framesRequired}/${p.framesAvailable}`],["Cleanup records",`${p.cleanupRequired}/${p.cleanupHomes}`],["Maximum service delay",p.maxServiceDelay??"Not stated"],["Deadline slack",p.deadlineSlack??"Not stated"],["Cancellation latency",p.checkpointLatency??"Not stated"],["Reply wait edges",String(p.waitEdges.length)]];
+  $("plan-state").innerHTML=rows.map(([k,v])=>`<dt>${k}</dt><dd>${v}</dd>`).join("");$("plan-verdict").textContent=p.verdict;
+  $("plan-verdict").style.background=p.verdict==="Admitted"?"var(--forest-soft)":p.verdict==="Admission Rejection"?"var(--bad-soft)":"var(--blue-soft)";
+  $("plan-verdict").style.color=p.verdict==="Admitted"?"var(--forest)":p.verdict==="Admission Rejection"?"var(--bad)":"var(--blue)";
+  $("formula").textContent=`Mailbox commitment ${p.mailboxPeak} ≤ ${p.mailboxCapacity}\nReply paths ${p.replyPaths} ≤ homes ${p.replyStorage}\nFrames ${p.framesRequired} ≤ homes ${p.framesAvailable}\nCleanup ${p.cleanupRequired} ≤ homes ${p.cleanupHomes}`;
+  $("trace").innerHTML=p.trace.length?p.trace.map((t,i)=>`<div class="trace-row ${p.violations.length&&i===p.trace.length-1?"bad":""}"><span>${i+1}. <strong>${t.kind}</strong><br>${t.detail}</span></div>`).join(""):`<p class="empty">Add Planning Requirements, then verify.</p>`;
+}
+function renderCollections(){
+  $("proposals").innerHTML=state.proposals.length?state.proposals.map(p=>`<div class="message"><strong>${p.id} · ${p.state}</strong><p>${p.mode} · host arrival #${p.hostArrival}</p><p>${p.sender}/T${p.turn}/S${p.ordinal}${p.resourceId?` · ${p.state==="Waiting for capacity"?"owns":p.state==="Cancelled before admission"?"returned":"carried"} ${p.resourceId}`:""}</p></div>`).join(""):`<p class="empty">No admission proposals.</p>`;
+  const replies=state.replies.map(r=>`<div class="reply"><strong>${r.id} · ${r.state}</strong><p>waiter: ${r.waiter}</p><p>fulfiller: ${r.fulfiller}</p><p>return path: ${r.returnPath}</p></div>`);
+  const resources=state.resources.map(r=>`<div class="resource"><strong>${r.id}</strong><p>Custody: ${r.home}</p></div>`);
+  $("resources").innerHTML=[...replies,...resources].join("");
+  const children=state.group.children.map(c=>`<div class="child"><strong>${c.id} · ${c.state}</strong><p>${c.state==="Quiesced"?"returned":"owns"} ${c.resource}</p></div>`);
+  const cleanup=state.group.cleanup.map((c,i)=>`<div class="child"><strong>Cleanup ${i+1}</strong><p>${c}</p></div>`);
+  $("group").innerHTML=`<div class="child"><strong>${state.group.id} · ${state.group.phase}</strong><p>admission ${state.group.admissionOpen?"open":"closed"}</p></div>${[...children,...cleanup].join("")||'<p class="empty">No child or cleanup records.</p>'}`;
+}
+function renderEvents(){$("events").innerHTML=state.events.length?[...state.events].reverse().map(e=>`<div class="event ${e.tone}"><strong>${e.n}. ${e.kind}</strong><br>${e.text}</div>`).join(""):`<p class="empty">Choose an action or walkthrough.</p>`}
+function renderWalkthroughs(){
+  $("tabs").innerHTML=walkthroughs.map((w,i)=>`<button class="tab ${i===activeWalkthrough?"active":""}" onclick="startWalkthrough(${i})">${w.title}</button>`).join("");
+  const w=walkthroughs[activeWalkthrough];$("walkthrough-copy").textContent=w.copy;
+  $("steps").innerHTML=w.steps.map(([label],i)=>`<button class="${i===walkthroughStep?"primary":""}" ${i>walkthroughStep?"disabled":""} onclick="runWalkthroughStep(${i})">${i+1}. ${label}</button>`).join("")+`<span class="step-marker">${walkthroughStep}/${w.steps.length} steps explored</span>`;
+}
+function render(){renderActions();renderRuntime();renderPlan();renderCollections();renderEvents();renderWalkthroughs()}
+render();
+</script>
+</body>
+</html>

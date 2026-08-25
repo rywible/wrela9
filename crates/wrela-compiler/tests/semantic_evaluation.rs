@@ -583,10 +583,15 @@ fn increment(mut counter: Counter):
 fn observe(read counter: Counter) -> i64:
     return counter.value
 
+fn consume(take counter: Counter):
+    pass
+
 fn compute() -> i64:
     mut counter = Counter(value=4)
     increment(mut counter)
-    return observe(counter)
+    answer = observe(counter)
+    consume(take counter)
+    return answer
 
 const VALUE: i64 = compute()
 
@@ -1300,7 +1305,7 @@ enum State:
 fn build() -> Image:
     card = Card(value=42)
     ticket = Ticket(bytes=b"ok")
-    return Image.new(score=card.score(), ticket=ticket, state=State.Ready)
+    return Image.new(score=card.score(), ticket=take ticket, state=State.Ready)
 "#;
     let outcome = compile(source);
     let CompilationOutcome::Accepted(accepted) = outcome else {
@@ -3170,6 +3175,379 @@ fn build() -> Image:
 }
 
 #[test]
+fn a_live_protocol_resource_must_be_explicitly_discharged_on_fallthrough() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn broken():
+    ticket = Ticket(id=1)
+    pass
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("a live protocol Resource cannot disappear on fallthrough");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.resource_not_discharged",
+        (b"ticket", 0),
+        &[],
+        &[("subject", "ticket"), ("state", "live_undischarged")],
+        &[
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
+        ],
+    );
+}
+
+#[test]
+fn aggregate_discharge_preserves_each_nested_resource_obligation_once() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+resource struct Envelope:
+    left: Ticket
+    right: Ticket
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn broken():
+    envelope = Envelope(left=Ticket(id=1), right=Ticket(id=2))
+    consume(take envelope.left)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("moving one field cannot erase its sibling's discharge obligation");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.resource_not_discharged",
+        (b"envelope", 0),
+        &[],
+        &[
+            ("subject", "envelope.right"),
+            ("state", "live_undischarged"),
+        ],
+        &[
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
+        ],
+    );
+}
+
+#[test]
+fn fixed_array_discharge_preserves_each_indexed_resource_obligation_once() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn broken():
+    tickets = [Ticket(id=1), Ticket(id=2)]
+    consume(take tickets[0])
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("moving one fixed-array element cannot erase its sibling obligation");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.resource_not_discharged",
+        (b"tickets", 0),
+        &[],
+        &[("subject", "tickets[1]"), ("state", "live_undischarged")],
+        &[
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
+        ],
+    );
+}
+
+#[test]
+fn dynamic_array_discharge_cannot_lose_the_remaining_resource_obligation() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn tickets() -> [Ticket]:
+    values = [Ticket(id=1), Ticket(id=2)]
+    return take values
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn broken():
+    values = tickets()
+    consume(take values[0])
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("a dynamic array cannot lose the unenumerated Resource remainder");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.resource_not_discharged",
+        (b"values", 2),
+        &[],
+        &[("subject", "values"), ("state", "live_undischarged")],
+        &[("owner_identity", IdentityDomain::Definition, "broken")],
+    );
+}
+
+#[test]
+fn a_branch_cannot_hide_a_live_resource_from_its_scope_exit() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn broken(flag: bool):
+    if flag:
+        ticket = Ticket(id=1)
+        pass
+    pass
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("a continuing branch must discharge its branch-local Resource");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.resource_not_discharged",
+        (b"ticket", 0),
+        &[],
+        &[("subject", "ticket"), ("state", "live_undischarged")],
+        &[
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
+        ],
+    );
+}
+
+#[test]
+fn an_early_return_cannot_abandon_a_live_resource() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn broken() -> i64:
+    ticket = Ticket(id=1)
+    return 1
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("return must discharge every live Resource before leaving");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.resource_not_discharged",
+        (b"ticket", 0),
+        &[],
+        &[("subject", "ticket"), ("state", "live_undischarged")],
+        &[
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
+        ],
+    );
+}
+
+#[test]
+fn break_cannot_abandon_a_loop_local_resource() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn broken():
+    for flag in [true]:
+        ticket = Ticket(id=1)
+        break
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("break must discharge every Resource leaving the loop body scope");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.resource_not_discharged",
+        (b"ticket", 0),
+        &[],
+        &[("subject", "ticket"), ("state", "live_undischarged")],
+        &[
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
+        ],
+    );
+}
+
+#[test]
+fn continue_cannot_abandon_a_loop_local_resource() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn broken():
+    for flag in [true]:
+        ticket = Ticket(id=1)
+        continue
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("continue must discharge every Resource leaving the iteration scope");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.resource_not_discharged",
+        (b"ticket", 0),
+        &[],
+        &[("subject", "ticket"), ("state", "live_undischarged")],
+        &[
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
+        ],
+    );
+}
+
+#[test]
+fn a_take_pattern_preserves_the_witness_resource_obligation() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn broken():
+    value = Ticket(id=1)
+    match value:
+        case take ticket:
+            pass
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("a take binding must remain responsible for the moved Resource");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.resource_not_discharged",
+        (b"ticket", 0),
+        &[],
+        &[("subject", "ticket"), ("state", "live_undischarged")],
+        &[
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
+        ],
+    );
+}
+
+#[test]
+fn an_existential_preserves_its_resource_witness_discharge_law() {
+    let source = br#"interface Identified:
+    fn identity(read self) -> i64
+
+resource struct Ticket implements Identified:
+    id: i64
+    fn identity(read self) -> i64:
+        return self.id
+
+fn erase(take ticket: Ticket) -> any Identified:
+    return take ticket
+
+fn broken():
+    ticket = Ticket(id=1)
+    value = erase(take ticket)
+    pass
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("an existential must retain its Resource witness obligation");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.resource_not_discharged",
+        (b"value", 0),
+        &[],
+        &[("subject", "value"), ("state", "live_undischarged")],
+        &[
+            ("subject_identity", IdentityDomain::Definition, "Identified"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
+        ],
+    );
+}
+
+#[test]
+fn propagation_cannot_return_while_a_protocol_resource_is_live() {
+    let source = br#"struct Failure:
+    code: i64
+
+resource struct Ticket:
+    id: i64
+
+fn maybe() -> Result[i64, Failure]:
+    return Result.Err(Failure(code=1))
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn broken() -> Result[i64, Failure]:
+    ticket = Ticket(id=1)
+    value = maybe()?
+    consume(take ticket)
+    return Result.Ok(value)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("postfix propagation is a recoverable exit and cannot leak custody");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.resource_not_discharged",
+        (b"ticket", 1),
+        &[],
+        &[("subject", "ticket"), ("state", "live_undischarged")],
+        &[
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
+        ],
+    );
+}
+
+#[test]
 fn resource_replacement_requires_prior_transfer_and_reinitializes_the_place() {
     let invalid = br#"resource struct Ticket:
     id: i64
@@ -3209,7 +3587,9 @@ fn replace_after_transfer() -> i64:
     mut ticket = Ticket(id=1)
     consume(take ticket)
     ticket = Ticket(id=2)
-    return ticket.id
+    id = ticket.id
+    consume(take ticket)
+    return id
 
 @image
 fn build() -> Image:
@@ -3265,10 +3645,15 @@ fn inspect(read left: Ticket, read right: Ticket) -> i64:
 fn edit(mut ticket: Ticket):
     ticket.id = 9
 
+fn consume(take ticket: Ticket):
+    pass
+
 fn use_loans(take ticket: Ticket) -> i64:
     before = inspect(ticket, ticket)
     edit(mut ticket)
-    return before + ticket.id
+    answer = before + ticket.id
+    consume(take ticket)
+    return answer
 
 @image
 fn build() -> Image:
@@ -3758,7 +4143,9 @@ fn restored() -> i64:
     consume(take envelope)
     envelope.left = Ticket(id=3)
     envelope.right = Ticket(id=4)
-    return envelope.left.id + envelope.right.id
+    answer = envelope.left.id + envelope.right.id
+    consume(take envelope)
+    return answer
 
 @image
 fn build() -> Image:

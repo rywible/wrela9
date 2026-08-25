@@ -2266,6 +2266,7 @@ fn analyze_with_probe(
                 typed_hir::CustodyDiagnosticState::Loaned => "loaned",
                 typed_hir::CustodyDiagnosticState::ConflictingLoan => "conflicting_loan",
                 typed_hir::CustodyDiagnosticState::PathDependent => "path_dependent",
+                typed_hir::CustodyDiagnosticState::LiveUndischarged => "live_undischarged",
             };
             let mut diagnostic =
                 Diagnostic::new(kind.diagnostic_code(), site, RecoveryAction::None)

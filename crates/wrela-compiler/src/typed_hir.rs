@@ -19,7 +19,7 @@ use crate::syntax::{
 };
 use crate::type_semantics::{
     CallError, CallableParameter, CallableSignature, LabelMode, can_initialize, can_pass,
-    can_return, can_unify, contains_resource,
+    can_return, can_unify,
 };
 use crate::{Cancellation, SourceRange};
 
@@ -112,23 +112,32 @@ struct MoveState {
 }
 
 impl MoveState {
-    fn is_unreadable(&self, place: &Place) -> bool {
-        let place = PlaceKey::from_place(place);
+    fn is_key_fully_moved(&self, place: &PlaceKey) -> bool {
+        self.places.iter().any(|moved| moved.covers(place))
+            && !self.restored.iter().any(|restored| place.covers(restored))
+    }
+
+    fn is_key_unreadable(&self, place: &PlaceKey) -> bool {
         let moved_ancestor = self
             .places
             .iter()
-            .filter(|moved| moved.covers(&place))
+            .filter(|moved| moved.covers(place))
             .map(|moved| moved.projections.len())
             .max();
         let restored_ancestor = self
             .restored
             .iter()
-            .filter(|restored| restored.covers(&place))
+            .filter(|restored| restored.covers(place))
             .map(|restored| restored.projections.len())
             .max();
         moved_ancestor
             .is_some_and(|moved| restored_ancestor.is_none_or(|restored| moved >= restored))
             || self.places.iter().any(|moved| place.covers(moved))
+    }
+
+    fn is_unreadable(&self, place: &Place) -> bool {
+        let place = PlaceKey::from_place(place);
+        self.is_key_unreadable(&place)
     }
 
     fn move_place(&mut self, place: &Place) -> bool {
@@ -350,6 +359,275 @@ pub(crate) struct ResolvedInterfaceRequirement {
     pub(crate) return_type: Type,
 }
 
+/// The closed vocabulary by which one Resource Type satisfies its recoverable-exit
+/// obligation. This remains private to Typed HIR: source operations transfer or
+/// discharge custody without learning how the compiler represents the proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DischargeLaw {
+    Explicit,
+    CompilerReclaim(AuthenticatedReclaim),
+    Structural(Arc<[DischargeComponent]>),
+    ExistentialWitness(Arc<[WitnessDischarge]>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthenticatedReclaim {
+    PoolOwnership,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DischargeComponent {
+    identity: DischargeComponentIdentity,
+    law: DischargeLaw,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DischargeComponentIdentity {
+    Field(DefinitionId),
+    Element,
+    Tuple(u32),
+    Success,
+    Error,
+    Present,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WitnessDischarge {
+    witness: DefinitionId,
+    law: DischargeLaw,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RawDischargeLaw {
+    type_id: TypeId,
+    type_: Type,
+    law: DischargeLaw,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DischargeLawRegistry {
+    observed: RefCell<BTreeMap<TypeId, Type>>,
+    authenticated_reclaims: RefCell<BTreeSet<TypeId>>,
+}
+
+impl DischargeLawRegistry {
+    fn reset(&self) {
+        self.observed.borrow_mut().clear();
+        self.authenticated_reclaims.borrow_mut().clear();
+    }
+
+    fn observe(&self, type_id: TypeId, type_: &Type) -> Result<(), VerificationFailure> {
+        match self.observed.borrow_mut().entry(type_id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(type_.clone());
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == type_ => Ok(()),
+            std::collections::btree_map::Entry::Occupied(_) => Err(VerificationFailure::Defect {
+                evidence: Arc::from(format!("discharge-law TypeId collision {:032x}", type_id.0)),
+            }),
+        }
+    }
+
+    fn authenticate_reclaim(&self, type_id: TypeId) -> Result<(), VerificationFailure> {
+        if !self.observed.borrow().contains_key(&type_id) {
+            return defect("authenticated reclaim names an unobserved TypeId");
+        }
+        self.authenticated_reclaims.borrow_mut().insert(type_id);
+        Ok(())
+    }
+
+    fn authenticated_law(&self, type_: &Type) -> Option<DischargeLaw> {
+        self.observed
+            .borrow()
+            .iter()
+            .find(|(type_id, observed)| {
+                *observed == type_ && self.authenticated_reclaims.borrow().contains(type_id)
+            })
+            .map(|_| DischargeLaw::CompilerReclaim(AuthenticatedReclaim::PoolOwnership))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct VerifiedDischargeLaws {
+    laws: BTreeMap<TypeId, DischargeLaw>,
+    by_type: BTreeMap<Type, DischargeLaw>,
+    _verified: Verified,
+}
+
+#[derive(Clone, Debug)]
+struct LiveDischargeObligation {
+    place: PlaceKey,
+    subject: Arc<str>,
+    subject_identity: Option<DefinitionId>,
+}
+
+impl DischargeLaw {
+    fn requires_explicit_discharge(&self) -> bool {
+        match self {
+            Self::Explicit => true,
+            Self::CompilerReclaim(_) => false,
+            Self::Structural(components) => components
+                .iter()
+                .any(|component| component.law.requires_explicit_discharge()),
+            Self::ExistentialWitness(witnesses) => witnesses
+                .iter()
+                .any(|witness| witness.law.requires_explicit_discharge()),
+        }
+    }
+}
+
+fn derive_discharge_law(
+    type_: &Type,
+    structs: &BTreeMap<DefinitionId, ResolvedStruct>,
+    interfaces: &BTreeMap<DefinitionId, ResolvedInterface>,
+    nominal_displays: &BTreeMap<DefinitionId, Arc<str>>,
+) -> Option<DischargeLaw> {
+    match type_ {
+        Type::Own { .. } => Some(DischargeLaw::CompilerReclaim(
+            AuthenticatedReclaim::PoolOwnership,
+        )),
+        Type::Nominal {
+            definition,
+            arguments,
+            ..
+        } => {
+            let struct_ = structs.get(definition)?;
+            if !struct_.resource {
+                return arguments.iter().find_map(|argument| {
+                    derive_discharge_law(argument, structs, interfaces, nominal_displays)
+                });
+            }
+            let substitutions = struct_
+                .type_parameters
+                .iter()
+                .copied()
+                .zip(arguments.iter().cloned())
+                .collect::<BTreeMap<_, _>>();
+            let fields = if struct_.field_selections.is_empty()
+                || arguments.iter().any(type_has_placeholder)
+            {
+                Arc::from(struct_.fields.clone())
+            } else {
+                struct_
+                    .applied_fields
+                    .borrow()
+                    .get(arguments)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::from(struct_.fields.clone()))
+            };
+            let components = fields
+                .iter()
+                .filter_map(|field| {
+                    derive_discharge_law(
+                        &substitute(&field.type_, &substitutions),
+                        structs,
+                        interfaces,
+                        nominal_displays,
+                    )
+                    .map(|law| DischargeComponent {
+                        identity: DischargeComponentIdentity::Field(field.definition),
+                        law,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Some(if components.is_empty() {
+                DischargeLaw::Explicit
+            } else {
+                DischargeLaw::Structural(components.into())
+            })
+        }
+        Type::Array(element) | Type::FixedArray { element, .. } => {
+            derive_discharge_law(element, structs, interfaces, nominal_displays).map(|law| {
+                DischargeLaw::Structural(Arc::from([DischargeComponent {
+                    identity: DischargeComponentIdentity::Element,
+                    law,
+                }]))
+            })
+        }
+        Type::Tuple(members) => {
+            let components = members
+                .iter()
+                .enumerate()
+                .filter_map(|(index, member)| {
+                    derive_discharge_law(member, structs, interfaces, nominal_displays).map(|law| {
+                        DischargeComponent {
+                            identity: DischargeComponentIdentity::Tuple(
+                                u32::try_from(index).unwrap_or(u32::MAX),
+                            ),
+                            law,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            (!components.is_empty()).then(|| DischargeLaw::Structural(components.into()))
+        }
+        Type::Result { success, error } => {
+            let components = derive_discharge_law(success, structs, interfaces, nominal_displays)
+                .map(|law| DischargeComponent {
+                    identity: DischargeComponentIdentity::Success,
+                    law,
+                })
+                .into_iter()
+                .chain(error.as_deref().and_then(|error| {
+                    derive_discharge_law(error, structs, interfaces, nominal_displays).map(|law| {
+                        DischargeComponent {
+                            identity: DischargeComponentIdentity::Error,
+                            law,
+                        }
+                    })
+                }))
+                .collect::<Vec<_>>();
+            (!components.is_empty()).then(|| DischargeLaw::Structural(components.into()))
+        }
+        Type::Option(value) => derive_discharge_law(value, structs, interfaces, nominal_displays)
+            .map(|law| {
+                DischargeLaw::Structural(Arc::from([DischargeComponent {
+                    identity: DischargeComponentIdentity::Present,
+                    law,
+                }]))
+            }),
+        Type::Any { interface, .. } => {
+            let witnesses = interfaces
+                .get(interface)?
+                .implementations
+                .keys()
+                .filter_map(|definition| {
+                    let display = nominal_displays.get(definition)?.clone();
+                    derive_discharge_law(
+                        &Type::Nominal {
+                            definition: *definition,
+                            display,
+                            arguments: Arc::from([]),
+                        },
+                        structs,
+                        interfaces,
+                        nominal_displays,
+                    )
+                    .map(|law| WitnessDischarge {
+                        witness: *definition,
+                        law,
+                    })
+                })
+                .collect::<Vec<_>>();
+            (!witnesses.is_empty()).then(|| DischargeLaw::ExistentialWitness(witnesses.into()))
+        }
+        Type::Unit
+        | Type::Bool
+        | Type::Integer(_)
+        | Type::Float(_)
+        | Type::Text
+        | Type::Scalar
+        | Type::Bytes
+        | Type::ConstU64(_)
+        | Type::PoolArgument(_)
+        | Type::Function { .. }
+        | Type::Builtin(_)
+        | Type::Parameter { .. }
+        | Type::Infer => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResolvedName {
     Function(DefinitionId),
@@ -465,6 +743,7 @@ pub(crate) struct ProgramInput {
     pub(crate) namespace: NamespaceCatalog,
     pub(crate) nominal_displays: BTreeMap<DefinitionId, Arc<str>>,
     pub(crate) comptime_roots: Vec<(ModuleId, ExpressionSyntax)>,
+    pub(crate) discharge_laws: DischargeLawRegistry,
 }
 
 #[derive(Clone, Debug)]
@@ -478,6 +757,7 @@ pub(crate) struct VerifiedProgram {
     specializations: BTreeMap<SpecializationId, SpecializationRecord>,
     comptime_expressions: BTreeMap<SourceRange, Expression>,
     closures: BTreeMap<ClosureId, Arc<HirClosure>>,
+    _discharge_laws: VerifiedDischargeLaws,
     fingerprint: u128,
     _verified: Verified,
 }
@@ -897,6 +1177,7 @@ pub(crate) enum CreatorFailureKind {
     UnresolvedType,
     ResourceRequiresTake,
     ResourceReplacementRequiresDischarge,
+    ResourceNotDischarged,
     MustUseValue,
 }
 
@@ -947,6 +1228,7 @@ impl CreatorFailureKind {
             Self::ResourceReplacementRequiresDischarge => {
                 "semantic.resource_replacement_requires_discharge"
             }
+            Self::ResourceNotDischarged => "semantic.resource_not_discharged",
             Self::MustUseValue => "semantic.must_use_value",
         }
     }
@@ -959,6 +1241,7 @@ pub(crate) enum CustodyDiagnosticState {
     Loaned,
     ConflictingLoan,
     PathDependent,
+    LiveUndischarged,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1165,6 +1448,7 @@ pub(crate) fn verify(
     cancellation: &Cancellation,
 ) -> Result<VerifiedProgram, VerificationFailure> {
     validate_input(&input)?;
+    input.discharge_laws.reset();
     intern_input_types(&input, identity_catalog)?;
     let mut specializations = BTreeMap::new();
     let mut pending_specializations = BTreeSet::new();
@@ -1259,6 +1543,9 @@ pub(crate) fn verify(
             ));
         }
         let body = lowerer.statements(&function.body, &function.return_type)?;
+        if syntax_statements_fall_through(&function.body) {
+            lowerer.check_recoverable_exit()?;
+        }
         functions.insert(
             function.id,
             Arc::new(HirFunction {
@@ -1351,6 +1638,9 @@ pub(crate) fn verify(
             ));
         }
         let body: Arc<[Statement]> = lowerer.statements(&test.body, &Type::Unit)?.into();
+        if syntax_statements_fall_through(&test.body) {
+            lowerer.check_recoverable_exit()?;
+        }
         if !test.asynchronous && statements_suspend(&body) {
             return creator(CreatorFailureKind::AwaitRequiresAsync, &test.source);
         }
@@ -1385,6 +1675,7 @@ pub(crate) fn verify(
             return defect("specialized body has no identity-catalog observation");
         }
     }
+    let discharge_laws = construct_and_verify_discharge_laws(&input)?;
     identity_catalog.finalize();
 
     let mut closures = BTreeMap::new();
@@ -1480,6 +1771,11 @@ pub(crate) fn verify(
             append_part(&mut canonical, &parameter.type_.canonical_key());
         }
     }
+    append_collection_header(&mut canonical, 9, discharge_laws.laws.len());
+    for (type_id, law) in &discharge_laws.laws {
+        canonical.extend_from_slice(&type_id.0.to_be_bytes());
+        append_discharge_law(&mut canonical, law);
+    }
     let artifact_catalog = ArtifactCatalog {
         templates: &functions,
         specialized: &specialized_functions,
@@ -1489,6 +1785,7 @@ pub(crate) fn verify(
         variants: &input.variants,
         structs: &input.structs,
         interfaces: &input.interfaces,
+        discharge_laws: Some(&discharge_laws),
     };
     verify_lowered_artifact(&artifact_catalog, &test_bodies)?;
     Ok(VerifiedProgram {
@@ -1501,6 +1798,7 @@ pub(crate) fn verify(
         specializations,
         comptime_expressions,
         closures,
+        _discharge_laws: discharge_laws,
         fingerprint: canonical.digest128(),
         _verified: Verified,
     })
@@ -1542,6 +1840,7 @@ fn verify_comptime_condition_with_values(
     generic_const_values: &BTreeMap<String, (IntegerType, u64)>,
 ) -> Result<(VerifiedProgram, Expression), VerificationFailure> {
     validate_input(input)?;
+    input.discharge_laws.reset();
     intern_input_types(input, identity_catalog)?;
     let mut specializations = BTreeMap::new();
     let mut pending_specializations = BTreeSet::new();
@@ -1698,6 +1997,7 @@ fn verify_comptime_condition_with_values(
     for constant in constants.values() {
         collect_expression_closures(&constant.expression, &mut closures)?;
     }
+    let discharge_laws = construct_and_verify_discharge_laws(input)?;
     let program = VerifiedProgram {
         functions,
         specialized_functions,
@@ -1708,6 +2008,7 @@ fn verify_comptime_condition_with_values(
         specializations,
         comptime_expressions: BTreeMap::from([(condition.range.clone(), expression.clone())]),
         closures,
+        _discharge_laws: discharge_laws,
         fingerprint: 0,
         _verified: Verified,
     };
@@ -1755,6 +2056,9 @@ fn lower_concrete_function(
         ));
     }
     let body = lowerer.statements(&function.body, &function.return_type)?;
+    if syntax_statements_fall_through(&function.body) {
+        lowerer.check_recoverable_exit()?;
+    }
     Ok(HirFunction {
         id: function.id,
         name: function.name.clone(),
@@ -1951,6 +2255,9 @@ pub(crate) fn lower_functions_for_error_inference(
             ));
         }
         let body = lowerer.statements(&function.body, &function.return_type)?;
+        if syntax_statements_fall_through(&function.body) {
+            lowerer.check_recoverable_exit()?;
+        }
         functions.insert(
             function.id,
             Arc::new(HirFunction {
@@ -2055,6 +2362,9 @@ fn materialize_missing_specializations(
         }
         let return_type = substitute(&function.return_type, &substitutions);
         let body = lowerer.statements(&function.body, &return_type)?;
+        if syntax_statements_fall_through(&function.body) {
+            lowerer.check_recoverable_exit()?;
+        }
         specialized_functions.insert(
             record.id,
             Arc::new(HirFunction {
@@ -2089,18 +2399,48 @@ fn append_argument_order(bytes: &mut impl ByteSink, order: &[u16]) {
     }
 }
 
+fn append_discharge_law(bytes: &mut impl ByteSink, law: &DischargeLaw) {
+    match law {
+        DischargeLaw::Explicit => bytes.push(0),
+        DischargeLaw::CompilerReclaim(AuthenticatedReclaim::PoolOwnership) => bytes.push(1),
+        DischargeLaw::Structural(components) => {
+            bytes.push(2);
+            append_collection_header(bytes, 0, components.len());
+            for component in &**components {
+                match component.identity {
+                    DischargeComponentIdentity::Field(definition) => {
+                        bytes.push(0);
+                        bytes.extend_from_slice(&definition.0.to_be_bytes());
+                    }
+                    DischargeComponentIdentity::Element => bytes.push(1),
+                    DischargeComponentIdentity::Tuple(index) => {
+                        bytes.push(2);
+                        bytes.extend_from_slice(&index.to_be_bytes());
+                    }
+                    DischargeComponentIdentity::Success => bytes.push(3),
+                    DischargeComponentIdentity::Error => bytes.push(4),
+                    DischargeComponentIdentity::Present => bytes.push(5),
+                }
+                append_discharge_law(bytes, &component.law);
+            }
+        }
+        DischargeLaw::ExistentialWitness(witnesses) => {
+            bytes.push(3);
+            append_collection_header(bytes, 0, witnesses.len());
+            for witness in &**witnesses {
+                bytes.extend_from_slice(&witness.witness.0.to_be_bytes());
+                append_discharge_law(bytes, &witness.law);
+            }
+        }
+    }
+}
+
 fn intern_input_types(
     input: &ProgramInput,
     identities: &mut IdentityCatalog,
 ) -> Result<(), VerificationFailure> {
-    let mut intern = |type_: &Type| {
-        identities
-            .intern_type(type_)
-            .map(|_| ())
-            .map_err(|collision| VerificationFailure::Defect {
-                evidence: Arc::from(format!("type identity collision {:032x}", collision.digest)),
-            })
-    };
+    let mut intern =
+        |type_: &Type| observe_type_tree(type_, identities, &input.discharge_laws).map(|_| ());
     for function in input.functions.values() {
         for parameter in &function.parameters {
             intern(&parameter.type_)?;
@@ -2115,7 +2455,187 @@ fn intern_input_types(
             intern(&parameter.type_)?;
         }
     }
+    for struct_ in input.structs.values() {
+        for field in &struct_.fields {
+            intern(&field.type_)?;
+        }
+        if struct_.type_parameters.is_empty() {
+            intern(&Type::Nominal {
+                definition: struct_.definition,
+                display: struct_.display.clone(),
+                arguments: Arc::from([]),
+            })?;
+        }
+    }
+    for variant in input.variants.values() {
+        for parameter in &variant.parameters {
+            intern(&parameter.type_)?;
+        }
+    }
+    for type_ in input.aliases.values() {
+        intern(type_)?;
+    }
     Ok(())
+}
+
+fn observe_type_tree(
+    type_: &Type,
+    identities: &mut IdentityCatalog,
+    registry: &DischargeLawRegistry,
+) -> Result<TypeId, VerificationFailure> {
+    match type_ {
+        Type::Array(element)
+        | Type::FixedArray { element, .. }
+        | Type::Own { value: element, .. }
+        | Type::Option(element) => {
+            observe_type_tree(element, identities, registry)?;
+        }
+        Type::Tuple(members) => {
+            for member in &**members {
+                observe_type_tree(member, identities, registry)?;
+            }
+        }
+        Type::Function {
+            parameters,
+            return_type,
+        } => {
+            for parameter in &**parameters {
+                observe_type_tree(parameter, identities, registry)?;
+            }
+            observe_type_tree(return_type, identities, registry)?;
+        }
+        Type::Result { success, error } => {
+            observe_type_tree(success, identities, registry)?;
+            if let Some(error) = error {
+                observe_type_tree(error, identities, registry)?;
+            }
+        }
+        Type::Nominal { arguments, .. } => {
+            for argument in &**arguments {
+                observe_type_tree(argument, identities, registry)?;
+            }
+        }
+        Type::Unit
+        | Type::Bool
+        | Type::Integer(_)
+        | Type::Float(_)
+        | Type::Text
+        | Type::Scalar
+        | Type::Bytes
+        | Type::ConstU64(_)
+        | Type::PoolArgument(_)
+        | Type::Any { .. }
+        | Type::Builtin(_)
+        | Type::Parameter { .. }
+        | Type::Infer => {}
+    }
+    let type_id =
+        identities
+            .intern_type(type_)
+            .map_err(|collision| VerificationFailure::Defect {
+                evidence: Arc::from(format!("type identity collision {:032x}", collision.digest)),
+            })?;
+    registry.observe(type_id, type_)?;
+    Ok(type_id)
+}
+
+fn construct_discharge_laws(
+    observed: &BTreeMap<TypeId, Type>,
+    authenticated_reclaims: &BTreeSet<TypeId>,
+    input: &ProgramInput,
+) -> Vec<RawDischargeLaw> {
+    observed
+        .iter()
+        .filter_map(|(type_id, type_)| {
+            authenticated_reclaims
+                .contains(type_id)
+                .then_some(DischargeLaw::CompilerReclaim(
+                    AuthenticatedReclaim::PoolOwnership,
+                ))
+                .or_else(|| {
+                    derive_discharge_law(
+                        type_,
+                        &input.structs,
+                        &input.interfaces,
+                        &input.nominal_displays,
+                    )
+                })
+                .map(|law| RawDischargeLaw {
+                    type_id: *type_id,
+                    type_: type_.clone(),
+                    law,
+                })
+        })
+        .collect()
+}
+
+fn verify_discharge_laws(
+    observed: &BTreeMap<TypeId, Type>,
+    claimed: &[RawDischargeLaw],
+    authenticated_reclaims: &BTreeSet<TypeId>,
+    structs: &BTreeMap<DefinitionId, ResolvedStruct>,
+    interfaces: &BTreeMap<DefinitionId, ResolvedInterface>,
+    nominal_displays: &BTreeMap<DefinitionId, Arc<str>>,
+) -> Result<VerifiedDischargeLaws, VerificationFailure> {
+    let mut laws = BTreeMap::new();
+    for claim in claimed {
+        if observed.get(&claim.type_id) != Some(&claim.type_) {
+            return defect("discharge law names an unobserved or mismatched TypeId");
+        }
+        let structural_law =
+            derive_discharge_law(&claim.type_, structs, interfaces, nominal_displays);
+        if authenticated_reclaims.contains(&claim.type_id) && structural_law.is_none() {
+            return defect("authenticated reclaim attached to a Data TypeId");
+        }
+        let expected = authenticated_reclaims
+            .contains(&claim.type_id)
+            .then_some(DischargeLaw::CompilerReclaim(
+                AuthenticatedReclaim::PoolOwnership,
+            ))
+            .or(structural_law);
+        let Some(expected) = expected else {
+            return defect("discharge law attached to a Data TypeId");
+        };
+        if claim.law != expected {
+            return defect("discharge law contradicts its Resource Type structure");
+        }
+        if laws.insert(claim.type_id, claim.law.clone()).is_some() {
+            return defect("Resource TypeId has more than one Discharge Law");
+        }
+    }
+    for (type_id, type_) in observed {
+        if (authenticated_reclaims.contains(type_id)
+            || derive_discharge_law(type_, structs, interfaces, nominal_displays).is_some())
+            && !laws.contains_key(type_id)
+        {
+            return defect("Resource TypeId has no Discharge Law");
+        }
+    }
+    let by_type = observed
+        .iter()
+        .filter_map(|(type_id, type_)| laws.get(type_id).cloned().map(|law| (type_.clone(), law)))
+        .collect();
+    Ok(VerifiedDischargeLaws {
+        laws,
+        by_type,
+        _verified: Verified,
+    })
+}
+
+fn construct_and_verify_discharge_laws(
+    input: &ProgramInput,
+) -> Result<VerifiedDischargeLaws, VerificationFailure> {
+    let observed = input.discharge_laws.observed.borrow().clone();
+    let authenticated_reclaims = input.discharge_laws.authenticated_reclaims.borrow().clone();
+    let claimed = construct_discharge_laws(&observed, &authenticated_reclaims, input);
+    verify_discharge_laws(
+        &observed,
+        &claimed,
+        &authenticated_reclaims,
+        &input.structs,
+        &input.interfaces,
+        &input.nominal_displays,
+    )
 }
 
 struct ArtifactCatalog<'a> {
@@ -2127,6 +2647,7 @@ struct ArtifactCatalog<'a> {
     variants: &'a BTreeMap<VariantId, ResolvedVariant>,
     structs: &'a BTreeMap<DefinitionId, ResolvedStruct>,
     interfaces: &'a BTreeMap<DefinitionId, ResolvedInterface>,
+    discharge_laws: Option<&'a VerifiedDischargeLaws>,
 }
 
 fn artifact_struct_fields(
@@ -2279,20 +2800,26 @@ fn verify_specialized_artifact(
             .iter()
             .map(|(local, type_, _)| (*local, type_.clone()))
             .collect::<BTreeMap<_, _>>();
+        let discharge_exempt = locals.keys().copied().collect::<BTreeSet<_>>();
+        let mut moved = MoveState::default();
         let mut previous_source_start = function.source.start();
         verify_loop_control(&function.body, 0)?;
         verify_statements(
             &function.body,
             &function.return_type,
             &mut locals,
-            &mut MoveState::default(),
+            &mut moved,
             &mut Vec::new(),
             &ArtifactVerificationAuthority {
                 catalog,
                 provenance_owner: &function.source,
+                discharge_exempt: &discharge_exempt,
             },
             &mut previous_source_start,
         )?;
+        if verified_statements_fall_through(&function.body) {
+            verify_artifact_scope_discharged(&locals, &moved, &discharge_exempt, catalog)?;
+        }
         if statements_have_placeholder(&function.body) {
             return defect("concrete Specialization operation contains a placeholder type");
         }
@@ -2576,6 +3103,7 @@ fn verify_lowered_artifact(
                 return defect("lowered function repeats a parameter LocalId");
             }
         }
+        let discharge_exempt = locals.keys().copied().collect::<BTreeSet<_>>();
         let mut moved = MoveState::default();
         let mut previous_source_start = function.source.start();
         verify_loop_control(&function.body, 0)?;
@@ -2588,9 +3116,13 @@ fn verify_lowered_artifact(
             &ArtifactVerificationAuthority {
                 catalog,
                 provenance_owner: &function.source,
+                discharge_exempt: &discharge_exempt,
             },
             &mut previous_source_start,
         )?;
+        if verified_statements_fall_through(&function.body) {
+            verify_artifact_scope_discharged(&locals, &moved, &discharge_exempt, catalog)?;
+        }
     }
     for (key, constant) in catalog.constants {
         if key != &constant.id {
@@ -2613,20 +3145,26 @@ fn verify_lowered_artifact(
             .iter()
             .map(|(local, type_, _)| (*local, type_.clone()))
             .collect::<BTreeMap<_, _>>();
+        let discharge_exempt = locals.keys().copied().collect::<BTreeSet<_>>();
+        let mut moved = MoveState::default();
         let mut previous_source_start = test.source.start();
         verify_loop_control(&test.body, 0)?;
         verify_statements(
             &test.body,
             &Type::Unit,
             &mut locals,
-            &mut MoveState::default(),
+            &mut moved,
             &mut Vec::new(),
             &ArtifactVerificationAuthority {
                 catalog,
                 provenance_owner: &test.source,
+                discharge_exempt: &discharge_exempt,
             },
             &mut previous_source_start,
         )?;
+        if verified_statements_fall_through(&test.body) {
+            verify_artifact_scope_discharged(&locals, &moved, &discharge_exempt, catalog)?;
+        }
         if statements_have_placeholder(&test.body) {
             return defect("verified Test body contains a placeholder type");
         }
@@ -2637,6 +3175,7 @@ fn verify_lowered_artifact(
 struct ArtifactVerificationAuthority<'a, 'catalog> {
     catalog: &'a ArtifactCatalog<'catalog>,
     provenance_owner: &'a SourceRange,
+    discharge_exempt: &'a BTreeSet<LocalId>,
 }
 
 fn verify_statements(
@@ -2667,7 +3206,7 @@ fn verify_statements(
             Statement::Return { value, source: _ } => {
                 let actual = if let Some(value) = value {
                     let actual = verify_expression_artifact(value, locals, moved, catalog, source)?;
-                    if artifact_type_owns_resource(&actual, catalog.structs)
+                    if artifact_type_owns_resource(&actual, catalog)
                         && root_place(value).is_some()
                         && value.access != AccessMode::Move
                     {
@@ -2680,6 +3219,12 @@ fn verify_statements(
                 if !can_return(&actual, return_type) {
                     return defect("lowered return expression disagrees with function type");
                 }
+                verify_artifact_scope_discharged(
+                    locals,
+                    moved,
+                    authority.discharge_exempt,
+                    catalog,
+                )?;
             }
             Statement::Panic { value, .. } | Statement::Evaluate(value) => {
                 verify_expression_artifact(value, locals, moved, catalog, source)?;
@@ -2701,7 +3246,7 @@ fn verify_statements(
             }
             Statement::Initialize { place, value, .. } => {
                 let type_ = verify_expression_artifact(value, locals, moved, catalog, source)?;
-                if artifact_type_owns_resource(&type_, catalog.structs)
+                if artifact_type_owns_resource(&type_, catalog)
                     && root_place(value).is_some()
                     && value.access != AccessMode::Move
                 {
@@ -2713,7 +3258,7 @@ fn verify_statements(
             }
             Statement::Assign { place, value, .. } => {
                 let type_ = verify_expression_artifact(value, locals, moved, catalog, source)?;
-                if artifact_type_owns_resource(&type_, catalog.structs)
+                if artifact_type_owns_resource(&type_, catalog)
                     && root_place(value).is_some()
                     && value.access != AccessMode::Move
                 {
@@ -2723,8 +3268,7 @@ fn verify_statements(
                 if !can_initialize(&type_, &expected) {
                     return defect("lowered assignment changes the local type");
                 }
-                if artifact_type_owns_resource(&expected, catalog.structs)
-                    && !moved.is_uninitialized(place)
+                if artifact_type_owns_resource(&expected, catalog) && !moved.is_uninitialized(place)
                 {
                     return defect("lowered assignment replaces live Resource custody");
                 }
@@ -2741,6 +3285,7 @@ fn verify_statements(
                 {
                     return defect("lowered if condition is not Bool");
                 }
+                let visible = locals.keys().copied().collect::<BTreeSet<_>>();
                 let mut then_locals = locals.clone();
                 let mut then_moved = moved.clone();
                 verify_statements(
@@ -2752,6 +3297,9 @@ fn verify_statements(
                     authority,
                     previous_source_start,
                 )?;
+                if verified_statements_fall_through(then_branch) {
+                    verify_artifact_scope_discharged(&then_locals, &then_moved, &visible, catalog)?;
+                }
                 let mut else_locals = locals.clone();
                 let mut else_moved = moved.clone();
                 verify_statements(
@@ -2763,6 +3311,9 @@ fn verify_statements(
                     authority,
                     previous_source_start,
                 )?;
+                if verified_statements_fall_through(else_branch) {
+                    verify_artifact_scope_discharged(&else_locals, &else_moved, &visible, catalog)?;
+                }
                 *moved = match (
                     verified_statements_fall_through(then_branch),
                     verified_statements_fall_through(else_branch),
@@ -2781,6 +3332,7 @@ fn verify_statements(
                 ..
             } => {
                 let matched = verify_expression_artifact(value, locals, moved, catalog, source)?;
+                let visible = locals.keys().copied().collect::<BTreeSet<_>>();
                 let mut then_locals = locals.clone();
                 verify_match_pattern_artifact(pattern, &matched, &mut then_locals, catalog)?;
                 let mut then_moved = moved.clone();
@@ -2793,6 +3345,9 @@ fn verify_statements(
                     authority,
                     previous_source_start,
                 )?;
+                if verified_statements_fall_through(then_branch) {
+                    verify_artifact_scope_discharged(&then_locals, &then_moved, &visible, catalog)?;
+                }
                 let mut else_locals = locals.clone();
                 let mut else_moved = moved.clone();
                 verify_statements(
@@ -2804,6 +3359,9 @@ fn verify_statements(
                     authority,
                     previous_source_start,
                 )?;
+                if verified_statements_fall_through(else_branch) {
+                    verify_artifact_scope_discharged(&else_locals, &else_moved, &visible, catalog)?;
+                }
                 *moved = match (
                     verified_statements_fall_through(then_branch),
                     verified_statements_fall_through(else_branch),
@@ -2837,7 +3395,10 @@ fn verify_statements(
                 let body_falls_through = verified_statements_fall_through(body);
                 let visible = locals.keys().copied().collect::<BTreeSet<_>>();
                 verify_match_pattern_artifact(pattern, &element, locals, catalog)?;
-                loop_custody.push(LoopCustodyEdges::default());
+                loop_custody.push(LoopCustodyEdges {
+                    artifact_scope_exclusions: visible.clone(),
+                    ..LoopCustodyEdges::default()
+                });
                 verify_statements(
                     body,
                     return_type,
@@ -2847,6 +3408,9 @@ fn verify_statements(
                     authority,
                     previous_source_start,
                 )?;
+                if body_falls_through {
+                    verify_artifact_scope_discharged(locals, moved, &visible, catalog)?;
+                }
                 let mut edges = loop_custody
                     .pop()
                     .expect("verified for loop custody scope was pushed");
@@ -2891,7 +3455,11 @@ fn verify_statements(
                 }
                 let moved_before = moved.clone();
                 let body_falls_through = verified_statements_fall_through(body);
-                loop_custody.push(LoopCustodyEdges::default());
+                let visible = locals.keys().copied().collect::<BTreeSet<_>>();
+                loop_custody.push(LoopCustodyEdges {
+                    artifact_scope_exclusions: visible.clone(),
+                    ..LoopCustodyEdges::default()
+                });
                 verify_statements(
                     body,
                     return_type,
@@ -2901,9 +3469,13 @@ fn verify_statements(
                     authority,
                     previous_source_start,
                 )?;
+                if body_falls_through {
+                    verify_artifact_scope_discharged(locals, moved, &visible, catalog)?;
+                }
                 let edges = loop_custody
                     .pop()
                     .expect("verified while loop custody scope was pushed");
+                locals.retain(|local, _| visible.contains(local));
                 let mut continuing = edges.continues;
                 if body_falls_through {
                     continuing.push(moved.clone());
@@ -2915,22 +3487,39 @@ fn verify_statements(
                 exits.push(moved_before.clone());
                 *moved = verify_reachable_custody(exits)?.unwrap_or(moved_before);
             }
-            Statement::Break(_) => loop_custody
-                .last_mut()
-                .ok_or_else(|| VerificationFailure::Defect {
-                    evidence: Arc::from("lowered break has no custody loop scope"),
-                })?
-                .breaks
-                .push(moved.clone()),
-            Statement::Continue(_) => loop_custody
-                .last_mut()
-                .ok_or_else(|| VerificationFailure::Defect {
-                    evidence: Arc::from("lowered continue has no custody loop scope"),
-                })?
-                .continues
-                .push(moved.clone()),
+            Statement::Break(_) => {
+                let exclusions = loop_custody
+                    .last()
+                    .ok_or_else(|| VerificationFailure::Defect {
+                        evidence: Arc::from("lowered break has no custody loop scope"),
+                    })?
+                    .artifact_scope_exclusions
+                    .clone();
+                verify_artifact_scope_discharged(locals, moved, &exclusions, catalog)?;
+                loop_custody
+                    .last_mut()
+                    .expect("custody scope was checked")
+                    .breaks
+                    .push(moved.clone());
+            }
+            Statement::Continue(_) => {
+                let exclusions = loop_custody
+                    .last()
+                    .ok_or_else(|| VerificationFailure::Defect {
+                        evidence: Arc::from("lowered continue has no custody loop scope"),
+                    })?
+                    .artifact_scope_exclusions
+                    .clone();
+                verify_artifact_scope_discharged(locals, moved, &exclusions, catalog)?;
+                loop_custody
+                    .last_mut()
+                    .expect("custody scope was checked")
+                    .continues
+                    .push(moved.clone());
+            }
             Statement::Match { value, cases, .. } => {
                 let matched = verify_expression_artifact(value, locals, moved, catalog, source)?;
+                let visible = locals.keys().copied().collect::<BTreeSet<_>>();
                 let mut pattern_keys = BTreeSet::new();
                 if !cases
                     .iter()
@@ -2984,6 +3573,12 @@ fn verify_statements(
                         previous_source_start,
                     )?;
                     if verified_statements_fall_through(&case.body) {
+                        verify_artifact_scope_discharged(
+                            &case_locals,
+                            &case_moved,
+                            &visible,
+                            catalog,
+                        )?;
                         branch_moved.push(case_moved);
                     }
                 }
@@ -2997,6 +3592,7 @@ fn verify_statements(
                 body,
                 ..
             } => {
+                let visible = locals.keys().copied().collect::<BTreeSet<_>>();
                 let scope_type = verify_expression_artifact(scope, locals, moved, catalog, source)?;
                 if locals.insert(binding.local, scope_type).is_some() {
                     return defect("lowered Pool scope repeats a LocalId");
@@ -3010,6 +3606,9 @@ fn verify_statements(
                     authority,
                     previous_source_start,
                 )?;
+                if verified_statements_fall_through(body) {
+                    verify_artifact_scope_discharged(locals, moved, &visible, catalog)?;
+                }
                 locals.remove(&binding.local);
                 moved.restore_place(binding);
             }
@@ -3059,15 +3658,127 @@ fn literal_type(literal: &Literal) -> Type {
     }
 }
 
-fn artifact_type_owns_resource(
+fn artifact_type_owns_resource(type_: &Type, catalog: &ArtifactCatalog<'_>) -> bool {
+    if let Some(laws) = catalog.discharge_laws {
+        return laws.by_type.contains_key(type_);
+    }
+    let displays = catalog
+        .structs
+        .iter()
+        .map(|(definition, struct_)| (*definition, struct_.display.clone()))
+        .collect::<BTreeMap<_, _>>();
+    derive_discharge_law(type_, catalog.structs, catalog.interfaces, &displays).is_some()
+}
+
+fn artifact_has_live_discharge_obligation(
     type_: &Type,
-    structs: &BTreeMap<DefinitionId, ResolvedStruct>,
+    place: &PlaceKey,
+    moved: &MoveState,
+    catalog: &ArtifactCatalog<'_>,
 ) -> bool {
-    contains_resource(type_, &|definition| {
-        structs
-            .get(&definition)
-            .is_some_and(|struct_| struct_.resource)
-    })
+    let displays = catalog
+        .structs
+        .iter()
+        .map(|(definition, struct_)| (*definition, struct_.display.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let law = catalog
+        .discharge_laws
+        .and_then(|laws| laws.by_type.get(type_).cloned())
+        .or_else(|| derive_discharge_law(type_, catalog.structs, catalog.interfaces, &displays));
+    let Some(law) = law else {
+        return false;
+    };
+    if !law.requires_explicit_discharge() {
+        return false;
+    }
+    if let Type::Nominal {
+        definition,
+        arguments,
+        ..
+    } = type_
+        && let Some(struct_) = catalog.structs.get(definition)
+        && struct_.resource
+    {
+        let substitutions = struct_
+            .type_parameters
+            .iter()
+            .copied()
+            .zip(arguments.iter().cloned())
+            .collect::<BTreeMap<_, _>>();
+        let fields = artifact_struct_fields(struct_, arguments).unwrap_or_default();
+        let resource_fields = fields
+            .iter()
+            .filter_map(|field| {
+                let type_ = substitute(&field.type_, &substitutions);
+                artifact_type_owns_resource(&type_, catalog).then_some((field, type_))
+            })
+            .collect::<Vec<_>>();
+        if !resource_fields.is_empty() {
+            return resource_fields.into_iter().any(|(field, field_type)| {
+                let mut projections = place.projections.to_vec();
+                projections.push(ProjectionKey::Field(
+                    *definition,
+                    Arc::from(field.name.as_str()),
+                ));
+                artifact_has_live_discharge_obligation(
+                    &field_type,
+                    &PlaceKey {
+                        local: place.local,
+                        projections: projections.into(),
+                    },
+                    moved,
+                    catalog,
+                )
+            });
+        }
+    }
+    if let Type::FixedArray {
+        element,
+        length: ArrayLength::Value(length),
+    } = type_
+        && artifact_type_owns_resource(element, catalog)
+    {
+        return (0..*length).any(|index| {
+            let mut projections = place.projections.to_vec();
+            projections.push(ProjectionKey::Index(Some(i128::from(index))));
+            artifact_has_live_discharge_obligation(
+                element,
+                &PlaceKey {
+                    local: place.local,
+                    projections: projections.into(),
+                },
+                moved,
+                catalog,
+            )
+        });
+    }
+    if matches!(type_, Type::Array(_)) {
+        return !moved.is_key_fully_moved(place);
+    }
+    !moved.is_key_unreadable(place)
+}
+
+fn verify_artifact_scope_discharged(
+    locals: &BTreeMap<LocalId, Type>,
+    moved: &MoveState,
+    excluded: &BTreeSet<LocalId>,
+    catalog: &ArtifactCatalog<'_>,
+) -> Result<(), VerificationFailure> {
+    if locals.iter().any(|(local, type_)| {
+        !excluded.contains(local)
+            && artifact_has_live_discharge_obligation(
+                type_,
+                &PlaceKey {
+                    local: *local,
+                    projections: Arc::from([]),
+                },
+                moved,
+                catalog,
+            )
+    }) {
+        return defect("lowered recoverable exit abandons live Resource custody");
+    }
+    Ok(())
 }
 
 fn match_pattern_key(pattern: &HirMatchPattern) -> Vec<u8> {
@@ -3201,7 +3912,7 @@ fn verify_expression_artifact(
                 return defect("lowered read uses a LocalId after it was moved");
             }
             if expression.access == AccessMode::Move {
-                if !artifact_type_owns_resource(&type_, catalog.structs) {
+                if !artifact_type_owns_resource(&type_, catalog) {
                     return defect("lowered move does not transfer a Resource-owning place");
                 }
                 if !moved.move_place(place) {
@@ -3276,7 +3987,7 @@ fn verify_expression_artifact(
             let mut closure_locals = BTreeMap::new();
             for (local, type_) in &*closure.captures {
                 if locals.get(local) != Some(type_)
-                    || artifact_type_owns_resource(type_, catalog.structs)
+                    || artifact_type_owns_resource(type_, catalog)
                     || closure_locals.insert(*local, type_.clone()).is_some()
                 {
                     return defect("lowered closure capture is invalid");
@@ -3910,6 +4621,7 @@ fn verify_reachable_custody(
 struct LoopCustodyEdges {
     breaks: Vec<MoveState>,
     continues: Vec<MoveState>,
+    artifact_scope_exclusions: BTreeSet<LocalId>,
 }
 
 struct Lowerer<'a> {
@@ -3925,10 +4637,13 @@ struct Lowerer<'a> {
     namespace: &'a NamespaceCatalog,
     nominal_displays: &'a BTreeMap<DefinitionId, Arc<str>>,
     locals: BTreeMap<String, (LocalId, Type, bool)>,
+    local_origins: BTreeMap<LocalId, SourceRange>,
+    parameter_locals: BTreeSet<LocalId>,
     moved: MoveState,
     known_integers: BTreeMap<LocalId, i128>,
     loop_depth: usize,
     loop_custody: Vec<LoopCustodyEdges>,
+    loop_scope_exclusions: Vec<BTreeSet<LocalId>>,
     next_local: u32,
     build_authority: &'a BuildAuthority,
     pool_authority: &'a PoolAuthority,
@@ -3971,10 +4686,13 @@ impl<'a> Lowerer<'a> {
             namespace: &input.namespace,
             nominal_displays: &input.nominal_displays,
             locals: BTreeMap::new(),
+            local_origins: BTreeMap::new(),
+            parameter_locals: BTreeSet::new(),
             moved: MoveState::default(),
             known_integers: BTreeMap::new(),
             loop_depth: 0,
             loop_custody: Vec::new(),
+            loop_scope_exclusions: Vec::new(),
             next_local: 0,
             build_authority: authorities.build(),
             pool_authority: authorities.pool(),
@@ -4211,6 +4929,7 @@ impl<'a> Lowerer<'a> {
         }
         let id = self.bind_local(name, type_)?;
         self.locals.get_mut(name).expect("new local").2 = mutable;
+        self.local_origins.insert(id, site.clone());
         Ok(id)
     }
 
@@ -4221,6 +4940,7 @@ impl<'a> Lowerer<'a> {
         ownership: OwnershipSyntax,
     ) -> Result<LocalId, VerificationFailure> {
         let id = self.bind_local(name, type_)?;
+        self.parameter_locals.insert(id);
         self.locals.get_mut(name).expect("new parameter").2 =
             matches!(ownership, OwnershipSyntax::Mut | OwnershipSyntax::Take);
         Ok(id)
@@ -4472,6 +5192,7 @@ impl<'a> Lowerer<'a> {
                     if let Some(value) = &value {
                         self.require_owned_transfer(value)?;
                     }
+                    self.check_recoverable_exit()?;
                     Statement::Return {
                         value,
                         source: range.clone(),
@@ -4626,7 +5347,7 @@ impl<'a> Lowerer<'a> {
                             name,
                             declared_type.unwrap_or_else(|| value.type_.clone()),
                             *mutable_binding,
-                            range,
+                            &place_syntax.range,
                         )?;
                         if let Some(value) = known_integer {
                             self.known_integers.insert(place, value);
@@ -4654,6 +5375,10 @@ impl<'a> Lowerer<'a> {
                     if let ExpressionSyntaxKind::Is { value, pattern } = &condition.kind {
                         let value = self.expression(value)?;
                         let before = self.locals.clone();
+                        let visible_before = before
+                            .values()
+                            .map(|(local, _, _)| *local)
+                            .collect::<BTreeSet<_>>();
                         let moved_before = self.moved.clone();
                         let known_before = self.known_integers.clone();
                         let pattern = self
@@ -4664,12 +5389,18 @@ impl<'a> Lowerer<'a> {
                         let then_terminates = !syntax_statements_fall_through(then_branch);
                         let else_terminates = !syntax_statements_fall_through(else_branch);
                         let then_branch = self.statements(then_branch, return_type)?;
+                        if !then_terminates {
+                            self.check_recoverable_exit_excluding(&visible_before)?;
+                        }
                         let then_moved = self.moved.clone();
                         let then_known = self.known_integers.clone();
                         self.locals.clone_from(&before);
                         self.moved.clone_from(&moved_before);
                         self.known_integers.clone_from(&known_before);
                         let else_branch = self.statements(else_branch, return_type)?;
+                        if !else_terminates {
+                            self.check_recoverable_exit_excluding(&visible_before)?;
+                        }
                         let else_moved = self.moved.clone();
                         let else_known = self.known_integers.clone();
                         self.locals = before;
@@ -4700,17 +5431,27 @@ impl<'a> Lowerer<'a> {
                             return creator(CreatorFailureKind::IfConditionRequiresBool, range);
                         }
                         let before = self.locals.clone();
+                        let visible_before = before
+                            .values()
+                            .map(|(local, _, _)| *local)
+                            .collect::<BTreeSet<_>>();
                         let moved_before = self.moved.clone();
                         let known_before = self.known_integers.clone();
                         let then_terminates = !syntax_statements_fall_through(then_branch);
                         let else_terminates = !syntax_statements_fall_through(else_branch);
                         let then_branch = self.statements(then_branch, return_type)?;
+                        if !then_terminates {
+                            self.check_recoverable_exit_excluding(&visible_before)?;
+                        }
                         let then_moved = self.moved.clone();
                         let then_known = self.known_integers.clone();
                         self.locals.clone_from(&before);
                         self.moved.clone_from(&moved_before);
                         self.known_integers.clone_from(&known_before);
                         let else_branch = self.statements(else_branch, return_type)?;
+                        if !else_terminates {
+                            self.check_recoverable_exit_excluding(&visible_before)?;
+                        }
                         let else_moved = self.moved.clone();
                         let else_known = self.known_integers.clone();
                         self.locals = before;
@@ -4753,6 +5494,11 @@ impl<'a> Lowerer<'a> {
                         _ => return creator(CreatorFailureKind::ArgumentTypeMismatch, range),
                     };
                     let visible = self.locals.keys().cloned().collect::<BTreeSet<_>>();
+                    let visible_locals = self
+                        .locals
+                        .values()
+                        .map(|(local, _, _)| *local)
+                        .collect::<BTreeSet<_>>();
                     let known_before = self.known_integers.clone();
                     let pattern = self.lower_match_pattern(pattern, element)?.ok_or_else(|| {
                         creator_value(CreatorFailureKind::InvalidMatchPattern, range)
@@ -4768,7 +5514,14 @@ impl<'a> Lowerer<'a> {
                     let body_falls_through = syntax_statements_fall_through(body);
                     self.loop_depth += 1;
                     self.loop_custody.push(LoopCustodyEdges::default());
+                    self.loop_scope_exclusions.push(visible_locals.clone());
                     let body = self.statements(body, return_type);
+                    if body.is_ok() && body_falls_through {
+                        self.check_recoverable_exit_excluding(&visible_locals)?;
+                    }
+                    self.loop_scope_exclusions
+                        .pop()
+                        .expect("for loop discharge scope was pushed");
                     let mut edges = self
                         .loop_custody
                         .pop()
@@ -4830,11 +5583,23 @@ impl<'a> Lowerer<'a> {
                         return creator(CreatorFailureKind::IfConditionRequiresBool, range);
                     }
                     let moved_before = self.moved.clone();
+                    let visible_locals = self
+                        .locals
+                        .values()
+                        .map(|(local, _, _)| *local)
+                        .collect::<BTreeSet<_>>();
                     let known_before = self.known_integers.clone();
                     let body_falls_through = syntax_statements_fall_through(body);
                     self.loop_depth += 1;
                     self.loop_custody.push(LoopCustodyEdges::default());
+                    self.loop_scope_exclusions.push(visible_locals.clone());
                     let body = self.statements(body, return_type);
+                    if body.is_ok() && body_falls_through {
+                        self.check_recoverable_exit_excluding(&visible_locals)?;
+                    }
+                    self.loop_scope_exclusions
+                        .pop()
+                        .expect("while loop discharge scope was pushed");
                     let edges = self
                         .loop_custody
                         .pop()
@@ -4866,6 +5631,12 @@ impl<'a> Lowerer<'a> {
                     if self.loop_depth == 0 {
                         return creator(CreatorFailureKind::LoopControlOutsideLoop, range);
                     }
+                    let excluded = self
+                        .loop_scope_exclusions
+                        .last()
+                        .cloned()
+                        .expect("loop depth and discharge scopes agree");
+                    self.check_recoverable_exit_excluding(&excluded)?;
                     self.loop_custody
                         .last_mut()
                         .expect("loop depth and custody scopes agree")
@@ -4877,6 +5648,12 @@ impl<'a> Lowerer<'a> {
                     if self.loop_depth == 0 {
                         return creator(CreatorFailureKind::LoopControlOutsideLoop, range);
                     }
+                    let excluded = self
+                        .loop_scope_exclusions
+                        .last()
+                        .cloned()
+                        .expect("loop depth and discharge scopes agree");
+                    self.check_recoverable_exit_excluding(&excluded)?;
                     self.loop_custody
                         .last_mut()
                         .expect("loop depth and custody scopes agree")
@@ -4891,6 +5668,10 @@ impl<'a> Lowerer<'a> {
                 } => {
                     let value = self.expression(value)?;
                     let before = self.locals.clone();
+                    let visible_before = before
+                        .values()
+                        .map(|(local, _, _)| *local)
+                        .collect::<BTreeSet<_>>();
                     let moved_before = self.moved.clone();
                     let known_before = self.known_integers.clone();
                     let mut lowered = Vec::new();
@@ -4937,6 +5718,7 @@ impl<'a> Lowerer<'a> {
                         }
                         let body = self.statements(&case.body, return_type)?;
                         if syntax_statements_fall_through(&case.body) {
+                            self.check_recoverable_exit_excluding(&visible_before)?;
                             continuing_custody.push(self.moved.clone());
                             continuing_known.push(self.known_integers.clone());
                         }
@@ -5009,6 +5791,9 @@ impl<'a> Lowerer<'a> {
                     if !self.pool_authority.is_scoped_factory(definition) {
                         return creator(CreatorFailureKind::UnsupportedLayerOneSyntax, range);
                     }
+                    self.input
+                        .discharge_laws
+                        .authenticate_reclaim(scope.type_id)?;
                     let visible = self.locals.keys().cloned().collect::<BTreeSet<_>>();
                     let binding_place =
                         self.bind_source_local(binding, scope.type_.clone(), true, range)?;
@@ -5095,6 +5880,14 @@ impl<'a> Lowerer<'a> {
         self.expected_expression_type = previous;
         if let Ok(expression) = &mut expression {
             self.apply_expected_type(expression, expected)?;
+            let observed = observe_type_tree(
+                &expression.type_,
+                self.identity_catalog,
+                &self.input.discharge_laws,
+            )?;
+            if observed != expression.type_id {
+                return defect("coerced expression TypeId disagrees with its discharge type");
+            }
         }
         expression
     }
@@ -5749,6 +6542,7 @@ impl<'a> Lowerer<'a> {
                         );
                     }
                 };
+                self.check_recoverable_exit()?;
                 let type_ = (**success).clone();
                 (ExpressionKind::Propagate(Box::new(value)), type_)
             }
@@ -5811,12 +6605,7 @@ impl<'a> Lowerer<'a> {
         type_: Type,
         source: SourceRange,
     ) -> Result<Expression, VerificationFailure> {
-        let type_id = self
-            .identity_catalog
-            .intern_type(&type_)
-            .map_err(|collision| VerificationFailure::Defect {
-                evidence: Arc::from(format!("type identity collision {:032x}", collision.digest)),
-            })?;
+        let type_id = observe_type_tree(&type_, self.identity_catalog, &self.input.discharge_laws)?;
         Ok(Expression {
             kind,
             type_id,
@@ -6076,11 +6865,177 @@ impl<'a> Lowerer<'a> {
     }
 
     fn type_owns_resource(&self, type_: &Type) -> bool {
-        contains_resource(type_, &|definition| {
-            self.structs
-                .get(&definition)
-                .is_some_and(|struct_| struct_.resource)
-        })
+        self.discharge_law(type_).is_some()
+    }
+
+    fn discharge_law(&self, type_: &Type) -> Option<DischargeLaw> {
+        self.input
+            .discharge_laws
+            .authenticated_law(type_)
+            .or_else(|| {
+                derive_discharge_law(type_, self.structs, self.interfaces, self.nominal_displays)
+            })
+    }
+
+    fn collect_live_discharge_obligations(
+        &self,
+        type_: &Type,
+        place: &PlaceKey,
+        subject: &str,
+        obligations: &mut Vec<LiveDischargeObligation>,
+    ) {
+        let Some(law) = self.discharge_law(type_) else {
+            return;
+        };
+        if !law.requires_explicit_discharge() {
+            return;
+        }
+        if let Type::Nominal {
+            definition,
+            arguments,
+            ..
+        } = type_
+            && let Some(struct_) = self.structs.get(definition)
+            && struct_.resource
+        {
+            let substitutions = struct_
+                .type_parameters
+                .iter()
+                .copied()
+                .zip(arguments.iter().cloned())
+                .collect::<BTreeMap<_, _>>();
+            let fields = if struct_.field_selections.is_empty()
+                || arguments.iter().any(type_has_placeholder)
+            {
+                Arc::from(struct_.fields.clone())
+            } else {
+                struct_
+                    .applied_fields
+                    .borrow()
+                    .get(arguments)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::from(struct_.fields.clone()))
+            };
+            let resource_fields = fields
+                .iter()
+                .filter_map(|field| {
+                    let type_ = substitute(&field.type_, &substitutions);
+                    self.discharge_law(&type_)
+                        .is_some()
+                        .then_some((field, type_))
+                })
+                .collect::<Vec<_>>();
+            if !resource_fields.is_empty() {
+                for (field, field_type) in resource_fields {
+                    let mut projections = place.projections.to_vec();
+                    projections.push(ProjectionKey::Field(
+                        *definition,
+                        Arc::from(field.name.as_str()),
+                    ));
+                    let field_place = PlaceKey {
+                        local: place.local,
+                        projections: projections.into(),
+                    };
+                    self.collect_live_discharge_obligations(
+                        &field_type,
+                        &field_place,
+                        &format!("{subject}.{}", field.name),
+                        obligations,
+                    );
+                }
+                return;
+            }
+        }
+        if let Type::FixedArray {
+            element,
+            length: ArrayLength::Value(length),
+        } = type_
+            && self.discharge_law(element).is_some()
+        {
+            for index in 0..*length {
+                let mut projections = place.projections.to_vec();
+                projections.push(ProjectionKey::Index(Some(i128::from(index))));
+                self.collect_live_discharge_obligations(
+                    element,
+                    &PlaceKey {
+                        local: place.local,
+                        projections: projections.into(),
+                    },
+                    &format!("{subject}[{index}]"),
+                    obligations,
+                );
+            }
+            return;
+        }
+        if matches!(type_, Type::Array(_)) {
+            if !self.moved.is_key_fully_moved(place) {
+                obligations.push(LiveDischargeObligation {
+                    place: place.clone(),
+                    subject: Arc::from(subject),
+                    subject_identity: None,
+                });
+            }
+            return;
+        }
+        if !self.moved.is_key_unreadable(place) {
+            obligations.push(LiveDischargeObligation {
+                place: place.clone(),
+                subject: Arc::from(subject),
+                subject_identity: match type_ {
+                    Type::Nominal { definition, .. } => Some(*definition),
+                    Type::Any { interface, .. } => Some(*interface),
+                    _ => None,
+                },
+            });
+        }
+    }
+
+    fn check_recoverable_exit(&self) -> Result<(), VerificationFailure> {
+        self.check_recoverable_exit_excluding(&self.parameter_locals)
+    }
+
+    fn check_recoverable_exit_excluding(
+        &self,
+        excluded: &BTreeSet<LocalId>,
+    ) -> Result<(), VerificationFailure> {
+        let mut candidates = self
+            .locals
+            .iter()
+            .filter(|(_, (local, _, _))| !excluded.contains(local))
+            .flat_map(|(name, (local, type_, _))| {
+                let mut obligations = Vec::new();
+                self.collect_live_discharge_obligations(
+                    type_,
+                    &PlaceKey {
+                        local: *local,
+                        projections: Arc::from([]),
+                    },
+                    name,
+                    &mut obligations,
+                );
+                obligations
+                    .into_iter()
+                    .map(|obligation| (self.local_origins.get(local), obligation))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.0
+                .map(SourceRange::start)
+                .cmp(&right.0.map(SourceRange::start))
+                .then(left.1.subject.cmp(&right.1.subject))
+        });
+        let Some((Some(site), obligation)) = candidates.first() else {
+            return Ok(());
+        };
+        Err(custody_value(
+            CreatorFailureKind::ResourceNotDischarged,
+            site,
+            Arc::clone(&obligation.subject),
+            CustodyDiagnosticState::LiveUndischarged,
+            obligation.subject_identity,
+            self.owner_identity,
+            self.moved.origins.get(&obligation.place).cloned(),
+        ))
     }
 
     fn require_owned_transfer(&self, expression: &Expression) -> Result<(), VerificationFailure> {
@@ -6525,7 +7480,7 @@ impl<'a> Lowerer<'a> {
                     }
                     *local
                 } else {
-                    self.bind_source_local(name, expected.clone(), false, &pattern.range)?
+                    self.bind_source_local(name, expected.clone(), false, &inner.range)?
                 };
                 Ok(HirMatchPattern::Binding {
                     local,
@@ -9264,6 +10219,142 @@ fn append_range(bytes: &mut impl ByteSink, range: &SourceRange) {
 mod tests {
     use super::*;
 
+    fn pool_owned_bool() -> Type {
+        Type::Own {
+            pool: PoolTerm::Concrete(PoolId(1)),
+            value: Arc::new(Type::Bool),
+        }
+    }
+
+    #[test]
+    fn discharge_law_verifier_rejects_missing_and_duplicate_resource_laws() {
+        let type_id = TypeId(1);
+        let type_ = pool_owned_bool();
+        let observed = BTreeMap::from([(type_id, type_.clone())]);
+        let structs = BTreeMap::new();
+        let interfaces = BTreeMap::new();
+        let displays = BTreeMap::new();
+        assert!(matches!(
+            verify_discharge_laws(
+                &observed,
+                &[],
+                &BTreeSet::new(),
+                &structs,
+                &interfaces,
+                &displays,
+            ),
+            Err(VerificationFailure::Defect { .. })
+        ));
+        let claim = RawDischargeLaw {
+            type_id,
+            type_,
+            law: DischargeLaw::CompilerReclaim(AuthenticatedReclaim::PoolOwnership),
+        };
+        assert!(matches!(
+            verify_discharge_laws(
+                &observed,
+                &[claim.clone(), claim],
+                &BTreeSet::new(),
+                &structs,
+                &interfaces,
+                &displays,
+            ),
+            Err(VerificationFailure::Defect { .. })
+        ));
+    }
+
+    #[test]
+    fn discharge_law_verifier_rejects_an_unauthenticated_claim() {
+        let type_id = TypeId(1);
+        let type_ = pool_owned_bool();
+        let observed = BTreeMap::from([(type_id, type_.clone())]);
+        assert!(matches!(
+            verify_discharge_laws(
+                &observed,
+                &[RawDischargeLaw {
+                    type_id,
+                    type_,
+                    law: DischargeLaw::Explicit,
+                }],
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            ),
+            Err(VerificationFailure::Defect { .. })
+        ));
+    }
+
+    #[test]
+    fn discharge_law_registry_observes_each_resource_component_type_id() {
+        let nested = pool_owned_bool();
+        let aggregate = Type::FixedArray {
+            element: Arc::new(nested.clone()),
+            length: ArrayLength::Value(2),
+        };
+        let registry = DischargeLawRegistry::default();
+        let mut identities = crate::identity::IdentityCatalog::empty();
+        let nested_id = observe_type_tree(&aggregate, &mut identities, &registry)
+            .expect("aggregate and component types are observed");
+        let observed = registry.observed.borrow();
+        assert_eq!(observed.len(), 3);
+        assert!(observed.values().any(|type_| type_ == &nested));
+        assert_eq!(observed.get(&nested_id), Some(&aggregate));
+    }
+
+    #[test]
+    fn post_lowering_discharge_verifier_rejects_a_live_resource_artifact() {
+        let local = LocalId(1);
+        let definition = DefinitionId(9);
+        let resource = Type::Nominal {
+            definition,
+            display: Arc::from("Ticket"),
+            arguments: Arc::from([]),
+        };
+        let templates = BTreeMap::new();
+        let specialized = BTreeMap::new();
+        let constants = BTreeMap::new();
+        let specializations = BTreeMap::new();
+        let variants = BTreeMap::new();
+        let structs = BTreeMap::from([(
+            definition,
+            ResolvedStruct {
+                definition,
+                module: ModuleId(1),
+                display: Arc::from("Ticket"),
+                resource: true,
+                type_parameters: Vec::new(),
+                generic_parameter_names: Arc::from([]),
+                generic_constraints: Arc::from([]),
+                fields: Vec::new(),
+                field_selections: Arc::from([]),
+                applied_fields: RefCell::new(BTreeMap::new()),
+            },
+        )]);
+        let interfaces = BTreeMap::new();
+        let identities = crate::identity::IdentityCatalog::empty();
+        let catalog = ArtifactCatalog {
+            templates: &templates,
+            specialized: &specialized,
+            constants: &constants,
+            specializations: &specializations,
+            identities: &identities,
+            variants: &variants,
+            structs: &structs,
+            interfaces: &interfaces,
+            discharge_laws: None,
+        };
+        assert!(matches!(
+            verify_artifact_scope_discharged(
+                &BTreeMap::from([(local, resource)]),
+                &MoveState::default(),
+                &BTreeSet::new(),
+                &catalog,
+            ),
+            Err(VerificationFailure::Defect { .. })
+        ));
+    }
+
     #[test]
     fn malformed_compiler_artifact_is_contained_as_a_verification_defect() {
         let mut identities = crate::identity::IdentityCatalog::empty();
@@ -9339,6 +10430,7 @@ mod tests {
             variants: &variants,
             structs: &structs,
             interfaces: &interfaces,
+            discharge_laws: None,
         };
         assert!(matches!(
             verify_expression_artifact(
@@ -9365,6 +10457,7 @@ mod tests {
                 &ArtifactVerificationAuthority {
                     catalog: &catalog,
                     provenance_owner: &owner,
+                    discharge_exempt: &BTreeSet::new(),
                 },
                 &mut previous,
             ),
@@ -9413,6 +10506,7 @@ mod tests {
             variants: &variants,
             structs: &structs,
             interfaces: &interfaces,
+            discharge_laws: None,
         };
 
         assert!(matches!(
@@ -9508,6 +10602,7 @@ mod tests {
             variants: &variants,
             structs: &structs,
             interfaces: &interfaces,
+            discharge_laws: None,
         };
         let mut locals = BTreeMap::from([(local, owned_type)]);
         let mut previous = owner.start();
@@ -9521,6 +10616,7 @@ mod tests {
                 &ArtifactVerificationAuthority {
                     catalog: &catalog,
                     provenance_owner: &owner,
+                    discharge_exempt: &BTreeSet::new(),
                 },
                 &mut previous,
             ),
@@ -9566,6 +10662,7 @@ mod tests {
             variants: &variants,
             structs: &structs,
             interfaces: &interfaces,
+            discharge_laws: None,
         };
         assert!(matches!(
             verify_expression_artifact(
@@ -9634,6 +10731,7 @@ mod tests {
             variants: &variants,
             structs: &structs,
             interfaces: &interfaces,
+            discharge_laws: None,
         };
         let mut locals = BTreeMap::from([
             (destination, owned_type.clone()),
@@ -9650,6 +10748,7 @@ mod tests {
                 &ArtifactVerificationAuthority {
                     catalog: &catalog,
                     provenance_owner: &owner,
+                    discharge_exempt: &BTreeSet::new(),
                 },
                 &mut previous,
             ),
@@ -9729,6 +10828,7 @@ mod tests {
             variants: &variants,
             structs: &structs,
             interfaces: &interfaces,
+            discharge_laws: None,
         };
         let mut previous = owner.start();
         assert!(matches!(
@@ -9741,6 +10841,7 @@ mod tests {
                 &ArtifactVerificationAuthority {
                     catalog: &catalog,
                     provenance_owner: &owner,
+                    discharge_exempt: &BTreeSet::new(),
                 },
                 &mut previous,
             ),

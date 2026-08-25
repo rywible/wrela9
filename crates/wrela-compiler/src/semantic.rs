@@ -3539,10 +3539,8 @@ fn resolution_observations(program: &VerifiedProgram) -> Vec<ResolutionObservati
                 Statement::Panic { value, .. }
                 | Statement::Initialize { value, .. }
                 | Statement::Assign { value, .. }
-                | Statement::Evaluate(value)
-                | Statement::Defer {
-                    expression: value, ..
-                } => expression(value, observations),
+                | Statement::Evaluate(value) => expression(value, observations),
+                Statement::Defer { action, .. } => expression(action.expression(), observations),
                 Statement::Assert { condition, .. } | Statement::Expect { condition, .. } => {
                     expression(condition, observations);
                 }

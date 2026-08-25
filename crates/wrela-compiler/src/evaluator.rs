@@ -11,9 +11,9 @@ use crate::model::{
     Type, VariantId,
 };
 use crate::typed_hir::{
-    BinaryOperator, CallTarget, ClosureId, Expression, ExpressionKind, HirClosure, HirFunction,
-    HirMatchCase, HirMatchPattern, Literal, LocalId, Place, PlaceProjection, Statement,
-    VerifiedProgram, root_place,
+    BinaryOperator, CallTarget, CleanupAction, CleanupOperandMode, ClosureId, Expression,
+    ExpressionKind, HirClosure, HirFunction, HirMatchCase, HirMatchPattern, Literal, LocalId,
+    Place, PlaceProjection, Statement, VerifiedProgram, root_place,
 };
 use crate::{
     Cancellation, CanonicalValue, EvaluationContributorObservation, EvaluationFrameObservation,
@@ -124,17 +124,11 @@ struct MachineFrame<'hir> {
     writebacks: Vec<(LocalId, Place)>,
 }
 
-/// One immutable registration-time plan. Captured values are owned here until
-/// the plan is consumed exactly once by recoverable scope unwinding.
-enum CleanupPlan<'hir> {
-    Expression(&'hir Expression),
-    Call {
-        target: &'hir CallTarget,
-        argument_expressions: &'hir [Expression],
-        callable: Option<Value>,
-        arguments: Vec<Value>,
-        site: &'hir SourceRange,
-    },
+/// One registered instance of an immutable typed-HIR Cleanup Action. Only the
+/// operands whose verified mode transfers Resource custody are captured here.
+struct CleanupPlan<'hir> {
+    action: &'hir CleanupAction,
+    captured_arguments: Vec<Option<Value>>,
 }
 
 enum Control<'hir> {
@@ -219,6 +213,7 @@ enum Control<'hir> {
         bindings: Vec<LocalId>,
     },
     ClearLocals(Vec<LocalId>),
+    ReclaimCompilerOwnedLocal(LocalId),
     ForNext {
         function: &'hir HirFunction,
         pattern: &'hir HirMatchPattern,
@@ -274,10 +269,9 @@ enum Control<'hir> {
         site: &'hir SourceRange,
     },
     FinishRegisterCleanup {
-        target: &'hir CallTarget,
-        arguments: &'hir [Expression],
-        site: &'hir SourceRange,
+        action: &'hir CleanupAction,
     },
+    PushCapturedCleanupOperand(Value),
     ExecuteCleanup(CleanupPlan<'hir>),
 }
 
@@ -313,6 +307,26 @@ fn exited_locals(controls: &[Control<'_>], start: usize) -> Vec<LocalId> {
         .flatten()
         .copied()
         .collect()
+}
+
+fn exited_compiler_owned_locals(controls: &[Control<'_>], start: usize) -> Vec<LocalId> {
+    controls[start..]
+        .iter()
+        .rev()
+        .filter_map(|control| match control {
+            Control::ReclaimCompilerOwnedLocal(local) => Some(*local),
+            _ => None,
+        })
+        .collect()
+}
+
+fn push_compiler_owned_reclaims(controls: &mut Vec<Control<'_>>, locals: Vec<LocalId>) {
+    controls.extend(
+        locals
+            .into_iter()
+            .rev()
+            .map(Control::ReclaimCompilerOwnedLocal),
+    );
 }
 
 fn push_deferred_controls<'hir>(
@@ -995,17 +1009,21 @@ impl<'a> Engine<'a> {
                             value: Some(value), ..
                         } => {
                             let deferred = take_deferred_actions(controls, 0);
+                            let compiler_owned = exited_compiler_owned_locals(controls, 0);
                             controls.clear();
                             controls.push(Control::FinishReturn {
                                 return_type: &function.return_type,
                             });
+                            push_compiler_owned_reclaims(controls, compiler_owned);
                             push_deferred_controls(controls, deferred);
                             controls.push(Control::Expression(value));
                         }
                         Statement::Return { value: None, .. } => {
                             let deferred = take_deferred_actions(controls, 0);
+                            let compiler_owned = exited_compiler_owned_locals(controls, 0);
                             controls.clear();
                             controls.push(Control::FinishUnitReturn);
+                            push_compiler_owned_reclaims(controls, compiler_owned);
                             push_deferred_controls(controls, deferred);
                         }
                         Statement::Panic { value, source } => {
@@ -1120,8 +1138,10 @@ impl<'a> Engine<'a> {
                             };
                             let deferred = take_deferred_actions(controls, index + 1);
                             let locals = exited_locals(controls, index + 1);
+                            let compiler_owned = exited_compiler_owned_locals(controls, index + 1);
                             controls.truncate(index);
                             controls.push(Control::ClearLocals(locals));
+                            push_compiler_owned_reclaims(controls, compiler_owned);
                             push_deferred_controls(controls, deferred);
                         }
                         Statement::Continue(_) => {
@@ -1133,37 +1153,42 @@ impl<'a> Engine<'a> {
                             };
                             let deferred = take_deferred_actions(controls, index + 1);
                             let locals = exited_locals(controls, index + 1);
+                            let compiler_owned = exited_compiler_owned_locals(controls, index + 1);
                             controls.truncate(index + 1);
                             controls.push(Control::ClearLocals(locals));
+                            push_compiler_owned_reclaims(controls, compiler_owned);
                             push_deferred_controls(controls, deferred);
                         }
                         Statement::Match { value, cases, .. } => {
                             controls.push(Control::FinishMatch { function, cases });
                             controls.push(Control::Expression(value));
                         }
-                        Statement::Defer { expression, .. } => {
-                            if let ExpressionKind::Call { target, arguments } = &expression.kind {
-                                controls.push(Control::FinishRegisterCleanup {
-                                    target,
-                                    arguments,
-                                    site: &expression.source,
-                                });
-                                controls.extend(arguments.iter().rev().map(Control::Expression));
-                                if let CallTarget::Callable { value } = target {
-                                    controls.push(Control::Expression(value));
-                                }
-                                continue;
+                        Statement::Defer { action, .. } => {
+                            controls.push(Control::FinishRegisterCleanup { action });
+                            if let CleanupAction::Call {
+                                expression,
+                                argument_modes,
+                                ..
+                            } = action
+                            {
+                                let ExpressionKind::Call { arguments, .. } = &expression.kind
+                                else {
+                                    return Err(EvalFailure::Defect(Arc::from(
+                                        "verified cleanup call plan names a non-call expression",
+                                    )));
+                                };
+                                controls.extend(
+                                    arguments
+                                        .iter()
+                                        .zip(argument_modes.iter())
+                                        .rev()
+                                        .filter_map(|(argument, mode)| {
+                                            (*mode
+                                                == CleanupOperandMode::CaptureResourceAtRegistration)
+                                                .then_some(Control::Expression(argument))
+                                        }),
+                                );
                             }
-                            let Some(Control::EndScope { deferred }) = controls
-                                .iter_mut()
-                                .rev()
-                                .find(|control| matches!(control, Control::EndScope { .. }))
-                            else {
-                                return Err(EvalFailure::Defect(Arc::from(
-                                    "verified defer appeared outside a lexical scope",
-                                )));
-                            };
-                            deferred.push(CleanupPlan::Expression(expression));
                         }
                         Statement::WithPool {
                             binding,
@@ -1171,7 +1196,7 @@ impl<'a> Engine<'a> {
                             body,
                             ..
                         } => {
-                            controls.push(Control::ClearLocals(vec![binding.local]));
+                            controls.push(Control::ReclaimCompilerOwnedLocal(binding.local));
                             controls.push(Control::Block {
                                 function,
                                 statements: body,
@@ -1195,8 +1220,8 @@ impl<'a> Engine<'a> {
                         controls.push(Control::ExecuteCleanup(action));
                     }
                 }
-                Control::ExecuteCleanup(action) => match action {
-                    CleanupPlan::Expression(expression) => {
+                Control::ExecuteCleanup(plan) => match plan.action {
+                    CleanupAction::Expression(expression) => {
                         let controls = &mut frames
                             .last_mut()
                             .expect("machine has current frame")
@@ -1204,21 +1229,16 @@ impl<'a> Engine<'a> {
                         controls.push(Control::Discard);
                         controls.push(Control::Expression(expression));
                     }
-                    CleanupPlan::Call {
-                        target,
-                        argument_expressions,
-                        callable,
-                        arguments,
-                        site,
+                    CleanupAction::Call {
+                        expression,
+                        callable_mode,
+                        argument_modes,
                     } => {
-                        if let Some(callable) = callable {
-                            self.release(value_size(&callable))?;
-                            self.push_value(&mut frames, callable)?;
-                        }
-                        for argument in arguments {
-                            self.release(value_size(&argument))?;
-                            self.push_value(&mut frames, argument)?;
-                        }
+                        let ExpressionKind::Call { target, arguments } = &expression.kind else {
+                            return Err(EvalFailure::Defect(Arc::from(
+                                "verified cleanup call plan names a non-call expression",
+                            )));
+                        };
                         let controls = &mut frames
                             .last_mut()
                             .expect("machine has current frame")
@@ -1226,11 +1246,46 @@ impl<'a> Engine<'a> {
                         controls.push(Control::Discard);
                         controls.push(Control::FinishCall {
                             target,
-                            arguments: argument_expressions,
-                            site,
+                            arguments,
+                            site: &expression.source,
                         });
+                        for ((argument, mode), captured) in arguments
+                            .iter()
+                            .zip(argument_modes.iter())
+                            .zip(plan.captured_arguments)
+                            .rev()
+                        {
+                            controls.push(match mode {
+                                CleanupOperandMode::EvaluateAtExit => Control::Expression(argument),
+                                CleanupOperandMode::CaptureResourceAtRegistration => {
+                                    Control::PushCapturedCleanupOperand(captured.ok_or_else(
+                                        || {
+                                            EvalFailure::Defect(Arc::from(
+                                                "verified captured cleanup operand is missing",
+                                            ))
+                                        },
+                                    )?)
+                                }
+                            });
+                        }
+                        match (callable_mode, target) {
+                            (
+                                Some(CleanupOperandMode::EvaluateAtExit),
+                                CallTarget::Callable { value },
+                            ) => controls.push(Control::Expression(value)),
+                            (None, CallTarget::Callable { .. }) | (Some(_), _) => {
+                                return Err(EvalFailure::Defect(Arc::from(
+                                    "verified cleanup callable timing disagrees with its target",
+                                )));
+                            }
+                            (None, _) => {}
+                        }
                     }
                 },
+                Control::PushCapturedCleanupOperand(value) => {
+                    self.release(value_size(&value))?;
+                    self.push_value(&mut frames, value)?;
+                }
                 Control::FinishReturn { return_type } => {
                     let value = self.pop_value(&mut frames)?;
                     let value = coerce(value, return_type)
@@ -1689,6 +1744,9 @@ impl<'a> Engine<'a> {
                     }
                 },
                 Control::ClearLocals(locals) => self.clear_locals(&mut frames, &locals)?,
+                Control::ReclaimCompilerOwnedLocal(local) => {
+                    self.reclaim_compiler_owned_local(&mut frames, local)?
+                }
                 Control::FinishArray { count } => {
                     let values = self.pop_values(&mut frames, count)?;
                     self.push_value(&mut frames, Value::Array(values.into()))?;
@@ -1862,8 +1920,10 @@ impl<'a> Engine<'a> {
                                     .expect("machine has current frame")
                                     .controls;
                                 let deferred = take_deferred_actions(controls, 0);
+                                let compiler_owned = exited_compiler_owned_locals(controls, 0);
                                 controls.clear();
                                 controls.push(Control::FinishReturn { return_type });
+                                push_compiler_owned_reclaims(controls, compiler_owned);
                                 push_deferred_controls(controls, deferred);
                             }
                             self.push_value(&mut frames, alternative)?;
@@ -1888,22 +1948,21 @@ impl<'a> Engine<'a> {
                     let value = apply_binary(operator, left, right, site)?;
                     self.push_value(&mut frames, value)?;
                 }
-                Control::FinishRegisterCleanup {
-                    target,
-                    arguments: argument_expressions,
-                    site,
-                } => {
-                    let arguments = self.pop_values(&mut frames, argument_expressions.len())?;
-                    let callable = if matches!(target, CallTarget::Callable { .. }) {
-                        Some(self.pop_value(&mut frames)?)
-                    } else {
-                        None
+                Control::FinishRegisterCleanup { action } => {
+                    let mut captured_arguments = match action {
+                        CleanupAction::Expression(_) => Vec::new(),
+                        CleanupAction::Call { argument_modes, .. } => {
+                            vec![None; argument_modes.len()]
+                        }
                     };
-                    if let Some(callable) = &callable {
-                        self.retain(value_size(callable))?;
-                    }
-                    for argument in &arguments {
-                        self.retain(value_size(argument))?;
+                    if let CleanupAction::Call { argument_modes, .. } = action {
+                        for (index, mode) in argument_modes.iter().enumerate().rev() {
+                            if *mode == CleanupOperandMode::CaptureResourceAtRegistration {
+                                let value = self.pop_value(&mut frames)?;
+                                self.retain(value_size(&value))?;
+                                captured_arguments[index] = Some(value);
+                            }
+                        }
                     }
                     let Some(Control::EndScope { deferred }) = frames
                         .last_mut()
@@ -1917,12 +1976,9 @@ impl<'a> Engine<'a> {
                             "verified cleanup registration has no lexical scope",
                         )));
                     };
-                    deferred.push(CleanupPlan::Call {
-                        target,
-                        argument_expressions,
-                        callable,
-                        arguments,
-                        site,
+                    deferred.push(CleanupPlan {
+                        action,
+                        captured_arguments,
                     });
                 }
                 Control::FinishCall {
@@ -2286,6 +2342,25 @@ impl<'a> Engine<'a> {
             }
         }
         Ok(())
+    }
+
+    fn reclaim_compiler_owned_local<'hir>(
+        &mut self,
+        frames: &mut [MachineFrame<'hir>],
+        local: LocalId,
+    ) -> Result<(), EvalFailure> {
+        let value = frames
+            .last_mut()
+            .ok_or_else(|| EvalFailure::Defect(Arc::from("Pool reclaim without a frame")))?
+            .locals
+            .get_mut(local.0 as usize)
+            .and_then(Option::take)
+            .ok_or_else(|| {
+                EvalFailure::Defect(Arc::from(
+                    "authenticated compiler-owned local was omitted or reclaimed twice",
+                ))
+            })?;
+        self.release(value_size(&value))
     }
 
     fn complete_frame<'hir>(
@@ -3746,5 +3821,61 @@ mod tests {
             }),
             17
         );
+    }
+
+    #[test]
+    fn compiler_owned_reclamation_rejects_a_second_reclaim() {
+        let mut identities = crate::identity::IdentityCatalog::empty();
+        let program = typed_hir::verify(
+            ProgramInput::default(),
+            &BuildAuthority::test_compiler_distribution(),
+            &PoolAuthority::from_authenticated_scoped_factory(None),
+            &mut identities,
+            &Cancellation::new(),
+        )
+        .expect("empty program verifies");
+        let cancellation = Cancellation::new();
+        let mut engine = Engine::new(&program, &cancellation);
+        let local = LocalId(0);
+        let value = Value::Bool(true);
+        engine
+            .retain(value_size(&value))
+            .expect("fixture is retained");
+        let mut frames = vec![MachineFrame {
+            kind: FrameKind::Root,
+            controls: Vec::new(),
+            values: Vec::new(),
+            locals: vec![Some(value)],
+            writebacks: Vec::new(),
+        }];
+
+        engine
+            .reclaim_compiler_owned_local(&mut frames, local)
+            .expect("first authenticated reclaim succeeds");
+        assert!(matches!(
+            engine.reclaim_compiler_owned_local(&mut frames, local),
+            Err(EvalFailure::Defect(_))
+        ));
+    }
+
+    #[test]
+    fn registered_cleanup_is_transferred_out_of_its_scope_once() {
+        let action = CleanupAction::Expression(Expression {
+            kind: ExpressionKind::Literal(Literal::Unit),
+            type_id: crate::model::TypeId(1),
+            type_: Type::Unit,
+            coerced_from: None,
+            access: crate::typed_hir::AccessMode::Copy,
+            source: SourceRange::from_u64("src/image.wr", 0, 1),
+        });
+        let mut controls = vec![Control::EndScope {
+            deferred: vec![CleanupPlan {
+                action: &action,
+                captured_arguments: Vec::new(),
+            }],
+        }];
+
+        assert_eq!(take_deferred_actions(&mut controls, 0).len(), 1);
+        assert!(take_deferred_actions(&mut controls, 0).is_empty());
     }
 }

@@ -2996,11 +2996,17 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = compile(source) else {
         panic!("a Cleanup Action cannot retain a Resource loan until scope exit");
     };
-    assert!(
-        rejected
-            .diagnostics()
-            .iter()
-            .any(|diagnostic| diagnostic.code() == "semantic.loan_across_cleanup")
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.loan_across_cleanup",
+        (b"    defer inspect(ticket)", 0),
+        &[(b"ticket", 3, "related")],
+        &[("subject", "ticket"), ("state", "loaned")],
+        &[
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
+        ],
     );
 }
 
@@ -3021,11 +3027,14 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = compile(source) else {
         panic!("moving a Resource into cleanup without discharging it must reject");
     };
-    assert!(
-        rejected
-            .diagnostics()
-            .iter()
-            .any(|diagnostic| diagnostic.code() == "semantic.must_use_value")
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.must_use_value",
+        (b"    defer take ticket", 0),
+        &[],
+        &[],
+        &[],
     );
 }
 
@@ -3049,9 +3058,15 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = compile(source) else {
         panic!("a Resource move cannot hide inside a late-bound cleanup expression");
     };
-    assert!(rejected.diagnostics().iter().any(|diagnostic| {
-        diagnostic.code() == "semantic.cleanup_resource_capture_requires_call"
-    }));
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.cleanup_resource_capture_requires_call",
+        (b"    defer (consume(take ticket), ())", 0),
+        &[],
+        &[],
+        &[],
+    );
 }
 
 #[test]
@@ -3114,6 +3129,205 @@ fn build() -> Image:
         .position(|window| window == b"    panic \"body panic\"")
         .expect("body Panic site");
     assert_eq!(diagnostic.primary().start(), expected as u64);
+}
+
+#[test]
+fn terminal_panic_does_not_evaluate_deferred_data_arguments() {
+    let source = br#"fn argument() -> i64:
+    panic "deferred argument ran before scope exit"
+
+fn cleanup(value: i64):
+    pass
+
+fn run():
+    defer cleanup(argument())
+    panic "body panic"
+
+const VALUE: () = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("the body Panic must terminate evaluation");
+    };
+    let diagnostic = rejected
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.code() == "evaluation.panicked")
+        .expect("body Panic diagnostic");
+    let expected = source
+        .windows(b"    panic \"body panic\"".len())
+        .position(|window| window == b"    panic \"body panic\"")
+        .expect("body Panic site");
+    assert_eq!(diagnostic.primary().start(), expected as u64);
+}
+
+#[test]
+fn recoverable_exits_execute_the_complete_cleanup_stack_in_reverse_order() {
+    let cases: &[(&str, &[u8])] = &[
+        (
+            "fallthrough",
+            br#"fn oldest():
+    panic "oldest fallthrough cleanup"
+
+fn newest():
+    pass
+
+fn run():
+    defer oldest()
+    defer newest()
+
+const VALUE: () = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#,
+        ),
+        (
+            "return",
+            br#"fn oldest():
+    panic "oldest return cleanup"
+
+fn newest():
+    pass
+
+fn run() -> i64:
+    defer oldest()
+    defer newest()
+    return 7
+
+const VALUE: i64 = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#,
+        ),
+        (
+            "propagation",
+            br#"enum Failure:
+    Failed
+
+fn fail() -> Result[i64, Failure]:
+    return Result.Err(Failure.Failed)
+
+fn oldest():
+    panic "oldest propagation cleanup"
+
+fn newest():
+    pass
+
+fn run() -> Result[i64, Failure]:
+    defer oldest()
+    defer newest()
+    return fail()?
+
+const VALUE: Result[i64, Failure] = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#,
+        ),
+        (
+            "break",
+            br#"fn oldest():
+    panic "oldest break cleanup"
+
+fn newest():
+    pass
+
+fn run():
+    for value in [1]:
+        defer oldest()
+        defer newest()
+        break
+
+const VALUE: () = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#,
+        ),
+        (
+            "continue",
+            br#"fn oldest():
+    panic "oldest continue cleanup"
+
+fn newest():
+    pass
+
+fn run():
+    for value in [1]:
+        defer oldest()
+        defer newest()
+        continue
+
+const VALUE: () = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#,
+        ),
+    ];
+
+    for (exit, source) in cases {
+        let CompilationOutcome::Rejected(rejected) = compile(source) else {
+            panic!("{exit} must execute the older cleanup after the newer one succeeds");
+        };
+        let diagnostic = rejected
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code() == "evaluation.panicked")
+            .unwrap_or_else(|| panic!("{exit} cleanup Panic diagnostic"));
+        let needle = format!("    panic \"oldest {exit} cleanup\"");
+        let expected = source
+            .windows(needle.len())
+            .position(|window| window == needle.as_bytes())
+            .unwrap_or_else(|| panic!("{exit} oldest cleanup site"));
+        assert_eq!(diagnostic.primary().start(), expected as u64, "{exit}");
+    }
+}
+
+#[test]
+fn deferred_cleanup_captures_a_nested_resource_aggregate_at_registration() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+resource struct Envelope:
+    ticket: Ticket
+
+fn cleanup(take envelope: Envelope):
+    if envelope.ticket.id != 1:
+        panic "cleanup captured the reinitialized aggregate"
+
+fn consume(take envelope: Envelope):
+    pass
+
+fn run():
+    envelope = Envelope(ticket=Ticket(id=1))
+    defer cleanup(take envelope)
+    envelope = Envelope(ticket=Ticket(id=2))
+    consume(take envelope)
+
+const VALUE: () = run()
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "nested Resource custody must be captured once at registration: {outcome:#?}"
+    );
 }
 
 #[test]

@@ -864,7 +864,7 @@ pub(crate) enum Statement {
         source: SourceRange,
     },
     Defer {
-        expression: Expression,
+        action: CleanupAction,
         source: SourceRange,
     },
     WithPool {
@@ -874,6 +874,35 @@ pub(crate) enum Statement {
         source: SourceRange,
     },
     Pass(SourceRange),
+}
+
+/// The verified, immutable execution plan for one deferred cleanup action.
+///
+/// Resource-owning operands transfer custody when the action is registered;
+/// Data operands (including a callable target) retain ordinary expression
+/// timing and are evaluated only when a recoverable exit executes the action.
+#[derive(Clone, Debug)]
+pub(crate) enum CleanupAction {
+    Expression(Expression),
+    Call {
+        expression: Expression,
+        callable_mode: Option<CleanupOperandMode>,
+        argument_modes: Arc<[CleanupOperandMode]>,
+    },
+}
+
+impl CleanupAction {
+    pub(crate) fn expression(&self) -> &Expression {
+        match self {
+            Self::Expression(expression) | Self::Call { expression, .. } => expression,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CleanupOperandMode {
+    EvaluateAtExit,
+    CaptureResourceAtRegistration,
 }
 
 #[derive(Clone, Debug)]
@@ -2125,11 +2154,11 @@ fn collect_statement_demands(
             Statement::Panic { value, .. }
             | Statement::Initialize { value, .. }
             | Statement::Assign { value, .. }
-            | Statement::Evaluate(value)
-            | Statement::Defer {
-                expression: value, ..
-            } => {
+            | Statement::Evaluate(value) => {
                 collect_expression_demands(value, constants, functions);
+            }
+            Statement::Defer { action, .. } => {
+                collect_expression_demands(action.expression(), constants, functions);
             }
             Statement::Assert { condition, .. } | Statement::Expect { condition, .. } => {
                 collect_expression_demands(condition, constants, functions);
@@ -3115,10 +3144,8 @@ fn statements_have_placeholder(statements: &[Statement]) -> bool {
         }
         | Statement::Initialize { value, .. }
         | Statement::Assign { value, .. }
-        | Statement::Evaluate(value)
-        | Statement::Defer {
-            expression: value, ..
-        } => expression_has_placeholder(value),
+        | Statement::Evaluate(value) => expression_has_placeholder(value),
+        Statement::Defer { action, .. } => expression_has_placeholder(action.expression()),
         Statement::If {
             condition: value,
             then_branch,
@@ -3175,10 +3202,10 @@ fn collect_statement_closures(
             }
             | Statement::Initialize { value, .. }
             | Statement::Assign { value, .. }
-            | Statement::Evaluate(value)
-            | Statement::Defer {
-                expression: value, ..
-            } => collect_expression_closures(value, closures)?,
+            | Statement::Evaluate(value) => collect_expression_closures(value, closures)?,
+            Statement::Defer { action, .. } => {
+                collect_expression_closures(action.expression(), closures)?
+            }
             Statement::If {
                 condition: value,
                 then_branch,
@@ -3310,10 +3337,8 @@ fn statements_suspend(statements: &[Statement]) -> bool {
         }
         | Statement::Initialize { value, .. }
         | Statement::Assign { value, .. }
-        | Statement::Evaluate(value)
-        | Statement::Defer {
-            expression: value, ..
-        } => expression_suspends(value),
+        | Statement::Evaluate(value) => expression_suspends(value),
+        Statement::Defer { action, .. } => expression_suspends(action.expression()),
         Statement::If {
             condition: value,
             then_branch,
@@ -3550,7 +3575,8 @@ fn verify_statements(
             Statement::Panic { value, .. } | Statement::Evaluate(value) => {
                 verify_expression_artifact(value, locals, moved, catalog, source)?;
             }
-            Statement::Defer { expression, .. } => {
+            Statement::Defer { action, .. } => {
+                let expression = action.expression();
                 let type_ = verify_expression_artifact(expression, locals, moved, catalog, source)?;
                 if matches!(type_, Type::Result { .. })
                     || expression_contains_propagation(expression)
@@ -3576,6 +3602,53 @@ fn verify_statements(
                     })
                 {
                     return defect("lowered cleanup action retains a Resource loan");
+                }
+                match (action, &expression.kind) {
+                    (CleanupAction::Expression(_), ExpressionKind::Call { .. }) => {
+                        return defect("lowered cleanup call omits its operand execution plan");
+                    }
+                    (
+                        CleanupAction::Call {
+                            callable_mode,
+                            argument_modes,
+                            ..
+                        },
+                        ExpressionKind::Call { target, arguments },
+                    ) => {
+                        let expected_callable = matches!(target, CallTarget::Callable { .. })
+                            .then_some(CleanupOperandMode::EvaluateAtExit);
+                        if *callable_mode != expected_callable {
+                            return defect(
+                                "lowered cleanup callable timing disagrees with its call target",
+                            );
+                        }
+                        if argument_modes.len() != arguments.len() {
+                            return defect(
+                                "lowered cleanup operand plan disagrees with its call arity",
+                            );
+                        }
+                        for (mode, argument) in argument_modes.iter().zip(arguments.iter()) {
+                            let expected = if argument.access == AccessMode::Move
+                                && artifact_type_owns_resource(
+                                    argument.type_id,
+                                    &argument.type_,
+                                    catalog,
+                                ) {
+                                CleanupOperandMode::CaptureResourceAtRegistration
+                            } else {
+                                CleanupOperandMode::EvaluateAtExit
+                            };
+                            if *mode != expected {
+                                return defect(
+                                    "lowered cleanup operand timing disagrees with custody",
+                                );
+                            }
+                        }
+                    }
+                    (CleanupAction::Call { .. }, _) => {
+                        return defect("lowered cleanup call plan names a non-call expression");
+                    }
+                    (CleanupAction::Expression(_), _) => {}
                 }
             }
             Statement::Assert { condition, .. } | Statement::Expect { condition, .. } => {
@@ -6456,10 +6529,39 @@ impl<'a> Lowerer<'a> {
                                 && self.type_owns_resource(&argument.type_)
                         })
                     {
-                        return creator(CreatorFailureKind::LoanAcrossCleanup, &argument.source);
+                        let place = root_place(argument).ok_or_else(|| {
+                            creator_value(CreatorFailureKind::LoanAcrossCleanup, &argument.source)
+                        })?;
+                        return Err(self.custody_failure(
+                            CreatorFailureKind::LoanAcrossCleanup,
+                            range,
+                            &PlaceKey::from_place(&place),
+                            CustodyDiagnosticState::Loaned,
+                            Some(argument.source.clone()),
+                        ));
                     }
+                    let action = match &expression.kind {
+                        ExpressionKind::Call { target, arguments } => CleanupAction::Call {
+                            callable_mode: matches!(target, CallTarget::Callable { .. })
+                                .then_some(CleanupOperandMode::EvaluateAtExit),
+                            argument_modes: arguments
+                                .iter()
+                                .map(|argument| {
+                                    if argument.access == AccessMode::Move
+                                        && self.type_owns_resource(&argument.type_)
+                                    {
+                                        CleanupOperandMode::CaptureResourceAtRegistration
+                                    } else {
+                                        CleanupOperandMode::EvaluateAtExit
+                                    }
+                                })
+                                .collect(),
+                            expression,
+                        },
+                        _ => CleanupAction::Expression(expression),
+                    };
                     Statement::Defer {
-                        expression,
+                        action,
                         source: range.clone(),
                     }
                 }
@@ -10839,10 +10941,36 @@ fn append_statements(bytes: &mut impl ByteSink, statements: &[Statement]) {
                     append_statements(bytes, &case.body);
                 }
             }
-            Statement::Defer { expression, source } => {
+            Statement::Defer { action, source } => {
                 bytes.push(15);
                 append_range(bytes, source);
-                append_expression(bytes, expression);
+                append_expression(bytes, action.expression());
+                match action {
+                    CleanupAction::Expression(_) => bytes.push(0),
+                    CleanupAction::Call {
+                        callable_mode,
+                        argument_modes,
+                        ..
+                    } => {
+                        bytes.push(1);
+                        bytes.push(match callable_mode {
+                            None => 0,
+                            Some(CleanupOperandMode::EvaluateAtExit) => 1,
+                            Some(CleanupOperandMode::CaptureResourceAtRegistration) => 2,
+                        });
+                        bytes.extend_from_slice(
+                            &u64::try_from(argument_modes.len())
+                                .unwrap_or(u64::MAX)
+                                .to_be_bytes(),
+                        );
+                        for mode in argument_modes.iter() {
+                            bytes.push(match mode {
+                                CleanupOperandMode::EvaluateAtExit => 0,
+                                CleanupOperandMode::CaptureResourceAtRegistration => 1,
+                            });
+                        }
+                    }
+                }
             }
             Statement::WithPool {
                 binding,
@@ -12021,5 +12149,246 @@ mod tests {
             ),
             Err(VerificationFailure::Defect { .. })
         ));
+    }
+
+    #[test]
+    fn cleanup_verifier_rejects_each_single_fault_in_its_execution_contract() {
+        let owner = SourceRange::from_u64("src/image.wr", 0, 10);
+        let source = SourceRange::from_u64("src/image.wr", 1, 2);
+        let local = LocalId(1);
+        let resource = pool_owned_bool();
+        let mut identities = crate::identity::IdentityCatalog::empty();
+        let resource_id = identities
+            .intern_type(&resource)
+            .expect("Resource-owning type interns");
+        let unit_id = identities.intern_type(&Type::Unit).expect("Unit interns");
+        let tuple_type = Type::Tuple(Arc::from([Type::Unit, Type::Unit]));
+        let tuple_id = identities.intern_type(&tuple_type).expect("tuple interns");
+        let callable_local = LocalId(3);
+        let callable_type = Type::Function {
+            parameters: Arc::from([]),
+            return_type: Arc::new(Type::Unit),
+        };
+        let callable_id = identities
+            .intern_type(&callable_type)
+            .expect("callable type interns");
+        let definitions = [DefinitionId(10), DefinitionId(20), DefinitionId(30)];
+        let specializations = [
+            SpecializationId(11),
+            SpecializationId(21),
+            SpecializationId(31),
+        ];
+        let parameter_definitions = [DefinitionId(12), DefinitionId(22), DefinitionId(32)];
+        let accesses = [AccessMode::Move, AccessMode::Read, AccessMode::Move];
+        let returns = [Type::Unit, Type::Unit, resource.clone()];
+        let specialized = definitions
+            .iter()
+            .zip(specializations)
+            .zip(parameter_definitions)
+            .zip(accesses)
+            .zip(returns.iter())
+            .map(
+                |((((definition, specialization), parameter), access), return_type)| {
+                    (
+                        specialization,
+                        Arc::new(HirFunction {
+                            id: *definition,
+                            name: "cleanup".to_owned(),
+                            module_display: "image".to_owned(),
+                            modifier: crate::syntax::FunctionModifier::Ordinary,
+                            parameters: vec![(LocalId(2), resource.clone(), access)],
+                            parameter_type_ids: Arc::from([resource_id]),
+                            parameter_definitions: Arc::from([parameter]),
+                            return_type: return_type.clone(),
+                            body: Arc::from([]),
+                            source: owner.clone(),
+                        }),
+                    )
+                },
+            )
+            .collect::<BTreeMap<_, _>>();
+        let specialization_records = definitions
+            .iter()
+            .zip(specializations)
+            .map(|(definition, id)| {
+                (
+                    id,
+                    SpecializationRecord {
+                        id,
+                        definition: *definition,
+                        type_arguments: Arc::from([]),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let templates = BTreeMap::new();
+        let constants = BTreeMap::new();
+        let variants = BTreeMap::new();
+        let structs = BTreeMap::new();
+        let interfaces = BTreeMap::new();
+        let catalog = ArtifactCatalog {
+            templates: &templates,
+            specialized: &specialized,
+            constants: &constants,
+            specializations: &specialization_records,
+            identities: &identities,
+            variants: &variants,
+            structs: &structs,
+            interfaces: &interfaces,
+            discharge_laws: None,
+        };
+        let read = |access| Expression {
+            kind: ExpressionKind::Read(Place::local(local)),
+            type_id: resource_id,
+            type_: resource.clone(),
+            coerced_from: None,
+            access,
+            source: source.clone(),
+        };
+        let call = |index: usize, argument: Expression| {
+            let type_ = returns[index].clone();
+            let type_id = if type_ == Type::Unit {
+                unit_id
+            } else {
+                resource_id
+            };
+            Expression {
+                kind: ExpressionKind::Call {
+                    target: CallTarget::Function {
+                        definition: definitions[index],
+                        specialization: specializations[index],
+                        argument_order: Arc::from([0]),
+                        argument_parameters: Arc::from([parameter_definitions[index]]),
+                    },
+                    arguments: Arc::from([argument]),
+                },
+                type_id,
+                type_,
+                coerced_from: None,
+                access: if type_id == resource_id {
+                    AccessMode::Move
+                } else {
+                    AccessMode::Copy
+                },
+                source: source.clone(),
+            }
+        };
+        let verify_action = |action| {
+            let mut previous = owner.start();
+            verify_statements(
+                &[Statement::Defer {
+                    action,
+                    source: source.clone(),
+                }],
+                &Type::Unit,
+                &mut BTreeMap::from([
+                    (
+                        local,
+                        ArtifactLocalType {
+                            type_id: resource_id,
+                            type_: resource.clone(),
+                        },
+                    ),
+                    (
+                        callable_local,
+                        ArtifactLocalType {
+                            type_id: callable_id,
+                            type_: callable_type.clone(),
+                        },
+                    ),
+                ]),
+                &mut MoveState::default(),
+                &mut Vec::new(),
+                &ArtifactVerificationAuthority {
+                    catalog: &catalog,
+                    provenance_owner: &owner,
+                    discharge_exempt: &BTreeSet::new(),
+                },
+                &mut previous,
+            )
+        };
+        let evidence = |result: Result<(), VerificationFailure>| match result {
+            Err(VerificationFailure::Defect { evidence }) => evidence,
+            other => panic!("expected a contained verifier defect, got {other:?}"),
+        };
+
+        assert_eq!(
+            evidence(verify_action(CleanupAction::Call {
+                expression: call(2, read(AccessMode::Move)),
+                callable_mode: None,
+                argument_modes: Arc::from([CleanupOperandMode::CaptureResourceAtRegistration,]),
+            }))
+            .as_ref(),
+            "lowered cleanup action leaves a Resource result undisposed"
+        );
+        let hidden_call = call(0, read(AccessMode::Move));
+        assert_eq!(
+            evidence(verify_action(CleanupAction::Expression(Expression {
+                kind: ExpressionKind::Tuple(Arc::from([
+                    hidden_call,
+                    Expression {
+                        kind: ExpressionKind::Literal(Literal::Unit),
+                        type_id: unit_id,
+                        type_: Type::Unit,
+                        coerced_from: None,
+                        access: AccessMode::Copy,
+                        source: source.clone(),
+                    },
+                ])),
+                type_id: tuple_id,
+                type_: tuple_type,
+                coerced_from: None,
+                access: AccessMode::Copy,
+                source: source.clone(),
+            })))
+            .as_ref(),
+            "lowered non-call cleanup expression captures Resource custody"
+        );
+        assert_eq!(
+            evidence(verify_action(CleanupAction::Call {
+                expression: call(1, read(AccessMode::Read)),
+                callable_mode: None,
+                argument_modes: Arc::from([CleanupOperandMode::EvaluateAtExit]),
+            }))
+            .as_ref(),
+            "lowered cleanup action retains a Resource loan"
+        );
+        assert_eq!(
+            evidence(verify_action(CleanupAction::Call {
+                expression: call(0, read(AccessMode::Move)),
+                callable_mode: None,
+                argument_modes: Arc::from([CleanupOperandMode::EvaluateAtExit]),
+            }))
+            .as_ref(),
+            "lowered cleanup operand timing disagrees with custody"
+        );
+        assert_eq!(
+            evidence(verify_action(CleanupAction::Call {
+                expression: Expression {
+                    kind: ExpressionKind::Call {
+                        target: CallTarget::Callable {
+                            value: Box::new(Expression {
+                                kind: ExpressionKind::Read(Place::local(callable_local)),
+                                type_id: callable_id,
+                                type_: callable_type.clone(),
+                                coerced_from: None,
+                                access: AccessMode::Copy,
+                                source: source.clone(),
+                            }),
+                        },
+                        arguments: Arc::from([]),
+                    },
+                    type_id: unit_id,
+                    type_: Type::Unit,
+                    coerced_from: None,
+                    access: AccessMode::Copy,
+                    source: source.clone(),
+                },
+                callable_mode: Some(CleanupOperandMode::CaptureResourceAtRegistration),
+                argument_modes: Arc::from([]),
+            }))
+            .as_ref(),
+            "lowered cleanup callable timing disagrees with its call target"
+        );
     }
 }

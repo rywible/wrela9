@@ -50,6 +50,48 @@ pub(crate) fn syntax_statements_terminate(statements: &[StatementSyntax]) -> boo
     })
 }
 
+pub(crate) fn syntax_statements_fall_through(statements: &[StatementSyntax]) -> bool {
+    !statements.iter().any(|statement| match statement {
+        StatementSyntax::Return { .. }
+        | StatementSyntax::Panic { .. }
+        | StatementSyntax::Break(_)
+        | StatementSyntax::Continue(_) => true,
+        StatementSyntax::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            !else_branch.is_empty()
+                && !syntax_statements_fall_through(then_branch)
+                && !syntax_statements_fall_through(else_branch)
+        }
+        StatementSyntax::Comptime { branches, .. } => {
+            branches
+                .last()
+                .is_some_and(|branch| branch.condition.is_none())
+                && branches
+                    .iter()
+                    .all(|branch| !syntax_statements_fall_through(&branch.statements))
+        }
+        StatementSyntax::Match { cases, .. } => {
+            syntax_match_exhaustive(cases)
+                && cases
+                    .iter()
+                    .all(|case| !syntax_statements_fall_through(&case.body))
+        }
+        StatementSyntax::With { body, .. } => !syntax_statements_fall_through(body),
+        StatementSyntax::Assert { .. }
+        | StatementSyntax::Assign { .. }
+        | StatementSyntax::Expect { .. }
+        | StatementSyntax::Evaluate(_)
+        | StatementSyntax::For { .. }
+        | StatementSyntax::While { .. }
+        | StatementSyntax::Defer { .. }
+        | StatementSyntax::Unsupported { .. }
+        | StatementSyntax::Pass(_) => false,
+    })
+}
+
 fn syntax_match_exhaustive(cases: &[MatchCaseSyntax]) -> bool {
     if cases.last().is_some_and(|case| {
         matches!(
@@ -97,9 +139,12 @@ fn syntax_pattern_can_close_match(kind: &PatternSyntaxKind) -> bool {
     }
 }
 
-pub(crate) fn verified_statements_terminate(statements: &[Statement]) -> bool {
-    statements.iter().any(|statement| match statement {
-        Statement::Return { .. } | Statement::Panic { .. } => true,
+pub(crate) fn verified_statements_fall_through(statements: &[Statement]) -> bool {
+    !statements.iter().any(|statement| match statement {
+        Statement::Return { .. }
+        | Statement::Panic { .. }
+        | Statement::Break(_)
+        | Statement::Continue(_) => true,
         Statement::If {
             then_branch,
             else_branch,
@@ -111,16 +156,16 @@ pub(crate) fn verified_statements_terminate(statements: &[Statement]) -> bool {
             ..
         } => {
             !else_branch.is_empty()
-                && verified_statements_terminate(then_branch)
-                && verified_statements_terminate(else_branch)
+                && !verified_statements_fall_through(then_branch)
+                && !verified_statements_fall_through(else_branch)
         }
         Statement::Match { cases, .. } => {
             verified_match_exhaustive(cases)
                 && cases
                     .iter()
-                    .all(|case| verified_statements_terminate(&case.body))
+                    .all(|case| !verified_statements_fall_through(&case.body))
         }
-        Statement::WithPool { body, .. } => verified_statements_terminate(body),
+        Statement::WithPool { body, .. } => !verified_statements_fall_through(body),
         Statement::Assert { .. }
         | Statement::Expect { .. }
         | Statement::Initialize { .. }
@@ -128,8 +173,6 @@ pub(crate) fn verified_statements_terminate(statements: &[Statement]) -> bool {
         | Statement::Evaluate(_)
         | Statement::For { .. }
         | Statement::While { .. }
-        | Statement::Break(_)
-        | Statement::Continue(_)
         | Statement::Defer { .. }
         | Statement::Pass(_) => false,
     })

@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use xxhash_rust::xxh3::{Xxh3, xxh3_128};
 
+use crate::control_flow::{syntax_statements_fall_through, verified_statements_fall_through};
 use crate::identity::IdentityCatalog;
 use crate::model::{
     ArrayLength, BuildKind, BuiltinType, BuiltinVariant, DefinitionId, FloatType, IntegerType,
@@ -52,6 +53,17 @@ enum ProjectionKey {
     Index(Option<i128>),
 }
 
+fn projections_overlap(left: &ProjectionKey, right: &ProjectionKey) -> bool {
+    match (left, right) {
+        (ProjectionKey::Field(left_owner, left), ProjectionKey::Field(right_owner, right)) => {
+            left_owner == right_owner && left == right
+        }
+        (ProjectionKey::Index(Some(left)), ProjectionKey::Index(Some(right))) => left == right,
+        (ProjectionKey::Index(_), ProjectionKey::Index(_)) => true,
+        _ => false,
+    }
+}
+
 impl PlaceKey {
     fn from_place(place: &Place) -> Self {
         Self {
@@ -78,17 +90,7 @@ impl PlaceKey {
         self.projections
             .iter()
             .zip(other.projections.iter())
-            .all(|(left, right)| match (left, right) {
-                (
-                    ProjectionKey::Field(left_owner, left),
-                    ProjectionKey::Field(right_owner, right),
-                ) => left_owner == right_owner && left == right,
-                (ProjectionKey::Index(Some(left)), ProjectionKey::Index(Some(right))) => {
-                    left == right
-                }
-                (ProjectionKey::Index(_), ProjectionKey::Index(_)) => true,
-                _ => false,
-            })
+            .all(|(left, right)| projections_overlap(left, right))
     }
 
     fn covers(&self, other: &Self) -> bool {
@@ -98,37 +100,44 @@ impl PlaceKey {
                 .projections
                 .iter()
                 .zip(other.projections.iter())
-                .all(|(left, right)| match (left, right) {
-                    (
-                        ProjectionKey::Field(left_owner, left),
-                        ProjectionKey::Field(right_owner, right),
-                    ) => left_owner == right_owner && left == right,
-                    (ProjectionKey::Index(Some(left)), ProjectionKey::Index(Some(right))) => {
-                        left == right
-                    }
-                    (ProjectionKey::Index(_), ProjectionKey::Index(_)) => true,
-                    _ => false,
-                })
+                .all(|(left, right)| projections_overlap(left, right))
     }
 }
 
 #[derive(Clone, Debug, Default)]
 struct MoveState {
     places: BTreeSet<PlaceKey>,
+    restored: BTreeSet<PlaceKey>,
     origins: BTreeMap<PlaceKey, SourceRange>,
 }
 
 impl MoveState {
     fn is_unreadable(&self, place: &Place) -> bool {
         let place = PlaceKey::from_place(place);
-        self.places.iter().any(|moved| moved.conflicts(&place))
+        let moved_ancestor = self
+            .places
+            .iter()
+            .filter(|moved| moved.covers(&place))
+            .map(|moved| moved.projections.len())
+            .max();
+        let restored_ancestor = self
+            .restored
+            .iter()
+            .filter(|restored| restored.covers(&place))
+            .map(|restored| restored.projections.len())
+            .max();
+        moved_ancestor
+            .is_some_and(|moved| restored_ancestor.is_none_or(|restored| moved >= restored))
+            || self.places.iter().any(|moved| place.covers(moved))
     }
 
     fn move_place(&mut self, place: &Place) -> bool {
         if self.is_unreadable(place) {
             return false;
         }
-        self.places.insert(PlaceKey::from_place(place))
+        let place = PlaceKey::from_place(place);
+        self.restored.retain(|restored| !place.conflicts(restored));
+        self.places.insert(place)
     }
 
     fn move_place_at(&mut self, place: &Place, source: &SourceRange) -> bool {
@@ -148,16 +157,19 @@ impl MoveState {
     }
 
     fn is_uninitialized(&self, place: &Place) -> bool {
-        let place = PlaceKey::from_place(place);
-        self.places.iter().any(|moved| moved.covers(&place))
+        self.is_unreadable(place)
     }
 
     fn restore_place(&mut self, place: &Place) -> bool {
         let place = PlaceKey::from_place(place);
-        let before = self.places.len();
-        self.places.retain(|moved| !moved.conflicts(&place));
-        self.origins.retain(|moved, _| !moved.conflicts(&place));
-        before != self.places.len()
+        let before = (self.places.len(), self.restored.len());
+        self.places.retain(|moved| !place.covers(moved));
+        self.origins.retain(|moved, _| !place.covers(moved));
+        self.restored.retain(|restored| !place.covers(restored));
+        if self.places.iter().any(|moved| moved.covers(&place)) {
+            self.restored.insert(place);
+        }
+        before != (self.places.len(), self.restored.len())
     }
 
     fn contains_local(&self, local: LocalId) -> bool {
@@ -168,10 +180,14 @@ impl MoveState {
         self.restore_place(&Place::local(local))
     }
 
-    fn extend(&mut self, other: Self) {
-        self.places.extend(other.places);
-        for (place, source) in other.origins {
-            self.origins.entry(place).or_insert(source);
+    fn finish_aggregate_restoration(&mut self, aggregate: &Place, children: &[Place]) {
+        let aggregate = PlaceKey::from_place(aggregate);
+        if self.places.contains(&aggregate)
+            && children.iter().all(|child| !self.is_unreadable(child))
+        {
+            self.places.remove(&aggregate);
+            self.origins.remove(&aggregate);
+            self.restored.retain(|restored| !aggregate.covers(restored));
         }
     }
 
@@ -179,8 +195,14 @@ impl MoveState {
         let place = self
             .places
             .symmetric_difference(&other.places)
-            .next()?
-            .clone();
+            .next()
+            .cloned()
+            .or_else(|| {
+                self.restored
+                    .symmetric_difference(&other.restored)
+                    .next()
+                    .cloned()
+            })?;
         let origin = self
             .origins
             .get(&place)
@@ -935,6 +957,15 @@ impl CreatorFailureKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CustodyDiagnosticState {
+    Moved,
+    Initialized,
+    Loaned,
+    ConflictingLoan,
+    PathDependent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum VerificationFailure {
     Creator {
         kind: CreatorFailureKind,
@@ -944,7 +975,7 @@ pub(crate) enum VerificationFailure {
         kind: CreatorFailureKind,
         site: SourceRange,
         subject: Arc<str>,
-        state: Arc<str>,
+        state: CustodyDiagnosticState,
         related: Option<SourceRange>,
     },
     Defect {
@@ -2112,6 +2143,73 @@ fn artifact_struct_fields(
         })
 }
 
+fn artifact_place_type(place: &Place, locals: &BTreeMap<LocalId, Type>) -> Option<Type> {
+    place
+        .projections
+        .last()
+        .map(|projection| match projection {
+            PlaceProjection::Field { type_, .. } | PlaceProjection::Index { type_, .. } => {
+                type_.clone()
+            }
+        })
+        .or_else(|| locals.get(&place.local).cloned())
+}
+
+fn restore_artifact_place_custody(
+    moved: &mut MoveState,
+    place: &Place,
+    locals: &BTreeMap<LocalId, Type>,
+    catalog: &ArtifactCatalog<'_>,
+) -> Result<(), VerificationFailure> {
+    moved.restore_place(place);
+    for projection_count in (0..place.projections.len()).rev() {
+        let aggregate = Place {
+            local: place.local,
+            projections: place.projections[..projection_count].into(),
+        };
+        let Some(Type::Nominal {
+            definition,
+            arguments,
+            ..
+        }) = artifact_place_type(&aggregate, locals)
+        else {
+            continue;
+        };
+        let struct_ =
+            catalog
+                .structs
+                .get(&definition)
+                .ok_or_else(|| VerificationFailure::Defect {
+                    evidence: Arc::from("lowered place names an unknown aggregate type"),
+                })?;
+        let substitutions = struct_
+            .type_parameters
+            .iter()
+            .copied()
+            .zip(arguments.iter().cloned())
+            .collect::<BTreeMap<_, _>>();
+        let fields = artifact_struct_fields(struct_, &arguments)?;
+        let children = fields
+            .iter()
+            .map(|field| {
+                let mut projections = aggregate.projections.to_vec();
+                projections.push(PlaceProjection::Field {
+                    definition,
+                    name: Arc::from(field.name.as_str()),
+                    type_: substitute(&field.type_, &substitutions),
+                    mutable: field.mutable,
+                });
+                Place {
+                    local: aggregate.local,
+                    projections: projections.into(),
+                }
+            })
+            .collect::<Vec<_>>();
+        moved.finish_aggregate_restoration(&aggregate, &children);
+    }
+    Ok(())
+}
+
 fn type_has_placeholder(type_: &Type) -> bool {
     match type_ {
         Type::Parameter { .. } | Type::Infer => true,
@@ -2185,8 +2283,11 @@ fn verify_specialized_artifact(
             &function.return_type,
             &mut locals,
             &mut MoveState::default(),
-            catalog,
-            &function.source,
+            &mut Vec::new(),
+            &ArtifactVerificationAuthority {
+                catalog,
+                provenance_owner: &function.source,
+            },
             &mut previous_source_start,
         )?;
         if statements_have_placeholder(&function.body) {
@@ -2480,8 +2581,11 @@ fn verify_lowered_artifact(
             &function.return_type,
             &mut locals,
             &mut moved,
-            catalog,
-            &function.source,
+            &mut Vec::new(),
+            &ArtifactVerificationAuthority {
+                catalog,
+                provenance_owner: &function.source,
+            },
             &mut previous_source_start,
         )?;
     }
@@ -2513,8 +2617,11 @@ fn verify_lowered_artifact(
             &Type::Unit,
             &mut locals,
             &mut MoveState::default(),
-            catalog,
-            &test.source,
+            &mut Vec::new(),
+            &ArtifactVerificationAuthority {
+                catalog,
+                provenance_owner: &test.source,
+            },
             &mut previous_source_start,
         )?;
         if statements_have_placeholder(&test.body) {
@@ -2524,15 +2631,22 @@ fn verify_lowered_artifact(
     verify_specialized_artifact(catalog.specialized, catalog)
 }
 
+struct ArtifactVerificationAuthority<'a, 'catalog> {
+    catalog: &'a ArtifactCatalog<'catalog>,
+    provenance_owner: &'a SourceRange,
+}
+
 fn verify_statements(
     statements: &[Statement],
     return_type: &Type,
     locals: &mut BTreeMap<LocalId, Type>,
     moved: &mut MoveState,
-    catalog: &ArtifactCatalog<'_>,
-    provenance_owner: &SourceRange,
+    loop_custody: &mut Vec<LoopCustodyEdges>,
+    authority: &ArtifactVerificationAuthority<'_, '_>,
     previous_source_start: &mut u64,
 ) -> Result<(), VerificationFailure> {
+    let catalog = authority.catalog;
+    let provenance_owner = authority.provenance_owner;
     for statement in statements {
         let source = statement_source(statement);
         if source.path() != provenance_owner.path()
@@ -2547,7 +2661,14 @@ fn verify_statements(
         match statement {
             Statement::Return { value, source: _ } => {
                 let actual = if let Some(value) = value {
-                    verify_expression_artifact(value, locals, moved, catalog, source)?
+                    let actual = verify_expression_artifact(value, locals, moved, catalog, source)?;
+                    if artifact_type_owns_resource(&actual, catalog.structs)
+                        && root_place(value).is_some()
+                        && value.access != AccessMode::Move
+                    {
+                        return defect("lowered Resource return omits an explicit move");
+                    }
+                    actual
                 } else {
                     Type::Unit
                 };
@@ -2575,17 +2696,29 @@ fn verify_statements(
             }
             Statement::Initialize { place, value, .. } => {
                 let type_ = verify_expression_artifact(value, locals, moved, catalog, source)?;
+                if artifact_type_owns_resource(&type_, catalog.structs)
+                    && root_place(value).is_some()
+                    && value.access != AccessMode::Move
+                {
+                    return defect("lowered Resource initialization omits an explicit move");
+                }
                 if locals.insert(place.local, type_).is_some() {
                     return defect("lowered initialization repeats a LocalId");
                 }
             }
             Statement::Assign { place, value, .. } => {
                 let type_ = verify_expression_artifact(value, locals, moved, catalog, source)?;
+                if artifact_type_owns_resource(&type_, catalog.structs)
+                    && root_place(value).is_some()
+                    && value.access != AccessMode::Move
+                {
+                    return defect("lowered Resource assignment omits an explicit move");
+                }
                 let expected = verify_place_artifact(place, locals, moved, catalog, source)?;
                 if !can_initialize(&type_, &expected) {
                     return defect("lowered assignment changes the local type");
                 }
-                moved.restore_place(place);
+                restore_artifact_place_custody(moved, place, locals, catalog)?;
             }
             Statement::If {
                 condition,
@@ -2605,8 +2738,8 @@ fn verify_statements(
                     return_type,
                     &mut then_locals,
                     &mut then_moved,
-                    catalog,
-                    provenance_owner,
+                    loop_custody,
+                    authority,
                     previous_source_start,
                 )?;
                 let mut else_locals = locals.clone();
@@ -2616,16 +2749,19 @@ fn verify_statements(
                     return_type,
                     &mut else_locals,
                     &mut else_moved,
-                    catalog,
-                    provenance_owner,
+                    loop_custody,
+                    authority,
                     previous_source_start,
                 )?;
-                if !crate::control_flow::verified_statements_terminate(then_branch) {
-                    moved.extend(then_moved);
-                }
-                if !crate::control_flow::verified_statements_terminate(else_branch) {
-                    moved.extend(else_moved);
-                }
+                *moved = match (
+                    verified_statements_fall_through(then_branch),
+                    verified_statements_fall_through(else_branch),
+                ) {
+                    (true, true) => verify_custody_join(then_moved, else_moved)?,
+                    (true, false) => then_moved,
+                    (false, true) => else_moved,
+                    (false, false) => moved.clone(),
+                };
             }
             Statement::IfPattern {
                 value,
@@ -2643,8 +2779,8 @@ fn verify_statements(
                     return_type,
                     &mut then_locals,
                     &mut then_moved,
-                    catalog,
-                    provenance_owner,
+                    loop_custody,
+                    authority,
                     previous_source_start,
                 )?;
                 let mut else_locals = locals.clone();
@@ -2654,16 +2790,19 @@ fn verify_statements(
                     return_type,
                     &mut else_locals,
                     &mut else_moved,
-                    catalog,
-                    provenance_owner,
+                    loop_custody,
+                    authority,
                     previous_source_start,
                 )?;
-                if !crate::control_flow::verified_statements_terminate(then_branch) {
-                    moved.extend(then_moved);
-                }
-                if !crate::control_flow::verified_statements_terminate(else_branch) {
-                    moved.extend(else_moved);
-                }
+                *moved = match (
+                    verified_statements_fall_through(then_branch),
+                    verified_statements_fall_through(else_branch),
+                ) {
+                    (true, true) => verify_custody_join(then_moved, else_moved)?,
+                    (true, false) => then_moved,
+                    (false, true) => else_moved,
+                    (false, false) => moved.clone(),
+                };
             }
             Statement::For {
                 pattern,
@@ -2673,6 +2812,10 @@ fn verify_statements(
             } => {
                 let iterable_type =
                     verify_expression_artifact(iterable, locals, moved, catalog, source)?;
+                let exact_iterations = match &iterable_type {
+                    Type::FixedArray { length, .. } => length.value(),
+                    _ => None,
+                };
                 let element = match iterable_type {
                     Type::Array(element) | Type::FixedArray { element, .. } => element,
                     _ => return defect("lowered for iterable is not a bounded array"),
@@ -2680,22 +2823,53 @@ fn verify_statements(
                 if !artifact_pattern_irrefutable(pattern, &element, catalog) {
                     return defect("lowered for pattern is refutable");
                 }
+                let moved_before = moved.clone();
+                let body_falls_through = verified_statements_fall_through(body);
                 let visible = locals.keys().copied().collect::<BTreeSet<_>>();
                 verify_match_pattern_artifact(pattern, &element, locals, catalog)?;
+                loop_custody.push(LoopCustodyEdges::default());
                 verify_statements(
                     body,
                     return_type,
                     locals,
                     moved,
-                    catalog,
-                    provenance_owner,
+                    loop_custody,
+                    authority,
                     previous_source_start,
                 )?;
+                let mut edges = loop_custody
+                    .pop()
+                    .expect("verified for loop custody scope was pushed");
                 let bindings = match_pattern_binding_signature(pattern);
                 locals.retain(|local, _| visible.contains(local));
                 for local in bindings.keys() {
-                    moved.restore_place(&Place::local(*local));
+                    let binding = Place::local(*local);
+                    moved.restore_place(&binding);
+                    for state in edges.breaks.iter_mut().chain(edges.continues.iter_mut()) {
+                        state.restore_place(&binding);
+                    }
                 }
+                let mut continuing = edges.continues;
+                if body_falls_through {
+                    continuing.push(moved.clone());
+                }
+                if exact_iterations.is_none_or(|iterations| iterations > 1) {
+                    for state in &continuing {
+                        verify_custody_join(moved_before.clone(), state.clone())?;
+                    }
+                }
+                let mut exits = edges.breaks;
+                match exact_iterations {
+                    Some(0) => exits.push(moved_before.clone()),
+                    Some(1) => exits.extend(continuing),
+                    Some(_) => {
+                        if !continuing.is_empty() {
+                            exits.push(moved_before.clone());
+                        }
+                    }
+                    None => exits.push(moved_before.clone()),
+                }
+                *moved = verify_reachable_custody(exits)?.unwrap_or(moved_before);
             }
             Statement::While {
                 condition, body, ..
@@ -2705,17 +2879,46 @@ fn verify_statements(
                 {
                     return defect("lowered while condition is not Bool");
                 }
+                let moved_before = moved.clone();
+                let body_falls_through = verified_statements_fall_through(body);
+                loop_custody.push(LoopCustodyEdges::default());
                 verify_statements(
                     body,
                     return_type,
                     locals,
                     moved,
-                    catalog,
-                    provenance_owner,
+                    loop_custody,
+                    authority,
                     previous_source_start,
                 )?;
+                let edges = loop_custody
+                    .pop()
+                    .expect("verified while loop custody scope was pushed");
+                let mut continuing = edges.continues;
+                if body_falls_through {
+                    continuing.push(moved.clone());
+                }
+                for state in continuing {
+                    verify_custody_join(moved_before.clone(), state)?;
+                }
+                let mut exits = edges.breaks;
+                exits.push(moved_before.clone());
+                *moved = verify_reachable_custody(exits)?.unwrap_or(moved_before);
             }
-            Statement::Break(_) | Statement::Continue(_) => {}
+            Statement::Break(_) => loop_custody
+                .last_mut()
+                .ok_or_else(|| VerificationFailure::Defect {
+                    evidence: Arc::from("lowered break has no custody loop scope"),
+                })?
+                .breaks
+                .push(moved.clone()),
+            Statement::Continue(_) => loop_custody
+                .last_mut()
+                .ok_or_else(|| VerificationFailure::Defect {
+                    evidence: Arc::from("lowered continue has no custody loop scope"),
+                })?
+                .continues
+                .push(moved.clone()),
             Statement::Match { value, cases, .. } => {
                 let matched = verify_expression_artifact(value, locals, moved, catalog, source)?;
                 let mut pattern_keys = BTreeSet::new();
@@ -2766,16 +2969,16 @@ fn verify_statements(
                         return_type,
                         &mut case_locals,
                         &mut case_moved,
-                        catalog,
-                        provenance_owner,
+                        loop_custody,
+                        authority,
                         previous_source_start,
                     )?;
-                    if !crate::control_flow::verified_statements_terminate(&case.body) {
+                    if verified_statements_fall_through(&case.body) {
                         branch_moved.push(case_moved);
                     }
                 }
-                for case_moved in branch_moved {
-                    moved.extend(case_moved);
+                if let Some(joined) = verify_reachable_custody(branch_moved)? {
+                    *moved = joined;
                 }
             }
             Statement::WithPool {
@@ -2793,8 +2996,8 @@ fn verify_statements(
                     return_type,
                     locals,
                     moved,
-                    catalog,
-                    provenance_owner,
+                    loop_custody,
+                    authority,
                     previous_source_start,
                 )?;
                 locals.remove(&binding.local);
@@ -2982,7 +3185,12 @@ fn verify_expression_artifact(
                 return defect("lowered read uses a LocalId after it was moved");
             }
             if expression.access == AccessMode::Move {
-                moved.move_place(place);
+                if !artifact_type_owns_resource(&type_, catalog.structs) {
+                    return defect("lowered move does not transfer a Resource-owning place");
+                }
+                if !moved.move_place(place) {
+                    return defect("lowered move repeats an unavailable Resource transfer");
+                }
             }
             type_
         }
@@ -3076,6 +3284,7 @@ fn verify_expression_artifact(
             expression.type_.clone()
         }
         ExpressionKind::Call { target, arguments } => {
+            verify_artifact_call_custody(arguments)?;
             let callable_type = if let CallTarget::Callable { value } = target {
                 Some(verify_expression_artifact(
                     value,
@@ -3103,6 +3312,9 @@ fn verify_expression_artifact(
                         return defect("callable target is not a function value");
                     };
                     if parameters.len() != argument_types.len()
+                        || arguments
+                            .iter()
+                            .any(|argument| argument.access != AccessMode::Copy)
                         || argument_types
                             .iter()
                             .zip(parameters.iter())
@@ -3124,7 +3336,13 @@ fn verify_expression_artifact(
                             .iter()
                             .map(|index| function.parameter_definitions[usize::from(*index)])
                             .collect::<Vec<_>>();
-                        if argument_parameters.as_ref() != expected_parameters {
+                        if argument_parameters.as_ref() != expected_parameters
+                            || !argument_accesses_match(
+                                arguments,
+                                argument_order,
+                                &function.parameters,
+                            )
+                        {
                             return defect("template call parameter identities disagree");
                         }
                         let ordered = reorder_types(&argument_types, argument_order)?;
@@ -3166,6 +3384,7 @@ fn verify_expression_artifact(
                     if function.id != *definition
                         || argument_parameters.as_ref() != expected_parameters
                         || !arguments_match(&ordered, &function.parameters)
+                        || !argument_accesses_match(arguments, argument_order, &function.parameters)
                     {
                         return defect("concrete call operands disagree with specialization");
                     }
@@ -3228,6 +3447,11 @@ fn verify_expression_artifact(
                         if function.id != *definition
                             || function.parameters.len() != argument_types.len()
                             || argument_order.len() != argument_types.len()
+                            || !argument_accesses_match(
+                                arguments,
+                                argument_order,
+                                &function.parameters,
+                            )
                         {
                             return defect("interface call alternative signature is malformed");
                         }
@@ -3484,6 +3708,9 @@ fn verify_expression_artifact(
             Type::Bool
         }
         ExpressionKind::Await(value) => {
+            if call_loan(value).is_some() {
+                return defect("lowered await holds a Resource loan across suspension");
+            }
             verify_expression_artifact(value, locals, moved, catalog, &expression.source)?
         }
         ExpressionKind::Propagate(value) => {
@@ -3550,6 +3777,45 @@ fn arguments_match(argument_types: &[Type], parameters: &[(LocalId, Type, Access
             .all(|(argument, (_, parameter, _))| can_pass(argument, parameter))
 }
 
+fn argument_accesses_match(
+    arguments: &[Expression],
+    source_to_parameter: &[u16],
+    parameters: &[(LocalId, Type, AccessMode)],
+) -> bool {
+    arguments.len() == source_to_parameter.len()
+        && arguments
+            .iter()
+            .zip(source_to_parameter)
+            .all(|(argument, parameter)| {
+                parameters
+                    .get(usize::from(*parameter))
+                    .is_some_and(|(_, _, access)| argument.access == *access)
+            })
+}
+
+fn verify_artifact_call_custody(arguments: &[Expression]) -> Result<(), VerificationFailure> {
+    let mut active_places: Vec<(PlaceKey, AccessMode)> = Vec::new();
+    for argument in arguments {
+        let Some(place) = root_place(argument).map(|place| PlaceKey::from_place(&place)) else {
+            continue;
+        };
+        if matches!(
+            argument.access,
+            AccessMode::Read | AccessMode::Mut | AccessMode::Move
+        ) && active_places.iter().any(|(other, other_access)| {
+            other.conflicts(&place)
+                && !matches!(
+                    (*other_access, argument.access),
+                    (AccessMode::Read, AccessMode::Read)
+                )
+        }) {
+            return defect("lowered call contains overlapping Resource loans");
+        }
+        active_places.push((place, argument.access));
+    }
+    Ok(())
+}
+
 fn reorder_types(
     source: &[Type],
     source_to_parameter: &[u16],
@@ -3601,6 +3867,35 @@ fn validate_input(input: &ProgramInput) -> Result<(), VerificationFailure> {
     Ok(())
 }
 
+fn verify_custody_join(
+    left: MoveState,
+    right: MoveState,
+) -> Result<MoveState, VerificationFailure> {
+    if left.mismatch(&right).is_some() {
+        return defect("lowered control flow has path-dependent Resource custody");
+    }
+    Ok(left)
+}
+
+fn verify_reachable_custody(
+    states: impl IntoIterator<Item = MoveState>,
+) -> Result<Option<MoveState>, VerificationFailure> {
+    let mut states = states.into_iter();
+    let Some(mut joined) = states.next() else {
+        return Ok(None);
+    };
+    for state in states {
+        joined = verify_custody_join(joined, state)?;
+    }
+    Ok(Some(joined))
+}
+
+#[derive(Default)]
+struct LoopCustodyEdges {
+    breaks: Vec<MoveState>,
+    continues: Vec<MoveState>,
+}
+
 struct Lowerer<'a> {
     module: ModuleId,
     input: &'a ProgramInput,
@@ -3617,6 +3912,7 @@ struct Lowerer<'a> {
     moved: MoveState,
     known_integers: BTreeMap<LocalId, i128>,
     loop_depth: usize,
+    loop_custody: Vec<LoopCustodyEdges>,
     next_local: u32,
     build_authority: &'a BuildAuthority,
     pool_authority: &'a PoolAuthority,
@@ -3661,6 +3957,7 @@ impl<'a> Lowerer<'a> {
             moved: MoveState::default(),
             known_integers: BTreeMap::new(),
             loop_depth: 0,
+            loop_custody: Vec::new(),
             next_local: 0,
             build_authority: authorities.build(),
             pool_authority: authorities.pool(),
@@ -3805,6 +4102,70 @@ impl<'a> Lowerer<'a> {
                 &condition.range,
             ),
         }
+    }
+
+    fn place_type(&self, place: &Place) -> Option<Type> {
+        place
+            .projections
+            .last()
+            .map(|projection| match projection {
+                PlaceProjection::Field { type_, .. } | PlaceProjection::Index { type_, .. } => {
+                    type_.clone()
+                }
+            })
+            .or_else(|| {
+                self.locals
+                    .values()
+                    .find_map(|(local, type_, _)| (*local == place.local).then(|| type_.clone()))
+            })
+    }
+
+    fn restore_place_custody(
+        &mut self,
+        place: &Place,
+        site: &SourceRange,
+    ) -> Result<(), VerificationFailure> {
+        self.moved.restore_place(place);
+        for projection_count in (0..place.projections.len()).rev() {
+            let aggregate = Place {
+                local: place.local,
+                projections: place.projections[..projection_count].into(),
+            };
+            let Some(Type::Nominal {
+                definition,
+                arguments,
+                ..
+            }) = self.place_type(&aggregate)
+            else {
+                continue;
+            };
+            let parameters = self.structs[&definition]
+                .type_parameters
+                .iter()
+                .copied()
+                .zip(arguments.iter().cloned())
+                .collect::<BTreeMap<_, _>>();
+            let fields = self.struct_fields(definition, &arguments, site)?;
+            let children = fields
+                .iter()
+                .map(|field| {
+                    let mut projections = aggregate.projections.to_vec();
+                    projections.push(PlaceProjection::Field {
+                        definition,
+                        name: Arc::from(field.name.as_str()),
+                        type_: substitute(&field.type_, &parameters),
+                        mutable: field.mutable,
+                    });
+                    Place {
+                        local: aggregate.local,
+                        projections: projections.into(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            self.moved
+                .finish_aggregate_restoration(&aggregate, &children);
+        }
+        Ok(())
     }
 
     fn bind_local(&mut self, name: &str, type_: Type) -> Result<LocalId, VerificationFailure> {
@@ -4072,6 +4433,9 @@ impl<'a> Lowerer<'a> {
                             },
                         )?;
                     }
+                    if let Some(value) = &value {
+                        self.require_owned_transfer(value)?;
+                    }
                     Statement::Return {
                         value,
                         source: range.clone(),
@@ -4140,7 +4504,7 @@ impl<'a> Lowerer<'a> {
                                 CreatorFailureKind::ReadAfterMove,
                                 range,
                                 self.place_subject(place),
-                                "moved",
+                                CustodyDiagnosticState::Moved,
                                 self.moved.origin(place).cloned(),
                             ));
                         }
@@ -4197,14 +4561,14 @@ impl<'a> Lowerer<'a> {
                                 CreatorFailureKind::ResourceReplacementRequiresDischarge,
                                 range,
                                 self.place_subject(&place),
-                                "initialized",
+                                CustodyDiagnosticState::Initialized,
                                 None,
                             ));
                         }
                         if !writable && !uninitialized {
                             return creator(CreatorFailureKind::ImmutableReassignment, range);
                         }
-                        self.moved.restore_place(&place);
+                        self.restore_place_custody(&place, range)?;
                         if place.projections.is_empty() {
                             if let Some(value) = known_integer {
                                 self.known_integers.insert(place.local, value);
@@ -4261,10 +4625,8 @@ impl<'a> Lowerer<'a> {
                             .ok_or_else(|| {
                                 creator_value(CreatorFailureKind::InvalidMatchPattern, range)
                             })?;
-                        let then_terminates =
-                            crate::control_flow::syntax_statements_terminate(then_branch);
-                        let else_terminates =
-                            crate::control_flow::syntax_statements_terminate(else_branch);
+                        let then_terminates = !syntax_statements_fall_through(then_branch);
+                        let else_terminates = !syntax_statements_fall_through(else_branch);
                         let then_branch = self.statements(then_branch, return_type)?;
                         let then_moved = self.moved.clone();
                         let then_known = self.known_integers.clone();
@@ -4281,12 +4643,14 @@ impl<'a> Lowerer<'a> {
                             (true, false) => else_known,
                             (true, true) => known_before,
                         };
-                        self.moved = match (then_terminates, else_terminates) {
-                            (false, false) => self.join_custody(then_moved, else_moved, range)?,
-                            (false, true) => then_moved,
-                            (true, false) => else_moved,
-                            (true, true) => moved_before,
-                        };
+                        self.moved = self.select_branch_custody(
+                            moved_before,
+                            then_moved,
+                            else_moved,
+                            then_terminates,
+                            else_terminates,
+                            range,
+                        )?;
                         Statement::IfPattern {
                             value,
                             pattern,
@@ -4302,10 +4666,8 @@ impl<'a> Lowerer<'a> {
                         let before = self.locals.clone();
                         let moved_before = self.moved.clone();
                         let known_before = self.known_integers.clone();
-                        let then_terminates =
-                            crate::control_flow::syntax_statements_terminate(then_branch);
-                        let else_terminates =
-                            crate::control_flow::syntax_statements_terminate(else_branch);
+                        let then_terminates = !syntax_statements_fall_through(then_branch);
+                        let else_terminates = !syntax_statements_fall_through(else_branch);
                         let then_branch = self.statements(then_branch, return_type)?;
                         let then_moved = self.moved.clone();
                         let then_known = self.known_integers.clone();
@@ -4322,12 +4684,14 @@ impl<'a> Lowerer<'a> {
                             (true, false) => else_known,
                             (true, true) => known_before,
                         };
-                        self.moved = match (then_terminates, else_terminates) {
-                            (false, false) => self.join_custody(then_moved, else_moved, range)?,
-                            (false, true) => then_moved,
-                            (true, false) => else_moved,
-                            (true, true) => moved_before,
-                        };
+                        self.moved = self.select_branch_custody(
+                            moved_before,
+                            then_moved,
+                            else_moved,
+                            then_terminates,
+                            else_terminates,
+                            range,
+                        )?;
                         Statement::If {
                             condition,
                             then_branch: then_branch.into(),
@@ -4365,21 +4729,46 @@ impl<'a> Lowerer<'a> {
                         .copied()
                         .map(Place::local)
                         .collect::<Vec<_>>();
+                    let body_falls_through = syntax_statements_fall_through(body);
                     self.loop_depth += 1;
+                    self.loop_custody.push(LoopCustodyEdges::default());
                     let body = self.statements(body, return_type);
+                    let mut edges = self
+                        .loop_custody
+                        .pop()
+                        .expect("for loop custody scope was pushed");
                     self.loop_depth -= 1;
                     let body = body?;
                     self.locals.retain(|name, _| visible.contains(name));
                     for binding in &binding_places {
                         self.moved.restore_place(binding);
-                    }
-                    self.moved = match exact_iterations {
-                        Some(0) => moved_before,
-                        Some(1) => self.moved.clone(),
-                        Some(_) | None => {
-                            self.join_custody(moved_before, self.moved.clone(), range)?
+                        for state in edges.breaks.iter_mut().chain(edges.continues.iter_mut()) {
+                            state.restore_place(binding);
                         }
-                    };
+                    }
+                    let mut continuing = edges.continues;
+                    if body_falls_through {
+                        continuing.push(self.moved.clone());
+                    }
+                    if exact_iterations.is_none_or(|iterations| iterations > 1) {
+                        for state in &continuing {
+                            self.join_custody(moved_before.clone(), state.clone(), range)?;
+                        }
+                    }
+                    let mut exits = edges.breaks;
+                    match exact_iterations {
+                        Some(0) => exits.push(moved_before.clone()),
+                        Some(1) => exits.extend(continuing),
+                        Some(_) => {
+                            if !continuing.is_empty() {
+                                exits.push(moved_before.clone());
+                            }
+                        }
+                        None => exits.push(moved_before.clone()),
+                    }
+                    self.moved = self
+                        .join_reachable_custody(exits, range)?
+                        .unwrap_or(moved_before);
                     self.known_integers =
                         join_known_integers(&[known_before, self.known_integers.clone()]);
                     for binding in &binding_places {
@@ -4406,11 +4795,28 @@ impl<'a> Lowerer<'a> {
                     }
                     let moved_before = self.moved.clone();
                     let known_before = self.known_integers.clone();
+                    let body_falls_through = syntax_statements_fall_through(body);
                     self.loop_depth += 1;
+                    self.loop_custody.push(LoopCustodyEdges::default());
                     let body = self.statements(body, return_type);
+                    let edges = self
+                        .loop_custody
+                        .pop()
+                        .expect("while loop custody scope was pushed");
                     self.loop_depth -= 1;
                     let body = body?;
-                    self.moved = self.join_custody(moved_before, self.moved.clone(), range)?;
+                    let mut continuing = edges.continues;
+                    if body_falls_through {
+                        continuing.push(self.moved.clone());
+                    }
+                    for state in continuing {
+                        self.join_custody(moved_before.clone(), state, range)?;
+                    }
+                    let mut exits = edges.breaks;
+                    exits.push(moved_before.clone());
+                    self.moved = self
+                        .join_reachable_custody(exits, range)?
+                        .unwrap_or(moved_before);
                     self.known_integers =
                         join_known_integers(&[known_before, self.known_integers.clone()]);
                     Statement::While {
@@ -4424,12 +4830,22 @@ impl<'a> Lowerer<'a> {
                     if self.loop_depth == 0 {
                         return creator(CreatorFailureKind::LoopControlOutsideLoop, range);
                     }
+                    self.loop_custody
+                        .last_mut()
+                        .expect("loop depth and custody scopes agree")
+                        .breaks
+                        .push(self.moved.clone());
                     Statement::Break(range.clone())
                 }
                 StatementSyntax::Continue(range) => {
                     if self.loop_depth == 0 {
                         return creator(CreatorFailureKind::LoopControlOutsideLoop, range);
                     }
+                    self.loop_custody
+                        .last_mut()
+                        .expect("loop depth and custody scopes agree")
+                        .continues
+                        .push(self.moved.clone());
                     Statement::Continue(range.clone())
                 }
                 StatementSyntax::Match {
@@ -4484,7 +4900,7 @@ impl<'a> Lowerer<'a> {
                             );
                         }
                         let body = self.statements(&case.body, return_type)?;
-                        if !crate::control_flow::syntax_statements_terminate(&case.body) {
+                        if syntax_statements_fall_through(&case.body) {
                             continuing_custody.push(self.moved.clone());
                             continuing_known.push(self.known_integers.clone());
                         }
@@ -5133,7 +5549,7 @@ impl<'a> Lowerer<'a> {
                         CreatorFailureKind::LoanAcrossSuspension,
                         &syntax.range,
                         self.place_subject(&place),
-                        "loaned",
+                        CustodyDiagnosticState::Loaned,
                         Some(loan.source.clone()),
                     ));
                 }
@@ -5512,7 +5928,7 @@ impl<'a> Lowerer<'a> {
                 CreatorFailureKind::ReadAfterMove,
                 &expression.source,
                 self.place_subject(&place),
-                "moved",
+                CustodyDiagnosticState::Moved,
                 self.moved.origin(&place).cloned(),
             ));
         }
@@ -5553,11 +5969,43 @@ impl<'a> Lowerer<'a> {
                 CreatorFailureKind::CustodyJoinMismatch,
                 site,
                 self.place_key_subject(&place),
-                "path_dependent",
+                CustodyDiagnosticState::PathDependent,
                 related,
             ));
         }
         Ok(left)
+    }
+
+    fn select_branch_custody(
+        &self,
+        before: MoveState,
+        then_state: MoveState,
+        else_state: MoveState,
+        then_exits: bool,
+        else_exits: bool,
+        site: &SourceRange,
+    ) -> Result<MoveState, VerificationFailure> {
+        match (then_exits, else_exits) {
+            (false, false) => self.join_custody(then_state, else_state, site),
+            (false, true) => Ok(then_state),
+            (true, false) => Ok(else_state),
+            (true, true) => Ok(before),
+        }
+    }
+
+    fn join_reachable_custody(
+        &self,
+        states: impl IntoIterator<Item = MoveState>,
+        site: &SourceRange,
+    ) -> Result<Option<MoveState>, VerificationFailure> {
+        let mut states = states.into_iter();
+        let Some(mut joined) = states.next() else {
+            return Ok(None);
+        };
+        for state in states {
+            joined = self.join_custody(joined, state, site)?;
+        }
+        Ok(Some(joined))
     }
 
     fn type_owns_resource(&self, type_: &Type) -> bool {
@@ -6305,7 +6753,7 @@ impl<'a> Lowerer<'a> {
                     CreatorFailureKind::ReadAfterMove,
                     &syntax.range,
                     self.place_subject(&place),
-                    "moved",
+                    CustodyDiagnosticState::Moved,
                     self.moved.origin(&place).cloned(),
                 ));
             }
@@ -6324,7 +6772,7 @@ impl<'a> Lowerer<'a> {
                     CreatorFailureKind::ReadAfterMove,
                     &syntax.range,
                     self.place_subject(&place),
-                    "moved",
+                    CustodyDiagnosticState::Moved,
                     self.moved.origin(&place).cloned(),
                 ));
             }
@@ -6560,7 +7008,7 @@ impl<'a> Lowerer<'a> {
                     CreatorFailureKind::LoanConflict,
                     &argument.source,
                     self.place_subject(&place),
-                    "conflicting_loan",
+                    CustodyDiagnosticState::ConflictingLoan,
                     Some(related.clone()),
                 ));
             }
@@ -8117,14 +8565,14 @@ fn custody_value(
     kind: CreatorFailureKind,
     site: &SourceRange,
     subject: Arc<str>,
-    state: &'static str,
+    state: CustodyDiagnosticState,
     related: Option<SourceRange>,
 ) -> VerificationFailure {
     VerificationFailure::Custody {
         kind,
         site: site.clone(),
         subject,
-        state: Arc::from(state),
+        state,
         related,
     }
 }
@@ -8840,8 +9288,11 @@ mod tests {
                 &Type::Unit,
                 &mut BTreeMap::new(),
                 &mut MoveState::default(),
-                &catalog,
-                &owner,
+                &mut Vec::new(),
+                &ArtifactVerificationAuthority {
+                    catalog: &catalog,
+                    provenance_owner: &owner,
+                },
                 &mut previous,
             ),
             Err(VerificationFailure::Defect { .. })
@@ -8929,5 +9380,232 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn post_lowering_verifier_rejects_path_dependent_custody() {
+        let owner = SourceRange::from_u64("src/image.wr", 0, 10);
+        let condition_range = SourceRange::from_u64("src/image.wr", 1, 2);
+        let move_range = SourceRange::from_u64("src/image.wr", 3, 4);
+        let local = LocalId(1);
+        let owned_type = Type::Own {
+            pool: PoolTerm::Concrete(PoolId(1)),
+            value: Arc::new(Type::Bool),
+        };
+        let mut identities = crate::identity::IdentityCatalog::empty();
+        let bool_id = identities.intern_type(&Type::Bool).expect("type interns");
+        let owned_id = identities
+            .intern_type(&owned_type)
+            .expect("resource type interns");
+        let condition = Expression {
+            kind: ExpressionKind::Literal(Literal::Bool(true)),
+            type_id: bool_id,
+            type_: Type::Bool,
+            coerced_from: None,
+            access: AccessMode::Copy,
+            source: condition_range,
+        };
+        let moved_value = Expression {
+            kind: ExpressionKind::Read(Place::local(local)),
+            type_id: owned_id,
+            type_: owned_type.clone(),
+            coerced_from: None,
+            access: AccessMode::Move,
+            source: move_range.clone(),
+        };
+        let statements = [Statement::If {
+            condition,
+            then_branch: Arc::from([Statement::Evaluate(moved_value)]),
+            else_branch: Arc::from([]),
+            source: SourceRange::from_u64("src/image.wr", 1, 5),
+        }];
+        let templates = BTreeMap::new();
+        let specialized = BTreeMap::new();
+        let constants = BTreeMap::new();
+        let specializations = BTreeMap::new();
+        let variants = BTreeMap::new();
+        let structs = BTreeMap::new();
+        let interfaces = BTreeMap::new();
+        let catalog = ArtifactCatalog {
+            templates: &templates,
+            specialized: &specialized,
+            constants: &constants,
+            specializations: &specializations,
+            identities: &identities,
+            variants: &variants,
+            structs: &structs,
+            interfaces: &interfaces,
+        };
+        let mut locals = BTreeMap::from([(local, owned_type)]);
+        let mut previous = owner.start();
+        assert!(matches!(
+            verify_statements(
+                &statements,
+                &Type::Unit,
+                &mut locals,
+                &mut MoveState::default(),
+                &mut Vec::new(),
+                &ArtifactVerificationAuthority {
+                    catalog: &catalog,
+                    provenance_owner: &owner,
+                },
+                &mut previous,
+            ),
+            Err(VerificationFailure::Defect { .. })
+        ));
+    }
+
+    #[test]
+    fn post_lowering_verifier_rejects_illegal_moves_and_overlapping_loans() {
+        let owner = SourceRange::from_u64("src/image.wr", 0, 10);
+        let source = SourceRange::from_u64("src/image.wr", 1, 2);
+        let local = LocalId(1);
+        let mut identities = crate::identity::IdentityCatalog::empty();
+        let bool_id = identities.intern_type(&Type::Bool).expect("type interns");
+        let owned_type = Type::Own {
+            pool: PoolTerm::Concrete(PoolId(1)),
+            value: Arc::new(Type::Bool),
+        };
+        let owned_id = identities
+            .intern_type(&owned_type)
+            .expect("Resource-owning type interns");
+        let moved_data = Expression {
+            kind: ExpressionKind::Read(Place::local(local)),
+            type_id: bool_id,
+            type_: Type::Bool,
+            coerced_from: None,
+            access: AccessMode::Move,
+            source: source.clone(),
+        };
+        let templates = BTreeMap::new();
+        let specialized = BTreeMap::new();
+        let constants = BTreeMap::new();
+        let specializations = BTreeMap::new();
+        let variants = BTreeMap::new();
+        let structs = BTreeMap::new();
+        let interfaces = BTreeMap::new();
+        let catalog = ArtifactCatalog {
+            templates: &templates,
+            specialized: &specialized,
+            constants: &constants,
+            specializations: &specializations,
+            identities: &identities,
+            variants: &variants,
+            structs: &structs,
+            interfaces: &interfaces,
+        };
+        assert!(matches!(
+            verify_expression_artifact(
+                &moved_data,
+                &BTreeMap::from([(local, Type::Bool)]),
+                &mut MoveState::default(),
+                &catalog,
+                &owner,
+            ),
+            Err(VerificationFailure::Defect { .. })
+        ));
+        let loan = |access| Expression {
+            kind: ExpressionKind::Read(Place::local(local)),
+            type_id: owned_id,
+            type_: owned_type.clone(),
+            coerced_from: None,
+            access,
+            source: source.clone(),
+        };
+        assert!(matches!(
+            verify_artifact_call_custody(&[loan(AccessMode::Mut), loan(AccessMode::Read)]),
+            Err(VerificationFailure::Defect { .. })
+        ));
+    }
+
+    #[test]
+    fn post_lowering_verifier_rejects_a_moved_loop_back_edge() {
+        let owner = SourceRange::from_u64("src/image.wr", 0, 10);
+        let loop_range = SourceRange::from_u64("src/image.wr", 1, 5);
+        let move_range = SourceRange::from_u64("src/image.wr", 3, 4);
+        let local = LocalId(1);
+        let mut identities = crate::identity::IdentityCatalog::empty();
+        let bool_id = identities.intern_type(&Type::Bool).expect("type interns");
+        let array_type = Type::FixedArray {
+            element: Arc::new(Type::Bool),
+            length: ArrayLength::Value(2),
+        };
+        let array_id = identities
+            .intern_type(&array_type)
+            .expect("array type interns");
+        let owned_type = Type::Own {
+            pool: PoolTerm::Concrete(PoolId(1)),
+            value: Arc::new(Type::Bool),
+        };
+        let owned_id = identities
+            .intern_type(&owned_type)
+            .expect("Resource-owning type interns");
+        let iterable = Expression {
+            kind: ExpressionKind::Array(
+                [true, false]
+                    .into_iter()
+                    .map(|value| Expression {
+                        kind: ExpressionKind::Literal(Literal::Bool(value)),
+                        type_id: bool_id,
+                        type_: Type::Bool,
+                        coerced_from: None,
+                        access: AccessMode::Copy,
+                        source: SourceRange::from_u64("src/image.wr", 1, 2),
+                    })
+                    .collect(),
+            ),
+            type_id: array_id,
+            type_: array_type,
+            coerced_from: None,
+            access: AccessMode::Copy,
+            source: loop_range.clone(),
+        };
+        let moved = Expression {
+            kind: ExpressionKind::Read(Place::local(local)),
+            type_id: owned_id,
+            type_: owned_type.clone(),
+            coerced_from: None,
+            access: AccessMode::Move,
+            source: move_range,
+        };
+        let statements = [Statement::For {
+            pattern: HirMatchPattern::Wildcard,
+            iterable,
+            body: Arc::from([Statement::Evaluate(moved)]),
+            source: loop_range,
+        }];
+        let templates = BTreeMap::new();
+        let specialized = BTreeMap::new();
+        let constants = BTreeMap::new();
+        let specializations = BTreeMap::new();
+        let variants = BTreeMap::new();
+        let structs = BTreeMap::new();
+        let interfaces = BTreeMap::new();
+        let catalog = ArtifactCatalog {
+            templates: &templates,
+            specialized: &specialized,
+            constants: &constants,
+            specializations: &specializations,
+            identities: &identities,
+            variants: &variants,
+            structs: &structs,
+            interfaces: &interfaces,
+        };
+        let mut previous = owner.start();
+        assert!(matches!(
+            verify_statements(
+                &statements,
+                &Type::Unit,
+                &mut BTreeMap::from([(local, owned_type)]),
+                &mut MoveState::default(),
+                &mut Vec::new(),
+                &ArtifactVerificationAuthority {
+                    catalog: &catalog,
+                    provenance_owner: &owner,
+                },
+                &mut previous,
+            ),
+            Err(VerificationFailure::Defect { .. })
+        ));
     }
 }

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use wrela_compiler::{
     Cancellation, CanonicalValue, CompilationOutcome, CompilationRequest, Compiler,
     CompilerInstallation, ConstructionKind, Diagnostic, DiagnosticValue, EvaluationOutcome,
-    EvaluationPolicy, IdentityDomain, InspectSelection, ProjectFile, ProjectSnapshot, Root,
-    SyntaxNodeKind,
+    EvaluationPolicy, IdentityDomain, InspectSelection, ProjectFile, ProjectSnapshot,
+    RecoveryAction, RejectedCompilation, Root, SyntaxNodeKind,
 };
 
 fn has_text_parameter(diagnostic: &Diagnostic, name: &str, expected: &str) -> bool {
@@ -15,6 +15,67 @@ fn has_text_parameter(diagnostic: &Diagnostic, name: &str, expected: &str) -> bo
             parameter.as_ref() == name
                 && matches!(value, DiagnosticValue::Text(value) if value.as_ref() == expected)
         })
+}
+
+fn nth_byte_range(source: &[u8], needle: &[u8], occurrence: usize) -> (u64, u64) {
+    let start = source
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(index, candidate)| (candidate == needle).then_some(index))
+        .nth(occurrence)
+        .expect("expected diagnostic source fragment");
+    (
+        u64::try_from(start).expect("test source offset fits u64"),
+        u64::try_from(start + needle.len()).expect("test source offset fits u64"),
+    )
+}
+
+fn assert_exact_custody_rejection(
+    rejected: &RejectedCompilation,
+    source: &[u8],
+    code: &str,
+    primary: (&[u8], usize),
+    labels: &[(&[u8], usize, &str)],
+    parameters: &[(&str, &str)],
+    identities: &[(IdentityDomain, &str)],
+) {
+    let [diagnostic] = rejected.diagnostics() else {
+        panic!(
+            "expected exactly one canonical diagnostic: {:#?}",
+            rejected.diagnostics()
+        );
+    };
+    assert_eq!(diagnostic.code(), code);
+    assert_eq!(diagnostic.primary().path(), "src/image.wr");
+    assert_eq!(
+        (diagnostic.primary().start(), diagnostic.primary().end()),
+        nth_byte_range(source, primary.0, primary.1)
+    );
+    assert_eq!(diagnostic.labels().len(), labels.len());
+    for (actual, (needle, occurrence, role)) in diagnostic.labels().iter().zip(labels) {
+        assert_eq!(actual.range().path(), "src/image.wr");
+        assert_eq!(
+            (actual.range().start(), actual.range().end()),
+            nth_byte_range(source, needle, *occurrence)
+        );
+        assert_eq!(actual.role(), *role);
+    }
+    let expected_parameters = parameters
+        .iter()
+        .map(|(name, value)| (Arc::from(*name), DiagnosticValue::Text(Arc::from(*value))))
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostic.typed_parameters(), expected_parameters);
+    assert_eq!(diagnostic.recovery(), &RecoveryAction::None);
+    for (domain, name) in identities {
+        assert!(
+            rejected
+                .inspection()
+                .identities()
+                .iter()
+                .any(|identity| { identity.domain() == *domain && identity.name() == *name }),
+            "missing relevant semantic identity {domain:?}:{name}"
+        );
+    }
 }
 
 fn compile(source: &[u8]) -> CompilationOutcome {
@@ -3089,26 +3150,17 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = outcome else {
         panic!("ordinary source ownership misuse must be rejected: {outcome:#?}");
     };
-    let diagnostic = rejected
-        .diagnostics()
-        .iter()
-        .find(|diagnostic| diagnostic.code() == "semantic.read_after_move")
-        .expect("use-after-move has one stable custody diagnostic");
-    assert_eq!(diagnostic.primary().path(), "src/image.wr");
-    assert_eq!(diagnostic.labels().len(), 1);
-    assert_eq!(diagnostic.labels()[0].role(), "related");
-    assert_eq!(
-        diagnostic.typed_parameters(),
-        [
-            (
-                Arc::from("subject"),
-                DiagnosticValue::Text(Arc::from("value.id")),
-            ),
-            (
-                Arc::from("state"),
-                DiagnosticValue::Text(Arc::from("moved"))
-            ),
-        ]
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.read_after_move",
+        (b"value.id", 0),
+        &[(b"take value", 2, "related")],
+        &[("subject", "value.id"), ("state", "moved")],
+        &[
+            (IdentityDomain::Definition, "Ticket"),
+            (IdentityDomain::Definition, "broken"),
+        ],
     );
 }
 
@@ -3129,9 +3181,18 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = compile(invalid) else {
         panic!("replacing live Resource custody must be rejected");
     };
-    assert!(rejected.diagnostics().iter().any(|diagnostic| {
-        diagnostic.code() == "semantic.resource_replacement_requires_discharge"
-    }));
+    assert_exact_custody_rejection(
+        &rejected,
+        invalid,
+        "semantic.resource_replacement_requires_discharge",
+        (b"    ticket = Ticket(id=2)", 0),
+        &[],
+        &[("subject", "ticket"), ("state", "initialized")],
+        &[
+            (IdentityDomain::Definition, "Ticket"),
+            (IdentityDomain::Definition, "broken"),
+        ],
+    );
 
     let valid = br#"resource struct Ticket:
     id: i64
@@ -3177,11 +3238,17 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = compile(overlapping) else {
         panic!("a mutable loan cannot overlap a read loan of the same Resource");
     };
-    assert!(
-        rejected
-            .diagnostics()
-            .iter()
-            .any(|diagnostic| diagnostic.code() == "semantic.loan_conflict")
+    assert_exact_custody_rejection(
+        &rejected,
+        overlapping,
+        "semantic.loan_conflict",
+        (b"ticket", 2),
+        &[(b"mut ticket", 0, "related")],
+        &[("subject", "ticket"), ("state", "conflicting_loan")],
+        &[
+            (IdentityDomain::Definition, "Ticket"),
+            (IdentityDomain::Definition, "broken"),
+        ],
     );
 
     let valid = br#"resource struct Ticket:
@@ -3227,11 +3294,17 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = compile(invalid) else {
         panic!("an awaited call cannot retain a Resource loan");
     };
-    assert!(
-        rejected
-            .diagnostics()
-            .iter()
-            .any(|diagnostic| diagnostic.code() == "semantic.loan_across_suspension")
+    assert_exact_custody_rejection(
+        &rejected,
+        invalid,
+        "semantic.loan_across_suspension",
+        (b"await inspect(ticket)", 0),
+        &[(b"ticket", 3, "related")],
+        &[("subject", "ticket"), ("state", "loaned")],
+        &[
+            (IdentityDomain::Definition, "Ticket"),
+            (IdentityDomain::Definition, "broken"),
+        ],
     );
 
     let valid = br#"resource struct Ticket:
@@ -3278,11 +3351,17 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = outcome else {
         panic!("a Resource field cannot be moved twice: {outcome:#?}");
     };
-    assert!(
-        rejected
-            .diagnostics()
-            .iter()
-            .any(|diagnostic| diagnostic.code() == "semantic.read_after_move")
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.read_after_move",
+        (b"envelope.ticket", 1),
+        &[(b"take envelope.ticket", 0, "related")],
+        &[("subject", "envelope.ticket"), ("state", "moved")],
+        &[
+            (IdentityDomain::Definition, "Envelope"),
+            (IdentityDomain::Definition, "broken"),
+        ],
     );
 }
 
@@ -3298,7 +3377,7 @@ fn choose(flag: bool, take ticket: Ticket) -> Ticket:
     if flag:
         consume(take ticket)
         return Ticket(id=0)
-    return ticket
+    return take ticket
 
 @image
 fn build() -> Image:
@@ -3328,11 +3407,17 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = compile(invalid) else {
         panic!("a live branch move must reject the later read");
     };
-    assert!(
-        rejected
-            .diagnostics()
-            .iter()
-            .any(|diagnostic| { diagnostic.code() == "semantic.custody_join_mismatch" })
+    assert_exact_custody_rejection(
+        &rejected,
+        invalid,
+        "semantic.custody_join_mismatch",
+        (b"    if flag:", 0),
+        &[(b"take ticket", 2, "related")],
+        &[("subject", "ticket"), ("state", "path_dependent")],
+        &[
+            (IdentityDomain::Definition, "Ticket"),
+            (IdentityDomain::Definition, "broken"),
+        ],
     );
 }
 
@@ -3356,25 +3441,18 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = compile(source) else {
         panic!("continuing branches cannot disagree about the Resource custodian");
     };
-    let diagnostic = rejected
-        .diagnostics()
-        .iter()
-        .find(|diagnostic| diagnostic.code() == "semantic.custody_join_mismatch")
-        .expect("the control-flow join reports one custody mismatch");
-    assert_eq!(
-        diagnostic.typed_parameters(),
-        [
-            (
-                Arc::from("subject"),
-                DiagnosticValue::Text(Arc::from("ticket")),
-            ),
-            (
-                Arc::from("state"),
-                DiagnosticValue::Text(Arc::from("path_dependent")),
-            ),
-        ]
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.custody_join_mismatch",
+        (b"    if flag:", 0),
+        &[(b"take ticket", 2, "related")],
+        &[("subject", "ticket"), ("state", "path_dependent")],
+        &[
+            (IdentityDomain::Definition, "Ticket"),
+            (IdentityDomain::Definition, "broken"),
+        ],
     );
-    assert_eq!(diagnostic.labels().len(), 1);
 }
 
 #[test]
@@ -3400,11 +3478,17 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = compile(source) else {
         panic!("continuing match arms cannot disagree about Resource custody");
     };
-    assert!(
-        rejected
-            .diagnostics()
-            .iter()
-            .any(|diagnostic| diagnostic.code() == "semantic.custody_join_mismatch")
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.custody_join_mismatch",
+        (b"    match flag:", 0),
+        &[(b"take ticket", 2, "related")],
+        &[("subject", "ticket"), ("state", "path_dependent")],
+        &[
+            (IdentityDomain::Definition, "Ticket"),
+            (IdentityDomain::Definition, "broken"),
+        ],
     );
 }
 
@@ -3428,11 +3512,17 @@ fn build() -> Image:
     let CompilationOutcome::Rejected(rejected) = compile(source) else {
         panic!("a loop back-edge must restore the entering Resource custodian");
     };
-    assert!(
-        rejected
-            .diagnostics()
-            .iter()
-            .any(|diagnostic| diagnostic.code() == "semantic.custody_join_mismatch")
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.custody_join_mismatch",
+        (b"    for flag in [true, false]:", 0),
+        &[(b"take ticket", 2, "related")],
+        &[("subject", "ticket"), ("state", "path_dependent")],
+        &[
+            (IdentityDomain::Definition, "Ticket"),
+            (IdentityDomain::Definition, "broken"),
+        ],
     );
 
     let one_iteration = br#"resource struct Ticket:
@@ -3454,6 +3544,198 @@ fn build() -> Image:
     assert!(
         matches!(outcome, CompilationOutcome::Accepted(_)),
         "one exact iteration has one unambiguous post-loop custodian: {outcome:#?}"
+    );
+}
+
+#[test]
+fn reinitializing_one_field_does_not_restore_a_moved_resource_aggregate() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+resource struct Envelope:
+    mut left: Ticket
+    right: Ticket
+
+fn consume(take envelope: Envelope):
+    pass
+
+fn broken() -> i64:
+    mut envelope = Envelope(left=Ticket(id=1), right=Ticket(id=2))
+    consume(take envelope)
+    envelope.left = Ticket(id=3)
+    return envelope.right.id
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(source) else {
+        panic!("reinitializing one child cannot restore a moved Resource aggregate");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        source,
+        "semantic.read_after_move",
+        (b"envelope.right.id", 0),
+        &[(b"take envelope", 1, "related")],
+        &[("subject", "envelope.right.id"), ("state", "moved")],
+        &[
+            (IdentityDomain::Definition, "Envelope"),
+            (IdentityDomain::Definition, "broken"),
+        ],
+    );
+
+    let fully_restored = br#"resource struct Ticket:
+    id: i64
+
+resource struct Envelope:
+    mut left: Ticket
+    mut right: Ticket
+
+fn consume(take envelope: Envelope):
+    pass
+
+fn valid():
+    mut envelope = Envelope(left=Ticket(id=1), right=Ticket(id=2))
+    consume(take envelope)
+    envelope.left = Ticket(id=3)
+    envelope.right = Ticket(id=4)
+    consume(take envelope)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(fully_restored);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "restoring every child restores the Resource aggregate: {outcome:#?}"
+    );
+}
+
+#[test]
+fn returning_a_resource_requires_an_explicit_take() {
+    let implicit = br#"resource struct Ticket:
+    id: i64
+
+fn broken(take ticket: Ticket) -> Ticket:
+    return ticket
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(implicit) else {
+        panic!("a Resource return must not copy custody implicitly");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        implicit,
+        "semantic.resource_requires_take",
+        (b"ticket", 1),
+        &[],
+        &[],
+        &[
+            (IdentityDomain::Definition, "Ticket"),
+            (IdentityDomain::Definition, "broken"),
+        ],
+    );
+
+    let explicit = br#"resource struct Ticket:
+    id: i64
+
+fn transfer(take ticket: Ticket) -> Ticket:
+    return take ticket
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(explicit);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "an explicit Resource return transfers custody: {outcome:#?}"
+    );
+}
+
+#[test]
+fn a_guaranteed_break_uses_the_break_edge_custody_state() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn valid(take ticket: Ticket):
+    for flag in [true, false]:
+        consume(take ticket)
+        break
+    pass
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "the guaranteed break exits with the post-transfer custody state: {outcome:#?}"
+    );
+}
+
+#[test]
+fn continue_uses_the_back_edge_custody_state() {
+    let one_iteration = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn valid(take ticket: Ticket):
+    for flag in [true]:
+        consume(take ticket)
+        continue
+    pass
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(one_iteration);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "the final continue exits with the post-transfer custody state: {outcome:#?}"
+    );
+
+    let repeated = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn broken(take ticket: Ticket):
+    for flag in [true, false]:
+        consume(take ticket)
+        continue
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let CompilationOutcome::Rejected(rejected) = compile(repeated) else {
+        panic!("a moved Resource cannot cross a reachable continue back-edge");
+    };
+    assert_exact_custody_rejection(
+        &rejected,
+        repeated,
+        "semantic.custody_join_mismatch",
+        (b"    for flag in [true, false]:", 0),
+        &[(b"take ticket", 2, "related")],
+        &[("subject", "ticket"), ("state", "path_dependent")],
+        &[
+            (IdentityDomain::Definition, "Ticket"),
+            (IdentityDomain::Definition, "broken"),
+        ],
     );
 }
 

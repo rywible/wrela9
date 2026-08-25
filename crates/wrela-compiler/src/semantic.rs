@@ -2259,6 +2259,13 @@ fn analyze_with_probe(
             state,
             related,
         }) => {
+            let state = match state {
+                typed_hir::CustodyDiagnosticState::Moved => "moved",
+                typed_hir::CustodyDiagnosticState::Initialized => "initialized",
+                typed_hir::CustodyDiagnosticState::Loaned => "loaned",
+                typed_hir::CustodyDiagnosticState::ConflictingLoan => "conflicting_loan",
+                typed_hir::CustodyDiagnosticState::PathDependent => "path_dependent",
+            };
             let mut diagnostic =
                 Diagnostic::new(kind.diagnostic_code(), site, RecoveryAction::None)
                     .with_parameter("subject", subject)

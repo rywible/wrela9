@@ -2257,6 +2257,7 @@ fn analyze_with_probe(
             site,
             subject,
             state,
+            identities,
             related,
         }) => {
             let state = match state {
@@ -2270,6 +2271,20 @@ fn analyze_with_probe(
                 Diagnostic::new(kind.diagnostic_code(), site, RecoveryAction::None)
                     .with_parameter("subject", subject)
                     .with_parameter("state", state);
+            if let Some(identity) = identities.subject {
+                diagnostic = diagnostic.with_identity_parameter(
+                    "subject_identity",
+                    IdentityDomain::Definition,
+                    identity.0,
+                );
+            }
+            if let Some(identity) = identities.owner {
+                diagnostic = diagnostic.with_identity_parameter(
+                    "owner_identity",
+                    IdentityDomain::Definition,
+                    identity.0,
+                );
+            }
             if let Some(related) = related {
                 diagnostic = diagnostic.with_label(related, DiagnosticLabelRole::Related);
             }

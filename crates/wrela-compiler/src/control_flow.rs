@@ -9,87 +9,92 @@ use crate::syntax::{
 };
 use crate::typed_hir::{HirMatchCase, HirMatchPattern, Literal, Statement};
 
+#[derive(Clone, Copy)]
+struct FlowSummary {
+    falls_through: bool,
+    terminates_function: bool,
+}
+
+impl FlowSummary {
+    const FALLTHROUGH: Self = Self {
+        falls_through: true,
+        terminates_function: false,
+    };
+    const FUNCTION_EXIT: Self = Self {
+        falls_through: false,
+        terminates_function: true,
+    };
+    const LOOP_EXIT: Self = Self {
+        falls_through: false,
+        terminates_function: false,
+    };
+
+    fn alternatives(summaries: impl IntoIterator<Item = Self>, exhaustive: bool) -> Self {
+        if !exhaustive {
+            return Self::FALLTHROUGH;
+        }
+        let summaries = summaries.into_iter().collect::<Vec<_>>();
+        Self {
+            falls_through: summaries.iter().any(|summary| summary.falls_through),
+            terminates_function: summaries.iter().all(|summary| summary.terminates_function),
+        }
+    }
+}
+
+fn syntax_flow(statements: &[StatementSyntax]) -> FlowSummary {
+    for statement in statements {
+        let summary = match statement {
+            StatementSyntax::Return { .. } | StatementSyntax::Panic { .. } => {
+                FlowSummary::FUNCTION_EXIT
+            }
+            StatementSyntax::Break(_) | StatementSyntax::Continue(_) => FlowSummary::LOOP_EXIT,
+            StatementSyntax::If {
+                then_branch,
+                else_branch,
+                ..
+            } => FlowSummary::alternatives(
+                [syntax_flow(then_branch), syntax_flow(else_branch)],
+                !else_branch.is_empty(),
+            ),
+            StatementSyntax::Comptime { branches, .. } => {
+                let exhaustive = branches
+                    .last()
+                    .is_some_and(|branch| branch.condition.is_none());
+                FlowSummary::alternatives(
+                    branches
+                        .iter()
+                        .map(|branch| syntax_flow(&branch.statements)),
+                    exhaustive,
+                )
+            }
+            StatementSyntax::Match { cases, .. } => FlowSummary::alternatives(
+                cases.iter().map(|case| syntax_flow(&case.body)),
+                syntax_match_exhaustive(cases),
+            ),
+            StatementSyntax::With { body, .. } => syntax_flow(body),
+            StatementSyntax::Assert { .. }
+            | StatementSyntax::Assign { .. }
+            | StatementSyntax::Expect { .. }
+            | StatementSyntax::Evaluate(_)
+            | StatementSyntax::For { .. }
+            | StatementSyntax::While { .. }
+            | StatementSyntax::Defer { .. }
+            | StatementSyntax::Unsupported { .. }
+            | StatementSyntax::Pass(_) => FlowSummary::FALLTHROUGH,
+        };
+        if !summary.falls_through {
+            return summary;
+        }
+    }
+    FlowSummary::FALLTHROUGH
+}
+
 pub(crate) fn syntax_statements_terminate(statements: &[StatementSyntax]) -> bool {
-    statements.iter().any(|statement| match statement {
-        StatementSyntax::Return { .. } | StatementSyntax::Panic { .. } => true,
-        StatementSyntax::If {
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            !else_branch.is_empty()
-                && syntax_statements_terminate(then_branch)
-                && syntax_statements_terminate(else_branch)
-        }
-        StatementSyntax::Comptime { branches, .. } => {
-            branches
-                .last()
-                .is_some_and(|branch| branch.condition.is_none())
-                && branches
-                    .iter()
-                    .all(|branch| syntax_statements_terminate(&branch.statements))
-        }
-        StatementSyntax::Match { cases, .. } => {
-            syntax_match_exhaustive(cases)
-                && cases
-                    .iter()
-                    .all(|case| syntax_statements_terminate(&case.body))
-        }
-        StatementSyntax::With { body, .. } => syntax_statements_terminate(body),
-        StatementSyntax::Assert { .. }
-        | StatementSyntax::Assign { .. }
-        | StatementSyntax::Expect { .. }
-        | StatementSyntax::Evaluate(_)
-        | StatementSyntax::For { .. }
-        | StatementSyntax::While { .. }
-        | StatementSyntax::Break(_)
-        | StatementSyntax::Continue(_)
-        | StatementSyntax::Defer { .. }
-        | StatementSyntax::Unsupported { .. }
-        | StatementSyntax::Pass(_) => false,
-    })
+    syntax_flow(statements).terminates_function
 }
 
 pub(crate) fn syntax_statements_fall_through(statements: &[StatementSyntax]) -> bool {
-    !statements.iter().any(|statement| match statement {
-        StatementSyntax::Return { .. }
-        | StatementSyntax::Panic { .. }
-        | StatementSyntax::Break(_)
-        | StatementSyntax::Continue(_) => true,
-        StatementSyntax::If {
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            !else_branch.is_empty()
-                && !syntax_statements_fall_through(then_branch)
-                && !syntax_statements_fall_through(else_branch)
-        }
-        StatementSyntax::Comptime { branches, .. } => {
-            branches
-                .last()
-                .is_some_and(|branch| branch.condition.is_none())
-                && branches
-                    .iter()
-                    .all(|branch| !syntax_statements_fall_through(&branch.statements))
-        }
-        StatementSyntax::Match { cases, .. } => {
-            syntax_match_exhaustive(cases)
-                && cases
-                    .iter()
-                    .all(|case| !syntax_statements_fall_through(&case.body))
-        }
-        StatementSyntax::With { body, .. } => !syntax_statements_fall_through(body),
-        StatementSyntax::Assert { .. }
-        | StatementSyntax::Assign { .. }
-        | StatementSyntax::Expect { .. }
-        | StatementSyntax::Evaluate(_)
-        | StatementSyntax::For { .. }
-        | StatementSyntax::While { .. }
-        | StatementSyntax::Defer { .. }
-        | StatementSyntax::Unsupported { .. }
-        | StatementSyntax::Pass(_) => false,
-    })
+    syntax_flow(statements).falls_through
 }
 
 fn syntax_match_exhaustive(cases: &[MatchCaseSyntax]) -> bool {
@@ -139,43 +144,48 @@ fn syntax_pattern_can_close_match(kind: &PatternSyntaxKind) -> bool {
     }
 }
 
+fn verified_flow(statements: &[Statement]) -> FlowSummary {
+    for statement in statements {
+        let summary = match statement {
+            Statement::Return { .. } | Statement::Panic { .. } => FlowSummary::FUNCTION_EXIT,
+            Statement::Break(_) | Statement::Continue(_) => FlowSummary::LOOP_EXIT,
+            Statement::If {
+                then_branch,
+                else_branch,
+                ..
+            }
+            | Statement::IfPattern {
+                then_branch,
+                else_branch,
+                ..
+            } => FlowSummary::alternatives(
+                [verified_flow(then_branch), verified_flow(else_branch)],
+                !else_branch.is_empty(),
+            ),
+            Statement::Match { cases, .. } => FlowSummary::alternatives(
+                cases.iter().map(|case| verified_flow(&case.body)),
+                verified_match_exhaustive(cases),
+            ),
+            Statement::WithPool { body, .. } => verified_flow(body),
+            Statement::Assert { .. }
+            | Statement::Expect { .. }
+            | Statement::Initialize { .. }
+            | Statement::Assign { .. }
+            | Statement::Evaluate(_)
+            | Statement::For { .. }
+            | Statement::While { .. }
+            | Statement::Defer { .. }
+            | Statement::Pass(_) => FlowSummary::FALLTHROUGH,
+        };
+        if !summary.falls_through {
+            return summary;
+        }
+    }
+    FlowSummary::FALLTHROUGH
+}
+
 pub(crate) fn verified_statements_fall_through(statements: &[Statement]) -> bool {
-    !statements.iter().any(|statement| match statement {
-        Statement::Return { .. }
-        | Statement::Panic { .. }
-        | Statement::Break(_)
-        | Statement::Continue(_) => true,
-        Statement::If {
-            then_branch,
-            else_branch,
-            ..
-        }
-        | Statement::IfPattern {
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            !else_branch.is_empty()
-                && !verified_statements_fall_through(then_branch)
-                && !verified_statements_fall_through(else_branch)
-        }
-        Statement::Match { cases, .. } => {
-            verified_match_exhaustive(cases)
-                && cases
-                    .iter()
-                    .all(|case| !verified_statements_fall_through(&case.body))
-        }
-        Statement::WithPool { body, .. } => !verified_statements_fall_through(body),
-        Statement::Assert { .. }
-        | Statement::Expect { .. }
-        | Statement::Initialize { .. }
-        | Statement::Assign { .. }
-        | Statement::Evaluate(_)
-        | Statement::For { .. }
-        | Statement::While { .. }
-        | Statement::Defer { .. }
-        | Statement::Pass(_) => false,
-    })
+    verified_flow(statements).falls_through
 }
 
 pub(crate) fn verified_match_exhaustive(cases: &[HirMatchCase]) -> bool {

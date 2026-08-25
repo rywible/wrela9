@@ -42,6 +42,7 @@ enum EvalFailure {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Value {
+    Unavailable,
     Unit,
     Bool(bool),
     Integer {
@@ -166,6 +167,7 @@ enum Control<'hir> {
     FinishReadPlace {
         place: &'hir Place,
         index_count: usize,
+        access: crate::typed_hir::AccessMode,
     },
     SelectBranch {
         function: &'hir HirFunction,
@@ -646,13 +648,15 @@ impl<'a> Engine<'a> {
                                 let value = if expression.access
                                     == crate::typed_hir::AccessMode::Move
                                 {
-                                    frames
+                                    let root = frames
                                         .last_mut()
                                         .and_then(|frame| {
                                             frame.locals.get_mut(place.local.0 as usize)
                                         })
-                                        .and_then(Option::take)
-                                        .ok_or(EvalFailure::Creator(RejectKind::MissingLocal))?
+                                        .and_then(Option::as_mut)
+                                        .ok_or(EvalFailure::Creator(RejectKind::MissingLocal))?;
+                                    let unavailable = unavailable_shape(root);
+                                    std::mem::replace(root, unavailable)
                                 } else {
                                     frames
                                         .last()
@@ -680,6 +684,7 @@ impl<'a> Engine<'a> {
                                 controls.push(Control::FinishReadPlace {
                                     place,
                                     index_count: indexes.len(),
+                                    access: expression.access,
                                 });
                                 controls.extend(indexes.into_iter().rev().map(Control::Expression));
                             }
@@ -1211,14 +1216,27 @@ impl<'a> Engine<'a> {
                     self.retain(value_size(&value))?;
                     frames.last_mut().expect("machine has frame").locals[index] = Some(value);
                 }
-                Control::FinishReadPlace { place, index_count } => {
+                Control::FinishReadPlace {
+                    place,
+                    index_count,
+                    access,
+                } => {
                     let indexes = self.pop_values(&mut frames, index_count)?;
-                    let root = frames
-                        .last()
-                        .and_then(|frame| frame.locals.get(place.local.0 as usize))
-                        .and_then(Option::as_ref)
-                        .ok_or(EvalFailure::Creator(RejectKind::MissingLocal))?;
-                    let value = read_projected_value(root, &place.projections, &indexes)?;
+                    let value = if access == crate::typed_hir::AccessMode::Move {
+                        let root = frames
+                            .last_mut()
+                            .and_then(|frame| frame.locals.get_mut(place.local.0 as usize))
+                            .and_then(Option::as_mut)
+                            .ok_or(EvalFailure::Creator(RejectKind::MissingLocal))?;
+                        extract_projected_value(root, &place.projections, &indexes)?
+                    } else {
+                        let root = frames
+                            .last()
+                            .and_then(|frame| frame.locals.get(place.local.0 as usize))
+                            .and_then(Option::as_ref)
+                            .ok_or(EvalFailure::Creator(RejectKind::MissingLocal))?;
+                        read_projected_value(root, &place.projections, &indexes)?
+                    };
                     self.push_value(&mut frames, value)?;
                 }
                 Control::StorePlace { place, index_count } => {
@@ -2359,7 +2377,7 @@ fn function_writebacks(
 
 fn value_size(value: &Value) -> u64 {
     match value {
-        Value::Unit => 0,
+        Value::Unavailable | Value::Unit => 0,
         Value::Bool(_) => 1,
         Value::Integer { .. }
         | Value::Float { .. }
@@ -2414,7 +2432,8 @@ fn collect_construction_edges(value: &Value, edges: &mut Vec<u128>) {
                 collect_construction_edges(value, edges);
             }
         }
-        Value::Unit
+        Value::Unavailable
+        | Value::Unit
         | Value::Bool(_)
         | Value::Integer { .. }
         | Value::Float { .. }
@@ -2458,7 +2477,8 @@ fn collect_test_applications(value: &Value, applications: &mut Vec<AppliedTest>)
                 collect_test_applications(value, applications);
             }
         }
-        Value::Unit
+        Value::Unavailable
+        | Value::Unit
         | Value::Bool(_)
         | Value::Integer { .. }
         | Value::Float { .. }
@@ -2799,6 +2819,81 @@ fn pattern_bindings(value: &Value, pattern: &HirMatchPattern) -> Option<Vec<(Loc
     }
 }
 
+fn unavailable_shape(value: &Value) -> Value {
+    match value {
+        Value::Struct {
+            definition,
+            type_display,
+            fields,
+        } => Value::Struct {
+            definition: *definition,
+            type_display: type_display.clone(),
+            fields: fields
+                .iter()
+                .map(|(name, value)| (name.clone(), unavailable_shape(value)))
+                .collect(),
+        },
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(unavailable_shape)
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        Value::Tuple(values) => Value::Tuple(
+            values
+                .iter()
+                .map(unavailable_shape)
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        Value::BuiltinVariant { variant, payload } => Value::BuiltinVariant {
+            variant: *variant,
+            payload: payload
+                .iter()
+                .map(unavailable_shape)
+                .collect::<Vec<_>>()
+                .into(),
+        },
+        Value::UserVariant {
+            id,
+            variant_order,
+            type_display,
+            variant_display,
+            payload,
+        } => Value::UserVariant {
+            id: *id,
+            variant_order: *variant_order,
+            type_display: type_display.clone(),
+            variant_display: variant_display.clone(),
+            payload: payload
+                .iter()
+                .map(unavailable_shape)
+                .collect::<Vec<_>>()
+                .into(),
+        },
+        Value::TestApplication { id, payload } => Value::TestApplication {
+            id: *id,
+            payload: payload
+                .iter()
+                .map(unavailable_shape)
+                .collect::<Vec<_>>()
+                .into(),
+        },
+        Value::Unavailable
+        | Value::Unit
+        | Value::Bool(_)
+        | Value::Integer { .. }
+        | Value::Float { .. }
+        | Value::Text(_)
+        | Value::Scalar(_)
+        | Value::Bytes(_)
+        | Value::Function(_)
+        | Value::Closure { .. }
+        | Value::SymbolicHandle { .. } => Value::Unavailable,
+    }
+}
+
 fn read_projected_value(
     root: &Value,
     projections: &[PlaceProjection],
@@ -2807,6 +2902,11 @@ fn read_projected_value(
     let mut value = root;
     let mut index_offset = 0;
     for projection in projections {
+        if matches!(value, Value::Unavailable) {
+            return Err(EvalFailure::Defect(Arc::from(
+                "verified place reads unavailable runtime custody",
+            )));
+        }
         match projection {
             PlaceProjection::Field { name, .. } => {
                 let Value::Struct { fields, .. } = value else {
@@ -2848,7 +2948,79 @@ fn read_projected_value(
             }
         }
     }
+    if matches!(value, Value::Unavailable) {
+        return Err(EvalFailure::Defect(Arc::from(
+            "verified place reads unavailable runtime custody",
+        )));
+    }
     Ok(value.clone())
+}
+
+fn extract_projected_value(
+    root: &mut Value,
+    projections: &[PlaceProjection],
+    indexes: &[Value],
+) -> Result<Value, EvalFailure> {
+    fn extract(
+        current: &mut Value,
+        projections: &[PlaceProjection],
+        indexes: &[Value],
+        index_offset: &mut usize,
+    ) -> Result<Value, EvalFailure> {
+        let Some((projection, remaining)) = projections.split_first() else {
+            if matches!(current, Value::Unavailable) {
+                return Err(EvalFailure::Defect(Arc::from(
+                    "verified move extracts unavailable runtime custody",
+                )));
+            }
+            let unavailable = unavailable_shape(current);
+            return Ok(std::mem::replace(current, unavailable));
+        };
+        match projection {
+            PlaceProjection::Field { name, .. } => {
+                let Value::Struct { fields, .. } = current else {
+                    return Err(EvalFailure::Defect(Arc::from(
+                        "verified place field extracts through a non-struct value",
+                    )));
+                };
+                let field = Arc::make_mut(fields)
+                    .iter_mut()
+                    .find(|(field, _)| field == name)
+                    .map(|(_, value)| value)
+                    .ok_or_else(|| {
+                        EvalFailure::Defect(Arc::from(
+                            "verified place field names an absent runtime field",
+                        ))
+                    })?;
+                extract(field, remaining, indexes, index_offset)
+            }
+            PlaceProjection::Index { index, .. } => {
+                let Some(Value::Integer {
+                    value: authored, ..
+                }) = indexes.get(*index_offset)
+                else {
+                    return Err(EvalFailure::Defect(Arc::from(
+                        "verified place index is not an integer",
+                    )));
+                };
+                *index_offset += 1;
+                let Value::Array(values) = current else {
+                    return Err(EvalFailure::Defect(Arc::from(
+                        "verified place index extracts through a non-array value",
+                    )));
+                };
+                let element = usize::try_from(*authored)
+                    .ok()
+                    .and_then(|offset| Arc::make_mut(values).get_mut(offset))
+                    .ok_or_else(|| {
+                        EvalFailure::Panic(PanicKind::IndexOutOfBounds, index.source.clone())
+                    })?;
+                extract(element, remaining, indexes, index_offset)
+            }
+        }
+    }
+
+    extract(root, projections, indexes, &mut 0)
 }
 
 fn store_projected_value(
@@ -3144,6 +3316,9 @@ fn value_matches(value: &Value, expected: &Type) -> bool {
 
 fn canonical(value: Value) -> CanonicalValue {
     match value {
+        Value::Unavailable => {
+            unreachable!("unavailable runtime custody cannot become a canonical result")
+        }
         Value::Unit => CanonicalValue::Unit,
         Value::Bool(value) => CanonicalValue::Bool(value),
         Value::Integer { kind, value } => CanonicalValue::Integer {
@@ -3252,6 +3427,29 @@ fn decode_float(kind: FloatType, bits: u64) -> f64 {
 mod tests {
     use super::*;
     use crate::typed_hir::{self, BuildAuthority, PoolAuthority, ProgramInput};
+
+    #[test]
+    fn projected_resource_moves_extract_instead_of_clone() {
+        let projection = PlaceProjection::Field {
+            definition: DefinitionId(1),
+            name: Arc::from("ticket"),
+            type_: Type::Bool,
+            mutable: true,
+        };
+        let mut root = Value::Struct {
+            definition: DefinitionId(1),
+            type_display: Arc::from("Envelope"),
+            fields: Arc::from([
+                (Arc::from("ticket"), Value::Bool(true)),
+                (Arc::from("other"), Value::Bool(false)),
+            ]),
+        };
+
+        let extracted = extract_projected_value(&mut root, std::slice::from_ref(&projection), &[])
+            .expect("verified projection extracts");
+        assert_eq!(extracted, Value::Bool(true));
+        assert!(read_projected_value(&root, &[projection], &[]).is_err());
+    }
 
     #[test]
     fn logical_fuel_exhaustion_is_exact_and_host_time_independent() {

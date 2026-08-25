@@ -181,13 +181,9 @@ impl MoveState {
     }
 
     fn finish_aggregate_restoration(&mut self, aggregate: &Place, children: &[Place]) {
-        let aggregate = PlaceKey::from_place(aggregate);
-        if self.places.contains(&aggregate)
-            && children.iter().all(|child| !self.is_unreadable(child))
+        if self.is_unreadable(aggregate) && children.iter().all(|child| !self.is_unreadable(child))
         {
-            self.places.remove(&aggregate);
-            self.origins.remove(&aggregate);
-            self.restored.retain(|restored| !aggregate.covers(restored));
+            self.restore_place(aggregate);
         }
     }
 
@@ -976,12 +972,19 @@ pub(crate) enum VerificationFailure {
         site: SourceRange,
         subject: Arc<str>,
         state: CustodyDiagnosticState,
+        identities: Box<CustodyIdentities>,
         related: Option<SourceRange>,
     },
     Defect {
         evidence: Arc<str>,
     },
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CustodyIdentities {
+    pub(crate) subject: Option<DefinitionId>,
+    pub(crate) owner: Option<DefinitionId>,
 }
 
 #[derive(Clone, Debug)]
@@ -2647,7 +2650,9 @@ fn verify_statements(
 ) -> Result<(), VerificationFailure> {
     let catalog = authority.catalog;
     let provenance_owner = authority.provenance_owner;
+    let mut reachable = true;
     for statement in statements {
+        let unreachable_state = (!reachable).then(|| (moved.clone(), loop_custody.clone()));
         let source = statement_source(statement);
         if source.path() != provenance_owner.path()
             || source.start() > source.end()
@@ -2717,6 +2722,11 @@ fn verify_statements(
                 let expected = verify_place_artifact(place, locals, moved, catalog, source)?;
                 if !can_initialize(&type_, &expected) {
                     return defect("lowered assignment changes the local type");
+                }
+                if artifact_type_owns_resource(&expected, catalog.structs)
+                    && !moved.is_uninitialized(place)
+                {
+                    return defect("lowered assignment replaces live Resource custody");
                 }
                 restore_artifact_place_custody(moved, place, locals, catalog)?;
             }
@@ -3004,6 +3014,12 @@ fn verify_statements(
                 moved.restore_place(binding);
             }
             Statement::Pass(_) => {}
+        }
+        if let Some((state, loop_state)) = unreachable_state {
+            *moved = state;
+            *loop_custody = loop_state;
+        } else {
+            reachable = verified_statements_fall_through(std::slice::from_ref(statement));
         }
     }
     Ok(())
@@ -3890,7 +3906,7 @@ fn verify_reachable_custody(
     Ok(Some(joined))
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct LoopCustodyEdges {
     breaks: Vec<MoveState>,
     continues: Vec<MoveState>,
@@ -3922,6 +3938,7 @@ struct Lowerer<'a> {
     concrete_context: bool,
     test_application_context: u16,
     expected_expression_type: Option<Type>,
+    owner_identity: Option<DefinitionId>,
     generic_interface_bounds: BTreeMap<TypeParameterId, DefinitionId>,
     generic_const_values: BTreeMap<String, (IntegerType, u64)>,
 }
@@ -3967,6 +3984,7 @@ impl<'a> Lowerer<'a> {
             concrete_context,
             test_application_context: 0,
             expected_expression_type: None,
+            owner_identity: None,
             generic_interface_bounds: BTreeMap::new(),
             generic_const_values: BTreeMap::new(),
         }
@@ -3977,6 +3995,7 @@ impl<'a> Lowerer<'a> {
         function: &ResolvedFunction,
         substitutions: Option<&BTreeMap<TypeParameterId, Type>>,
     ) {
+        self.owner_identity = Some(function.id);
         self.generic_interface_bounds = function
             .type_parameters
             .iter()
@@ -4389,16 +4408,33 @@ impl<'a> Lowerer<'a> {
         return_type: &Type,
     ) -> Result<Vec<Statement>, VerificationFailure> {
         let mut statements = Vec::new();
+        let mut reachable = true;
         for statement in syntax {
             if self.cancellation.is_cancelled() {
                 return Err(VerificationFailure::Cancelled);
             }
+            let unreachable_state = (!reachable).then(|| {
+                (
+                    self.moved.clone(),
+                    self.known_integers.clone(),
+                    self.loop_custody.clone(),
+                )
+            });
             if let StatementSyntax::Comptime { branches, range } = statement {
                 if self.concrete_context {
                     let selected = self.select_comptime_statements(branches)?;
+                    let selected_falls_through = syntax_statements_fall_through(&selected);
                     statements.extend(self.statements(&selected, return_type)?);
+                    if reachable {
+                        reachable = selected_falls_through;
+                    }
                 } else {
                     statements.push(Statement::Pass(range.clone()));
+                }
+                if let Some((moved, known_integers, loop_custody)) = unreachable_state {
+                    self.moved = moved;
+                    self.known_integers = known_integers;
+                    self.loop_custody = loop_custody;
                 }
                 continue;
             }
@@ -4500,10 +4536,10 @@ impl<'a> Lowerer<'a> {
                         (operator, lowered_place.as_ref())
                     {
                         if self.moved.is_unreadable(place) {
-                            return Err(custody_value(
+                            return Err(self.custody_failure(
                                 CreatorFailureKind::ReadAfterMove,
                                 range,
-                                self.place_subject(place),
+                                &PlaceKey::from_place(place),
                                 CustodyDiagnosticState::Moved,
                                 self.moved.origin(place).cloned(),
                             ));
@@ -4557,10 +4593,10 @@ impl<'a> Lowerer<'a> {
                         }
                         let uninitialized = self.moved.is_uninitialized(&place);
                         if self.type_owns_resource(&type_) && !uninitialized {
-                            return Err(custody_value(
+                            return Err(self.custody_failure(
                                 CreatorFailureKind::ResourceReplacementRequiresDischarge,
                                 range,
-                                self.place_subject(&place),
+                                &PlaceKey::from_place(&place),
                                 CustodyDiagnosticState::Initialized,
                                 None,
                             ));
@@ -4993,6 +5029,13 @@ impl<'a> Lowerer<'a> {
                 StatementSyntax::Comptime { range, .. } => Statement::Pass(range.clone()),
                 StatementSyntax::Pass(range) => Statement::Pass(range.clone()),
             });
+            if let Some((moved, known_integers, loop_custody)) = unreachable_state {
+                self.moved = moved;
+                self.known_integers = known_integers;
+                self.loop_custody = loop_custody;
+            } else {
+                reachable = syntax_statements_fall_through(std::slice::from_ref(statement));
+            }
         }
         Ok(statements)
     }
@@ -5545,10 +5588,10 @@ impl<'a> Lowerer<'a> {
                     let place = root_place(loan).ok_or_else(|| VerificationFailure::Defect {
                         evidence: Arc::from("lowered Resource loan has no source place"),
                     })?;
-                    return Err(custody_value(
+                    return Err(self.custody_failure(
                         CreatorFailureKind::LoanAcrossSuspension,
                         &syntax.range,
-                        self.place_subject(&place),
+                        &PlaceKey::from_place(&place),
                         CustodyDiagnosticState::Loaned,
                         Some(loan.source.clone()),
                     ));
@@ -5924,19 +5967,15 @@ impl<'a> Lowerer<'a> {
         if let Some(place) = root_place(expression)
             && !self.moved.move_place_at(&place, &expression.source)
         {
-            return Err(custody_value(
+            return Err(self.custody_failure(
                 CreatorFailureKind::ReadAfterMove,
                 &expression.source,
-                self.place_subject(&place),
+                &PlaceKey::from_place(&place),
                 CustodyDiagnosticState::Moved,
                 self.moved.origin(&place).cloned(),
             ));
         }
         Ok(())
-    }
-
-    fn place_subject(&self, place: &Place) -> Arc<str> {
-        self.place_key_subject(&PlaceKey::from_place(place))
     }
 
     fn place_key_subject(&self, place: &PlaceKey) -> Arc<str> {
@@ -5958,6 +5997,34 @@ impl<'a> Lowerer<'a> {
         Arc::from(subject)
     }
 
+    fn custody_failure(
+        &self,
+        kind: CreatorFailureKind,
+        site: &SourceRange,
+        place: &PlaceKey,
+        state: CustodyDiagnosticState,
+        related: Option<SourceRange>,
+    ) -> VerificationFailure {
+        let subject_identity = self.locals.values().find_map(|(local, type_, _)| {
+            if *local != place.local {
+                return None;
+            }
+            match type_ {
+                Type::Nominal { definition, .. } => Some(*definition),
+                _ => None,
+            }
+        });
+        custody_value(
+            kind,
+            site,
+            self.place_key_subject(place),
+            state,
+            subject_identity,
+            self.owner_identity,
+            related,
+        )
+    }
+
     fn join_custody(
         &self,
         left: MoveState,
@@ -5965,10 +6032,10 @@ impl<'a> Lowerer<'a> {
         site: &SourceRange,
     ) -> Result<MoveState, VerificationFailure> {
         if let Some((place, related)) = left.mismatch(&right) {
-            return Err(custody_value(
+            return Err(self.custody_failure(
                 CreatorFailureKind::CustodyJoinMismatch,
                 site,
-                self.place_key_subject(&place),
+                &place,
                 CustodyDiagnosticState::PathDependent,
                 related,
             ));
@@ -6749,10 +6816,10 @@ impl<'a> Lowerer<'a> {
                 projections: projections.into(),
             };
             if self.moved.is_unreadable(&place) {
-                return Err(custody_value(
+                return Err(self.custody_failure(
                     CreatorFailureKind::ReadAfterMove,
                     &syntax.range,
-                    self.place_subject(&place),
+                    &PlaceKey::from_place(&place),
                     CustodyDiagnosticState::Moved,
                     self.moved.origin(&place).cloned(),
                 ));
@@ -6768,10 +6835,10 @@ impl<'a> Lowerer<'a> {
         {
             if self.moved.contains_local(*id) {
                 let place = Place::local(*id);
-                return Err(custody_value(
+                return Err(self.custody_failure(
                     CreatorFailureKind::ReadAfterMove,
                     &syntax.range,
-                    self.place_subject(&place),
+                    &PlaceKey::from_place(&place),
                     CustodyDiagnosticState::Moved,
                     self.moved.origin(&place).cloned(),
                 ));
@@ -7004,10 +7071,10 @@ impl<'a> Lowerer<'a> {
                     && !matches!((other_access, access), (AccessMode::Read, AccessMode::Read))
             }) {
                 let place = root_place(argument).expect("loan place was resolved above");
-                return Err(custody_value(
+                return Err(self.custody_failure(
                     CreatorFailureKind::LoanConflict,
                     &argument.source,
-                    self.place_subject(&place),
+                    &PlaceKey::from_place(&place),
                     CustodyDiagnosticState::ConflictingLoan,
                     Some(related.clone()),
                 ));
@@ -8566,6 +8633,8 @@ fn custody_value(
     site: &SourceRange,
     subject: Arc<str>,
     state: CustodyDiagnosticState,
+    subject_identity: Option<DefinitionId>,
+    owner_identity: Option<DefinitionId>,
     related: Option<SourceRange>,
 ) -> VerificationFailure {
     VerificationFailure::Custody {
@@ -8573,6 +8642,10 @@ fn custody_value(
         site: site.clone(),
         subject,
         state,
+        identities: Box::new(CustodyIdentities {
+            subject: subject_identity,
+            owner: owner_identity,
+        }),
         related,
     }
 }
@@ -9514,6 +9587,72 @@ mod tests {
         };
         assert!(matches!(
             verify_artifact_call_custody(&[loan(AccessMode::Mut), loan(AccessMode::Read)]),
+            Err(VerificationFailure::Defect { .. })
+        ));
+    }
+
+    #[test]
+    fn post_lowering_verifier_rejects_live_resource_replacement() {
+        let owner = SourceRange::from_u64("src/image.wr", 0, 10);
+        let source = SourceRange::from_u64("src/image.wr", 1, 2);
+        let destination = LocalId(1);
+        let source_local = LocalId(2);
+        let owned_type = Type::Own {
+            pool: PoolTerm::Concrete(PoolId(1)),
+            value: Arc::new(Type::Bool),
+        };
+        let mut identities = crate::identity::IdentityCatalog::empty();
+        let owned_id = identities
+            .intern_type(&owned_type)
+            .expect("Resource-owning type interns");
+        let replacement = Expression {
+            kind: ExpressionKind::Read(Place::local(source_local)),
+            type_id: owned_id,
+            type_: owned_type.clone(),
+            coerced_from: None,
+            access: AccessMode::Move,
+            source: source.clone(),
+        };
+        let statements = [Statement::Assign {
+            place: Place::local(destination),
+            value: replacement,
+            source,
+        }];
+        let templates = BTreeMap::new();
+        let specialized = BTreeMap::new();
+        let constants = BTreeMap::new();
+        let specializations = BTreeMap::new();
+        let variants = BTreeMap::new();
+        let structs = BTreeMap::new();
+        let interfaces = BTreeMap::new();
+        let catalog = ArtifactCatalog {
+            templates: &templates,
+            specialized: &specialized,
+            constants: &constants,
+            specializations: &specializations,
+            identities: &identities,
+            variants: &variants,
+            structs: &structs,
+            interfaces: &interfaces,
+        };
+        let mut locals = BTreeMap::from([
+            (destination, owned_type.clone()),
+            (source_local, owned_type),
+        ]);
+        let mut previous = owner.start();
+        assert!(matches!(
+            verify_statements(
+                &statements,
+                &Type::Unit,
+                &mut locals,
+                &mut MoveState::default(),
+                &mut Vec::new(),
+                &ArtifactVerificationAuthority {
+                    catalog: &catalog,
+                    provenance_owner: &owner,
+                },
+                &mut previous,
+            ),
             Err(VerificationFailure::Defect { .. })
         ));
     }

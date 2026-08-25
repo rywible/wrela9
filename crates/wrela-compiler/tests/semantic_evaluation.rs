@@ -37,7 +37,7 @@ fn assert_exact_custody_rejection(
     primary: (&[u8], usize),
     labels: &[(&[u8], usize, &str)],
     parameters: &[(&str, &str)],
-    identities: &[(IdentityDomain, &str)],
+    identities: &[(&str, IdentityDomain, &str)],
 ) {
     let [diagnostic] = rejected.diagnostics() else {
         panic!(
@@ -60,22 +60,27 @@ fn assert_exact_custody_rejection(
         );
         assert_eq!(actual.role(), *role);
     }
-    let expected_parameters = parameters
+    let mut expected_parameters = parameters
         .iter()
         .map(|(name, value)| (Arc::from(*name), DiagnosticValue::Text(Arc::from(*value))))
         .collect::<Vec<_>>();
+    for (parameter, domain, name) in identities {
+        let identity = rejected
+            .inspection()
+            .identities()
+            .iter()
+            .find(|identity| identity.domain() == *domain && identity.name() == *name)
+            .unwrap_or_else(|| panic!("missing relevant semantic identity {domain:?}:{name}"));
+        expected_parameters.push((
+            Arc::from(*parameter),
+            DiagnosticValue::Identity {
+                domain: *domain,
+                digest: identity.digest(),
+            },
+        ));
+    }
     assert_eq!(diagnostic.typed_parameters(), expected_parameters);
     assert_eq!(diagnostic.recovery(), &RecoveryAction::None);
-    for (domain, name) in identities {
-        assert!(
-            rejected
-                .inspection()
-                .identities()
-                .iter()
-                .any(|identity| { identity.domain() == *domain && identity.name() == *name }),
-            "missing relevant semantic identity {domain:?}:{name}"
-        );
-    }
 }
 
 fn compile(source: &[u8]) -> CompilationOutcome {
@@ -3158,8 +3163,8 @@ fn build() -> Image:
         &[(b"take value", 2, "related")],
         &[("subject", "value.id"), ("state", "moved")],
         &[
-            (IdentityDomain::Definition, "Ticket"),
-            (IdentityDomain::Definition, "broken"),
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
         ],
     );
 }
@@ -3189,8 +3194,8 @@ fn build() -> Image:
         &[],
         &[("subject", "ticket"), ("state", "initialized")],
         &[
-            (IdentityDomain::Definition, "Ticket"),
-            (IdentityDomain::Definition, "broken"),
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
         ],
     );
 
@@ -3246,8 +3251,8 @@ fn build() -> Image:
         &[(b"mut ticket", 0, "related")],
         &[("subject", "ticket"), ("state", "conflicting_loan")],
         &[
-            (IdentityDomain::Definition, "Ticket"),
-            (IdentityDomain::Definition, "broken"),
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
         ],
     );
 
@@ -3302,8 +3307,8 @@ fn build() -> Image:
         &[(b"ticket", 3, "related")],
         &[("subject", "ticket"), ("state", "loaned")],
         &[
-            (IdentityDomain::Definition, "Ticket"),
-            (IdentityDomain::Definition, "broken"),
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
         ],
     );
 
@@ -3359,8 +3364,8 @@ fn build() -> Image:
         &[(b"take envelope.ticket", 0, "related")],
         &[("subject", "envelope.ticket"), ("state", "moved")],
         &[
-            (IdentityDomain::Definition, "Envelope"),
-            (IdentityDomain::Definition, "broken"),
+            ("subject_identity", IdentityDomain::Definition, "Envelope"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
         ],
     );
 }
@@ -3415,8 +3420,8 @@ fn build() -> Image:
         &[(b"take ticket", 2, "related")],
         &[("subject", "ticket"), ("state", "path_dependent")],
         &[
-            (IdentityDomain::Definition, "Ticket"),
-            (IdentityDomain::Definition, "broken"),
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
         ],
     );
 }
@@ -3449,8 +3454,8 @@ fn build() -> Image:
         &[(b"take ticket", 2, "related")],
         &[("subject", "ticket"), ("state", "path_dependent")],
         &[
-            (IdentityDomain::Definition, "Ticket"),
-            (IdentityDomain::Definition, "broken"),
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
         ],
     );
 }
@@ -3486,8 +3491,8 @@ fn build() -> Image:
         &[(b"take ticket", 2, "related")],
         &[("subject", "ticket"), ("state", "path_dependent")],
         &[
-            (IdentityDomain::Definition, "Ticket"),
-            (IdentityDomain::Definition, "broken"),
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
         ],
     );
 }
@@ -3520,8 +3525,8 @@ fn build() -> Image:
         &[(b"take ticket", 2, "related")],
         &[("subject", "ticket"), ("state", "path_dependent")],
         &[
-            (IdentityDomain::Definition, "Ticket"),
-            (IdentityDomain::Definition, "broken"),
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
         ],
     );
 
@@ -3580,8 +3585,8 @@ fn build() -> Image:
         &[(b"take envelope", 1, "related")],
         &[("subject", "envelope.right.id"), ("state", "moved")],
         &[
-            (IdentityDomain::Definition, "Envelope"),
-            (IdentityDomain::Definition, "broken"),
+            ("subject_identity", IdentityDomain::Definition, "Envelope"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
         ],
     );
 
@@ -3635,10 +3640,7 @@ fn build() -> Image:
         (b"ticket", 1),
         &[],
         &[],
-        &[
-            (IdentityDomain::Definition, "Ticket"),
-            (IdentityDomain::Definition, "broken"),
-        ],
+        &[],
     );
 
     let explicit = br#"resource struct Ticket:
@@ -3733,9 +3735,96 @@ fn build() -> Image:
         &[(b"take ticket", 2, "related")],
         &[("subject", "ticket"), ("state", "path_dependent")],
         &[
-            (IdentityDomain::Definition, "Ticket"),
-            (IdentityDomain::Definition, "broken"),
+            ("subject_identity", IdentityDomain::Definition, "Ticket"),
+            ("owner_identity", IdentityDomain::Definition, "broken"),
         ],
+    );
+}
+
+#[test]
+fn evaluated_field_restoration_recreates_a_moved_resource_aggregate() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+resource struct Envelope:
+    mut left: Ticket
+    mut right: Ticket
+
+fn consume(take envelope: Envelope):
+    pass
+
+fn restored() -> i64:
+    mut envelope = Envelope(left=Ticket(id=1), right=Ticket(id=2))
+    consume(take envelope)
+    envelope.left = Ticket(id=3)
+    envelope.right = Ticket(id=4)
+    return envelope.left.id + envelope.right.id
+
+@image
+fn build() -> Image:
+    return Image.new(value=restored())
+"#;
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "evaluation must materialize the aggregate restored by its fields: {outcome:#?}"
+    );
+}
+
+#[test]
+fn restoring_nested_resource_leaves_restores_every_ancestor() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+resource struct Inner:
+    mut ticket: Ticket
+
+resource struct Outer:
+    mut inner: Inner
+
+fn consume(take outer: Outer):
+    pass
+
+fn restored():
+    mut outer = Outer(inner=Inner(ticket=Ticket(id=1)))
+    consume(take outer)
+    outer.inner.ticket = Ticket(id=2)
+    consume(take outer)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "restoring every nested Resource leaf restores its ancestor chain: {outcome:#?}"
+    );
+}
+
+#[test]
+fn unreachable_loop_control_does_not_contribute_custody_edges() {
+    let source = br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn valid(take ticket: Ticket):
+    for flag in [true, false]:
+        consume(take ticket)
+        break
+        continue
+    pass
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#;
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "an unreachable continue cannot create a loop custody edge: {outcome:#?}"
     );
 }
 

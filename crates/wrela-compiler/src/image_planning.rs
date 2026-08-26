@@ -3670,6 +3670,71 @@ fn verifier_validate_canonical_placements(
         return defect("assignment verifier found no symbolic core");
     }
 
+    if candidate
+        .placements
+        .iter()
+        .all(|placement| placement.core == cores[0].ordinal)
+    {
+        let mut units = 0_u64;
+        for requirement in candidate.planning_foundation.requirements.iter() {
+            if requirement.bounds != RequirementBounds::ImageLifetime {
+                continue;
+            }
+            let RequirementOwner::GeneratedRole(reference) = requirement.subject else {
+                return defect("assignment verifier found an unowned Image lifetime");
+            };
+            if !candidate
+                .planning_foundation
+                .generated_roles
+                .iter()
+                .any(|role| role.reference == reference)
+            {
+                return defect("assignment verifier found an unknown lifetime role");
+            }
+            units = units.saturating_add(1);
+        }
+        units = flow
+            .actors()
+            .filter(|actor| actor.handlers().next().is_some())
+            .fold(units, |total, _| {
+                total.saturating_add(u64::from(architecture.service().actor_turn_units))
+            });
+        for requirement in flow.requirements().filter(|requirement| {
+            requirement.kind() == FlowRequirementKind::GroupChildActivationBound
+        }) {
+            let group = requirement
+                .site()
+                .and_then(|site| flow.group(site))
+                .ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from(
+                        "assignment verifier found an unowned Group activation",
+                    ))
+                })?;
+            if group.handler() != requirement.handler().unwrap_or(0)
+                || group.child_activation_bound() != requirement.bound()
+                || u64::try_from(group.child_activation_count()).unwrap_or(u64::MAX)
+                    > requirement
+                        .bound()
+                        .min(u64::from(architecture.capacity().maximum_activation_homes))
+            {
+                return defect("assignment verifier found a false Group activation bound");
+            }
+            units = units.saturating_add(
+                requirement
+                    .bound()
+                    .saturating_mul(u64::from(architecture.service().group_child_units)),
+            );
+        }
+        checkpoint(cancellation)?;
+        return (units <= u64::from(cores[0].maximum_service_units))
+            .then_some(())
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from(
+                    "whole-Image assignment violates placement or per-core capacity",
+                ))
+            });
+    }
+
     let mut activations = Vec::<(Arc<[u128]>, u64, u64, u64)>::new();
     for requirement in candidate.planning_foundation.requirements.iter() {
         if requirement.bounds != RequirementBounds::ImageLifetime {
@@ -9481,32 +9546,37 @@ fn placement_constraints_hold(
     active: &[usize],
     placements: &[(u128, u16)],
 ) -> bool {
-    let placed = placements.iter().copied().collect::<BTreeMap<_, _>>();
     for core in &puzzle.cores {
-        let activations = active_activations(puzzle, active, &placed, core.identity);
-        if maximum_simultaneous_units(&activations) > core.maximum_activation_units {
+        if !placements
+            .iter()
+            .any(|(_, assigned)| *assigned == core.identity)
+        {
+            continue;
+        }
+        if maximum_simultaneous_units_on_core(puzzle, active, placements, core.identity)
+            > core.maximum_activation_units
+        {
             return false;
         }
     }
     for ordinal in active {
         match &puzzle.requirements[*ordinal].constraint {
             SolverConstraint::AllowedCores { executable, cores } => {
-                if !placed
-                    .get(executable)
-                    .is_some_and(|core| cores.contains(core))
+                if !placement_core(placements, *executable)
+                    .is_some_and(|core| cores.contains(&core))
                 {
                     return false;
                 }
             }
             SolverConstraint::Affinity { left, right } => {
-                if placed.get(left) != placed.get(right) {
+                if placement_core(placements, *left) != placement_core(placements, *right) {
                     return false;
                 }
             }
             SolverConstraint::AffinityGroup { executables } => {
                 let mut cores = executables
                     .iter()
-                    .filter_map(|executable| placed.get(executable));
+                    .filter_map(|executable| placement_core(placements, *executable));
                 if let Some(first) = cores.next()
                     && cores.any(|core| core != first)
                 {
@@ -9516,7 +9586,7 @@ fn placement_constraints_hold(
             SolverConstraint::ActorPlacement { executables, .. } => {
                 let mut cores = executables
                     .iter()
-                    .filter_map(|executable| placed.get(executable));
+                    .filter_map(|executable| placement_core(placements, *executable));
                 if let Some(first) = cores.next()
                     && cores.any(|core| core != first)
                 {
@@ -9524,31 +9594,42 @@ fn placement_constraints_hold(
                 }
             }
             SolverConstraint::Separation { left, right } => {
-                if placed.get(left) == placed.get(right) {
+                if placement_core(placements, *left) == placement_core(placements, *right) {
                     return false;
                 }
             }
             SolverConstraint::CoreCapacity { core, maximum } => {
-                let activations = active_activations(puzzle, active, &placed, *core);
-                if maximum_simultaneous_units(&activations) > *maximum {
+                if maximum_simultaneous_units_on_core(puzzle, active, placements, *core) > *maximum
+                {
                     return false;
                 }
             }
             SolverConstraint::Exclusive { executable } => {
-                let Some(core) = placed.get(executable) else {
+                let Some(core) = placement_core(placements, *executable) else {
                     return false;
                 };
-                let activations = active_activations(puzzle, active, &placed, *core);
-                let own = activations
-                    .iter()
-                    .filter(|activation| activation.0 == *executable)
-                    .collect::<Vec<_>>();
-                if own.iter().any(|activation| {
-                    activations.iter().any(|other| {
-                        other.0 != *executable
-                            && intervals_overlap(activation.2, activation.3, other.2, other.3)
-                    })
-                }) {
+                let overlapping_other = active.iter().any(|own_ordinal| {
+                    let Some(own) = constraint_activation_on_core(
+                        &puzzle.requirements[*own_ordinal].constraint,
+                        placements,
+                        core,
+                    ) else {
+                        return false;
+                    };
+                    own.0 == *executable
+                        && active.iter().any(|other_ordinal| {
+                            constraint_activation_on_core(
+                                &puzzle.requirements[*other_ordinal].constraint,
+                                placements,
+                                core,
+                            )
+                            .is_some_and(|other| {
+                                other.0 != *executable
+                                    && intervals_overlap(own.2, own.3, other.2, other.3)
+                            })
+                        })
+                });
+                if overlapping_other {
                     return false;
                 }
             }
@@ -9565,55 +9646,101 @@ fn placement_constraints_hold(
     true
 }
 
-fn active_activations(
+fn maximum_simultaneous_units_on_core(
     puzzle: &CanonicalProblem,
     active: &[usize],
-    placed: &BTreeMap<u128, u16>,
+    placements: &[(u128, u16)],
     core: u16,
-) -> Vec<(u128, u64, u64, u64)> {
+) -> u64 {
+    let mut whole_image_units = 0_u64;
+    let mut whole_image_lifetimes = true;
+    for ordinal in active {
+        let Some((_, units, start, end)) = constraint_activation_on_core(
+            &puzzle.requirements[*ordinal].constraint,
+            placements,
+            core,
+        ) else {
+            continue;
+        };
+        if start != 0 || end != 1 {
+            whole_image_lifetimes = false;
+            break;
+        }
+        whole_image_units = whole_image_units.saturating_add(units);
+    }
+    if whole_image_lifetimes {
+        return whole_image_units;
+    }
+
     active
         .iter()
-        .filter_map(|ordinal| match &puzzle.requirements[*ordinal].constraint {
-            SolverConstraint::Activation {
-                executable,
-                units,
-                start,
-                end,
-            } if placed.get(executable) == Some(&core) => Some((*executable, *units, *start, *end)),
-            SolverConstraint::ActorPlacement {
-                executables,
-                units,
-                start,
-                end,
-            } => {
-                let executable = executables.iter().min().copied()?;
-                (placed.get(&executable) == Some(&core))
-                    .then_some((executable, *units, *start, *end))
-            }
-            SolverConstraint::GroupActivation {
-                executable,
-                units,
-                start,
-                end,
-                ..
-            } if placed.get(executable) == Some(&core) => Some((*executable, *units, *start, *end)),
-            _ => None,
+        .filter_map(|ordinal| {
+            constraint_activation_on_core(
+                &puzzle.requirements[*ordinal].constraint,
+                placements,
+                core,
+            )
         })
-        .collect()
-}
-
-fn maximum_simultaneous_units(activations: &[(u128, u64, u64, u64)]) -> u64 {
-    activations
-        .iter()
         .flat_map(|activation| [activation.2, activation.3.saturating_sub(1)])
         .map(|point| {
-            activations
+            active
                 .iter()
+                .filter_map(|ordinal| {
+                    constraint_activation_on_core(
+                        &puzzle.requirements[*ordinal].constraint,
+                        placements,
+                        core,
+                    )
+                })
                 .filter(|activation| activation.2 <= point && point < activation.3)
                 .fold(0_u64, |sum, activation| sum.saturating_add(activation.1))
         })
         .max()
         .unwrap_or(0)
+}
+
+fn constraint_activation_on_core(
+    constraint: &SolverConstraint,
+    placements: &[(u128, u16)],
+    core: u16,
+) -> Option<(u128, u64, u64, u64)> {
+    match constraint {
+        SolverConstraint::Activation {
+            executable,
+            units,
+            start,
+            end,
+        } if placement_core(placements, *executable) == Some(core) => {
+            Some((*executable, *units, *start, *end))
+        }
+        SolverConstraint::ActorPlacement {
+            executables,
+            units,
+            start,
+            end,
+        } => {
+            let executable = executables.iter().min().copied()?;
+            (placement_core(placements, executable) == Some(core))
+                .then_some((executable, *units, *start, *end))
+        }
+        SolverConstraint::GroupActivation {
+            executable,
+            units,
+            start,
+            end,
+            ..
+        } if placement_core(placements, *executable) == Some(core) => {
+            Some((*executable, *units, *start, *end))
+        }
+        _ => None,
+    }
+}
+
+fn placement_core(placements: &[(u128, u16)], executable: u128) -> Option<u16> {
+    placements
+        .binary_search_by_key(&executable, |(candidate, _)| *candidate)
+        .ok()
+        .map(|ordinal| placements[ordinal].1)
 }
 
 const fn intervals_overlap(

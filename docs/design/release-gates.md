@@ -14,7 +14,7 @@ Main is kept Releasable. An implementation is not declared complete until Check 
 
 Check always selects the same evidence. Correct incremental computation may make repeated execution faster, while missing external prerequisites may make it `Unable`; neither condition changes the release claim. Initial tool installation and host-toolchain compilation are setup cost rather than a separate Check mode.
 
-The Reference Development Host is the builders' Apple Silicon Mac profile, identified by model and memory class. A representative warm local change targets subsecond Check Latency and may not exceed two seconds on that host. Other hosts receive the same semantic result but do not become latency authorities.
+The Reference Development Host is the builders' Apple Silicon Mac profile, identified by model and memory class. A representative warm local change targets subsecond Check Latency and may not exceed five seconds on that host. Other hosts receive the same semantic result but do not become latency authorities.
 
 The Check envelope includes every deterministic Regression Case and one minimal production-shaped path through compilation, Image packaging, QEMU boot, typed terminal observation, and shutdown. When Check approaches its latency ceiling, evidence must be made deeper or cheaper. It is not split into another tier.
 

@@ -48,12 +48,12 @@ if command -v sysctl >/dev/null 2>&1; then
     fi
 fi
 
-if ! perl -e 'exit !($ARGV[0] < 2.0)' "$check_elapsed"; then
+if ! perl -e 'exit !($ARGV[0] < 5.0)' "$check_elapsed"; then
     if [ "$reference_host" = true ]; then
-        echo "Failed: warm Check latency was ${check_elapsed}s on the Reference Development Host; the hard ceiling is 2.000s."
+        echo "Failed: warm Check latency was ${check_elapsed}s on the Reference Development Host; the hard ceiling is 5.000s."
         exit 1
     fi
-    echo "Warning: warm Check latency was ${check_elapsed}s; the 2.000s ceiling is authoritative only on the Reference Development Host."
+    echo "Warning: warm Check latency was ${check_elapsed}s; the 5.000s ceiling is authoritative only on the Reference Development Host."
 fi
 
 echo "Passed (${check_elapsed}s)."

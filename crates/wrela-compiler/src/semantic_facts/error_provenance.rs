@@ -323,6 +323,7 @@ pub(crate) fn analyze(
                 id.0,
                 function.name.clone(),
                 set.first().expect("one inferred error").display(),
+                function.source.clone(),
             ));
         } else {
             let mut diagnostic = Diagnostic::new(

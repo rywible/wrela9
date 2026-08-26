@@ -733,6 +733,7 @@ pub(crate) struct ProgramInput {
     pub(crate) namespace: NamespaceCatalog,
     pub(crate) nominal_displays: BTreeMap<DefinitionId, Arc<str>>,
     pub(crate) comptime_roots: Vec<(ModuleId, ExpressionSyntax)>,
+    pub(crate) inferred_error_definitions: BTreeSet<DefinitionId>,
 }
 
 #[derive(Clone, Debug)]
@@ -746,6 +747,7 @@ pub(crate) struct VerifiedProgram {
     specializations: BTreeMap<SpecializationId, SpecializationRecord>,
     comptime_expressions: BTreeMap<SourceRange, ComptimeExpression>,
     closures: BTreeMap<ClosureId, Arc<HirClosure>>,
+    inferred_error_definitions: BTreeSet<DefinitionId>,
     _discharge_laws: VerifiedDischargeLaws,
     fingerprint: u128,
     identity_catalog_revision: u128,
@@ -1496,6 +1498,9 @@ impl VerifiedProgram {
         }
         closures.into_keys().collect()
     }
+    pub(crate) fn inferred_error_definitions(&self) -> &BTreeSet<DefinitionId> {
+        &self.inferred_error_definitions
+    }
     pub(crate) const fn fingerprint(&self) -> u128 {
         self.fingerprint
     }
@@ -1850,7 +1855,7 @@ pub(crate) fn verify(
     }
 
     let mut canonical = Xxh3::new();
-    canonical.extend_from_slice(b"wrela.typed-hir\0\x03");
+    canonical.extend_from_slice(b"wrela.typed-hir\0\x04");
     canonical.push(0);
     canonical.extend_from_slice(&identity_catalog.revision_fingerprint().to_be_bytes());
     append_collection_header(&mut canonical, 1, functions.len());
@@ -1934,6 +1939,10 @@ pub(crate) fn verify(
         canonical.extend_from_slice(&type_id.0.to_be_bytes());
         append_discharge_law(&mut canonical, law);
     }
+    append_collection_header(&mut canonical, 10, input.inferred_error_definitions.len());
+    for definition in &input.inferred_error_definitions {
+        canonical.extend_from_slice(&definition.0.to_be_bytes());
+    }
     let artifact_catalog = ArtifactCatalog {
         templates: &functions,
         specialized: &specialized_functions,
@@ -1956,6 +1965,7 @@ pub(crate) fn verify(
         specializations,
         comptime_expressions,
         closures,
+        inferred_error_definitions: input.inferred_error_definitions,
         _discharge_laws: discharge_laws,
         fingerprint: canonical.digest128(),
         identity_catalog_revision: identity_catalog.revision_fingerprint(),
@@ -2177,6 +2187,7 @@ fn verify_comptime_condition_with_values(
             },
         )]),
         closures,
+        inferred_error_definitions: input.inferred_error_definitions.clone(),
         _discharge_laws: discharge_laws,
         fingerprint: 0,
         identity_catalog_revision: identity_catalog.revision_fingerprint(),

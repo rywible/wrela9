@@ -17,7 +17,7 @@ use crate::model::{BuildKind, SpecializationId};
 use crate::semantic_facts::{FunctionFacts, SolvedSemanticFacts};
 use crate::typed_hir::{AccessMode, VerifiedProgram};
 
-pub(crate) const PHASE_SCHEMA: &str = "wrela.completed-semantic-program.v2";
+pub(crate) const PHASE_SCHEMA: &str = "wrela.completed-semantic-program.v3";
 const COMPILER_SCHEMA: &str = "wrela.compiler.semantic-context.v1";
 const SEMANTIC_SCHEMA: &str = "wrela.semantic-authority.v1";
 
@@ -353,7 +353,7 @@ pub(crate) fn complete(
     });
 
     let program_fingerprint = input.program.fingerprint();
-    let facts_fingerprint = produce_facts_fingerprint(&input.facts);
+    let facts_fingerprint = produce_facts_fingerprint(&input.facts, cancellation)?;
     checkpoint(cancellation)?;
     let mut evaluations = Vec::with_capacity(input.evaluations.len());
     for authority in input.evaluations {
@@ -375,7 +375,7 @@ pub(crate) fn complete(
         });
     }
     evaluations.sort_by_key(|evaluation| evaluation.authority.root);
-    let evaluations_fingerprint = produce_evaluations_fingerprint(&evaluations);
+    let evaluations_fingerprint = produce_evaluations_fingerprint(&evaluations, cancellation)?;
     checkpoint(cancellation)?;
     let demand = produce_demand(
         context_identity,
@@ -427,8 +427,12 @@ pub(crate) fn complete(
         ),
     };
     let custody_fingerprint = input.program.custody_fingerprint();
-    let fingerprint =
-        produce_completed_fingerprint(context_identity, &receipts, custody_fingerprint);
+    let fingerprint = produce_completed_fingerprint(
+        context_identity,
+        &receipts,
+        custody_fingerprint,
+        cancellation,
+    )?;
     checkpoint(cancellation)?;
     let candidate = CompletedSemanticProgram {
         context,
@@ -472,9 +476,10 @@ fn verify(
         return defect("verified Typed Program belongs to a different Identity Catalog revision");
     }
 
-    let facts_fingerprint = verify_facts_fingerprint(&candidate.facts);
+    let facts_fingerprint = verify_facts_fingerprint(&candidate.facts, cancellation)?;
     checkpoint(cancellation)?;
-    let evaluations_fingerprint = verify_evaluations_fingerprint(&candidate.evaluations);
+    let evaluations_fingerprint =
+        verify_evaluations_fingerprint(&candidate.evaluations, cancellation)?;
     checkpoint(cancellation)?;
     let registry = BTreeMap::from([
         (ArtifactKind::TypedProgram, candidate.program.fingerprint()),
@@ -519,7 +524,8 @@ fn verify(
         candidate.context.identity,
         &candidate.receipts,
         candidate.custody_fingerprint,
-    );
+        cancellation,
+    )?;
     checkpoint(cancellation)?;
     if reconstructed != candidate.fingerprint {
         return defect("Completed Semantic Program fingerprint is false");
@@ -568,11 +574,30 @@ fn produce_demand(
     if !program.specializations().contains_key(&root) {
         return defect("Image Constructor has no concrete Specialization");
     }
-    let mut roots = image
-        .constructions()
-        .iter()
-        .map(|construction| SpecializationId(construction.owner))
-        .collect::<BTreeSet<_>>();
+    let mut roots = BTreeSet::new();
+    for construction in image.constructions() {
+        checkpoint(cancellation)?;
+        roots.insert(SpecializationId(construction.owner));
+    }
+    let mut retained_closures = BTreeSet::new();
+    for construction in image.constructions() {
+        for operand in &construction.operands {
+            if !crate::evaluator::visit_retained_executables(
+                &operand.value,
+                cancellation,
+                &mut |executable| match executable {
+                    crate::evaluator::RetainedExecutable::Function(identity) => {
+                        roots.insert(identity);
+                    }
+                    crate::evaluator::RetainedExecutable::Closure(identity) => {
+                        retained_closures.insert(identity);
+                    }
+                },
+            ) {
+                return Err(CompletionFailure::Cancelled);
+            }
+        }
+    }
     roots.insert(root);
     for application in test_applications {
         if cancellation.is_cancelled() {
@@ -585,24 +610,25 @@ fn produce_demand(
         };
         roots.extend(test_roots);
     }
-    let identities = reachable_specializations(&roots, facts)?;
-    let mut executables = identities
-        .iter()
-        .map(|identity| {
-            ExecutableReference::Specialization(TypedReference::new(
-                context,
-                ArtifactKind::Specialization,
-                identity.0,
-                specialization_current_meaning(program.fingerprint(), *identity),
-            ))
-        })
-        .collect::<Vec<_>>();
-    let applied_tests = test_applications
-        .iter()
-        .map(|application| application.id)
-        .collect::<BTreeSet<_>>();
-    executables.extend(applied_tests.iter().map(|test| {
-        ExecutableReference::TestBody(TypedReference::new(
+    let identities = reachable_specializations(&roots, facts, cancellation)?;
+    let mut executables = Vec::new();
+    for identity in &identities {
+        checkpoint(cancellation)?;
+        executables.push(ExecutableReference::Specialization(TypedReference::new(
+            context,
+            ArtifactKind::Specialization,
+            identity.0,
+            specialization_current_meaning(program.fingerprint(), *identity),
+        )));
+    }
+    let mut applied_tests = BTreeSet::new();
+    for application in test_applications {
+        checkpoint(cancellation)?;
+        applied_tests.insert(application.id);
+    }
+    for test in &applied_tests {
+        checkpoint(cancellation)?;
+        executables.push(ExecutableReference::TestBody(TypedReference::new(
             context,
             ArtifactKind::TestBody,
             test.identity,
@@ -611,23 +637,26 @@ fn produce_demand(
                 ArtifactKind::TestBody,
                 test.identity,
             ),
-        ))
-    }));
-    let mut closures = BTreeSet::new();
+        )));
+    }
+    let mut closures = retained_closures;
     for specialization in &identities {
+        checkpoint(cancellation)?;
         closures.extend(program.specialization_closures(*specialization));
     }
     for test in &applied_tests {
+        checkpoint(cancellation)?;
         closures.extend(program.test_closures(*test));
     }
-    executables.extend(closures.iter().map(|closure| {
-        ExecutableReference::ClosureBody(TypedReference::new(
+    for closure in &closures {
+        checkpoint(cancellation)?;
+        executables.push(ExecutableReference::ClosureBody(TypedReference::new(
             context,
             ArtifactKind::ClosureBody,
             closure.0,
             executable_current_meaning(program.fingerprint(), ArtifactKind::ClosureBody, closure.0),
-        ))
-    }));
+        )));
+    }
     executables.sort_by_key(|reference| {
         let raw = reference.raw();
         (raw.kind, raw.identity)
@@ -641,7 +670,7 @@ fn produce_demand(
             _ => None,
         })
         .ok_or_else(|| CompletionFailure::Defect(Arc::from("demand omitted its root")))?;
-    let fingerprint = produce_demand_fingerprint(root_reference, &executables);
+    let fingerprint = produce_demand_fingerprint(root_reference, &executables, cancellation)?;
     Ok(ExecutableDemand {
         root: root_reference,
         executables: executables.into(),
@@ -652,10 +681,12 @@ fn produce_demand(
 fn reachable_specializations(
     roots: &BTreeSet<SpecializationId>,
     facts: &SolvedSemanticFacts,
+    cancellation: &Cancellation,
 ) -> Result<BTreeSet<SpecializationId>, CompletionFailure> {
     let mut reachable = BTreeSet::new();
     let mut pending = roots.iter().rev().copied().collect::<Vec<_>>();
     while let Some(identity) = pending.pop() {
+        checkpoint(cancellation)?;
         if !reachable.insert(identity) {
             continue;
         }
@@ -674,20 +705,19 @@ fn produce_graph(
     program_fingerprint: u128,
     cancellation: &Cancellation,
 ) -> Result<SealedConstructionGraph, CompletionFailure> {
-    let demand_set = demand
-        .executables
-        .iter()
-        .filter_map(|reference| match reference {
-            ExecutableReference::Specialization(reference) => Some(reference.raw.identity),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
+    let mut demand_set = BTreeSet::new();
+    for reference in demand.executables.iter() {
+        checkpoint(cancellation)?;
+        if let ExecutableReference::Specialization(reference) = reference {
+            demand_set.insert(reference.raw.identity);
+        }
+    }
     let mut local_fingerprints = BTreeMap::new();
     for construction in image.constructions() {
         if cancellation.is_cancelled() {
             return Err(CompletionFailure::Cancelled);
         }
-        let local = produce_node_local_fingerprint(construction);
+        let local = produce_node_local_fingerprint(construction, cancellation)?;
         if local_fingerprints
             .insert(construction.identity, local)
             .is_some()
@@ -725,19 +755,25 @@ fn produce_graph(
     let mut derived_tests = Vec::new();
     for node in &nodes {
         for operand in node.operands.iter() {
-            crate::evaluator::visit_test_applications(&operand.value, &mut |id, payload| {
-                derived_tests.push(crate::evaluator::AppliedTest {
-                    id,
-                    payload: payload.to_vec(),
-                });
-            });
+            if !crate::evaluator::visit_test_applications_cancellable(
+                &operand.value,
+                cancellation,
+                &mut |id, payload| {
+                    derived_tests.push(crate::evaluator::AppliedTest {
+                        id,
+                        payload: payload.to_vec(),
+                    });
+                },
+            ) {
+                return Err(CompletionFailure::Cancelled);
+            }
         }
     }
     if derived_tests != image.test_applications {
         return defect("Test Application bookkeeping disagrees with typed construction operands");
     }
     for node in &nodes {
-        let _ = reconstruct_edges(context, &node.operands, &local_fingerprints)?;
+        let _ = reconstruct_edges(context, &node.operands, &local_fingerprints, cancellation)?;
     }
     let root_fingerprint = local_fingerprints
         .get(&image.root())
@@ -749,7 +785,7 @@ fn produce_graph(
         image.root(),
         root_fingerprint,
     );
-    let fingerprint = produce_graph_fingerprint(root, &nodes, &derived_tests);
+    let fingerprint = produce_graph_fingerprint(root, &nodes, &derived_tests, cancellation)?;
     Ok(SealedConstructionGraph {
         root,
         nodes: nodes.into(),
@@ -763,11 +799,16 @@ fn collect_operand_edges(
     operand: &ConstructionOperand,
     local_fingerprints: &BTreeMap<u128, u128>,
     edges: &mut Vec<GraphEdge>,
+    cancellation: &Cancellation,
 ) -> Result<(), CompletionFailure> {
     let mut handles = Vec::new();
-    crate::evaluator::visit_construction_handles(&operand.value, &mut |kind, identity| {
-        handles.push((kind, identity));
-    });
+    if !crate::evaluator::visit_construction_handles_cancellable(
+        &operand.value,
+        cancellation,
+        &mut |kind, identity| handles.push((kind, identity)),
+    ) {
+        return Err(CompletionFailure::Cancelled);
+    }
     for (kind, identity) in handles {
         let current = local_fingerprints.get(&identity).copied().ok_or_else(|| {
             CompletionFailure::Defect(Arc::from("graph handle names a missing node"))
@@ -829,14 +870,15 @@ fn verify_evaluation_coverage(
     cancellation: &Cancellation,
 ) -> Result<(), CompletionFailure> {
     let expected = program.expected_evaluation_roots(image);
-    if evaluations
-        .windows(2)
-        .any(|pair| pair[0].authority.root >= pair[1].authority.root)
-    {
-        return defect("evaluation table is not in canonical typed-root order");
+    for pair in evaluations.windows(2) {
+        checkpoint(cancellation)?;
+        if pair[0].authority.root >= pair[1].authority.root {
+            return defect("evaluation table is not in canonical typed-root order");
+        }
     }
     let mut supplied = BTreeSet::new();
     for evaluation in evaluations {
+        checkpoint(cancellation)?;
         if !supplied.insert(evaluation.authority.root) {
             return defect("evaluation table repeats a root");
         }
@@ -850,14 +892,14 @@ fn verify_evaluation_coverage(
             context,
         )?;
         let mut dependencies = BTreeSet::new();
-        if evaluation
-            .dependencies
-            .windows(2)
-            .any(|pair| pair[0].root >= pair[1].root)
-        {
-            return defect("evaluation dependencies are not in canonical typed-root order");
+        for pair in evaluation.dependencies.windows(2) {
+            checkpoint(cancellation)?;
+            if pair[0].root >= pair[1].root {
+                return defect("evaluation dependencies are not in canonical typed-root order");
+            }
         }
         for dependency in evaluation.dependencies.iter() {
+            checkpoint(cancellation)?;
             if !dependencies.insert(dependency.root) {
                 return defect("evaluation dependency table repeats a root");
             }
@@ -908,20 +950,18 @@ fn verify_evaluation_coverage(
             );
         }
     }
-    let graph = evaluations
-        .iter()
-        .map(|evaluation| {
-            (
-                evaluation.authority.root,
-                evaluation
-                    .dependencies
-                    .iter()
-                    .map(|dependency| dependency.root)
-                    .filter(|dependency| *dependency != evaluation.authority.root)
-                    .collect::<BTreeSet<_>>(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut graph = BTreeMap::new();
+    for evaluation in evaluations {
+        checkpoint(cancellation)?;
+        let mut dependencies = BTreeSet::new();
+        for dependency in evaluation.dependencies.iter() {
+            checkpoint(cancellation)?;
+            if dependency.root != evaluation.authority.root {
+                dependencies.insert(dependency.root);
+            }
+        }
+        graph.insert(evaluation.authority.root, dependencies);
+    }
     if crate::graph::recursive_nodes(&graph)
         .iter()
         .next()
@@ -956,12 +996,20 @@ fn verify_demand(
     if root_executable != candidate.demand.root {
         return defect("Executable Demand root reference is cross-context, wrong-kind, or stale");
     }
-    let mut roots = candidate
-        .graph
-        .nodes
-        .iter()
-        .map(|node| SpecializationId(node.owner.raw.identity))
-        .collect::<BTreeSet<_>>();
+    let mut roots = BTreeSet::new();
+    for node in candidate.graph.nodes.iter() {
+        checkpoint(cancellation)?;
+        roots.insert(SpecializationId(node.owner.raw.identity));
+    }
+    let mut retained_closures = BTreeSet::new();
+    for node in candidate.graph.nodes.iter() {
+        for operand in node.operands.iter() {
+            let mut retained = IndependentValueFacts::default();
+            independently_traverse_value(&operand.value, cancellation, &mut retained)?;
+            roots.extend(retained.functions);
+            retained_closures.extend(retained.closures);
+        }
+    }
     roots.insert(root);
     for application in candidate.graph.test_applications.iter() {
         if cancellation.is_cancelled() {
@@ -977,43 +1025,49 @@ fn verify_demand(
         };
         roots.extend(test_roots);
     }
-    let specializations = verify_reachable_specializations(&roots, &candidate.facts)?;
-    let tests = candidate
-        .graph
-        .test_applications
-        .iter()
-        .map(|application| application.id)
-        .collect::<BTreeSet<_>>();
-    let mut closures = BTreeSet::new();
+    let specializations = verify_reachable_specializations(&roots, &candidate.facts, cancellation)?;
+    let mut tests = BTreeSet::new();
+    for application in candidate.graph.test_applications.iter() {
+        checkpoint(cancellation)?;
+        tests.insert(application.id);
+    }
+    let mut closures = retained_closures;
     for specialization in &specializations {
+        checkpoint(cancellation)?;
         closures.extend(candidate.program.specialization_closures(*specialization));
     }
     for test in &tests {
+        checkpoint(cancellation)?;
         closures.extend(candidate.program.test_closures(*test));
     }
-    let mut exact = specializations
-        .iter()
-        .map(|identity| (ArtifactKind::Specialization, identity.0))
-        .collect::<BTreeSet<_>>();
-    exact.extend(
-        tests
-            .iter()
-            .map(|test| (ArtifactKind::TestBody, test.identity)),
-    );
-    exact.extend(
-        closures
-            .iter()
-            .map(|closure| (ArtifactKind::ClosureBody, closure.0)),
-    );
-    let supplied = candidate
-        .demand
-        .executables
-        .iter()
-        .map(|reference| {
-            let raw = reference.raw();
-            (raw.kind, raw.identity)
-        })
-        .collect::<BTreeSet<_>>();
+    let mut exact = BTreeSet::new();
+    for identity in &specializations {
+        checkpoint(cancellation)?;
+        exact.insert((ArtifactKind::Specialization, identity.0));
+    }
+    for test in &tests {
+        checkpoint(cancellation)?;
+        exact.insert((ArtifactKind::TestBody, test.identity));
+    }
+    for closure in &closures {
+        checkpoint(cancellation)?;
+        exact.insert((ArtifactKind::ClosureBody, closure.0));
+    }
+    let mut supplied = BTreeSet::new();
+    for reference in candidate.demand.executables.iter() {
+        checkpoint(cancellation)?;
+        let raw = reference.raw();
+        let expected_kind = match reference {
+            ExecutableReference::Specialization(_) => ArtifactKind::Specialization,
+            ExecutableReference::TestBody(_) => ArtifactKind::TestBody,
+            ExecutableReference::ClosureBody(_) => ArtifactKind::ClosureBody,
+            ExecutableReference::Generated(_) => ArtifactKind::GeneratedExecutable,
+        };
+        if raw.kind != expected_kind {
+            return defect("typed executable reference has the wrong kind");
+        }
+        supplied.insert((raw.kind, raw.identity));
+    }
     if exact != supplied {
         return defect("Executable Demand is not the exact reachable executable family");
     }
@@ -1049,8 +1103,11 @@ fn verify_demand(
             return defect("typed executable reference is stale");
         }
     }
-    if verify_demand_fingerprint(candidate.demand.root, &candidate.demand.executables)
-        != candidate.demand.fingerprint
+    if verify_demand_fingerprint(
+        candidate.demand.root,
+        &candidate.demand.executables,
+        cancellation,
+    )? != candidate.demand.fingerprint
     {
         return defect("Executable Demand fingerprint is false");
     }
@@ -1061,12 +1118,18 @@ fn verify_graph(
     candidate: &CompletedSemanticProgram,
     cancellation: &Cancellation,
 ) -> Result<(), CompletionFailure> {
-    let node_registry = candidate
-        .graph
-        .nodes
-        .iter()
-        .map(|node| (node.identity, node.local_fingerprint))
-        .collect::<BTreeMap<_, _>>();
+    let mut node_registry = BTreeMap::new();
+    let mut node_kinds = BTreeMap::new();
+    for node in candidate.graph.nodes.iter() {
+        checkpoint(cancellation)?;
+        if node_registry
+            .insert(node.identity, node.local_fingerprint)
+            .is_some()
+        {
+            return defect("construction graph repeats a node identity");
+        }
+        node_kinds.insert(node.identity, node.kind);
+    }
     verify_semantic_reference(
         candidate.graph.root.raw,
         candidate.context.identity,
@@ -1074,42 +1137,33 @@ fn verify_graph(
         &node_registry,
     )?;
     let root = candidate.graph.root.raw.identity;
-    let Some(root_node) = candidate
-        .graph
-        .nodes
-        .iter()
-        .find(|node| node.identity == root)
-    else {
+    let Some(root_kind) = node_kinds.get(&root).copied() else {
         return defect("construction graph root is missing");
     };
-    if root_node.kind != BuildKind::Image {
+    if root_kind != BuildKind::Image {
         return defect("construction graph root has the wrong kind");
     }
-    if candidate
-        .graph
-        .nodes
-        .iter()
-        .filter(|node| node.kind == BuildKind::Image)
-        .count()
-        != 1
-    {
+    let mut image_nodes = 0_usize;
+    for node in candidate.graph.nodes.iter() {
+        checkpoint(cancellation)?;
+        image_nodes = image_nodes.saturating_add(usize::from(node.kind == BuildKind::Image));
+    }
+    if image_nodes != 1 {
         return defect("construction graph has a false Image root identity");
     }
-    let demand_registry = candidate
-        .demand
-        .executables
-        .iter()
-        .filter_map(|reference| match reference {
-            ExecutableReference::Specialization(reference) => {
-                Some((reference.raw.identity, reference.raw.current_meaning))
-            }
-            _ => None,
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut demand_registry = BTreeMap::new();
+    for reference in candidate.demand.executables.iter() {
+        checkpoint(cancellation)?;
+        if let ExecutableReference::Specialization(reference) = reference {
+            demand_registry.insert(reference.raw.identity, reference.raw.current_meaning);
+        }
+    }
     let mut reconstructed_tests = Vec::new();
     for node in candidate.graph.nodes.iter() {
         for operand in node.operands.iter() {
-            independently_collect_test_applications(&operand.value, &mut reconstructed_tests);
+            let mut facts = IndependentValueFacts::default();
+            independently_traverse_value(&operand.value, cancellation, &mut facts)?;
+            reconstructed_tests.extend(facts.tests);
         }
     }
     if reconstructed_tests.as_slice() != candidate.graph.test_applications.as_ref() {
@@ -1131,7 +1185,7 @@ fn verify_graph(
         if cancellation.is_cancelled() {
             return Err(CompletionFailure::Cancelled);
         }
-        if verify_node_local_fingerprint(node) != node.local_fingerprint {
+        if verify_node_local_fingerprint(node, cancellation)? != node.local_fingerprint {
             return defect("construction node current meaning is stale");
         }
         verify_semantic_reference(
@@ -1142,11 +1196,9 @@ fn verify_graph(
         )?;
         let mut reconstructed = Vec::new();
         for operand in node.operands.iter() {
-            let mut handles = Vec::new();
-            crate::evaluator::visit_construction_handles(&operand.value, &mut |kind, identity| {
-                handles.push((kind, identity));
-            });
-            for (kind, identity) in handles {
+            let mut facts = IndependentValueFacts::default();
+            independently_traverse_value(&operand.value, cancellation, &mut facts)?;
+            for (kind, identity) in facts.handles {
                 let Some(current_meaning) = node_registry.get(&identity).copied() else {
                     return defect("graph handle names a missing node");
                 };
@@ -1165,36 +1217,39 @@ fn verify_graph(
             }
         }
         for edge in &reconstructed {
+            checkpoint(cancellation)?;
             verify_semantic_reference(
                 edge.target.raw,
                 candidate.context.identity,
                 ArtifactKind::ConstructionNode,
                 &node_registry,
             )?;
-            let target = candidate
-                .graph
-                .nodes
-                .iter()
-                .find(|target| target.identity == edge.target.raw.identity)
+            let target_kind = node_kinds
+                .get(&edge.target.raw.identity)
+                .copied()
                 .ok_or_else(|| CompletionFailure::Defect(Arc::from("missing graph target")))?;
-            if target.kind != edge.target_kind {
+            if target_kind != edge.target_kind {
                 return defect("construction handle refers to a node of the wrong kind");
             }
             if edge.ownership == AccessMode::Move {
-                *incoming_moves.entry(target.identity).or_default() += 1;
+                *incoming_moves.entry(edge.target.raw.identity).or_default() += 1;
             }
             adjacency
                 .entry(node.identity)
                 .or_default()
-                .insert(target.identity);
+                .insert(edge.target.raw.identity);
         }
     }
-    if incoming_moves.values().any(|count| *count > 1) {
-        return defect("construction graph duplicates Resource custody");
+    for count in incoming_moves.values() {
+        checkpoint(cancellation)?;
+        if *count > 1 {
+            return defect("construction graph duplicates Resource custody");
+        }
     }
     let mut reachable = BTreeSet::new();
     let mut pending = vec![root];
     while let Some(identity) = pending.pop() {
+        checkpoint(cancellation)?;
         if reachable.insert(identity) {
             pending.extend(
                 adjacency
@@ -1206,32 +1261,48 @@ fn verify_graph(
             );
         }
     }
-    if reachable != node_registry.keys().copied().collect() {
+    let mut all_nodes = BTreeSet::new();
+    for identity in node_registry.keys() {
+        checkpoint(cancellation)?;
+        all_nodes.insert(*identity);
+    }
+    if reachable != all_nodes {
         return defect("construction graph contains unreachable nodes");
     }
     if verify_graph_fingerprint(
         candidate.graph.root,
         &candidate.graph.nodes,
         &candidate.graph.test_applications,
-    ) != candidate.graph.fingerprint
+        cancellation,
+    )? != candidate.graph.fingerprint
     {
         return defect("construction graph fingerprint is false");
     }
     Ok(())
 }
 
-fn independently_collect_test_applications(
+#[derive(Default)]
+struct IndependentValueFacts {
+    handles: Vec<(BuildKind, u128)>,
+    functions: BTreeSet<SpecializationId>,
+    closures: BTreeSet<crate::typed_hir::ClosureId>,
+    tests: Vec<crate::evaluator::AppliedTest>,
+}
+
+fn independently_traverse_value(
     value: &Value,
-    applications: &mut Vec<crate::evaluator::AppliedTest>,
-) {
+    cancellation: &Cancellation,
+    facts: &mut IndependentValueFacts,
+) -> Result<(), CompletionFailure> {
+    checkpoint(cancellation)?;
     match value {
         Value::TestApplication { id, payload } => {
-            applications.push(crate::evaluator::AppliedTest {
+            facts.tests.push(crate::evaluator::AppliedTest {
                 id: *id,
                 payload: payload.to_vec(),
             });
             for nested in payload.iter() {
-                independently_collect_test_applications(nested, applications);
+                independently_traverse_value(nested, cancellation, facts)?;
             }
         }
         Value::Array(values)
@@ -1243,19 +1314,24 @@ fn independently_collect_test_applications(
             payload: values, ..
         } => {
             for nested in values.iter() {
-                independently_collect_test_applications(nested, applications);
+                independently_traverse_value(nested, cancellation, facts)?;
             }
         }
         Value::Struct { fields, .. } => {
             for (_, nested) in fields.iter() {
-                independently_collect_test_applications(nested, applications);
+                independently_traverse_value(nested, cancellation, facts)?;
             }
         }
-        Value::Closure { captures, .. } => {
+        Value::Closure { id, captures } => {
+            facts.closures.insert(*id);
             for (_, nested) in captures.iter() {
-                independently_collect_test_applications(nested, applications);
+                independently_traverse_value(nested, cancellation, facts)?;
             }
         }
+        Value::Function(identity) => {
+            facts.functions.insert(*identity);
+        }
+        Value::SymbolicHandle { kind, identity } => facts.handles.push((*kind, *identity)),
         Value::Unavailable
         | Value::Unit
         | Value::Bool(_)
@@ -1263,19 +1339,20 @@ fn independently_collect_test_applications(
         | Value::Float { .. }
         | Value::Text(_)
         | Value::Scalar(_)
-        | Value::Bytes(_)
-        | Value::Function(_)
-        | Value::SymbolicHandle { .. } => {}
+        | Value::Bytes(_) => {}
     }
+    Ok(())
 }
 
 fn verify_reachable_specializations(
     roots: &BTreeSet<SpecializationId>,
     facts: &SolvedSemanticFacts,
+    cancellation: &Cancellation,
 ) -> Result<BTreeSet<SpecializationId>, CompletionFailure> {
     let mut verified = BTreeSet::new();
     let mut work = roots.iter().copied().collect::<Vec<_>>();
     while let Some(identity) = work.pop() {
+        checkpoint(cancellation)?;
         if !verified.insert(identity) {
             continue;
         }
@@ -1295,10 +1372,12 @@ fn reconstruct_edges(
     context: u128,
     operands: &[ConstructionOperand],
     registry: &BTreeMap<u128, u128>,
+    cancellation: &Cancellation,
 ) -> Result<Vec<GraphEdge>, CompletionFailure> {
     let mut edges = Vec::new();
     for operand in operands {
-        collect_operand_edges(context, operand, registry, &mut edges)?;
+        checkpoint(cancellation)?;
+        collect_operand_edges(context, operand, registry, &mut edges, cancellation)?;
     }
     Ok(edges)
 }
@@ -1452,48 +1531,66 @@ const fn root_tag(root: Root) -> u8 {
     }
 }
 
-fn produce_facts_fingerprint(facts: &SolvedSemanticFacts) -> u128 {
-    hash_facts(b"wrela.solved-semantic-facts\0\x01", facts)
+fn produce_facts_fingerprint(
+    facts: &SolvedSemanticFacts,
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
+    hash_facts(b"wrela.solved-semantic-facts\0\x02", facts, cancellation)
 }
 
-fn verify_facts_fingerprint(facts: &SolvedSemanticFacts) -> u128 {
+fn verify_facts_fingerprint(
+    facts: &SolvedSemanticFacts,
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
     let mut encoding = VerificationEncoding::new();
-    encoding.part(b"wrela.solved-semantic-facts\0\x01");
+    encoding.part(b"wrela.solved-semantic-facts\0\x02");
     encoding.u64(facts.definitions.len());
     for (identity, function) in &facts.definitions {
+        checkpoint(cancellation)?;
         encoding.byte(1);
         encoding.u128(identity.0);
-        encoding.function_facts(function);
+        encoding.function_facts(function, cancellation)?;
     }
     encoding.u64(facts.specializations.len());
     for (identity, function) in &facts.specializations {
+        checkpoint(cancellation)?;
         encoding.byte(2);
         encoding.u128(identity.0);
-        encoding.function_facts(function);
+        encoding.function_facts(function, cancellation)?;
     }
     encoding.u64(facts.recursion.proven.len());
     for (identity, maximum) in &facts.recursion.proven {
+        checkpoint(cancellation)?;
         encoding.byte(3);
         encoding.u128(identity.0);
         encoding.u64(*maximum);
     }
     encoding.u64(facts.recursion.unproven.len());
     for source in &facts.recursion.unproven {
+        checkpoint(cancellation)?;
         encoding.part(source.path().as_bytes());
         encoding.u64(source.start());
         encoding.u64(source.end());
     }
     encoding.u64(facts.inferred_errors.len());
     for inferred in &facts.inferred_errors {
+        checkpoint(cancellation)?;
         encoding.u128(inferred.specialization_identity());
         encoding.part(inferred.function().as_bytes());
         encoding.part(inferred.error_type().as_bytes());
+        encoding.part(inferred.provenance().path().as_bytes());
+        encoding.u64(inferred.provenance().start());
+        encoding.u64(inferred.provenance().end());
     }
     encoding.u64(facts.diagnostics.len());
-    encoding.finish()
+    encoding.finish_cancellable(cancellation)
 }
 
-fn hash_facts(domain: &[u8], facts: &SolvedSemanticFacts) -> u128 {
+fn hash_facts(
+    domain: &[u8],
+    facts: &SolvedSemanticFacts,
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
     let mut hash = Xxh3::new();
     append_part(&mut hash, domain);
     hash.update(
@@ -1502,9 +1599,10 @@ fn hash_facts(domain: &[u8], facts: &SolvedSemanticFacts) -> u128 {
             .to_be_bytes(),
     );
     for (identity, function) in &facts.definitions {
+        checkpoint(cancellation)?;
         hash.update(&[1]);
         hash.update(&identity.0.to_be_bytes());
-        append_function_facts(&mut hash, function);
+        append_function_facts(&mut hash, function, cancellation)?;
     }
     hash.update(
         &u64::try_from(facts.specializations.len())
@@ -1512,9 +1610,10 @@ fn hash_facts(domain: &[u8], facts: &SolvedSemanticFacts) -> u128 {
             .to_be_bytes(),
     );
     for (identity, function) in &facts.specializations {
+        checkpoint(cancellation)?;
         hash.update(&[2]);
         hash.update(&identity.0.to_be_bytes());
-        append_function_facts(&mut hash, function);
+        append_function_facts(&mut hash, function, cancellation)?;
     }
     hash.update(
         &u64::try_from(facts.recursion.proven.len())
@@ -1522,6 +1621,7 @@ fn hash_facts(domain: &[u8], facts: &SolvedSemanticFacts) -> u128 {
             .to_be_bytes(),
     );
     for (identity, maximum) in &facts.recursion.proven {
+        checkpoint(cancellation)?;
         hash.update(&[3]);
         hash.update(&identity.0.to_be_bytes());
         hash.update(&maximum.to_be_bytes());
@@ -1532,6 +1632,7 @@ fn hash_facts(domain: &[u8], facts: &SolvedSemanticFacts) -> u128 {
             .to_be_bytes(),
     );
     for source in &facts.recursion.unproven {
+        checkpoint(cancellation)?;
         append_part(&mut hash, source.path().as_bytes());
         hash.update(&source.start().to_be_bytes());
         hash.update(&source.end().to_be_bytes());
@@ -1542,19 +1643,29 @@ fn hash_facts(domain: &[u8], facts: &SolvedSemanticFacts) -> u128 {
             .to_be_bytes(),
     );
     for inferred in &facts.inferred_errors {
+        checkpoint(cancellation)?;
         hash.update(&inferred.specialization_identity().to_be_bytes());
         append_part(&mut hash, inferred.function().as_bytes());
         append_part(&mut hash, inferred.error_type().as_bytes());
+        append_part(&mut hash, inferred.provenance().path().as_bytes());
+        hash.update(&inferred.provenance().start().to_be_bytes());
+        hash.update(&inferred.provenance().end().to_be_bytes());
     }
     hash.update(
         &u64::try_from(facts.diagnostics.len())
             .unwrap_or(u64::MAX)
             .to_be_bytes(),
     );
-    hash.digest128()
+    checkpoint(cancellation)?;
+    Ok(hash.digest128())
 }
 
-fn append_function_facts(hash: &mut Xxh3, facts: &FunctionFacts) {
+fn append_function_facts(
+    hash: &mut Xxh3,
+    facts: &FunctionFacts,
+    cancellation: &Cancellation,
+) -> Result<(), CompletionFailure> {
+    checkpoint(cancellation)?;
     hash.update(&[
         u8::from(facts.pure),
         u8::from(facts.may_panic),
@@ -1570,6 +1681,7 @@ fn append_function_facts(hash: &mut Xxh3, facts: &FunctionFacts) {
             .to_be_bytes(),
     );
     for kind in &facts.constructs {
+        checkpoint(cancellation)?;
         append_build_kind(hash, *kind);
     }
     hash.update(
@@ -1578,6 +1690,7 @@ fn append_function_facts(hash: &mut Xxh3, facts: &FunctionFacts) {
             .to_be_bytes(),
     );
     for (identity, multiplicity) in &facts.calls {
+        checkpoint(cancellation)?;
         hash.update(&identity.0.to_be_bytes());
         hash.update(&multiplicity.to_be_bytes());
     }
@@ -1587,22 +1700,35 @@ fn append_function_facts(hash: &mut Xxh3, facts: &FunctionFacts) {
             .to_be_bytes(),
     );
     for (identity, multiplicity) in &facts.specialization_calls {
+        checkpoint(cancellation)?;
         hash.update(&identity.0.to_be_bytes());
         hash.update(&multiplicity.to_be_bytes());
     }
+    Ok(())
 }
 
-fn produce_evaluations_fingerprint(evaluations: &[CompletedEvaluation]) -> u128 {
-    hash_evaluations(b"wrela.semantic-evaluation-table\0\x01", evaluations)
+fn produce_evaluations_fingerprint(
+    evaluations: &[CompletedEvaluation],
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
+    hash_evaluations(
+        b"wrela.semantic-evaluation-table\0\x01",
+        evaluations,
+        cancellation,
+    )
 }
 
-fn verify_evaluations_fingerprint(evaluations: &[CompletedEvaluation]) -> u128 {
+fn verify_evaluations_fingerprint(
+    evaluations: &[CompletedEvaluation],
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
     let mut encoding = VerificationEncoding::new();
     encoding.part(b"wrela.semantic-evaluation-table\0\x01");
     encoding.u64(evaluations.len());
     for evaluation in evaluations {
+        checkpoint(cancellation)?;
         let authority = &evaluation.authority;
-        encoding.typed_value(&authority.value);
+        encoding.typed_value(&authority.value, cancellation)?;
         encoding.byte(authority.policy as u8);
         encoding.byte(evaluation.root.raw.kind.tag());
         encoding.u128(evaluation.root.raw.identity);
@@ -1612,15 +1738,20 @@ fn verify_evaluations_fingerprint(evaluations: &[CompletedEvaluation]) -> u128 {
         encoding.u128(authority.typed_program_fingerprint);
         encoding.u64(evaluation.dependencies.len());
         for dependency in evaluation.dependencies.iter() {
+            checkpoint(cancellation)?;
             encoding.byte(dependency.raw.kind.tag());
             encoding.u128(dependency.raw.identity);
             encoding.u128(dependency.raw.current_meaning);
         }
     }
-    encoding.finish()
+    encoding.finish_cancellable(cancellation)
 }
 
-fn hash_evaluations(domain: &[u8], evaluations: &[CompletedEvaluation]) -> u128 {
+fn hash_evaluations(
+    domain: &[u8],
+    evaluations: &[CompletedEvaluation],
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
     let mut hash = Xxh3::new();
     append_part(&mut hash, domain);
     hash.update(
@@ -1629,8 +1760,9 @@ fn hash_evaluations(domain: &[u8], evaluations: &[CompletedEvaluation]) -> u128 
             .to_be_bytes(),
     );
     for evaluation in evaluations {
+        checkpoint(cancellation)?;
         let authority = &evaluation.authority;
-        append_typed_value(&mut hash, &authority.value);
+        append_typed_value(&mut hash, &authority.value, cancellation)?;
         hash.update(&[authority.policy as u8]);
         hash.update(&[evaluation.root.raw.kind.tag()]);
         hash.update(&evaluation.root.raw.identity.to_be_bytes());
@@ -1644,19 +1776,27 @@ fn hash_evaluations(domain: &[u8], evaluations: &[CompletedEvaluation]) -> u128 
                 .to_be_bytes(),
         );
         for dependency in evaluation.dependencies.iter() {
+            checkpoint(cancellation)?;
             hash.update(&[dependency.raw.kind.tag()]);
             hash.update(&dependency.raw.identity.to_be_bytes());
             hash.update(&dependency.raw.current_meaning.to_be_bytes());
         }
     }
-    hash.digest128()
+    checkpoint(cancellation)?;
+    Ok(hash.digest128())
 }
 
-fn produce_node_local_fingerprint(construction: &Construction) -> u128 {
-    hash_construction(b"wrela.construction-node\0\x01", construction)
+fn produce_node_local_fingerprint(
+    construction: &Construction,
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
+    hash_construction(b"wrela.construction-node\0\x01", construction, cancellation)
 }
 
-fn verify_node_local_fingerprint(node: &GraphNode) -> u128 {
+fn verify_node_local_fingerprint(
+    node: &GraphNode,
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
     let mut encoding = VerificationEncoding::new();
     encoding.part(b"wrela.construction-node\0\x01");
     encoding.u128(node.identity);
@@ -1667,14 +1807,19 @@ fn verify_node_local_fingerprint(node: &GraphNode) -> u128 {
     encoding.u64(node.site.end());
     encoding.u64(node.operands.len());
     for operand in node.operands.iter() {
+        checkpoint(cancellation)?;
         encoding.part(operand.label.as_bytes());
         encoding.byte(access_tag(operand.ownership));
-        encoding.typed_value(&operand.value);
+        encoding.typed_value(&operand.value, cancellation)?;
     }
-    encoding.finish()
+    encoding.finish_cancellable(cancellation)
 }
 
-fn hash_construction(domain: &[u8], construction: &Construction) -> u128 {
+fn hash_construction(
+    domain: &[u8],
+    construction: &Construction,
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
     let mut hash = Xxh3::new();
     append_part(&mut hash, domain);
     hash.update(&construction.identity.to_be_bytes());
@@ -1689,23 +1834,27 @@ fn hash_construction(domain: &[u8], construction: &Construction) -> u128 {
             .to_be_bytes(),
     );
     for operand in &construction.operands {
+        checkpoint(cancellation)?;
         append_part(&mut hash, operand.label.as_bytes());
         hash.update(&[access_tag(operand.ownership)]);
-        append_typed_value(&mut hash, &operand.value);
+        append_typed_value(&mut hash, &operand.value, cancellation)?;
     }
-    hash.digest128()
+    checkpoint(cancellation)?;
+    Ok(hash.digest128())
 }
 
 fn produce_graph_fingerprint(
     root: TypedReference<ConstructionNodeAuthority>,
     nodes: &[GraphNode],
     test_applications: &[crate::evaluator::AppliedTest],
-) -> u128 {
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
     hash_graph(
         b"wrela.sealed-construction-graph\0\x01",
         root,
         nodes,
         test_applications,
+        cancellation,
     )
 }
 
@@ -1713,31 +1862,37 @@ fn verify_graph_fingerprint(
     root: TypedReference<ConstructionNodeAuthority>,
     nodes: &[GraphNode],
     test_applications: &[crate::evaluator::AppliedTest],
-) -> u128 {
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
     let mut encoding = VerificationEncoding::new();
     encoding.part(b"wrela.sealed-construction-graph\0\x01");
     encoding.u128(root.raw.identity);
     encoding.u64(nodes.len());
-    let registry = nodes
-        .iter()
-        .map(|node| (node.identity, node.local_fingerprint))
-        .collect::<BTreeMap<_, _>>();
+    let mut registry = BTreeMap::new();
     for node in nodes {
+        checkpoint(cancellation)?;
+        registry.insert(node.identity, node.local_fingerprint);
+    }
+    for node in nodes {
+        checkpoint(cancellation)?;
         encoding.u128(node.identity);
         encoding.u128(node.local_fingerprint);
         let mut edges = Vec::new();
         for operand in node.operands.iter() {
-            crate::evaluator::visit_construction_handles(&operand.value, &mut |kind, identity| {
-                edges.push((
+            let mut facts = IndependentValueFacts::default();
+            independently_traverse_value(&operand.value, cancellation, &mut facts)?;
+            edges.extend(facts.handles.into_iter().map(|(kind, identity)| {
+                (
                     Arc::clone(&operand.label),
                     operand.ownership,
                     kind,
                     identity,
-                ));
-            });
+                )
+            }));
         }
         encoding.u64(edges.len());
         for (ordinal, (label, ownership, kind, identity)) in edges.iter().enumerate() {
+            checkpoint(cancellation)?;
             encoding.part(label.as_bytes());
             encoding.u32(u32::try_from(ordinal).unwrap_or(u32::MAX));
             encoding.byte(access_tag(*ownership));
@@ -1748,15 +1903,16 @@ fn verify_graph_fingerprint(
     }
     encoding.u64(test_applications.len());
     for application in test_applications {
+        checkpoint(cancellation)?;
         encoding.u128(application.id.suite.0);
         encoding.u128(application.id.test.0);
         encoding.u128(application.id.identity);
         encoding.u64(application.payload.len());
         for value in &application.payload {
-            encoding.typed_value(value);
+            encoding.typed_value(value, cancellation)?;
         }
     }
-    encoding.finish()
+    encoding.finish_cancellable(cancellation)
 }
 
 fn hash_graph(
@@ -1764,22 +1920,25 @@ fn hash_graph(
     root: TypedReference<ConstructionNodeAuthority>,
     nodes: &[GraphNode],
     test_applications: &[crate::evaluator::AppliedTest],
-) -> u128 {
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
     let mut hash = Xxh3::new();
     append_part(&mut hash, domain);
     hash.update(&root.raw.identity.to_be_bytes());
     hash.update(&u64::try_from(nodes.len()).unwrap_or(u64::MAX).to_be_bytes());
-    let registry = nodes
-        .iter()
-        .map(|node| (node.identity, node.local_fingerprint))
-        .collect::<BTreeMap<_, _>>();
+    let mut registry = BTreeMap::new();
     for node in nodes {
+        checkpoint(cancellation)?;
+        registry.insert(node.identity, node.local_fingerprint);
+    }
+    for node in nodes {
+        checkpoint(cancellation)?;
         hash.update(&node.identity.to_be_bytes());
         hash.update(&node.local_fingerprint.to_be_bytes());
-        let edges = reconstruct_edges(root.raw.context, &node.operands, &registry)
-            .unwrap_or_else(|_| panic!("verified graph operands name local nodes"));
+        let edges = reconstruct_edges(root.raw.context, &node.operands, &registry, cancellation)?;
         hash.update(&u64::try_from(edges.len()).unwrap_or(u64::MAX).to_be_bytes());
         for edge in &edges {
+            checkpoint(cancellation)?;
             append_part(&mut hash, edge.label.as_bytes());
             hash.update(&edge.ordinal.to_be_bytes());
             hash.update(&[access_tag(edge.ownership)]);
@@ -1794,6 +1953,7 @@ fn hash_graph(
             .to_be_bytes(),
     );
     for application in test_applications {
+        checkpoint(cancellation)?;
         hash.update(&application.id.suite.0.to_be_bytes());
         hash.update(&application.id.test.0.to_be_bytes());
         hash.update(&application.id.identity.to_be_bytes());
@@ -1803,41 +1963,51 @@ fn hash_graph(
                 .to_be_bytes(),
         );
         for value in &application.payload {
-            append_typed_value(&mut hash, value);
+            append_typed_value(&mut hash, value, cancellation)?;
         }
     }
-    hash.digest128()
+    checkpoint(cancellation)?;
+    Ok(hash.digest128())
 }
 
 fn produce_demand_fingerprint(
     root: TypedReference<SpecializationAuthority>,
     executables: &[ExecutableReference],
-) -> u128 {
-    hash_demand(b"wrela.executable-demand\0\x02", root, executables)
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
+    hash_demand(
+        b"wrela.executable-demand\0\x02",
+        root,
+        executables,
+        cancellation,
+    )
 }
 
 fn verify_demand_fingerprint(
     root: TypedReference<SpecializationAuthority>,
     executables: &[ExecutableReference],
-) -> u128 {
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
     let mut encoding = VerificationEncoding::new();
     encoding.part(b"wrela.executable-demand\0\x02");
     encoding.u128(root.raw.identity);
     encoding.u64(executables.len());
     for executable in executables {
+        checkpoint(cancellation)?;
         let reference = executable.raw();
         encoding.byte(reference.kind.tag());
         encoding.u128(reference.identity);
         encoding.u128(reference.current_meaning);
     }
-    encoding.finish()
+    encoding.finish_cancellable(cancellation)
 }
 
 fn hash_demand(
     domain: &[u8],
     root: TypedReference<SpecializationAuthority>,
     executables: &[ExecutableReference],
-) -> u128 {
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
     let mut hash = Xxh3::new();
     append_part(&mut hash, domain);
     hash.update(&root.raw.identity.to_be_bytes());
@@ -1847,24 +2017,37 @@ fn hash_demand(
             .to_be_bytes(),
     );
     for executable in executables {
+        checkpoint(cancellation)?;
         let reference = executable.raw();
         hash.update(&[reference.kind.tag()]);
         hash.update(&reference.identity.to_be_bytes());
         hash.update(&reference.current_meaning.to_be_bytes());
     }
-    hash.digest128()
+    checkpoint(cancellation)?;
+    Ok(hash.digest128())
 }
 
-fn produce_completed_fingerprint(context: u128, receipts: &DirectReceipts, custody: u128) -> u128 {
+fn produce_completed_fingerprint(
+    context: u128,
+    receipts: &DirectReceipts,
+    custody: u128,
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
     hash_completed(
         b"wrela.completed-semantic-program\0\x01",
         context,
         receipts,
         custody,
+        cancellation,
     )
 }
 
-fn verify_completed_fingerprint(context: u128, receipts: &DirectReceipts, custody: u128) -> u128 {
+fn verify_completed_fingerprint(
+    context: u128,
+    receipts: &DirectReceipts,
+    custody: u128,
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
     let mut encoding = VerificationEncoding::new();
     encoding.part(b"wrela.completed-semantic-program\0\x01");
     encoding.part(PHASE_SCHEMA.as_bytes());
@@ -1876,15 +2059,22 @@ fn verify_completed_fingerprint(context: u128, receipts: &DirectReceipts, custod
         receipts.graph.raw,
         receipts.demand.raw,
     ] {
+        checkpoint(cancellation)?;
         encoding.byte(reference.kind.tag());
         encoding.u128(reference.identity);
         encoding.u128(reference.current_meaning);
     }
     encoding.u128(custody);
-    encoding.finish()
+    encoding.finish_cancellable(cancellation)
 }
 
-fn hash_completed(domain: &[u8], context: u128, receipts: &DirectReceipts, custody: u128) -> u128 {
+fn hash_completed(
+    domain: &[u8],
+    context: u128,
+    receipts: &DirectReceipts,
+    custody: u128,
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
     let mut hash = Xxh3::new();
     append_part(&mut hash, domain);
     append_part(&mut hash, PHASE_SCHEMA.as_bytes());
@@ -1896,12 +2086,14 @@ fn hash_completed(domain: &[u8], context: u128, receipts: &DirectReceipts, custo
         receipts.graph.raw,
         receipts.demand.raw,
     ] {
+        checkpoint(cancellation)?;
         hash.update(&[reference.kind.tag()]);
         hash.update(&reference.identity.to_be_bytes());
         hash.update(&reference.current_meaning.to_be_bytes());
     }
     hash.update(&custody.to_be_bytes());
-    hash.digest128()
+    checkpoint(cancellation)?;
+    Ok(hash.digest128())
 }
 
 fn append_part(hash: &mut Xxh3, bytes: &[u8]) {
@@ -1909,7 +2101,12 @@ fn append_part(hash: &mut Xxh3, bytes: &[u8]) {
     hash.update(bytes);
 }
 
-fn append_typed_value(hash: &mut Xxh3, value: &Value) {
+fn append_typed_value(
+    hash: &mut Xxh3,
+    value: &Value,
+    cancellation: &Cancellation,
+) -> Result<(), CompletionFailure> {
+    checkpoint(cancellation)?;
     match value {
         Value::Unavailable => hash.update(&[0]),
         Value::Unit => hash.update(&[1]),
@@ -1950,20 +2147,20 @@ fn append_typed_value(hash: &mut Xxh3, value: &Value) {
             );
             for (local, value) in captures.iter() {
                 hash.update(&local.0.to_be_bytes());
-                append_typed_value(hash, value);
+                append_typed_value(hash, value, cancellation)?;
             }
         }
         Value::Tuple(values) => {
             hash.update(&[10]);
-            append_typed_values(hash, values);
+            append_typed_values(hash, values, cancellation)?;
         }
         Value::Array(values) => {
             hash.update(&[11]);
-            append_typed_values(hash, values);
+            append_typed_values(hash, values, cancellation)?;
         }
         Value::BuiltinVariant { variant, payload } => {
             hash.update(&[12, variant.canonical_tag()]);
-            append_typed_values(hash, payload);
+            append_typed_values(hash, payload, cancellation)?;
         }
         Value::UserVariant {
             id,
@@ -1979,7 +2176,7 @@ fn append_typed_value(hash: &mut Xxh3, value: &Value) {
             hash.update(&variant_order.to_be_bytes());
             append_part(hash, type_display.as_bytes());
             append_part(hash, variant_display.as_bytes());
-            append_typed_values(hash, payload);
+            append_typed_values(hash, payload, cancellation)?;
         }
         Value::Struct {
             definition,
@@ -1996,7 +2193,7 @@ fn append_typed_value(hash: &mut Xxh3, value: &Value) {
             );
             for (name, value) in fields.iter() {
                 append_part(hash, name.as_bytes());
-                append_typed_value(hash, value);
+                append_typed_value(hash, value, cancellation)?;
             }
         }
         Value::TestApplication { id, payload } => {
@@ -2004,7 +2201,7 @@ fn append_typed_value(hash: &mut Xxh3, value: &Value) {
             hash.update(&id.suite.0.to_be_bytes());
             hash.update(&id.test.0.to_be_bytes());
             hash.update(&id.identity.to_be_bytes());
-            append_typed_values(hash, payload);
+            append_typed_values(hash, payload, cancellation)?;
         }
         Value::SymbolicHandle { kind, identity } => {
             hash.update(&[16]);
@@ -2012,17 +2209,23 @@ fn append_typed_value(hash: &mut Xxh3, value: &Value) {
             hash.update(&identity.to_be_bytes());
         }
     }
+    Ok(())
 }
 
-fn append_typed_values(hash: &mut Xxh3, values: &[Value]) {
+fn append_typed_values(
+    hash: &mut Xxh3,
+    values: &[Value],
+    cancellation: &Cancellation,
+) -> Result<(), CompletionFailure> {
     hash.update(
         &u64::try_from(values.len())
             .unwrap_or(u64::MAX)
             .to_be_bytes(),
     );
     for value in values {
-        append_typed_value(hash, value);
+        append_typed_value(hash, value, cancellation)?;
     }
+    Ok(())
 }
 
 fn append_build_kind(hash: &mut Xxh3, kind: BuildKind) {
@@ -2060,6 +2263,15 @@ impl VerificationEncoding {
 
     fn finish(self) -> u128 {
         xxhash_rust::xxh3::xxh3_128(&self.bytes)
+    }
+
+    fn finish_cancellable(self, cancellation: &Cancellation) -> Result<u128, CompletionFailure> {
+        let mut hash = Xxh3::new();
+        for chunk in self.bytes.chunks(4_096) {
+            checkpoint(cancellation)?;
+            hash.update(chunk);
+        }
+        Ok(hash.digest128())
     }
 
     fn byte(&mut self, value: u8) {
@@ -2100,14 +2312,24 @@ impl VerificationEncoding {
         }
     }
 
-    fn values(&mut self, values: &[Value]) {
+    fn values(
+        &mut self,
+        values: &[Value],
+        cancellation: &Cancellation,
+    ) -> Result<(), CompletionFailure> {
         self.u64(values.len());
         for value in values {
-            self.typed_value(value);
+            self.typed_value(value, cancellation)?;
         }
+        Ok(())
     }
 
-    fn typed_value(&mut self, value: &Value) {
+    fn typed_value(
+        &mut self,
+        value: &Value,
+        cancellation: &Cancellation,
+    ) -> Result<(), CompletionFailure> {
+        checkpoint(cancellation)?;
         match value {
             Value::Unavailable => self.byte(0),
             Value::Unit => self.byte(1),
@@ -2147,21 +2369,21 @@ impl VerificationEncoding {
                 self.u64(captures.len());
                 for (local, value) in captures.iter() {
                     self.u32(local.0);
-                    self.typed_value(value);
+                    self.typed_value(value, cancellation)?;
                 }
             }
             Value::Tuple(values) => {
                 self.byte(10);
-                self.values(values);
+                self.values(values, cancellation)?;
             }
             Value::Array(values) => {
                 self.byte(11);
-                self.values(values);
+                self.values(values, cancellation)?;
             }
             Value::BuiltinVariant { variant, payload } => {
                 self.byte(12);
                 self.byte(variant.canonical_tag());
-                self.values(payload);
+                self.values(payload, cancellation)?;
             }
             Value::UserVariant {
                 id,
@@ -2177,7 +2399,7 @@ impl VerificationEncoding {
                 self.u32(*variant_order);
                 self.part(type_display.as_bytes());
                 self.part(variant_display.as_bytes());
-                self.values(payload);
+                self.values(payload, cancellation)?;
             }
             Value::Struct {
                 definition,
@@ -2190,7 +2412,7 @@ impl VerificationEncoding {
                 self.u64(fields.len());
                 for (name, value) in fields.iter() {
                     self.part(name.as_bytes());
-                    self.typed_value(value);
+                    self.typed_value(value, cancellation)?;
                 }
             }
             Value::TestApplication { id, payload } => {
@@ -2198,7 +2420,7 @@ impl VerificationEncoding {
                 self.u128(id.suite.0);
                 self.u128(id.test.0);
                 self.u128(id.identity);
-                self.values(payload);
+                self.values(payload, cancellation)?;
             }
             Value::SymbolicHandle { kind, identity } => {
                 self.byte(16);
@@ -2206,9 +2428,15 @@ impl VerificationEncoding {
                 self.u128(*identity);
             }
         }
+        Ok(())
     }
 
-    fn function_facts(&mut self, facts: &FunctionFacts) {
+    fn function_facts(
+        &mut self,
+        facts: &FunctionFacts,
+        cancellation: &Cancellation,
+    ) -> Result<(), CompletionFailure> {
+        checkpoint(cancellation)?;
         for value in [
             facts.pure,
             facts.may_panic,
@@ -2222,18 +2450,22 @@ impl VerificationEncoding {
         self.u64(facts.logical_cost);
         self.u64(facts.constructs.len());
         for kind in &facts.constructs {
+            checkpoint(cancellation)?;
             self.build_kind(*kind);
         }
         self.u64(facts.calls.len());
         for (identity, multiplicity) in &facts.calls {
+            checkpoint(cancellation)?;
             self.u128(identity.0);
             self.u64(*multiplicity);
         }
         self.u64(facts.specialization_calls.len());
         for (identity, multiplicity) in &facts.specialization_calls {
+            checkpoint(cancellation)?;
             self.u128(identity.0);
             self.u64(*multiplicity);
         }
+        Ok(())
     }
 }
 
@@ -2298,6 +2530,33 @@ fn build() -> Image:
         )
     }
 
+    fn completed_inferred_error_fixture() -> CompletedSemanticProgram {
+        completed_fixture_from_source(
+            br#"enum ReadError:
+    Missing
+
+fn inferred() -> Result[i64]:
+    return Result.Err(ReadError.Missing)
+
+@image
+fn build() -> Image:
+    return Image.new()
+"#,
+        )
+    }
+
+    fn completed_retained_function_fixture() -> CompletedSemanticProgram {
+        completed_fixture_from_source(
+            br#"pure fn callback(value: i64) -> i64:
+    return value + 1
+
+@image
+fn build() -> Image:
+    return Image.new(callback=callback)
+"#,
+        )
+    }
+
     fn completed_fixture_from_source(source: &'static [u8]) -> CompletedSemanticProgram {
         completed_fixture_from_source_with_root(source, Root::Image)
     }
@@ -2344,8 +2603,21 @@ fn build() -> Image:
         }
     }
 
+    fn produced<T>(result: Result<T, CompletionFailure>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(CompletionFailure::Cancelled) => panic!("test production unexpectedly cancelled"),
+            Err(CompletionFailure::Defect(evidence)) => {
+                panic!("test production defect: {evidence}")
+            }
+        }
+    }
+
     fn resign_facts(candidate: &mut CompletedSemanticProgram) {
-        let fingerprint = produce_facts_fingerprint(&candidate.facts);
+        let fingerprint = produced(produce_facts_fingerprint(
+            &candidate.facts,
+            &Cancellation::new(),
+        ));
         candidate.receipts.facts = TypedReference::new(
             candidate.context.identity,
             ArtifactKind::SolvedFacts,
@@ -2356,7 +2628,10 @@ fn build() -> Image:
     }
 
     fn resign_evaluations(candidate: &mut CompletedSemanticProgram) {
-        let fingerprint = produce_evaluations_fingerprint(&candidate.evaluations);
+        let fingerprint = produced(produce_evaluations_fingerprint(
+            &candidate.evaluations,
+            &Cancellation::new(),
+        ));
         candidate.receipts.evaluations = TypedReference::new(
             candidate.context.identity,
             ArtifactKind::EvaluationTable,
@@ -2367,8 +2642,11 @@ fn build() -> Image:
     }
 
     fn resign_demand(candidate: &mut CompletedSemanticProgram) {
-        candidate.demand.fingerprint =
-            produce_demand_fingerprint(candidate.demand.root, &candidate.demand.executables);
+        candidate.demand.fingerprint = produced(produce_demand_fingerprint(
+            candidate.demand.root,
+            &candidate.demand.executables,
+            &Cancellation::new(),
+        ));
         candidate.receipts.demand = TypedReference::new(
             candidate.context.identity,
             ArtifactKind::ExecutableDemand,
@@ -2379,11 +2657,12 @@ fn build() -> Image:
     }
 
     fn resign_graph(candidate: &mut CompletedSemanticProgram) {
-        candidate.graph.fingerprint = produce_graph_fingerprint(
+        candidate.graph.fingerprint = produced(produce_graph_fingerprint(
             candidate.graph.root,
             &candidate.graph.nodes,
             &candidate.graph.test_applications,
-        );
+            &Cancellation::new(),
+        ));
         candidate.receipts.graph = TypedReference::new(
             candidate.context.identity,
             ArtifactKind::ConstructionGraph,
@@ -2394,11 +2673,12 @@ fn build() -> Image:
     }
 
     fn resign_completed(candidate: &mut CompletedSemanticProgram) {
-        candidate.fingerprint = produce_completed_fingerprint(
+        candidate.fingerprint = produced(produce_completed_fingerprint(
             candidate.context.identity,
             &candidate.receipts,
             candidate.custody_fingerprint,
-        );
+            &Cancellation::new(),
+        ));
     }
 
     #[test]
@@ -2485,6 +2765,64 @@ fn build() -> Image:
                 evidence(verify(&candidate, &Cancellation::new()))
                     .contains("solved facts disagree with verified Typed Program"),
                 "pre-receipt fact corruption {corruption} must be independently rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn false_inferred_error_records_and_provenance_cannot_be_blessed() {
+        for corruption in 0..6 {
+            let mut candidate = completed_inferred_error_fixture();
+            let original = candidate
+                .facts
+                .inferred_errors
+                .first()
+                .expect("fixture inferred error")
+                .clone();
+            let errors = &mut Arc::make_mut(&mut candidate.facts).inferred_errors;
+            match corruption {
+                0 => errors.clear(),
+                1 => errors.push(original),
+                2 => {
+                    errors[0] = crate::InferredErrorObservation::new(
+                        original.specialization_identity(),
+                        "other",
+                        original.error_type(),
+                        original.provenance().clone(),
+                    );
+                }
+                3 => {
+                    errors[0] = crate::InferredErrorObservation::new(
+                        original.specialization_identity() ^ 1,
+                        original.function(),
+                        original.error_type(),
+                        original.provenance().clone(),
+                    );
+                }
+                4 => {
+                    errors[0] = crate::InferredErrorObservation::new(
+                        original.specialization_identity(),
+                        original.function(),
+                        "OtherError",
+                        original.provenance().clone(),
+                    );
+                }
+                5 => {
+                    errors[0] = crate::InferredErrorObservation::new(
+                        original.specialization_identity(),
+                        original.function(),
+                        original.error_type(),
+                        crate::SourceRange::new("src/other.wr", 1, 2),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            resign_facts(&mut candidate);
+
+            assert!(
+                evidence(verify(&candidate, &Cancellation::new()))
+                    .contains("solved facts disagree with verified Typed Program"),
+                "inferred-error corruption {corruption} must be independently rejected"
             );
         }
     }
@@ -2707,6 +3045,183 @@ fn build() -> Image:
     }
 
     #[test]
+    fn graph_retained_executable_references_reject_missing_wrong_kind_cross_context_and_stale() {
+        for corruption in 0..4 {
+            let mut candidate = completed_retained_function_fixture();
+            let root = candidate.demand.root.raw.identity;
+            let retained_index = candidate
+                .demand
+                .executables
+                .iter()
+                .position(|reference| {
+                    matches!(reference, ExecutableReference::Specialization(reference) if reference.raw.identity != root)
+                })
+                .expect("fixture retained callback executable");
+            match corruption {
+                0 => {
+                    let mut executables = candidate.demand.executables.to_vec();
+                    executables.remove(retained_index);
+                    candidate.demand.executables = executables.into();
+                }
+                1 => match &mut Arc::make_mut(&mut candidate.demand.executables)[retained_index] {
+                    ExecutableReference::Specialization(reference) => {
+                        reference.raw.kind = ArtifactKind::TestBody;
+                    }
+                    _ => unreachable!(),
+                },
+                2 => match &mut Arc::make_mut(&mut candidate.demand.executables)[retained_index] {
+                    ExecutableReference::Specialization(reference) => reference.raw.context ^= 1,
+                    _ => unreachable!(),
+                },
+                3 => match &mut Arc::make_mut(&mut candidate.demand.executables)[retained_index] {
+                    ExecutableReference::Specialization(reference) => {
+                        reference.raw.current_meaning ^= 1;
+                    }
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            }
+            resign_demand(&mut candidate);
+
+            let rejection = evidence(verify(&candidate, &Cancellation::new()));
+            assert!(
+                rejection.contains("exact reachable executable")
+                    || rejection.contains("wrong kind")
+                    || rejection.contains("crosses compilation contexts")
+                    || rejection.contains("stale"),
+                "graph-retained executable corruption {corruption} rejected as {rejection}"
+            );
+        }
+    }
+
+    #[test]
+    fn producer_and_independent_value_traversals_cover_every_value_variant() {
+        use crate::model::{BuiltinVariant, DefinitionId, TestId, VariantId};
+        use crate::typed_hir::{ClosureId, LocalId};
+
+        let test = TestId {
+            suite: DefinitionId(71),
+            test: DefinitionId(72),
+            identity: 73,
+        };
+        let handle = |kind, identity| Value::SymbolicHandle { kind, identity };
+        let value = Value::Tuple(Arc::from([
+            Value::Array(Arc::from([handle(BuildKind::Image, 11)])),
+            Value::BuiltinVariant {
+                variant: BuiltinVariant::OptionSome,
+                payload: Arc::from([handle(BuildKind::Test, 12)]),
+            },
+            Value::UserVariant {
+                id: VariantId {
+                    owner: DefinitionId(81),
+                    definition: DefinitionId(82),
+                    variant: 83,
+                },
+                variant_order: 1,
+                type_display: Arc::from("Choice"),
+                variant_display: Arc::from("Some"),
+                payload: Arc::from([handle(BuildKind::Image, 13)]),
+            },
+            Value::Struct {
+                definition: DefinitionId(91),
+                type_display: Arc::from("Container"),
+                fields: Arc::from([(Arc::from("value"), handle(BuildKind::Test, 14))]),
+            },
+            Value::TestApplication {
+                id: test,
+                payload: Arc::from([
+                    handle(BuildKind::Image, 15),
+                    Value::Function(SpecializationId(101)),
+                ]),
+            },
+            Value::Closure {
+                id: ClosureId(201),
+                captures: Arc::from([(
+                    LocalId(1),
+                    Value::Tuple(Arc::from([handle(BuildKind::Test, 16)])),
+                )]),
+            },
+            Value::Function(SpecializationId(102)),
+            Value::Unavailable,
+            Value::Unit,
+            Value::Bool(true),
+            Value::Integer {
+                kind: crate::model::IntegerType::I64,
+                value: 1,
+            },
+            Value::Float {
+                kind: crate::model::FloatType::F64,
+                bits: 1,
+            },
+            Value::Text(Arc::from("text")),
+            Value::Scalar('x'),
+            Value::Bytes(Arc::from([1_u8])),
+        ]));
+        let expected_handles = vec![
+            (BuildKind::Image, 11),
+            (BuildKind::Test, 12),
+            (BuildKind::Image, 13),
+            (BuildKind::Test, 14),
+            (BuildKind::Image, 15),
+            (BuildKind::Test, 16),
+        ];
+
+        let mut independent = IndependentValueFacts::default();
+        produced(independently_traverse_value(
+            &value,
+            &Cancellation::new(),
+            &mut independent,
+        ));
+        assert_eq!(independent.handles, expected_handles);
+        assert_eq!(
+            independent.functions,
+            BTreeSet::from([SpecializationId(101), SpecializationId(102)])
+        );
+        assert_eq!(independent.closures, BTreeSet::from([ClosureId(201)]));
+        assert_eq!(independent.tests.len(), 1);
+        assert_eq!(independent.tests[0].id, test);
+
+        let mut producer_handles = Vec::new();
+        assert!(crate::evaluator::visit_construction_handles_cancellable(
+            &value,
+            &Cancellation::new(),
+            &mut |kind, identity| producer_handles.push((kind, identity)),
+        ));
+        assert_eq!(producer_handles, expected_handles);
+        let mut producer_executables = Vec::new();
+        assert!(crate::evaluator::visit_retained_executables(
+            &value,
+            &Cancellation::new(),
+            &mut |executable| {
+                producer_executables.push(executable);
+            },
+        ));
+        assert_eq!(producer_executables.len(), 3);
+        assert_eq!(
+            producer_executables
+                .iter()
+                .filter(|executable| matches!(
+                    executable,
+                    crate::evaluator::RetainedExecutable::Function(_)
+                ))
+                .count(),
+            2
+        );
+        assert!(producer_executables.iter().any(|executable| matches!(
+            executable,
+            crate::evaluator::RetainedExecutable::Closure(ClosureId(201))
+        )));
+        let mut producer_tests = Vec::new();
+        assert!(crate::evaluator::visit_test_applications_cancellable(
+            &value,
+            &Cancellation::new(),
+            &mut |id, payload| producer_tests.push((id, payload.to_vec())),
+        ));
+        assert_eq!(producer_tests.len(), 1);
+        assert_eq!(producer_tests[0].0, test);
+    }
+
+    #[test]
     fn current_fixture_has_no_generated_executable_roles() {
         let candidate = completed_fixture();
         assert!(
@@ -2885,6 +3400,99 @@ fn build() -> Image:
     }
 
     #[test]
+    fn cancellation_interrupts_each_artifact_sized_completion_traversal() {
+        let candidate = completed_fixture_with_dependencies();
+
+        for encode in [
+            produce_facts_fingerprint
+                as fn(&SolvedSemanticFacts, &Cancellation) -> Result<u128, CompletionFailure>,
+            verify_facts_fingerprint,
+        ] {
+            let cancellation = Cancellation::new();
+            cancellation.cancel_after_private_polls(3);
+            assert!(matches!(
+                encode(candidate.facts.as_ref(), &cancellation),
+                Err(CompletionFailure::Cancelled)
+            ));
+        }
+
+        for encode in [
+            produce_evaluations_fingerprint
+                as fn(&[CompletedEvaluation], &Cancellation) -> Result<u128, CompletionFailure>,
+            verify_evaluations_fingerprint,
+        ] {
+            let cancellation = Cancellation::new();
+            cancellation.cancel_after_private_polls(3);
+            assert!(matches!(
+                encode(candidate.evaluations.as_ref(), &cancellation),
+                Err(CompletionFailure::Cancelled)
+            ));
+        }
+
+        let mut deep_graph = completed_fixture();
+        let operand = &mut Arc::make_mut(&mut deep_graph.graph.nodes)
+            .first_mut()
+            .expect("fixture node")
+            .operands;
+        let mut value = operand.first().expect("fixture operand").value.clone();
+        for _ in 0..64 {
+            value = Value::Array(Arc::from([value]));
+        }
+        Arc::make_mut(operand)
+            .first_mut()
+            .expect("fixture operand")
+            .value = value;
+        for verify_encoding in [false, true] {
+            let cancellation = Cancellation::new();
+            cancellation.cancel_after_private_polls(12);
+            let result = if verify_encoding {
+                verify_graph_fingerprint(
+                    deep_graph.graph.root,
+                    &deep_graph.graph.nodes,
+                    &deep_graph.graph.test_applications,
+                    &cancellation,
+                )
+            } else {
+                produce_graph_fingerprint(
+                    deep_graph.graph.root,
+                    &deep_graph.graph.nodes,
+                    &deep_graph.graph.test_applications,
+                    &cancellation,
+                )
+            };
+            assert!(matches!(result, Err(CompletionFailure::Cancelled)));
+        }
+
+        let roots = candidate
+            .demand
+            .executables
+            .iter()
+            .filter_map(|reference| match reference {
+                ExecutableReference::Specialization(reference) => {
+                    Some(SpecializationId(reference.raw.identity))
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for reachability in [
+            reachable_specializations
+                as fn(
+                    &BTreeSet<SpecializationId>,
+                    &SolvedSemanticFacts,
+                    &Cancellation,
+                ) -> Result<BTreeSet<SpecializationId>, CompletionFailure>,
+            verify_reachable_specializations,
+        ] {
+            let cancellation = Cancellation::new();
+            cancellation.cancel_after_private_polls(2);
+            assert!(matches!(
+                reachability(&roots, candidate.facts.as_ref(), &cancellation),
+                Err(CompletionFailure::Cancelled)
+            ));
+        }
+    }
+
+    #[test]
     fn canonical_parts_and_graph_edge_counts_are_boundary_safe() {
         let encode = |parts: &[&[u8]]| {
             let mut hash = Xxh3::new();
@@ -2901,16 +3509,18 @@ fn build() -> Image:
 
         let candidate = completed_fixture();
         assert_eq!(
-            produce_graph_fingerprint(
+            produced(produce_graph_fingerprint(
                 candidate.graph.root,
                 &candidate.graph.nodes,
                 &candidate.graph.test_applications,
-            ),
-            verify_graph_fingerprint(
+                &Cancellation::new(),
+            )),
+            produced(verify_graph_fingerprint(
                 candidate.graph.root,
                 &candidate.graph.nodes,
                 &candidate.graph.test_applications,
-            ),
+                &Cancellation::new(),
+            )),
             "producer and independent verifier agree on per-node edge framing"
         );
     }

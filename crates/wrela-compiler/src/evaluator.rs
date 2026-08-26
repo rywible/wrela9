@@ -404,6 +404,12 @@ pub(crate) struct AppliedTest {
     pub(crate) payload: Vec<Value>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetainedExecutable {
+    Function(SpecializationId),
+    Closure(crate::typed_hir::ClosureId),
+}
+
 impl<'a> Engine<'a> {
     pub(crate) fn new(program: &'a VerifiedProgram, cancellation: &'a Cancellation) -> Self {
         Self {
@@ -2722,6 +2728,115 @@ pub(crate) fn visit_construction_handles(value: &Value, visitor: &mut impl FnMut
     }
 }
 
+pub(crate) fn visit_construction_handles_cancellable(
+    value: &Value,
+    cancellation: &Cancellation,
+    visitor: &mut impl FnMut(BuildKind, u128),
+) -> bool {
+    if cancellation.is_cancelled() {
+        return false;
+    }
+    match value {
+        Value::SymbolicHandle { kind, identity } => visitor(*kind, *identity),
+        Value::Array(values)
+        | Value::Tuple(values)
+        | Value::BuiltinVariant {
+            payload: values, ..
+        }
+        | Value::UserVariant {
+            payload: values, ..
+        }
+        | Value::TestApplication {
+            payload: values, ..
+        } => {
+            for value in values.iter() {
+                if !visit_construction_handles_cancellable(value, cancellation, visitor) {
+                    return false;
+                }
+            }
+        }
+        Value::Struct { fields, .. } => {
+            for (_, value) in fields.iter() {
+                if !visit_construction_handles_cancellable(value, cancellation, visitor) {
+                    return false;
+                }
+            }
+        }
+        Value::Closure { captures, .. } => {
+            for (_, value) in captures.iter() {
+                if !visit_construction_handles_cancellable(value, cancellation, visitor) {
+                    return false;
+                }
+            }
+        }
+        Value::Unavailable
+        | Value::Unit
+        | Value::Bool(_)
+        | Value::Integer { .. }
+        | Value::Float { .. }
+        | Value::Function(_)
+        | Value::Text(_)
+        | Value::Scalar(_)
+        | Value::Bytes(_) => {}
+    }
+    true
+}
+
+pub(crate) fn visit_retained_executables(
+    value: &Value,
+    cancellation: &Cancellation,
+    visitor: &mut impl FnMut(RetainedExecutable),
+) -> bool {
+    if cancellation.is_cancelled() {
+        return false;
+    }
+    match value {
+        Value::Function(identity) => visitor(RetainedExecutable::Function(*identity)),
+        Value::Closure { id, captures } => {
+            visitor(RetainedExecutable::Closure(*id));
+            for (_, value) in captures.iter() {
+                if !visit_retained_executables(value, cancellation, visitor) {
+                    return false;
+                }
+            }
+        }
+        Value::Array(values)
+        | Value::Tuple(values)
+        | Value::BuiltinVariant {
+            payload: values, ..
+        }
+        | Value::UserVariant {
+            payload: values, ..
+        }
+        | Value::TestApplication {
+            payload: values, ..
+        } => {
+            for value in values.iter() {
+                if !visit_retained_executables(value, cancellation, visitor) {
+                    return false;
+                }
+            }
+        }
+        Value::Struct { fields, .. } => {
+            for (_, value) in fields.iter() {
+                if !visit_retained_executables(value, cancellation, visitor) {
+                    return false;
+                }
+            }
+        }
+        Value::Unavailable
+        | Value::Unit
+        | Value::Bool(_)
+        | Value::Integer { .. }
+        | Value::Float { .. }
+        | Value::Text(_)
+        | Value::Scalar(_)
+        | Value::Bytes(_)
+        | Value::SymbolicHandle { .. } => {}
+    }
+    true
+}
+
 fn construction_handle_count(value: &Value) -> usize {
     let mut count = 0_usize;
     visit_construction_handles(value, &mut |_, _| count = count.saturating_add(1));
@@ -2778,6 +2893,65 @@ pub(crate) fn visit_test_applications(value: &Value, visitor: &mut impl FnMut(Te
             }
         }
     }
+}
+
+pub(crate) fn visit_test_applications_cancellable(
+    value: &Value,
+    cancellation: &Cancellation,
+    visitor: &mut impl FnMut(TestId, &[Value]),
+) -> bool {
+    if cancellation.is_cancelled() {
+        return false;
+    }
+    match value {
+        Value::TestApplication { id, payload } => {
+            visitor(*id, payload);
+            for nested in payload.iter() {
+                if !visit_test_applications_cancellable(nested, cancellation, visitor) {
+                    return false;
+                }
+            }
+        }
+        Value::Array(values)
+        | Value::Tuple(values)
+        | Value::BuiltinVariant {
+            payload: values, ..
+        }
+        | Value::UserVariant {
+            payload: values, ..
+        } => {
+            for nested in values.iter() {
+                if !visit_test_applications_cancellable(nested, cancellation, visitor) {
+                    return false;
+                }
+            }
+        }
+        Value::Struct { fields, .. } => {
+            for (_, nested) in fields.iter() {
+                if !visit_test_applications_cancellable(nested, cancellation, visitor) {
+                    return false;
+                }
+            }
+        }
+        Value::Closure { captures, .. } => {
+            for (_, nested) in captures.iter() {
+                if !visit_test_applications_cancellable(nested, cancellation, visitor) {
+                    return false;
+                }
+            }
+        }
+        Value::Unavailable
+        | Value::Unit
+        | Value::Bool(_)
+        | Value::Integer { .. }
+        | Value::Float { .. }
+        | Value::Function(_)
+        | Value::Text(_)
+        | Value::Scalar(_)
+        | Value::Bytes(_)
+        | Value::SymbolicHandle { .. } => {}
+    }
+    true
 }
 
 fn apply_binary(

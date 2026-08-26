@@ -126,6 +126,77 @@ fn build() -> Image:
 }
 
 #[test]
+fn completed_semantic_demand_includes_callable_values_retained_by_the_image_graph() {
+    let source = br#"pure fn callback(value: i64) -> i64:
+    return value + 1
+
+@image
+fn build() -> Image:
+    return Image.new(callback=callback)
+"#;
+    let outcome = compile(vec![ProjectFile::new("src/image.wr", source)], Root::Image);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("Image retaining a function value must compile: {outcome:#?}");
+    };
+    assert_eq!(
+        accepted
+            .inspection()
+            .completed_semantic_program()
+            .expect("semantic completion observation")
+            .executable_count(),
+        2,
+        "the Image Constructor and retained callback are both executable demand"
+    );
+}
+
+#[test]
+fn completed_semantic_demand_finds_callable_values_inside_nested_graph_data() {
+    let source = br#"pure fn callback(value: i64) -> i64:
+    return value + 1
+
+@image
+fn build() -> Image:
+    return Image.new(callbacks=[(callback, [callback])])
+"#;
+    let outcome = compile(vec![ProjectFile::new("src/image.wr", source)], Root::Image);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("nested callable graph data must compile: {outcome:#?}");
+    };
+    assert_eq!(
+        accepted
+            .inspection()
+            .completed_semantic_program()
+            .expect("semantic completion observation")
+            .executable_count(),
+        2,
+        "repeated nested callback values create one executable demand"
+    );
+}
+
+#[test]
+fn completed_semantic_demand_includes_closures_retained_by_the_image_graph() {
+    let source = br#"@image
+fn build() -> Image:
+    offset = 2
+    callback = |value: i64| value + offset
+    return Image.new(callback=callback)
+"#;
+    let outcome = compile(vec![ProjectFile::new("src/image.wr", source)], Root::Image);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("Image retaining a closure must compile: {outcome:#?}");
+    };
+    assert_eq!(
+        accepted
+            .inspection()
+            .completed_semantic_program()
+            .expect("semantic completion observation")
+            .executable_count(),
+        2,
+        "the Image Constructor and retained closure are both executable demand"
+    );
+}
+
+#[test]
 fn nested_comptime_statements_select_test_bodies_before_test_semantics() {
     let source = br#"const ENABLED: bool = false
 

@@ -43,11 +43,13 @@ pub(crate) struct SolvedSemanticFacts {
 }
 
 pub(crate) fn solve(program: &VerifiedProgram, cancellation: &Cancellation) -> SolvedSemanticFacts {
-    let local_definitions = program
-        .functions()
-        .iter()
-        .map(|(id, function)| (*id, local_facts(function)))
-        .collect::<BTreeMap<_, _>>();
+    let mut local_definitions = BTreeMap::new();
+    for (identity, function) in program.functions() {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        local_definitions.insert(*identity, local_facts(function));
+    }
     let mut definitions = solve_function_facts(local_definitions.clone(), cancellation);
     let mut specializations = solve_specialization_facts(program, &local_definitions, cancellation);
     let recursion = analyze_recursion(program);
@@ -68,7 +70,33 @@ pub(crate) fn solve(program: &VerifiedProgram, cancellation: &Cancellation) -> S
                 .saturating_mul(*maximum_calls);
         }
     }
-    let (inferred_errors, diagnostics) = error_provenance::analyze(program, cancellation);
+    let (_, diagnostics) = error_provenance::analyze(program, cancellation);
+    let mut inferred_errors = Vec::new();
+    for (specialization, record) in program.specializations() {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        if !program
+            .inferred_error_definitions()
+            .contains(&record.definition)
+        {
+            continue;
+        }
+        let function = &program.specialized_functions()[specialization];
+        let Type::Result {
+            error: Some(error), ..
+        } = &function.return_type
+        else {
+            continue;
+        };
+        inferred_errors.push(InferredErrorObservation::new(
+            specialization.0,
+            function.name.clone(),
+            error.display(),
+            function.source.clone(),
+        ));
+    }
+    inferred_errors.sort_by_key(InferredErrorObservation::specialization_identity);
     SolvedSemanticFacts {
         definitions,
         specializations,
@@ -133,29 +161,37 @@ pub(crate) fn independently_verify(
     {
         return false;
     }
-    let local_definitions = program
-        .functions()
-        .iter()
-        .map(|(id, function)| (*id, verifier_local_facts(function)))
-        .collect::<BTreeMap<_, _>>();
+    let Some(inferred_errors) = verifier_inferred_errors(program, cancellation) else {
+        return false;
+    };
+    if inferred_errors != claimed.inferred_errors {
+        return false;
+    }
+    let mut local_definitions = BTreeMap::new();
+    for (identity, function) in program.functions() {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        local_definitions.insert(*identity, verifier_local_facts(function));
+    }
     let mut definitions = verifier_propagate(
         local_definitions.clone(),
         |facts| &facts.calls,
         cancellation,
     );
-    let specialization_base = program
-        .specialized_functions()
-        .iter()
-        .map(|(id, function)| {
-            let specialization = &program.specializations()[id];
-            let facts = if specialization.type_arguments.is_empty() {
-                local_definitions[&specialization.definition].clone()
-            } else {
-                verifier_local_facts(function)
-            };
-            (*id, facts)
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut specialization_base = BTreeMap::new();
+    for (identity, function) in program.specialized_functions() {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        let specialization = &program.specializations()[identity];
+        let facts = if specialization.type_arguments.is_empty() {
+            local_definitions[&specialization.definition].clone()
+        } else {
+            verifier_local_facts(function)
+        };
+        specialization_base.insert(*identity, facts);
+    }
     let mut specializations = verifier_propagate(
         specialization_base,
         |facts| &facts.specialization_calls,
@@ -182,6 +218,39 @@ pub(crate) fn independently_verify(
         }
     }
     definitions == claimed.definitions && specializations == claimed.specializations
+}
+
+fn verifier_inferred_errors(
+    program: &VerifiedProgram,
+    cancellation: &Cancellation,
+) -> Option<Vec<InferredErrorObservation>> {
+    let mut inferred = Vec::new();
+    for (specialization, record) in program.specializations() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        if !program
+            .inferred_error_definitions()
+            .contains(&record.definition)
+        {
+            continue;
+        }
+        let function = program.specialized_functions().get(specialization)?;
+        let Type::Result {
+            error: Some(error), ..
+        } = &function.return_type
+        else {
+            return None;
+        };
+        inferred.push(InferredErrorObservation::new(
+            specialization.0,
+            function.name.clone(),
+            error.display(),
+            function.source.clone(),
+        ));
+    }
+    inferred.sort_by_key(InferredErrorObservation::specialization_identity);
+    Some(inferred)
 }
 
 fn verifier_recursion(
@@ -394,7 +463,9 @@ where
         return BTreeMap::new();
     };
     let recursive = crate::graph::recursive_nodes(&graph);
-    let costs = verifier_costs(&base, &recursive, edges);
+    let Some(costs) = verifier_costs(&base, &recursive, edges, cancellation) else {
+        return BTreeMap::new();
+    };
     for (identity, cost) in costs {
         let fact = facts.get_mut(&identity).expect("verifier fact exists");
         fact.logical_cost = cost;
@@ -418,7 +489,8 @@ fn verifier_costs<N>(
     base: &BTreeMap<N, FunctionFacts>,
     recursive: &BTreeSet<N>,
     edges: impl Fn(&FunctionFacts) -> &BTreeMap<N, u64>,
-) -> BTreeMap<N, u64>
+    cancellation: &Cancellation,
+) -> Option<BTreeMap<N, u64>>
 where
     N: Copy + Ord,
 {
@@ -437,8 +509,14 @@ where
         .collect::<BTreeMap<_, _>>();
     let mut pending = base.keys().copied().collect::<BTreeSet<_>>();
     while !pending.is_empty() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
         let mut progressed = false;
         for identity in pending.clone() {
+            if cancellation.is_cancelled() {
+                return None;
+            }
             if recursive.contains(&identity) {
                 pending.remove(&identity);
                 progressed = true;
@@ -462,7 +540,7 @@ where
             break;
         }
     }
-    costs
+    Some(costs)
 }
 
 fn verifier_local_facts(function: &typed_hir::HirFunction) -> FunctionFacts {
@@ -628,10 +706,13 @@ fn solve_function_facts(
     base: BTreeMap<DefinitionId, FunctionFacts>,
     cancellation: &Cancellation,
 ) -> BTreeMap<DefinitionId, FunctionFacts> {
-    let graph = base
-        .iter()
-        .map(|(id, facts)| (*id, facts.calls.keys().copied().collect()))
-        .collect::<BTreeMap<_, _>>();
+    let mut graph = BTreeMap::new();
+    for (identity, facts) in &base {
+        if cancellation.is_cancelled() {
+            return BTreeMap::new();
+        }
+        graph.insert(*identity, facts.calls.keys().copied().collect());
+    }
     solve_fact_graph(base, graph, |fact| &fact.calls, cancellation)
 }
 
@@ -640,23 +721,29 @@ fn solve_specialization_facts(
     local_definitions: &BTreeMap<DefinitionId, FunctionFacts>,
     cancellation: &Cancellation,
 ) -> BTreeMap<SpecializationId, FunctionFacts> {
-    let base = program
-        .specialized_functions()
-        .iter()
-        .map(|(id, function)| {
-            let specialization = &program.specializations()[id];
-            let facts = if specialization.type_arguments.is_empty() {
-                local_definitions[&specialization.definition].clone()
-            } else {
-                local_facts(function)
-            };
-            (*id, facts)
-        })
-        .collect::<BTreeMap<_, _>>();
-    let graph = base
-        .iter()
-        .map(|(id, facts)| (*id, facts.specialization_calls.keys().copied().collect()))
-        .collect::<BTreeMap<_, BTreeSet<_>>>();
+    let mut base = BTreeMap::new();
+    for (identity, function) in program.specialized_functions() {
+        if cancellation.is_cancelled() {
+            return BTreeMap::new();
+        }
+        let specialization = &program.specializations()[identity];
+        let facts = if specialization.type_arguments.is_empty() {
+            local_definitions[&specialization.definition].clone()
+        } else {
+            local_facts(function)
+        };
+        base.insert(*identity, facts);
+    }
+    let mut graph = BTreeMap::new();
+    for (identity, facts) in &base {
+        if cancellation.is_cancelled() {
+            return BTreeMap::new();
+        }
+        graph.insert(
+            *identity,
+            facts.specialization_calls.keys().copied().collect(),
+        );
+    }
     solve_fact_graph(base, graph, |fact| &fact.specialization_calls, cancellation)
 }
 
@@ -677,7 +764,11 @@ where
         return BTreeMap::new();
     };
     let recursive = crate::graph::recursive_nodes(&graph);
-    let costs = solve_weighted_costs(&base, &recursive, weighted_edges);
+    let Some(costs) =
+        solve_weighted_costs_cancellable(&base, &recursive, weighted_edges, cancellation)
+    else {
+        return BTreeMap::new();
+    };
     for (id, cost) in costs {
         let fact = facts.get_mut(&id).expect("fact exists");
         fact.logical_cost = cost;
@@ -712,11 +803,25 @@ fn merge_function_facts(caller: &mut FunctionFacts, callee: &FunctionFacts) -> b
         )
 }
 
+#[cfg(test)]
 pub(crate) fn solve_weighted_costs<N>(
     base: &BTreeMap<N, FunctionFacts>,
     recursive: &BTreeSet<N>,
     edges: impl Fn(&FunctionFacts) -> &BTreeMap<N, u64>,
 ) -> BTreeMap<N, u64>
+where
+    N: Copy + Ord,
+{
+    solve_weighted_costs_cancellable(base, recursive, edges, &Cancellation::new())
+        .expect("fresh cancellation is active")
+}
+
+fn solve_weighted_costs_cancellable<N>(
+    base: &BTreeMap<N, FunctionFacts>,
+    recursive: &BTreeSet<N>,
+    edges: impl Fn(&FunctionFacts) -> &BTreeMap<N, u64>,
+    cancellation: &Cancellation,
+) -> Option<BTreeMap<N, u64>>
 where
     N: Copy + Ord,
 {
@@ -736,6 +841,9 @@ where
         })
         .collect::<BTreeMap<_, _>>();
     for (caller, facts) in base {
+        if cancellation.is_cancelled() {
+            return None;
+        }
         if recursive.contains(caller) {
             continue;
         }
@@ -746,6 +854,9 @@ where
             .collect::<Vec<_>>();
         remaining.insert(*caller, dependencies.len());
         for (callee, multiplicity) in dependencies {
+            if cancellation.is_cancelled() {
+                return None;
+            }
             callers
                 .entry(callee)
                 .or_default()
@@ -758,8 +869,14 @@ where
         .collect::<BTreeSet<_>>();
     ready.extend(recursive.iter().copied());
     while let Some(id) = ready.pop_first() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
         let callee_cost = costs[&id];
         for (caller, multiplicity) in callers.get(&id).into_iter().flatten() {
+            if cancellation.is_cancelled() {
+                return None;
+            }
             costs.entry(*caller).and_modify(|cost| {
                 *cost = cost.saturating_add(callee_cost.saturating_mul(*multiplicity));
             });
@@ -772,7 +889,7 @@ where
             }
         }
     }
-    costs
+    Some(costs)
 }
 
 fn local_facts(function: &typed_hir::HirFunction) -> FunctionFacts {

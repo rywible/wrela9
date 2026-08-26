@@ -890,7 +890,7 @@ fn accepted_compile_publishes_one_completed_semantic_program_observation() {
     assert_ne!(completed.executable_demand_fingerprint(), 0);
     assert_eq!(
         completed.phase_schema(),
-        "wrela.completed-semantic-program.v2"
+        "wrela.completed-semantic-program.v3"
     );
     assert!(completed.executable_count() >= 1);
 }

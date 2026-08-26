@@ -1985,6 +1985,13 @@ fn analyze_with_probe(
         .functions
         .values()
         .any(|function| matches!(function.return_type, Type::Result { error: None, .. }));
+    input.inferred_error_definitions = input
+        .functions
+        .iter()
+        .filter_map(|(identity, function)| {
+            matches!(function.return_type, Type::Result { error: None, .. }).then_some(*identity)
+        })
+        .collect();
     let inference_functions = if needs_error_inference {
         match typed_hir::lower_functions_for_error_inference(
             &input,
@@ -2430,27 +2437,6 @@ fn analyze_with_probe(
                 RecoveryAction::None,
             ));
         }
-        for specialization in program.specializations().values() {
-            if !inferred_signature_types.contains_key(&specialization.definition) {
-                continue;
-            }
-            let function = &program.specialized_functions()[&specialization.id];
-            let Type::Result {
-                error: Some(error), ..
-            } = &function.return_type
-            else {
-                return defect(
-                    "error-signature inference",
-                    Arc::from("inferred specialization does not have a concrete Result error"),
-                );
-            };
-            inferred_errors.push(InferredErrorObservation::new(
-                specialization.id.0,
-                function.name.clone(),
-                error.display(),
-            ));
-        }
-        inferred_errors.sort_by_key(InferredErrorObservation::specialization_identity);
         if executable_allowed && diagnostics.is_empty() {
             let mut engine = Engine::new(program, cancellation);
             for constant in program.constants().values() {

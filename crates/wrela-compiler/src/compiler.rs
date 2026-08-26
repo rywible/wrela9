@@ -1889,6 +1889,7 @@ pub struct InferredErrorObservation {
     specialization_identity: u128,
     function: Arc<str>,
     error_type: Arc<str>,
+    provenance: SourceRange,
 }
 
 impl InferredErrorObservation {
@@ -1896,11 +1897,13 @@ impl InferredErrorObservation {
         specialization_identity: u128,
         function: impl Into<Arc<str>>,
         error_type: impl Into<Arc<str>>,
+        provenance: SourceRange,
     ) -> Self {
         Self {
             specialization_identity,
             function: function.into(),
             error_type: error_type.into(),
+            provenance,
         }
     }
 
@@ -1917,6 +1920,10 @@ impl InferredErrorObservation {
     #[must_use]
     pub fn error_type(&self) -> &str {
         &self.error_type
+    }
+
+    pub(crate) const fn provenance(&self) -> &SourceRange {
+        &self.provenance
     }
 }
 

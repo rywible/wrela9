@@ -6,6 +6,7 @@ mod architecture_planning_consumer_tests;
 mod compiler;
 mod completed_semantic;
 mod control_flow;
+mod core;
 mod distribution;
 mod evaluator;
 mod graph;
@@ -36,6 +37,9 @@ pub use compiler::{
     SyntaxInvalidKind, SyntaxLayoutKind, SyntaxMissingKind, SyntaxNodeKind, SyntaxNodeObservation,
     SyntaxObservation, SyntaxTokenKind, SyntaxTriviaKind, TestApplicationObservation,
     TestBindingObservation, TypeObservation, TypeRole,
+};
+pub use core::{
+    CoreExecutableKind, CoreExecutableObservation, CoreOperationKind, CoreProgramObservation,
 };
 pub use image_planning::{
     DomainPlanKind, DomainPlanObservation, ExecutableDemandObservation, GeneratedRoleKind,

@@ -833,6 +833,10 @@ pub(crate) struct CorePlanningInput<'a> {
 
 #[allow(dead_code)]
 impl<'a> CorePlanningInput<'a> {
+    pub(crate) const fn fingerprint(&self) -> u128 {
+        self.foundation.fingerprint
+    }
+
     pub(crate) const fn context_identity(&self) -> u128 {
         self.foundation.context
     }

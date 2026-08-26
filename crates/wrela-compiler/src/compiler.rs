@@ -11,6 +11,7 @@ use crate::architecture_planning::{
     ArchitecturePlanningObservation, ArchitectureProfile, ContractFailureKind,
     VerifiedArchitecturePlanningContract,
 };
+use crate::core::{CoreFailure, CoreProgramObservation, VerifiedCoreProgram};
 use crate::image_planning::{
     PlanningFailure, PlanningFoundationObservation, VerifiedPlanningFoundation,
 };
@@ -984,6 +985,7 @@ pub struct Inspection {
     architecture_planning_contract: Option<ArchitecturePlanningObservation>,
     completed_semantic_program: Option<CompletedSemanticProgramObservation>,
     planning_foundation: Option<PlanningFoundationObservation>,
+    core_program: Option<CoreProgramObservation>,
 }
 
 impl Inspection {
@@ -1085,6 +1087,11 @@ impl Inspection {
     #[must_use]
     pub const fn planning_foundation(&self) -> Option<&PlanningFoundationObservation> {
         self.planning_foundation.as_ref()
+    }
+
+    #[must_use]
+    pub const fn core_program(&self) -> Option<&CoreProgramObservation> {
+        self.core_program.as_ref()
     }
 }
 
@@ -2112,6 +2119,7 @@ pub struct AcceptedCompilation {
     inspection: Inspection,
     completed_semantic_program: Arc<crate::completed_semantic::CompletedSemanticProgram>,
     planning_foundation: Option<Arc<VerifiedPlanningFoundation>>,
+    core_program: Option<Arc<VerifiedCoreProgram>>,
 }
 
 impl AcceptedCompilation {
@@ -2137,11 +2145,26 @@ impl AcceptedCompilation {
             .map(|planning| planning.fingerprint())
     }
 
+    #[must_use]
+    pub fn core_program_fingerprint(&self) -> Option<u128> {
+        self.core_program.as_ref().map(|core| core.fingerprint())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn completed_semantic_program(
         &self,
     ) -> &crate::completed_semantic::CompletedSemanticProgram {
         &self.completed_semantic_program
+    }
+
+    #[cfg(test)]
+    pub(crate) fn verified_planning_foundation(&self) -> Option<&VerifiedPlanningFoundation> {
+        self.planning_foundation.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn verified_core_program(&self) -> Option<&VerifiedCoreProgram> {
+        self.core_program.as_deref()
     }
 }
 
@@ -2575,6 +2598,21 @@ impl Compiler {
             None
         };
 
+        let core_program = match planning_foundation.as_ref() {
+            None => None,
+            Some(planning) => match self
+                .distribution
+                .core()
+                .derive(planning.for_core(), cancellation)
+            {
+                Ok(core) => Some(Arc::new(core)),
+                Err(CoreFailure::Cancelled) => return CompilationOutcome::Cancelled,
+                Err(CoreFailure::Defect(evidence)) => {
+                    return CompilationOutcome::Defect(Defect::new("Core", evidence));
+                }
+            },
+        };
+
         let Some(unreachable_project_syntax) = parse_unreachable_project_syntax(
             &request.project,
             &parsed_sources,
@@ -2652,6 +2690,11 @@ impl Compiler {
             } else {
                 None
             },
+            core_program: if request.inspection.planning {
+                core_program.as_ref().map(|core| core.observation())
+            } else {
+                None
+            },
         };
 
         if diagnostics.is_empty() {
@@ -2666,6 +2709,7 @@ impl Compiler {
                 inspection,
                 completed_semantic_program,
                 planning_foundation,
+                core_program,
             })
         } else {
             CompilationOutcome::Rejected(RejectedCompilation {

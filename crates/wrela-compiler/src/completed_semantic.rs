@@ -403,6 +403,69 @@ impl<'a> CorePlanningSemanticProgram<'a> {
             .copied()
             .map(core_source_executable_reference)
     }
+
+    pub(crate) fn executable_input(
+        self,
+        reference: CoreSourceExecutableRef,
+    ) -> Option<CoreSourceExecutableInput<'a>> {
+        if reference.context != self.program.context.identity {
+            return None;
+        }
+        let body = match reference.kind {
+            CoreSourceExecutableKind::Specialization => {
+                let identity = SpecializationId(reference.identity);
+                CoreSourceExecutableBody::Specialization(
+                    self.program.program.specialization_function(identity)?,
+                )
+            }
+            CoreSourceExecutableKind::TestBody => {
+                let id = self
+                    .program
+                    .graph
+                    .test_applications
+                    .iter()
+                    .find(|test| test.id.identity == reference.identity)?
+                    .id;
+                CoreSourceExecutableBody::Test {
+                    body: self.program.program.test_body(id)?,
+                    source: &self.program.program.test(id)?.source,
+                }
+            }
+            CoreSourceExecutableKind::ClosureBody => CoreSourceExecutableBody::Closure(
+                self.program
+                    .program
+                    .closure(crate::typed_hir::ClosureId(reference.identity))?,
+            ),
+        };
+        Some(CoreSourceExecutableInput { reference, body })
+    }
+
+    pub(crate) fn specialization_facts(
+        self,
+        identity: SpecializationId,
+    ) -> Option<&'a FunctionFacts> {
+        self.program.facts.specializations.get(&identity)
+    }
+
+    pub(crate) fn verified_program(self) -> &'a VerifiedProgram {
+        &self.program.program
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CoreSourceExecutableInput<'a> {
+    pub(crate) reference: CoreSourceExecutableRef,
+    pub(crate) body: CoreSourceExecutableBody<'a>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CoreSourceExecutableBody<'a> {
+    Specialization(&'a crate::typed_hir::HirFunction),
+    Test {
+        body: &'a [crate::typed_hir::Statement],
+        source: &'a crate::SourceRange,
+    },
+    Closure(&'a crate::typed_hir::HirClosure),
 }
 
 fn core_source_executable_reference(reference: ExecutableReference) -> CoreSourceExecutableRef {

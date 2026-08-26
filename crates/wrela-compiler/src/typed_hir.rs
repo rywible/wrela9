@@ -756,6 +756,7 @@ pub(crate) struct ProgramInput {
     pub(crate) nominal_displays: BTreeMap<DefinitionId, Arc<str>>,
     pub(crate) comptime_roots: Vec<(ModuleId, ExpressionSyntax)>,
     pub(crate) inferred_error_definitions: BTreeSet<DefinitionId>,
+    pub(crate) actor_definitions: BTreeSet<DefinitionId>,
     pub(crate) actor_handlers: BTreeSet<DefinitionId>,
     pub(crate) message_full_definition: Option<DefinitionId>,
 }
@@ -772,6 +773,8 @@ pub(crate) struct VerifiedProgram {
     comptime_expressions: BTreeMap<SourceRange, ComptimeExpression>,
     closures: BTreeMap<ClosureId, Arc<HirClosure>>,
     inferred_error_definitions: BTreeSet<DefinitionId>,
+    actor_definitions: BTreeSet<DefinitionId>,
+    actor_handlers: BTreeSet<DefinitionId>,
     _discharge_laws: VerifiedDischargeLaws,
     fingerprint: u128,
     identity_catalog_revision: u128,
@@ -1297,6 +1300,7 @@ pub(crate) enum CreatorFailureKind {
     ResourceNotDischarged,
     MustUseValue,
     TrySendRequiresActorHandler,
+    TrySendRequiresActorContext,
 }
 
 impl CreatorFailureKind {
@@ -1353,6 +1357,7 @@ impl CreatorFailureKind {
             Self::ResourceNotDischarged => "semantic.resource_not_discharged",
             Self::MustUseValue => "semantic.must_use_value",
             Self::TrySendRequiresActorHandler => "semantic.try_send_requires_actor_handler",
+            Self::TrySendRequiresActorContext => "semantic.try_send_requires_actor_context",
         }
     }
 }
@@ -1616,6 +1621,18 @@ impl VerifiedProgram {
     }
     pub(crate) fn inferred_error_definitions(&self) -> &BTreeSet<DefinitionId> {
         &self.inferred_error_definitions
+    }
+
+    pub(crate) fn is_actor_definition(&self, definition: DefinitionId) -> bool {
+        self.actor_definitions.contains(&definition)
+    }
+
+    pub(crate) fn actor_definitions(&self) -> impl Iterator<Item = DefinitionId> + '_ {
+        self.actor_definitions.iter().copied()
+    }
+
+    pub(crate) fn actor_handlers(&self) -> impl Iterator<Item = DefinitionId> + '_ {
+        self.actor_handlers.iter().copied()
     }
     pub(crate) const fn fingerprint(&self) -> u128 {
         self.fingerprint
@@ -2123,6 +2140,7 @@ pub(crate) fn verify(
         variants: &input.variants,
         structs: &input.structs,
         interfaces: &input.interfaces,
+        message_full_definition: input.message_full_definition,
         discharge_laws: Some(&discharge_laws),
     };
     verify_lowered_artifact(&artifact_catalog, &test_bodies)?;
@@ -2137,6 +2155,8 @@ pub(crate) fn verify(
         comptime_expressions,
         closures,
         inferred_error_definitions: input.inferred_error_definitions,
+        actor_definitions: input.actor_definitions,
+        actor_handlers: input.actor_handlers,
         _discharge_laws: discharge_laws,
         fingerprint: canonical.digest128(),
         identity_catalog_revision: identity_catalog.revision_fingerprint(),
@@ -2359,6 +2379,8 @@ fn verify_comptime_condition_with_values(
         )]),
         closures,
         inferred_error_definitions: input.inferred_error_definitions.clone(),
+        actor_definitions: input.actor_definitions.clone(),
+        actor_handlers: input.actor_handlers.clone(),
         _discharge_laws: discharge_laws,
         fingerprint: 0,
         identity_catalog_revision: identity_catalog.revision_fingerprint(),
@@ -3318,7 +3340,32 @@ struct ArtifactCatalog<'a> {
     variants: &'a BTreeMap<VariantId, ResolvedVariant>,
     structs: &'a BTreeMap<DefinitionId, ResolvedStruct>,
     interfaces: &'a BTreeMap<DefinitionId, ResolvedInterface>,
+    message_full_definition: Option<DefinitionId>,
     discharge_laws: Option<&'a VerifiedDischargeLaws>,
+}
+
+fn authenticated_message_full(catalog: &ArtifactCatalog<'_>, definition: DefinitionId) -> bool {
+    let Some(expected) = catalog.message_full_definition else {
+        return false;
+    };
+    let Some(struct_) = catalog.structs.get(&definition) else {
+        return false;
+    };
+    let [parameter] = struct_.type_parameters.as_slice() else {
+        return false;
+    };
+    let [field] = struct_.fields.as_slice() else {
+        return false;
+    };
+    expected == definition
+        && struct_.definition == definition
+        && struct_.resource
+        && struct_.display.as_ref() == "MessageFull"
+        && field.name == "arguments"
+        && matches!(
+            &field.type_,
+            Type::Parameter { owner, id, .. } if *owner == definition && id == parameter
+        )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5908,10 +5955,7 @@ fn verify_expression_artifact_with_cleanup(
             if success.as_ref() != &Type::Unit
                 || display.as_ref() != "MessageFull"
                 || full_arguments.as_ref() != [returned]
-                || catalog
-                    .structs
-                    .get(definition)
-                    .is_none_or(|full| !full.resource)
+                || !authenticated_message_full(catalog, *definition)
             {
                 return defect("lowered try_send result lost its exact MessageFull arguments");
             }
@@ -8142,6 +8186,15 @@ impl<'a> Lowerer<'a> {
                 (ExpressionKind::Await(Box::new(value)), type_)
             }
             ExpressionSyntaxKind::TrySend(value) => {
+                if self
+                    .owner_identity
+                    .is_none_or(|owner| !self.input.actor_handlers.contains(&owner))
+                {
+                    return creator(
+                        CreatorFailureKind::TrySendRequiresActorContext,
+                        &syntax.range,
+                    );
+                }
                 let value = self.expression(value)?;
                 let ExpressionKind::Call {
                     target: CallTarget::Function { definition, .. },
@@ -13078,6 +13131,7 @@ mod tests {
             variants: &variants,
             structs: &structs,
             interfaces: &interfaces,
+            message_full_definition: None,
             discharge_laws: None,
         };
         assert!(matches!(
@@ -13095,6 +13149,61 @@ mod tests {
             ),
             Err(VerificationFailure::Defect { .. })
         ));
+    }
+
+    #[test]
+    fn post_lowering_verifier_rejects_creator_message_full_lookalike() {
+        let authenticated = DefinitionId(41);
+        let lookalike = DefinitionId(42);
+        let parameter = TypeParameterId(0);
+        let message_full = |definition| ResolvedStruct {
+            definition,
+            module: ModuleId(1),
+            display: Arc::from("MessageFull"),
+            resource: true,
+            type_parameters: vec![parameter],
+            generic_parameter_names: Arc::from(["T".to_owned()]),
+            generic_constraints: Arc::from([]),
+            fields: vec![ResolvedField {
+                definition: DefinitionId(definition.0 + 100),
+                name: "arguments".to_owned(),
+                public: true,
+                mutable: false,
+                type_: Type::Parameter {
+                    owner: definition,
+                    id: parameter,
+                    display: Arc::from("T"),
+                },
+            }],
+            field_selections: Arc::from([]),
+            applied_fields: RefCell::new(BTreeMap::new()),
+        };
+        let templates = BTreeMap::new();
+        let specialized = BTreeMap::new();
+        let constants = BTreeMap::new();
+        let specializations = BTreeMap::new();
+        let variants = BTreeMap::new();
+        let structs = BTreeMap::from([
+            (authenticated, message_full(authenticated)),
+            (lookalike, message_full(lookalike)),
+        ]);
+        let interfaces = BTreeMap::new();
+        let identities = crate::identity::IdentityCatalog::empty();
+        let catalog = ArtifactCatalog {
+            templates: &templates,
+            specialized: &specialized,
+            constants: &constants,
+            specializations: &specializations,
+            identities: &identities,
+            variants: &variants,
+            structs: &structs,
+            interfaces: &interfaces,
+            message_full_definition: Some(authenticated),
+            discharge_laws: None,
+        };
+
+        assert!(authenticated_message_full(&catalog, authenticated));
+        assert!(!authenticated_message_full(&catalog, lookalike));
     }
 
     #[test]
@@ -13172,6 +13281,7 @@ mod tests {
             variants: &variants,
             structs: &structs,
             interfaces: &interfaces,
+            message_full_definition: None,
             discharge_laws: None,
         };
         assert!(matches!(
@@ -13248,6 +13358,7 @@ mod tests {
             variants: &variants,
             structs: &structs,
             interfaces: &interfaces,
+            message_full_definition: None,
             discharge_laws: None,
         };
 
@@ -13344,6 +13455,7 @@ mod tests {
             variants: &variants,
             structs: &structs,
             interfaces: &interfaces,
+            message_full_definition: None,
             discharge_laws: None,
         };
         let mut locals = BTreeMap::from([(
@@ -13410,6 +13522,7 @@ mod tests {
             variants: &variants,
             structs: &structs,
             interfaces: &interfaces,
+            message_full_definition: None,
             discharge_laws: None,
         };
         assert!(matches!(
@@ -13485,6 +13598,7 @@ mod tests {
             variants: &variants,
             structs: &structs,
             interfaces: &interfaces,
+            message_full_definition: None,
             discharge_laws: None,
         };
         let mut locals = BTreeMap::from([
@@ -13594,6 +13708,7 @@ mod tests {
             variants: &variants,
             structs: &structs,
             interfaces: &interfaces,
+            message_full_definition: None,
             discharge_laws: None,
         };
         let mut previous = owner.start();
@@ -13717,6 +13832,7 @@ mod tests {
             variants: &variants,
             structs: &structs,
             interfaces: &interfaces,
+            message_full_definition: None,
             discharge_laws: None,
         };
         let read_from = |local, access| Expression {

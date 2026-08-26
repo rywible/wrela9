@@ -1705,6 +1705,7 @@ fn analyze_with_probe(
                     .attributes
                     .contains(&AttributeSyntax::Actor)
                 {
+                    input.actor_definitions.insert(definition.id);
                     input.actor_handlers.extend(
                         struct_
                             .functions

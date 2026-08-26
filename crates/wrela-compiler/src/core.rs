@@ -423,6 +423,7 @@ struct ExecutableFacts {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CoreExecutable {
     reference: ExecutableReference,
+    flow_identity: u128,
     semantic_owner: u128,
     provenance: SourceRange,
     entry: RegionId,
@@ -984,17 +985,15 @@ fn observation_control_paths(
 }
 
 fn core_custody_reference(
-    executable: &CoreExecutable,
+    executable_identity: u128,
     operation: &Operation,
     effect_ordinal: usize,
     effect: &CustodyEffect,
 ) -> (u128, u128) {
     let mut identity = Xxh3::new();
     identity.update(b"wrela.core.custody-reference\0\x01");
-    identity.update(&executable.reference.identity.to_be_bytes());
-    identity.update(operation.provenance.path().as_bytes());
-    identity.update(&operation.provenance.start().to_be_bytes());
-    identity.update(&operation.provenance.end().to_be_bytes());
+    identity.update(&executable_identity.to_be_bytes());
+    identity.update(&operation.identity.to_be_bytes());
     identity.update(&[operation.kind.tag(), effect.operation.tag()]);
     identity.update(&(effect_ordinal as u64).to_be_bytes());
     let identity = identity.digest128();
@@ -1002,16 +1001,12 @@ fn core_custody_reference(
     let mut meaning = Xxh3::new();
     meaning.update(b"wrela.core.custody-reference-meaning\0\x01");
     meaning.update(&identity.to_be_bytes());
-    meaning.update(&executable.reference.current_meaning.to_be_bytes());
     meaning.update(&[
         effect.initialization.tag(),
         effect.custodian.tag(),
         effect.loan.tag(),
         effect.obligation.tag(),
     ]);
-    meaning.update(&effect.type_identity.unwrap_or(0).to_be_bytes());
-    meaning.update(&effect.source_home.unwrap_or(0).to_be_bytes());
-    meaning.update(&effect.destination_home.unwrap_or(0).to_be_bytes());
     meaning.update(&(effect.place.len() as u64).to_be_bytes());
     for part in effect.place.iter() {
         meaning.update(&part.to_be_bytes());
@@ -1019,11 +1014,22 @@ fn core_custody_reference(
     (identity, meaning.digest128())
 }
 
+fn stable_executable_identities(executables: &[CoreExecutable]) -> BTreeMap<u128, u128> {
+    executables
+        .iter()
+        .map(|executable| (executable.reference.identity, executable.flow_identity))
+        .collect()
+}
+
 fn observe_executable_custody(
     executable: &CoreExecutable,
     executables: &[CoreExecutable],
     cancellation: &Cancellation,
 ) -> Result<Arc<[CoreCustodyEffectObservation]>, CoreFailure> {
+    let executable_identity = stable_executable_identities(executables)
+        .get(&executable.reference.identity)
+        .copied()
+        .unwrap_or(u128::MAX);
     let control_paths = observation_control_paths(executable, cancellation)?;
     let producers = executable
         .regions
@@ -1140,6 +1146,7 @@ fn observe_executable_custody(
         .collect::<BTreeSet<_>>();
     let mut observations = Vec::new();
     let mut semantic_identities = BTreeSet::new();
+    let mut semantic_occurrences = BTreeMap::<u128, u64>::new();
     for operation in executable
         .regions
         .iter()
@@ -1301,9 +1308,16 @@ fn observe_executable_custody(
                         | FailureLaw::RecordTestFailure => false,
                     })
                 });
-            let semantic_identity = hash.digest128();
+            let semantic_base = hash.digest128();
+            let occurrence = semantic_occurrences.entry(semantic_base).or_default();
+            let mut identity = Xxh3::new();
+            identity.update(b"wrela.core.custody-observation-instance\0\x01");
+            identity.update(&semantic_base.to_be_bytes());
+            identity.update(&occurrence.to_be_bytes());
+            *occurrence = occurrence.saturating_add(1);
+            let semantic_identity = identity.digest128();
             let (reference_identity, reference_current_meaning) =
-                core_custody_reference(executable, operation, effect_role, effect);
+                core_custody_reference(executable_identity, operation, effect_role, effect);
             if !semantic_identities.insert(semantic_identity) {
                 return defect("Core custody observation identity collision");
             }
@@ -1431,39 +1445,40 @@ impl FlowCoreView<'_> {
 
     pub(crate) fn suspension_sites(&self) -> Vec<FlowCoreSuspensionSite> {
         let cancellation = Cancellation::new();
+        let executable_identities = stable_executable_identities(&self.core.executables);
         let mut sites = Vec::new();
         for executable in self.core.executables.iter() {
+            let executable_identity = executable_identities
+                .get(&executable.reference.identity)
+                .copied()
+                .unwrap_or(u128::MAX);
             let paths = observation_control_paths(executable, &cancellation).unwrap_or_default();
             let mut operations = executable
                 .regions
                 .iter()
                 .flat_map(|region| region.operations.iter())
-                .filter(|operation| operation.kind == CoreOperationKind::Suspension)
+                .filter(|operation| {
+                    matches!(
+                        operation.kind,
+                        CoreOperationKind::Suspension | CoreOperationKind::MessageProposal
+                    )
+                })
                 .collect::<Vec<_>>();
-            operations.sort_by(|left, right| {
-                (
-                    left.provenance.path(),
-                    left.provenance.start(),
-                    left.provenance.end(),
-                )
-                    .cmp(&(
-                        right.provenance.path(),
-                        right.provenance.start(),
-                        right.provenance.end(),
-                    ))
-            });
+            operations.sort_by_key(|operation| operation.identity);
             for operation in operations {
                 let mut identity = Xxh3::new();
-                identity.update(b"wrela.core.suspension-site\0\x01");
-                identity.update(&executable.reference.identity.to_be_bytes());
-                identity.update(operation.provenance.path().as_bytes());
-                identity.update(&operation.provenance.start().to_be_bytes());
-                identity.update(&operation.provenance.end().to_be_bytes());
+                identity.update(if operation.kind == CoreOperationKind::MessageProposal {
+                    b"wrela.core.message-proposal-site\0\x01".as_slice()
+                } else {
+                    b"wrela.core.suspension-site\0\x01".as_slice()
+                });
+                identity.update(&executable_identity.to_be_bytes());
+                identity.update(&operation.identity.to_be_bytes());
                 let identity = identity.digest128();
                 let mut meaning = Xxh3::new();
                 meaning.update(b"wrela.core.suspension-site-meaning\0\x01");
                 meaning.update(&identity.to_be_bytes());
-                meaning.update(&executable.reference.current_meaning.to_be_bytes());
+                meaning.update(&[operation.kind.tag()]);
                 sites.push(FlowCoreSuspensionSite {
                     handler: executable.reference.identity,
                     reference_identity: identity,
@@ -1473,6 +1488,7 @@ impl FlowCoreView<'_> {
                         .cloned()
                         .unwrap_or_else(|| Arc::from([])),
                     source: operation.provenance.clone(),
+                    program_order: operation.identity,
                 });
             }
         }
@@ -1482,7 +1498,12 @@ impl FlowCoreView<'_> {
 
     pub(crate) fn message_proposals(&self) -> Vec<FlowCoreMessageProposal> {
         let mut proposals = Vec::new();
+        let executable_identities = stable_executable_identities(&self.core.executables);
         for executable in self.core.executables.iter() {
+            let executable_identity = executable_identities
+                .get(&executable.reference.identity)
+                .copied()
+                .unwrap_or(u128::MAX);
             let control_paths =
                 observation_control_paths(executable, &Cancellation::new()).unwrap_or_default();
             let mut operations = executable
@@ -1491,38 +1512,17 @@ impl FlowCoreView<'_> {
                 .flat_map(|region| region.operations.iter())
                 .filter(|operation| operation.kind == CoreOperationKind::MessageProposal)
                 .collect::<Vec<_>>();
-            operations.sort_by(|left, right| {
-                (
-                    left.provenance.path(),
-                    left.provenance.start(),
-                    left.provenance.end(),
-                )
-                    .cmp(&(
-                        right.provenance.path(),
-                        right.provenance.start(),
-                        right.provenance.end(),
-                    ))
-            });
+            operations.sort_by_key(|operation| operation.identity);
             for (ordinal, operation) in operations.into_iter().enumerate() {
                 let mut operation_reference = Xxh3::new();
                 operation_reference.update(b"wrela.core.message-proposal-site\0\x01");
-                operation_reference.update(&executable.reference.identity.to_be_bytes());
-                operation_reference.update(operation.provenance.path().as_bytes());
-                operation_reference.update(&operation.provenance.start().to_be_bytes());
-                operation_reference.update(&operation.provenance.end().to_be_bytes());
+                operation_reference.update(&executable_identity.to_be_bytes());
+                operation_reference.update(&operation.identity.to_be_bytes());
                 let operation_reference = operation_reference.digest128();
                 let mut operation_meaning = Xxh3::new();
                 operation_meaning.update(b"wrela.core.message-proposal-site-meaning\0\x01");
                 operation_meaning.update(&operation_reference.to_be_bytes());
-                operation_meaning.update(&executable.reference.current_meaning.to_be_bytes());
-                operation_meaning.update(
-                    &operation
-                        .details
-                        .first()
-                        .copied()
-                        .unwrap_or(0)
-                        .to_be_bytes(),
-                );
+                operation_meaning.update(&[operation.kind.tag()]);
                 let custody = operation
                     .custody
                     .iter()
@@ -1530,7 +1530,12 @@ impl FlowCoreView<'_> {
                     .filter(|(_, effect)| effect.operation == CoreCustodyOperation::Move)
                     .map(|(effect_ordinal, effect)| {
                         let (reference_identity, reference_current_meaning) =
-                            core_custody_reference(executable, operation, effect_ordinal, effect);
+                            core_custody_reference(
+                                executable_identity,
+                                operation,
+                                effect_ordinal,
+                                effect,
+                            );
                         FlowCoreCustodyReference {
                             reference_identity,
                             reference_current_meaning,
@@ -1545,6 +1550,7 @@ impl FlowCoreView<'_> {
                     sender_handler: executable.reference.identity,
                     destination_handler: operation.details.first().copied().unwrap_or(0),
                     send_ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
+                    program_order: operation.identity,
                     operation_reference,
                     operation_current_meaning: operation_meaning.digest128(),
                     control_path: control_paths
@@ -1565,6 +1571,7 @@ pub(crate) struct FlowCoreMessageProposal {
     pub(crate) sender_handler: u128,
     pub(crate) destination_handler: u128,
     pub(crate) send_ordinal: u32,
+    pub(crate) program_order: u32,
     pub(crate) operation_reference: u128,
     pub(crate) operation_current_meaning: u128,
     pub(crate) control_path: Arc<[u32]>,
@@ -1579,6 +1586,7 @@ pub(crate) struct FlowCoreSuspensionSite {
     pub(crate) reference_current_meaning: u128,
     pub(crate) control_path: Arc<[u32]>,
     pub(crate) source: SourceRange,
+    pub(crate) program_order: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1877,94 +1885,103 @@ fn produce_source_executable(
         identity: input.reference.identity(),
         current_meaning: input.reference.current_meaning(),
     };
-    let (owner, provenance, signature, source_definition, facts, mut regions, rewrites) =
-        match input.body {
-            CoreSourceExecutableBody::Specialization(function) => {
-                let upstream = semantic
-                    .specialization_facts(SpecializationId(reference.identity))
-                    .ok_or_else(|| {
-                        CoreFailure::Defect(Arc::from("Core body has no solved facts"))
-                    })?;
-                let mut lowerer = ProducerLowerer::new(cancellation);
-                let entry = lowerer.lower_block(&function.body)?;
-                debug_assert_eq!(entry, RegionId(0));
-                let (regions, rewrites) = lowerer.finish();
-                (
-                    function.id.0,
-                    function.source.clone(),
-                    signature(
-                        function
-                            .parameters
-                            .iter()
-                            .zip(function.parameter_type_ids.iter())
-                            .map(|((local, type_, access), type_id)| {
-                                (local.0, type_, *type_id, core_access(*access))
-                            }),
-                        &function.return_type,
-                        function.return_type_id,
-                    ),
-                    Some(function.id.0),
-                    ExecutableFacts {
-                        pure: upstream.pure,
-                        may_panic: upstream.may_panic,
-                        suspends: upstream.suspends,
-                        ownership_transfer: upstream.ownership_transfer,
-                        evaluator_eligible: upstream.evaluator_eligible,
-                    },
-                    regions,
-                    rewrites,
-                )
-            }
-            CoreSourceExecutableBody::Test(test) => {
-                let mut lowerer = ProducerLowerer::new(cancellation);
-                let entry = lowerer.lower_block(&test.body)?;
-                debug_assert_eq!(entry, RegionId(0));
-                let (regions, rewrites) = lowerer.finish();
-                (
-                    reference.identity,
-                    test.source.clone(),
-                    signature(
-                        test.parameters
-                            .iter()
-                            .zip(test.parameter_type_ids.iter())
-                            .map(|((local, type_, access), type_id)| {
-                                (local.0, type_, *type_id, core_access(*access))
-                            }),
-                        &Type::Unit,
-                        test.return_type_id,
-                    ),
-                    None,
-                    facts_from_regions(&regions, semantic),
-                    regions,
-                    rewrites,
-                )
-            }
-            CoreSourceExecutableBody::Closure(closure) => {
-                let mut lowerer = ProducerLowerer::new(cancellation);
-                let entry = lowerer.lower_expression_body(&closure.body)?;
-                debug_assert_eq!(entry, RegionId(0));
-                let (regions, rewrites) = lowerer.finish();
-                (
-                    closure.id.0,
-                    closure.source.clone(),
-                    signature(
-                        closure
-                            .parameters
-                            .iter()
-                            .zip(closure.parameter_type_ids.iter())
-                            .map(|((local, type_), type_id)| {
-                                (local.0, type_, *type_id, CoreAccessLaw::CopyValue)
-                            }),
-                        &closure.return_type,
-                        closure.return_type_id,
-                    ),
-                    None,
-                    facts_from_regions(&regions, semantic),
-                    regions,
-                    rewrites,
-                )
-            }
-        };
+    let (
+        owner,
+        flow_identity,
+        provenance,
+        signature,
+        source_definition,
+        facts,
+        mut regions,
+        rewrites,
+    ) = match input.body {
+        CoreSourceExecutableBody::Specialization(function) => {
+            let upstream = semantic
+                .specialization_facts(SpecializationId(reference.identity))
+                .ok_or_else(|| CoreFailure::Defect(Arc::from("Core body has no solved facts")))?;
+            let mut lowerer = ProducerLowerer::new(cancellation);
+            let entry = lowerer.lower_block(&function.body)?;
+            debug_assert_eq!(entry, RegionId(0));
+            let (regions, rewrites) = lowerer.finish();
+            (
+                function.id.0,
+                flow_source_executable_identity(&function.name),
+                function.source.clone(),
+                signature(
+                    function
+                        .parameters
+                        .iter()
+                        .zip(function.parameter_type_ids.iter())
+                        .map(|((local, type_, access), type_id)| {
+                            (local.0, type_, *type_id, core_access(*access))
+                        }),
+                    &function.return_type,
+                    function.return_type_id,
+                ),
+                Some(function.id.0),
+                ExecutableFacts {
+                    pure: upstream.pure,
+                    may_panic: upstream.may_panic,
+                    suspends: upstream.suspends,
+                    ownership_transfer: upstream.ownership_transfer,
+                    evaluator_eligible: upstream.evaluator_eligible,
+                },
+                regions,
+                rewrites,
+            )
+        }
+        CoreSourceExecutableBody::Test(test) => {
+            let mut lowerer = ProducerLowerer::new(cancellation);
+            let entry = lowerer.lower_block(&test.body)?;
+            debug_assert_eq!(entry, RegionId(0));
+            let (regions, rewrites) = lowerer.finish();
+            (
+                reference.identity,
+                reference.identity,
+                test.source.clone(),
+                signature(
+                    test.parameters
+                        .iter()
+                        .zip(test.parameter_type_ids.iter())
+                        .map(|((local, type_, access), type_id)| {
+                            (local.0, type_, *type_id, core_access(*access))
+                        }),
+                    &Type::Unit,
+                    test.return_type_id,
+                ),
+                None,
+                facts_from_regions(&regions, semantic),
+                regions,
+                rewrites,
+            )
+        }
+        CoreSourceExecutableBody::Closure(closure) => {
+            let mut lowerer = ProducerLowerer::new(cancellation);
+            let entry = lowerer.lower_expression_body(&closure.body)?;
+            debug_assert_eq!(entry, RegionId(0));
+            let (regions, rewrites) = lowerer.finish();
+            (
+                closure.id.0,
+                reference.identity,
+                closure.source.clone(),
+                signature(
+                    closure
+                        .parameters
+                        .iter()
+                        .zip(closure.parameter_type_ids.iter())
+                        .map(|((local, type_), type_id)| {
+                            (local.0, type_, *type_id, CoreAccessLaw::CopyValue)
+                        }),
+                    &closure.return_type,
+                    closure.return_type_id,
+                ),
+                None,
+                facts_from_regions(&regions, semantic),
+                regions,
+                rewrites,
+            )
+        }
+    };
     producer_link_cleanup_control(&mut regions, cancellation)?;
     producer_attach_custody(
         &mut regions,
@@ -1981,6 +1998,7 @@ fn produce_source_executable(
     )?;
     let mut executable = CoreExecutable {
         reference,
+        flow_identity,
         semantic_owner: owner,
         provenance,
         entry: RegionId(0),
@@ -2037,6 +2055,7 @@ fn produce_generated_executable(
             identity: executable.identity(),
             current_meaning: executable.current_meaning(),
         },
+        flow_identity: executable.identity(),
         semantic_owner: role.owner().identity(),
         provenance,
         entry: RegionId(0),
@@ -2077,6 +2096,14 @@ const fn source_kind(kind: CoreSourceExecutableKind) -> CoreExecutableKind {
         CoreSourceExecutableKind::TestBody => CoreExecutableKind::SourceTestBody,
         CoreSourceExecutableKind::ClosureBody => CoreExecutableKind::SourceClosureBody,
     }
+}
+
+fn flow_source_executable_identity(name: &str) -> u128 {
+    let mut hash = Xxh3::new();
+    hash.update(b"wrela.core.flow-executable\0\x01");
+    hash.update(&(name.len() as u64).to_be_bytes());
+    hash.update(name.as_bytes());
+    hash.digest128()
 }
 
 fn core_type(type_: &Type, type_id: TypeId) -> CoreType {
@@ -4290,6 +4317,7 @@ fn encode_executable(
         executable.reference.context,
         executable.reference.identity,
         executable.reference.current_meaning,
+        executable.flow_identity,
         executable.semantic_owner,
     ] {
         hash.update(&value.to_be_bytes());
@@ -5743,6 +5771,7 @@ fn verify_generated_executable(
     };
     if supplied.reference.context != reference.context()
         || supplied.reference.current_meaning != reference.current_meaning()
+        || supplied.flow_identity != reference.identity()
         || supplied.semantic_owner != role.owner().identity()
         || supplied.provenance != provenance
         || supplied.entry != RegionId(0)
@@ -5806,6 +5835,7 @@ impl VerifierLowerer<'_> {
         checkpoint(cancellation)?;
         let (
             owner,
+            flow_identity,
             provenance,
             parameters,
             parameter_type_ids,
@@ -5822,6 +5852,7 @@ impl VerifierLowerer<'_> {
                     })?;
                 (
                     function.id.0,
+                    verifier_flow_source_executable_identity(&function.name),
                     &function.source,
                     function.parameters.as_slice(),
                     function.parameter_type_ids.as_ref(),
@@ -5832,6 +5863,7 @@ impl VerifierLowerer<'_> {
                 )
             }
             CoreSourceExecutableBody::Test(test) => (
+                input.reference.identity(),
                 input.reference.identity(),
                 &test.source,
                 test.parameters.as_slice(),
@@ -5863,6 +5895,7 @@ impl VerifierLowerer<'_> {
                 }
                 (
                     closure.id.0,
+                    input.reference.identity(),
                     &closure.source,
                     &[][..],
                     &[][..],
@@ -5877,6 +5910,7 @@ impl VerifierLowerer<'_> {
             || supplied.reference.kind != source_kind(input.reference.kind())
             || supplied.reference.identity != input.reference.identity()
             || supplied.reference.current_meaning != input.reference.current_meaning()
+            || supplied.flow_identity != flow_identity
             || supplied.semantic_owner != owner
             || &supplied.provenance != provenance
             || supplied.source_definition != source_definition
@@ -5987,6 +6021,14 @@ fn verifier_type_matches(actual: &CoreType, expected: &Type, expected_id: TypeId
     actual.identity == expected_id.0 && actual.shape == expected.canonical_key()
 }
 
+fn verifier_flow_source_executable_identity(name: &str) -> u128 {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"wrela.core.flow-executable\0\x01");
+    bytes.extend_from_slice(&(name.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(name.as_bytes());
+    xxh3_128(&bytes)
+}
+
 const fn verifier_access(access: crate::typed_hir::AccessMode) -> CoreAccessLaw {
     match access {
         crate::typed_hir::AccessMode::Copy => CoreAccessLaw::CopyValue,
@@ -6040,6 +6082,7 @@ fn verifier_encode_executable(
     bytes.extend_from_slice(&executable.reference.context.to_be_bytes());
     bytes.extend_from_slice(&executable.reference.identity.to_be_bytes());
     bytes.extend_from_slice(&executable.reference.current_meaning.to_be_bytes());
+    bytes.extend_from_slice(&executable.flow_identity.to_be_bytes());
     bytes.extend_from_slice(&executable.semantic_owner.to_be_bytes());
     verifier_encode_source(bytes, &executable.provenance);
     bytes.extend_from_slice(&executable.entry.0.to_be_bytes());

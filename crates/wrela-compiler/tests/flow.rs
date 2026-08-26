@@ -49,6 +49,8 @@ struct Receiver:
 
 @actor
 struct SenderA:
+    receiver: Receiver
+
     pub async fn deliver(self, receiver: Receiver, take token: Token):
         admission = try_send receiver.receive(take token)
         match admission:
@@ -60,6 +62,8 @@ struct SenderA:
 
 @actor
 struct SenderB:
+    receiver: Receiver
+
     pub async fn deliver(self, receiver: Receiver, take token: Token):
         admission = try_send receiver.receive(take token)
         match admission:
@@ -72,8 +76,8 @@ struct SenderB:
 @image
 fn build() -> Image:
     receiver = Receiver()
-    left = SenderA()
-    right = SenderB()
+    left = SenderA(receiver=receiver)
+    right = SenderB(receiver=receiver)
     return Image.new(receiver=receiver, left=left, right=right)
 "#;
 
@@ -126,9 +130,10 @@ fn try_send_arbitrates_canonically_and_preserves_resource_custody() {
         panic!("one-way Actor fixture accepts: {outcome:#?}");
     };
     let flow = accepted.inspection().flow_program().expect("Flow selected");
-    assert_eq!(flow.proposals().len(), 2);
+    let scenario = flow.model_scenarios().first().expect("bounded scenario");
+    assert_eq!(scenario.proposals().len(), 4);
 
-    let mut canonical = flow.proposals().iter().collect::<Vec<_>>();
+    let mut canonical = scenario.proposals().iter().collect::<Vec<_>>();
     canonical.sort_by_key(|proposal| proposal.key());
     assert!(canonical[0].arrival_ordinal() > canonical[1].arrival_ordinal());
     assert_eq!(canonical[0].outcome(), FlowSendOutcome::Admitted);
@@ -151,10 +156,7 @@ fn try_send_arbitrates_canonically_and_preserves_resource_custody() {
     );
     assert_eq!(canonical[0].resource_arguments().len(), 1);
     assert_eq!(canonical[1].resource_arguments().len(), 1);
-    assert_ne!(
-        canonical[0].resource_arguments(),
-        canonical[1].resource_arguments()
-    );
+    assert_ne!(canonical[0].key(), canonical[1].key());
     assert!(canonical[0].transfer_commit().is_some());
     assert!(canonical[1].transfer_commit().is_none());
     assert!(flow.model_agrees());
@@ -222,6 +224,173 @@ fn flow_fingerprint_ignores_inspection_reuse_reopen_and_file_enumeration() {
 }
 
 #[test]
+fn flow_semantic_identities_ignore_blank_lines_and_comments() {
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let compile = |path: &str, source: Vec<u8>| {
+        let request = CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new(path, source)]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all());
+        let outcome = compiler.compile(request, &Cancellation::new());
+        let CompilationOutcome::Accepted(accepted) = outcome else {
+            panic!("semantic-identity fixture {path} accepts: {outcome:#?}");
+        };
+        accepted
+    };
+    let baseline = compile("src/image.wr", ONE_WAY_SOURCE.to_vec());
+    let with_trivia = compile(
+        "src/image.wr",
+        [
+            b"# semantic identities ignore trivia\n\n".as_slice(),
+            ONE_WAY_SOURCE,
+        ]
+        .concat(),
+    );
+    let projection = |accepted: &wrela_compiler::AcceptedCompilation| {
+        let flow = accepted.inspection().flow_program().expect("Flow selected");
+        (
+            flow.fingerprint(),
+            flow.actors()
+                .iter()
+                .map(|actor| (actor.identity(), actor.construction_identity()))
+                .collect::<Vec<_>>(),
+            flow.suspension_homes()
+                .iter()
+                .map(|home| (home.identity(), home.suspension_reference()))
+                .collect::<Vec<_>>(),
+            flow.proposal_templates()
+                .iter()
+                .map(|template| {
+                    (
+                        template.identity(),
+                        template.current_meaning(),
+                        template.suspension_home(),
+                        template
+                            .resource_custody()
+                            .iter()
+                            .map(|custody| custody.core_reference_identity())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    assert_eq!(projection(&baseline), projection(&with_trivia));
+}
+
+#[test]
+fn flow_semantic_identities_ignore_an_actor_module_file_move() {
+    const ACTORS: &[u8] = br#"pub resource struct Token:
+    id: i64
+
+fn consume(take token: Token):
+    pass
+
+@actor
+pub struct Receiver:
+    pub async fn receive(self, take token: Token):
+        consume(take token)
+
+@actor
+pub struct Sender:
+    pub receiver: Receiver
+
+    pub async fn deliver(self, receiver: Receiver, take token: Token):
+        admission = try_send receiver.receive(take token)
+        match admission:
+            case Result.Ok(_):
+                pass
+            case Result.Err(take full):
+                consume(take full.arguments)
+        pass
+"#;
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let compile = |directory: &str| {
+        let image = format!(
+            "from {directory} import actors\n\n@image\nfn build() -> Image:\n    receiver = actors.Receiver()\n    sender = actors.Sender(receiver=receiver)\n    return Image.new(receiver=receiver, sender=sender)\n"
+        );
+        let request = CompilationRequest::new(
+            ProjectSnapshot::new(vec![
+                ProjectFile::new("src/image.wr", image.into_bytes()),
+                ProjectFile::new(format!("src/{directory}/actors.wr"), ACTORS),
+            ]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all());
+        let outcome = compiler.compile(request, &Cancellation::new());
+        let CompilationOutcome::Accepted(accepted) = outcome else {
+            panic!("moved Actor module fixture accepts: {outcome:#?}");
+        };
+        accepted
+    };
+    let baseline = compile("game");
+    let moved = compile("moved");
+    let projection = |accepted: &wrela_compiler::AcceptedCompilation| {
+        let flow = accepted.inspection().flow_program().expect("Flow selected");
+        (
+            flow.fingerprint(),
+            flow.actors()
+                .iter()
+                .map(|actor| {
+                    (
+                        actor.identity(),
+                        actor.construction_identity(),
+                        actor.permanent_core_requirement(),
+                        actor.handlers().len(),
+                        actor.wired_actor_constructions().to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            flow.requirements()
+                .iter()
+                .map(|requirement| (requirement.identity(), requirement.current_meaning()))
+                .collect::<Vec<_>>(),
+            flow.suspension_homes()
+                .iter()
+                .map(|home| {
+                    (
+                        home.identity(),
+                        home.suspension_reference(),
+                        home.suspension_current_meaning(),
+                        home.program_order(),
+                        home.control_path().to_vec(),
+                        home.requirement(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            flow.proposal_templates()
+                .iter()
+                .map(|template| {
+                    (
+                        template.identity(),
+                        template.current_meaning(),
+                        template.suspension_home(),
+                        template
+                            .resource_custody()
+                            .iter()
+                            .map(|custody| {
+                                (
+                                    custody.core_reference_identity(),
+                                    custody.core_reference_current_meaning(),
+                                    custody.place().to_vec(),
+                                    custody.proposal_home(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    assert_eq!(projection(&baseline), projection(&moved));
+}
+
+#[test]
 fn cancelled_requests_publish_no_partial_flow() {
     let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
     let cancellation = Cancellation::new();
@@ -278,6 +447,40 @@ fn build() -> Image:
 }
 
 #[test]
+fn one_actor_construction_shared_by_two_image_fields_has_one_authority() {
+    let source = br#"@actor
+struct Worker:
+    id: i64
+
+    pub async fn run(read self):
+        pass
+
+@image
+fn build() -> Image:
+    shared = Worker(id=1)
+    return Image.new(left=shared, right=shared)
+"#;
+    let request = CompilationRequest::new(
+        ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+        Root::Image,
+    )
+    .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+    .with_inspection(InspectSelection::all());
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let outcome = compiler.compile(request, &Cancellation::new());
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("shared Actor construction accepts: {outcome:#?}");
+    };
+    let flow = accepted.inspection().flow_program().expect("Flow selected");
+
+    assert_eq!(flow.actors().len(), 1);
+    assert_eq!(
+        flow.actors()[0].identity(),
+        flow.actors()[0].construction_identity()
+    );
+}
+
+#[test]
 fn try_send_rejects_a_non_actor_destination_before_flow() {
     let source = br#"fn ordinary():
     pass
@@ -317,6 +520,141 @@ fn build() -> Image:
 }
 
 #[test]
+fn try_send_outside_an_actor_handler_is_creator_rejected() {
+    let source = br#"async fn helper(receiver: Receiver, value: i64):
+    admission = try_send receiver.receive(value)
+    match admission:
+        case Result.Ok(_):
+            pass
+        case Result.Err(_):
+            pass
+
+@actor
+struct Receiver:
+    pub async fn receive(self, value: i64):
+        pass
+
+@actor
+struct Sender:
+    pub async fn deliver(self, receiver: Receiver, value: i64):
+        _ = await helper(receiver, value)
+
+@image
+fn build() -> Image:
+    return Image.new(receiver=Receiver(), sender=Sender())
+"#;
+    let request = CompilationRequest::new(
+        ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+        Root::Image,
+    )
+    .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+    .with_inspection(InspectSelection::all());
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let outcome = compiler.compile(request, &Cancellation::new());
+    let CompilationOutcome::Rejected(rejected) = outcome else {
+        panic!("helper-mediated try_send is Creator Rejected: {outcome:#?}");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.try_send_requires_actor_context")
+    );
+}
+
+#[test]
+fn build_wiring_selects_one_exact_actor_destination() {
+    let source = br#"resource struct Token:
+    id: i64
+
+fn consume(take token: Token):
+    pass
+
+@actor
+struct Receiver:
+    id: i64
+
+    pub async fn receive(self, take token: Token):
+        consume(take token)
+
+@actor
+struct Sender:
+    receiver: Receiver
+
+    pub async fn deliver(read self, receiver: Receiver, take token: Token):
+        admission = try_send receiver.receive(take token)
+        match admission:
+            case Result.Ok(_):
+                pass
+            case Result.Err(take full):
+                consume(take full.arguments)
+        pass
+
+@image
+fn build() -> Image:
+    selected = Receiver(id=1)
+    other = Receiver(id=2)
+    sender = Sender(receiver=selected)
+    return Image.new(selected=selected, other=other, sender=sender)
+"#;
+    let request = CompilationRequest::new(
+        ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+        Root::Image,
+    )
+    .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+    .with_inspection(InspectSelection::all());
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let outcome = compiler.compile(request, &Cancellation::new());
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("build-wired destination accepts: {outcome:#?}");
+    };
+    let flow = accepted.inspection().flow_program().expect("Flow selected");
+    let sender = flow
+        .actors()
+        .iter()
+        .find(|actor| !actor.wired_actor_constructions().is_empty())
+        .expect("Sender instance");
+    assert_eq!(sender.wired_actor_constructions().len(), 1);
+    assert_eq!(flow.proposal_templates().len(), 1);
+    assert_eq!(flow.proposal_templates()[0].sender(), sender.identity());
+    assert_eq!(
+        flow.proposal_templates()[0].destination(),
+        sender.wired_actor_constructions()[0]
+    );
+    assert_eq!(flow.suspension_homes().len(), 1);
+    let home = &flow.suspension_homes()[0];
+    assert_eq!(home.actor(), sender.identity());
+    assert_eq!(
+        flow.proposal_templates()[0].resource_custody()[0].proposal_home(),
+        home.identity()
+    );
+
+    let rewired_source = String::from_utf8(source.to_vec())
+        .expect("fixture is UTF-8")
+        .replace("Sender(receiver=selected)", "Sender(receiver=other)");
+    let rewired_request = CompilationRequest::new(
+        ProjectSnapshot::new(vec![ProjectFile::new(
+            "src/image.wr",
+            rewired_source.into_bytes(),
+        )]),
+        Root::Image,
+    )
+    .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+    .with_inspection(InspectSelection::all());
+    let CompilationOutcome::Accepted(rewired) =
+        compiler.compile(rewired_request, &Cancellation::new())
+    else {
+        panic!("rewired destination accepts");
+    };
+    let rewired_flow = rewired.inspection().flow_program().expect("Flow selected");
+    assert_ne!(
+        flow.proposal_templates()[0].destination(),
+        rewired_flow.proposal_templates()[0].destination()
+    );
+    assert_ne!(flow.fingerprint(), rewired_flow.fingerprint());
+}
+
+#[test]
 fn try_send_full_preserves_each_nested_resource_as_exact_core_custody() {
     let source = br#"resource struct Token:
     id: i64
@@ -339,6 +677,8 @@ struct Receiver:
 
 @actor
 struct Sender:
+    receiver: Receiver
+
     pub async fn deliver(self, receiver: Receiver, take envelope: Envelope):
         admission = try_send receiver.receive(take envelope)
         match admission:
@@ -351,7 +691,7 @@ struct Sender:
 @image
 fn build() -> Image:
     receiver = Receiver()
-    sender = Sender()
+    sender = Sender(receiver=receiver)
     return Image.new(receiver=receiver, sender=sender)
 "#;
     let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
@@ -438,11 +778,12 @@ fn build() -> Image:
         flow.suspension_homes()[1].requirement()
     );
     assert_eq!(
-        flow.trace()
+        flow.model_scenarios()[0]
+            .trace()
             .iter()
             .filter(|record| record.kind() == wrela_compiler::FlowEventKind::TurnSuspended)
             .count(),
-        1
+        2
     );
 }
 
@@ -461,6 +802,8 @@ struct Receiver:
 
 @actor
 struct Sender:
+    receiver: Receiver
+
     pub async fn deliver(self, receiver: Receiver, choose: bool, take token: Token):
         if choose:
             match try_send receiver.receive(take token):
@@ -479,7 +822,7 @@ struct Sender:
 @image
 fn build() -> Image:
     receiver = Receiver()
-    sender = Sender()
+    sender = Sender(receiver=receiver)
     return Image.new(receiver=receiver, sender=sender)
 "#;
     let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
@@ -506,27 +849,105 @@ fn build() -> Image:
         flow.proposal_templates()[0].control_path(),
         flow.proposal_templates()[1].control_path()
     );
-    assert_eq!(flow.proposals().len(), 2);
-    assert!(flow
-        .proposals()
-        .iter()
-        .all(|proposal| proposal.template_identity() == flow.proposals()[0].template_identity()));
-    assert_eq!(flow.proposals()[0].key().sender_turn_sequence(), 0);
-    assert_eq!(flow.proposals()[1].key().sender_turn_sequence(), 1);
-    assert_eq!(flow.proposals()[0].outcome(), FlowSendOutcome::Admitted);
-    assert_eq!(flow.proposals()[1].outcome(), FlowSendOutcome::Full);
-    for kind in [
-        wrela_compiler::FlowEventKind::MessageProposed,
-        wrela_compiler::FlowEventKind::MessageFull,
-        wrela_compiler::FlowEventKind::MailboxTransferCommitted,
-    ] {
-        assert!(flow.trace().iter().any(|record| record.kind() == kind));
+    assert_eq!(flow.model_scenarios().len(), 2);
+    for scenario in flow.model_scenarios() {
+        assert_eq!(scenario.proposals().len(), 2);
+        assert!(scenario.proposals().iter().all(|proposal| {
+            proposal.template_identity() == scenario.proposals()[0].template_identity()
+        }));
+        assert_eq!(scenario.proposals()[0].key().sender_turn_sequence(), 0);
+        assert_eq!(scenario.proposals()[1].key().sender_turn_sequence(), 1);
+        assert_eq!(scenario.proposals()[0].outcome(), FlowSendOutcome::Admitted);
+        assert_eq!(scenario.proposals()[1].outcome(), FlowSendOutcome::Full);
+        for kind in [
+            wrela_compiler::FlowEventKind::MessageProposed,
+            wrela_compiler::FlowEventKind::MessageFull,
+            wrela_compiler::FlowEventKind::MailboxTransferCommitted,
+        ] {
+            assert!(scenario.trace().iter().any(|record| record.kind() == kind));
+        }
     }
-    let admitted = flow.proposals()[0].key();
-    assert!(flow.trace().iter().any(|record| {
-        record.kind() == wrela_compiler::FlowEventKind::TurnStarted
-            && record.actor() == admitted.destination()
-            && record.logical_commit().is_some()
-    }));
     assert!(flow.model_agrees());
+}
+
+#[test]
+fn sequential_send_sites_share_a_turn_sequence_and_keep_program_ordinals() {
+    let source = br#"resource struct Token:
+    id: i64
+
+fn consume(take token: Token):
+    pass
+
+@actor
+struct Receiver:
+    pub async fn receive(self, take token: Token):
+        consume(take token)
+
+@actor
+struct Sender:
+    receiver: Receiver
+
+    pub async fn deliver(self, receiver: Receiver, take first: Token, take second: Token):
+        first_admission = try_send receiver.receive(take first)
+        match first_admission:
+            case Result.Ok(_):
+                pass
+            case Result.Err(take full):
+                consume(take full.arguments)
+        second_admission = try_send receiver.receive(take second)
+        match second_admission:
+            case Result.Ok(_):
+                pass
+            case Result.Err(take full):
+                consume(take full.arguments)
+        pass
+
+@image
+fn build() -> Image:
+    receiver = Receiver()
+    sender = Sender(receiver=receiver)
+    return Image.new(receiver=receiver, sender=sender)
+"#;
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let request = CompilationRequest::new(
+        ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+        Root::Image,
+    )
+    .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+    .with_inspection(InspectSelection::all());
+    let outcome = compiler.compile(request, &Cancellation::new());
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("sequential send fixture accepts: {outcome:#?}");
+    };
+    let flow = accepted.inspection().flow_program().expect("Flow selected");
+    assert_eq!(
+        flow.proposal_templates()
+            .iter()
+            .map(|template| template.send_ordinal())
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    let scenario = &flow.model_scenarios()[0];
+    for turn in 0..2 {
+        let proposals = scenario
+            .proposals()
+            .iter()
+            .filter(|proposal| proposal.key().sender_turn_sequence() == turn)
+            .collect::<Vec<_>>();
+        assert_eq!(proposals.len(), 2);
+        assert_eq!(proposals[0].key().send_ordinal(), 0);
+        assert_eq!(proposals[1].key().send_ordinal(), 1);
+    }
+    let sender = flow.proposal_templates()[0].sender();
+    assert_eq!(
+        scenario
+            .trace()
+            .iter()
+            .filter(|record| {
+                record.actor() == sender
+                    && record.kind() == wrela_compiler::FlowEventKind::TurnStarted
+            })
+            .count(),
+        2
+    );
 }

@@ -13,7 +13,7 @@ use crate::compiler::{
 use crate::evaluator::{Construction, ConstructionOperand, Engine, SemanticEvaluation, Value};
 use crate::identity::IdentityCatalog;
 use crate::image_evaluation::SealedImage;
-use crate::model::{BuildKind, DefinitionId, SpecializationId};
+use crate::model::{BuildKind, DefinitionId, SpecializationId, Type};
 use crate::semantic_facts::{FunctionFacts, SolvedSemanticFacts};
 use crate::typed_hir::{AccessMode, VerifiedProgram};
 
@@ -273,6 +273,7 @@ pub(crate) struct CompletedSemanticProgram {
     graph: SealedConstructionGraph,
     demand: ExecutableDemand,
     actors: Arc<[CompletedActor]>,
+    actor_fingerprint: u128,
     receipts: DirectReceipts,
     custody_fingerprint: u128,
     fingerprint: u128,
@@ -287,6 +288,7 @@ struct CompletedActor {
     construction_current_meaning: u128,
     source: crate::SourceRange,
     handlers: Arc<[SpecializationId]>,
+    wired_actor_constructions: Arc<[u128]>,
 }
 
 impl fmt::Debug for CompletedSemanticProgram {
@@ -447,6 +449,10 @@ impl<'a> FlowActorInput<'a> {
 
     pub(crate) fn handlers(self) -> impl ExactSizeIterator<Item = u128> + 'a {
         self.actor.handlers.iter().map(|handler| handler.0)
+    }
+
+    pub(crate) fn wired_actor_constructions(self) -> &'a [u128] {
+        &self.actor.wired_actor_constructions
     }
 }
 
@@ -698,10 +704,12 @@ pub(crate) fn complete(
         ),
     };
     let custody_fingerprint = input.program.custody_fingerprint();
+    let actor_fingerprint = produce_actor_fingerprint(&actors, cancellation)?;
     let fingerprint = produce_completed_fingerprint(
         context_identity,
         &receipts,
         custody_fingerprint,
+        actor_fingerprint,
         cancellation,
     )?;
     checkpoint(cancellation)?;
@@ -713,6 +721,7 @@ pub(crate) fn complete(
         graph,
         demand,
         actors: actors.into(),
+        actor_fingerprint,
         receipts,
         custody_fingerprint,
         fingerprint,
@@ -797,6 +806,7 @@ fn verify(
         candidate.context.identity,
         &candidate.receipts,
         candidate.custody_fingerprint,
+        candidate.actor_fingerprint,
         cancellation,
     )?;
     checkpoint(cancellation)?;
@@ -870,138 +880,48 @@ fn complete_actors(
             return defect("Actor type identity is duplicated");
         }
     }
-    let mut actors = Vec::new();
-    let mut identities = BTreeSet::new();
+    let actor_constructions = image
+        .constructions()
+        .iter()
+        .filter_map(|construction| match construction.kind {
+            BuildKind::Node { definition, .. } if actor_types.contains_key(&definition) => {
+                Some(construction.identity)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut actors = Vec::with_capacity(actor_constructions.len());
     for construction in image.constructions() {
         checkpoint(cancellation)?;
-        let construction_current_meaning =
-            produce_node_local_fingerprint(construction, cancellation)?;
-        for (operand_index, operand) in construction.operands.iter().enumerate() {
-            let mut path = vec![u64::try_from(operand_index).unwrap_or(u64::MAX)];
-            collect_actor_instances(
-                &operand.value,
-                construction.identity,
-                construction_current_meaning,
-                &construction.site,
-                &actor_types,
-                &mut path,
-                &mut actors,
+        let BuildKind::Node { definition, .. } = construction.kind else {
+            continue;
+        };
+        let Some((_, handlers)) = actor_types.get(&definition) else {
+            continue;
+        };
+        let mut wiring = BTreeSet::new();
+        for operand in &construction.operands {
+            crate::evaluator::visit_construction_handles(&operand.value, &mut |_, identity| {
+                if actor_constructions.contains(&identity) {
+                    wiring.insert(identity);
+                }
+            });
+        }
+        actors.push(CompletedActor {
+            identity: construction.identity,
+            actor_type_identity: definition.0,
+            construction_identity: construction.identity,
+            construction_current_meaning: produce_node_local_fingerprint(
+                construction,
                 cancellation,
-            )?;
-        }
-    }
-    for actor in &actors {
-        if !identities.insert(actor.identity) {
-            return defect("Actor instance identity is duplicated");
-        }
+            )?,
+            source: construction.site.clone(),
+            handlers: Arc::clone(handlers),
+            wired_actor_constructions: wiring.into_iter().collect::<Vec<_>>().into(),
+        });
     }
     actors.sort_by_key(|actor| actor.identity);
     Ok(actors)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn collect_actor_instances(
-    value: &Value,
-    construction_identity: u128,
-    construction_current_meaning: u128,
-    source: &crate::SourceRange,
-    actor_types: &BTreeMap<DefinitionId, (crate::SourceRange, Arc<[SpecializationId]>)>,
-    path: &mut Vec<u64>,
-    actors: &mut Vec<CompletedActor>,
-    cancellation: &Cancellation,
-) -> Result<(), CompletionFailure> {
-    checkpoint(cancellation)?;
-    match value {
-        Value::Struct {
-            definition, fields, ..
-        } => {
-            if let Some((_, handlers)) = actor_types.get(definition) {
-                let mut hash = Xxh3::new();
-                hash.update(b"wrela.actor-instance\0\x01");
-                hash.update(&construction_identity.to_be_bytes());
-                hash.update(&definition.0.to_be_bytes());
-                for coordinate in path.iter().copied() {
-                    hash.update(&coordinate.to_be_bytes());
-                }
-                actors.push(CompletedActor {
-                    identity: hash.digest128(),
-                    actor_type_identity: definition.0,
-                    construction_identity,
-                    construction_current_meaning,
-                    source: source.clone(),
-                    handlers: Arc::clone(handlers),
-                });
-                return Ok(());
-            }
-            for (index, (_, field)) in fields.iter().enumerate() {
-                path.push(u64::try_from(index).unwrap_or(u64::MAX));
-                collect_actor_instances(
-                    field,
-                    construction_identity,
-                    construction_current_meaning,
-                    source,
-                    actor_types,
-                    path,
-                    actors,
-                    cancellation,
-                )?;
-                path.pop();
-            }
-        }
-        Value::Array(values)
-        | Value::Tuple(values)
-        | Value::BuiltinVariant {
-            payload: values, ..
-        }
-        | Value::UserVariant {
-            payload: values, ..
-        }
-        | Value::TestApplication {
-            payload: values, ..
-        } => {
-            for (index, nested) in values.iter().enumerate() {
-                path.push(u64::try_from(index).unwrap_or(u64::MAX));
-                collect_actor_instances(
-                    nested,
-                    construction_identity,
-                    construction_current_meaning,
-                    source,
-                    actor_types,
-                    path,
-                    actors,
-                    cancellation,
-                )?;
-                path.pop();
-            }
-        }
-        Value::Closure { captures, .. } => {
-            for (index, (_, nested)) in captures.iter().enumerate() {
-                path.push(u64::try_from(index).unwrap_or(u64::MAX));
-                collect_actor_instances(
-                    nested,
-                    construction_identity,
-                    construction_current_meaning,
-                    source,
-                    actor_types,
-                    path,
-                    actors,
-                    cancellation,
-                )?;
-                path.pop();
-            }
-        }
-        Value::Unavailable
-        | Value::Unit
-        | Value::Bool(_)
-        | Value::Integer { .. }
-        | Value::Float { .. }
-        | Value::Text(_)
-        | Value::Scalar(_)
-        | Value::Bytes(_)
-        | Value::Function(_)
-        | Value::SymbolicHandle { .. } => {}
-    }
-    Ok(())
 }
 
 struct DemandInput<'a> {
@@ -1582,6 +1502,16 @@ fn verify_actors(
     candidate: &CompletedSemanticProgram,
     cancellation: &Cancellation,
 ) -> Result<(), CompletionFailure> {
+    let expected =
+        independently_reconstruct_actors(&candidate.program, &candidate.graph, cancellation)?;
+    if expected.as_slice() != candidate.actors.as_ref() {
+        return defect(
+            "Actor roster or direct construction wiring is not exact sealed graph authority",
+        );
+    }
+    if verify_actor_fingerprint(&expected, cancellation)? != candidate.actor_fingerprint {
+        return defect("Actor projection fingerprint is false");
+    }
     let mut previous = None;
     for actor in candidate.actors.iter() {
         checkpoint(cancellation)?;
@@ -1608,6 +1538,91 @@ fn verify_actors(
         }
     }
     Ok(())
+}
+
+fn independently_reconstruct_actors(
+    program: &VerifiedProgram,
+    graph: &SealedConstructionGraph,
+    cancellation: &Cancellation,
+) -> Result<Vec<CompletedActor>, CompletionFailure> {
+    let actor_types = program.actor_definitions().collect::<BTreeSet<_>>();
+    let actor_constructions = graph
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            BuildKind::Node { definition, .. } if actor_types.contains(&definition) => {
+                Some(node.identity)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut handlers = BTreeMap::<DefinitionId, Vec<SpecializationId>>::new();
+    for definition in program.actor_handlers() {
+        checkpoint(cancellation)?;
+        let Some(specialization) = program.default_specialization(definition) else {
+            return defect("Actor handler has no independently verified Specialization");
+        };
+        let Some(function) = program.specialization_function(specialization) else {
+            return defect("Actor handler Specialization is missing during reconstruction");
+        };
+        let Some((
+            _,
+            Type::Nominal {
+                definition: owner, ..
+            },
+            _,
+        )) = function.parameters.first()
+        else {
+            return defect("Actor handler receiver has no exact Actor type");
+        };
+        if !actor_types.contains(owner)
+            || function.modifier != crate::syntax::FunctionModifier::Async
+        {
+            return defect("Actor handler does not belong to an async Actor authority");
+        }
+        handlers.entry(*owner).or_default().push(specialization);
+    }
+    for values in handlers.values_mut() {
+        values.sort();
+        values.dedup();
+    }
+    let mut expected = Vec::with_capacity(actor_constructions.len());
+    for node in graph.nodes.iter() {
+        checkpoint(cancellation)?;
+        let BuildKind::Node { definition, .. } = node.kind else {
+            continue;
+        };
+        if !actor_types.contains(&definition) {
+            continue;
+        }
+        let mut wiring = BTreeSet::new();
+        for operand in node.operands.iter() {
+            let mut facts = IndependentValueFacts::default();
+            independently_traverse_value(&operand.value, cancellation, &mut facts)?;
+            wiring.extend(
+                facts
+                    .handles
+                    .into_iter()
+                    .map(|(_, identity)| identity)
+                    .filter(|identity| actor_constructions.contains(identity)),
+            );
+        }
+        expected.push(CompletedActor {
+            identity: node.identity,
+            actor_type_identity: definition.0,
+            construction_identity: node.identity,
+            construction_current_meaning: node.local_fingerprint,
+            source: node.site.clone(),
+            handlers: handlers
+                .get(&definition)
+                .cloned()
+                .unwrap_or_default()
+                .into(),
+            wired_actor_constructions: wiring.into_iter().collect::<Vec<_>>().into(),
+        });
+    }
+    expected.sort_by_key(|actor| actor.identity);
+    Ok(expected)
 }
 
 fn verify_graph(
@@ -1813,9 +1828,17 @@ fn independently_traverse_value(
                 independently_traverse_value(nested, cancellation, facts)?;
             }
         }
-        Value::Struct { fields, .. } => {
-            for (_, nested) in fields.iter() {
-                independently_traverse_value(nested, cancellation, facts)?;
+        Value::Struct {
+            construction,
+            fields,
+            ..
+        } => {
+            if let Some((kind, identity)) = construction {
+                facts.handles.push((*kind, *identity));
+            } else {
+                for (_, nested) in fields.iter() {
+                    independently_traverse_value(nested, cancellation, facts)?;
+                }
             }
         }
         Value::Closure { id, captures } => {
@@ -2298,9 +2321,6 @@ fn verify_node_local_fingerprint(
     encoding.u128(node.identity);
     encoding.build_kind(node.kind);
     encoding.u128(node.owner.raw.identity);
-    encoding.part(node.site.path().as_bytes());
-    encoding.u64(node.site.start());
-    encoding.u64(node.site.end());
     encoding.u64(node.operands.len());
     for operand in node.operands.iter() {
         checkpoint(cancellation)?;
@@ -2321,9 +2341,6 @@ fn hash_construction(
     hash.update(&construction.identity.to_be_bytes());
     append_build_kind(&mut hash, construction.kind);
     hash.update(&construction.owner.to_be_bytes());
-    append_part(&mut hash, construction.site.path().as_bytes());
-    hash.update(&construction.site.start().to_be_bytes());
-    hash.update(&construction.site.end().to_be_bytes());
     hash.update(
         &u64::try_from(construction.operands.len())
             .unwrap_or(u64::MAX)
@@ -2527,6 +2544,7 @@ fn produce_completed_fingerprint(
     context: u128,
     receipts: &DirectReceipts,
     custody: u128,
+    actors: u128,
     cancellation: &Cancellation,
 ) -> Result<u128, CompletionFailure> {
     hash_completed(
@@ -2534,14 +2552,78 @@ fn produce_completed_fingerprint(
         context,
         receipts,
         custody,
+        actors,
         cancellation,
     )
+}
+
+fn produce_actor_fingerprint(
+    actors: &[CompletedActor],
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
+    let mut hash = Xxh3::new();
+    append_part(&mut hash, b"wrela.completed-actor-projection\0\x01");
+    hash.update(
+        &u64::try_from(actors.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for actor in actors {
+        checkpoint(cancellation)?;
+        hash.update(&actor.identity.to_be_bytes());
+        hash.update(&actor.actor_type_identity.to_be_bytes());
+        hash.update(&actor.construction_identity.to_be_bytes());
+        hash.update(&actor.construction_current_meaning.to_be_bytes());
+        hash.update(
+            &u64::try_from(actor.handlers.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        for handler in actor.handlers.iter() {
+            hash.update(&handler.0.to_be_bytes());
+        }
+        hash.update(
+            &u64::try_from(actor.wired_actor_constructions.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        for construction in actor.wired_actor_constructions.iter() {
+            hash.update(&construction.to_be_bytes());
+        }
+    }
+    Ok(hash.digest128())
+}
+
+fn verify_actor_fingerprint(
+    actors: &[CompletedActor],
+    cancellation: &Cancellation,
+) -> Result<u128, CompletionFailure> {
+    let mut encoding = VerificationEncoding::new();
+    encoding.part(b"wrela.completed-actor-projection\0\x01");
+    encoding.u64(actors.len());
+    for actor in actors {
+        checkpoint(cancellation)?;
+        encoding.u128(actor.identity);
+        encoding.u128(actor.actor_type_identity);
+        encoding.u128(actor.construction_identity);
+        encoding.u128(actor.construction_current_meaning);
+        encoding.u64(actor.handlers.len());
+        for handler in actor.handlers.iter() {
+            encoding.u128(handler.0);
+        }
+        encoding.u64(actor.wired_actor_constructions.len());
+        for construction in actor.wired_actor_constructions.iter() {
+            encoding.u128(*construction);
+        }
+    }
+    encoding.finish_cancellable(cancellation)
 }
 
 fn verify_completed_fingerprint(
     context: u128,
     receipts: &DirectReceipts,
     custody: u128,
+    actors: u128,
     cancellation: &Cancellation,
 ) -> Result<u128, CompletionFailure> {
     let mut encoding = VerificationEncoding::new();
@@ -2561,6 +2643,7 @@ fn verify_completed_fingerprint(
         encoding.u128(reference.current_meaning);
     }
     encoding.u128(custody);
+    encoding.u128(actors);
     encoding.finish_cancellable(cancellation)
 }
 
@@ -2569,6 +2652,7 @@ fn hash_completed(
     context: u128,
     receipts: &DirectReceipts,
     custody: u128,
+    actors: u128,
     cancellation: &Cancellation,
 ) -> Result<u128, CompletionFailure> {
     let mut hash = Xxh3::new();
@@ -2588,6 +2672,7 @@ fn hash_completed(
         hash.update(&reference.current_meaning.to_be_bytes());
     }
     hash.update(&custody.to_be_bytes());
+    hash.update(&actors.to_be_bytes());
     checkpoint(cancellation)?;
     Ok(hash.digest128())
 }
@@ -2678,10 +2763,17 @@ fn append_typed_value(
             definition,
             type_display,
             fields,
+            construction,
         } => {
             hash.update(&[14]);
             hash.update(&definition.0.to_be_bytes());
             append_part(hash, type_display.as_bytes());
+            if let Some((kind, identity)) = construction {
+                hash.update(&[1, kind.canonical_tag()]);
+                hash.update(&identity.to_be_bytes());
+            } else {
+                hash.update(&[0]);
+            }
             hash.update(
                 &u64::try_from(fields.len())
                     .unwrap_or(u64::MAX)
@@ -2901,10 +2993,18 @@ impl VerificationEncoding {
                 definition,
                 type_display,
                 fields,
+                construction,
             } => {
                 self.byte(14);
                 self.u128(definition.0);
                 self.part(type_display.as_bytes());
+                if let Some((kind, identity)) = construction {
+                    self.byte(1);
+                    self.byte(kind.canonical_tag());
+                    self.u128(*identity);
+                } else {
+                    self.byte(0);
+                }
                 self.u64(fields.len());
                 for (name, value) in fields.iter() {
                     self.part(name.as_bytes());
@@ -3053,6 +3153,21 @@ fn build() -> Image:
         )
     }
 
+    fn completed_actor_fixture() -> CompletedSemanticProgram {
+        completed_fixture_from_source(
+            br#"@actor
+struct Worker:
+    pub async fn run(self):
+        pass
+
+@image
+fn build() -> Image:
+    worker = Worker()
+    return Image.new(worker=worker)
+"#,
+        )
+    }
+
     fn completed_fixture_from_source(source: &'static [u8]) -> CompletedSemanticProgram {
         completed_fixture_from_source_with_root(source, Root::Image)
     }
@@ -3152,6 +3267,14 @@ fn build() -> Image:
         resign_completed(candidate);
     }
 
+    fn resign_actors(candidate: &mut CompletedSemanticProgram) {
+        candidate.actor_fingerprint = produced(produce_actor_fingerprint(
+            &candidate.actors,
+            &Cancellation::new(),
+        ));
+        resign_completed(candidate);
+    }
+
     fn resign_graph(candidate: &mut CompletedSemanticProgram) {
         candidate.graph.fingerprint = produced(produce_graph_fingerprint(
             candidate.graph.root,
@@ -3173,6 +3296,7 @@ fn build() -> Image:
             candidate.context.identity,
             &candidate.receipts,
             candidate.custody_fingerprint,
+            candidate.actor_fingerprint,
             &Cancellation::new(),
         ));
     }
@@ -3183,7 +3307,38 @@ fn build() -> Image:
         let nodes = Arc::make_mut(&mut candidate.graph.nodes);
         nodes[0].kind = BuildKind::Test;
 
-        assert!(evidence(verify(&candidate, &Cancellation::new())).contains("construction node"));
+        let rejection = evidence(verify(&candidate, &Cancellation::new()));
+        assert!(
+            rejection.contains("construction node")
+                || rejection.contains("construction graph")
+                || rejection.contains("stale"),
+            "graph corruption rejected as {rejection}"
+        );
+    }
+
+    #[test]
+    fn exact_actor_construction_roster_rejects_missing_extra_and_repointed_records() {
+        let original = completed_actor_fixture();
+
+        let mut missing = original.clone();
+        missing.actors = Arc::from([]);
+        resign_actors(&mut missing);
+        assert!(evidence(verify(&missing, &Cancellation::new())).contains("Actor roster"));
+
+        let mut extra = original.clone();
+        let mut actors = extra.actors.to_vec();
+        let mut duplicate = actors[0].clone();
+        duplicate.identity ^= 1;
+        duplicate.construction_identity ^= 1;
+        actors.push(duplicate);
+        extra.actors = actors.into();
+        resign_actors(&mut extra);
+        assert!(evidence(verify(&extra, &Cancellation::new())).contains("Actor roster"));
+
+        let mut repointed = original;
+        Arc::make_mut(&mut repointed.actors)[0].actor_type_identity ^= 1;
+        resign_actors(&mut repointed);
+        assert!(evidence(verify(&repointed, &Cancellation::new())).contains("Actor roster"));
     }
 
     #[test]
@@ -3622,6 +3777,7 @@ fn build() -> Image:
                 definition: DefinitionId(91),
                 type_display: Arc::from("Container"),
                 fields: Arc::from([(Arc::from("value"), handle(BuildKind::Test, 14))]),
+                construction: None,
             },
             Value::TestApplication {
                 id: test,

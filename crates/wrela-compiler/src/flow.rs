@@ -11,6 +11,9 @@ use crate::core::FlowCoreView;
 use crate::image_planning::FlowPlanningInput;
 
 const PHASE_SCHEMA: &str = "wrela.flow.v1";
+type ControlPath = Arc<[u32]>;
+type SelectedControlPath = (u128, u128, ControlPath);
+type SelectedControlPaths = Arc<[SelectedControlPath]>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FlowRequirementKind {
@@ -90,20 +93,6 @@ impl FlowProposalKey {
     }
 }
 
-impl FlowEventKind {
-    const fn tag(self) -> u8 {
-        match self {
-            Self::TurnStarted => 1,
-            Self::TurnSuspended => 2,
-            Self::TurnResumed => 3,
-            Self::TurnCompleted => 4,
-            Self::MessageProposed => 5,
-            Self::MessageFull => 6,
-            Self::MailboxTransferCommitted => 7,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FlowRequirement {
     identity: u128,
@@ -126,6 +115,7 @@ struct Actor {
     max_active_turns: u8,
     permanent_core_requirement: u128,
     handlers: Arc<[u128]>,
+    wired_actor_constructions: Arc<[u128]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,6 +126,7 @@ struct SuspensionHome {
     suspension_reference: u128,
     suspension_current_meaning: u128,
     control_path: Arc<[u32]>,
+    program_order: u32,
     source: crate::SourceRange,
     slot_count: u64,
     retains_turn_lease: bool,
@@ -165,6 +156,8 @@ struct ProposalTemplate {
     destination: u128,
     destination_handler: u128,
     send_ordinal: u32,
+    program_order: u32,
+    suspension_home: u128,
     control_path: Arc<[u32]>,
     resource_custody: Arc<[FlowResourceCustody]>,
     source: crate::SourceRange,
@@ -215,9 +208,17 @@ struct ModelContract {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ModelResult {
+    scenarios: Arc<[ModelScenario]>,
+    agrees: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModelScenario {
+    identity: u128,
+    selected_paths: SelectedControlPaths,
+    turn_activation_bound: u64,
     trace: Arc<[FlowEvent]>,
     proposals: Arc<[FlowProposal]>,
-    agrees: bool,
 }
 
 #[derive(Clone)]
@@ -229,9 +230,8 @@ pub(crate) struct VerifiedFlowProgram {
     requirements: Arc<[FlowRequirement]>,
     suspension_homes: Arc<[SuspensionHome]>,
     proposal_templates: Arc<[ProposalTemplate]>,
-    trace: Arc<[FlowEvent]>,
-    proposals: Arc<[FlowProposal]>,
     model_contract: ModelContract,
+    model_scenarios: Arc<[ModelScenario]>,
     model: ModelResult,
     fingerprint: u128,
     _verified: Verified,
@@ -268,6 +268,7 @@ pub struct FlowActorObservation {
     max_active_turns: u8,
     permanent_core_requirement: u128,
     handlers: Arc<[u128]>,
+    wired_actor_constructions: Arc<[u128]>,
 }
 
 impl FlowActorObservation {
@@ -310,6 +311,11 @@ impl FlowActorObservation {
     pub fn handlers(&self) -> &[u128] {
         &self.handlers
     }
+
+    #[must_use]
+    pub fn wired_actor_constructions(&self) -> &[u128] {
+        &self.wired_actor_constructions
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -319,6 +325,7 @@ pub struct FlowSuspensionHomeObservation {
     handler: u128,
     suspension_reference: u128,
     suspension_current_meaning: u128,
+    program_order: u32,
     control_path: Arc<[u32]>,
     source: crate::SourceRange,
     slot_count: u64,
@@ -350,6 +357,11 @@ impl FlowSuspensionHomeObservation {
     #[must_use]
     pub const fn suspension_current_meaning(&self) -> u128 {
         self.suspension_current_meaning
+    }
+
+    #[must_use]
+    pub const fn program_order(&self) -> u32 {
+        self.program_order
     }
 
     #[must_use]
@@ -461,6 +473,8 @@ pub struct FlowProposalTemplateObservation {
     sender: u128,
     destination: u128,
     send_ordinal: u32,
+    program_order: u32,
+    suspension_home: u128,
     control_path: Arc<[u32]>,
     source: crate::SourceRange,
     resource_custody: Arc<[FlowResourceCustodyObservation]>,
@@ -486,6 +500,14 @@ impl FlowProposalTemplateObservation {
     #[must_use]
     pub const fn send_ordinal(&self) -> u32 {
         self.send_ordinal
+    }
+    #[must_use]
+    pub const fn program_order(&self) -> u32 {
+        self.program_order
+    }
+    #[must_use]
+    pub const fn suspension_home(&self) -> u128 {
+        self.suspension_home
     }
     #[must_use]
     pub fn control_path(&self) -> &[u32] {
@@ -656,10 +678,45 @@ pub struct FlowProgramObservation {
     requirements: Arc<[FlowRequirementObservation]>,
     suspension_homes: Arc<[FlowSuspensionHomeObservation]>,
     proposal_templates: Arc<[FlowProposalTemplateObservation]>,
-    trace: Arc<[FlowTraceRecord]>,
-    proposals: Arc<[FlowProposalObservation]>,
+    model_scenarios: Arc<[FlowModelScenarioObservation]>,
     model_case_count: usize,
     model_agrees: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlowModelScenarioObservation {
+    identity: u128,
+    selected_paths: SelectedControlPaths,
+    turn_activation_bound: u64,
+    trace: Arc<[FlowTraceRecord]>,
+    proposals: Arc<[FlowProposalObservation]>,
+}
+
+impl FlowModelScenarioObservation {
+    #[must_use]
+    pub const fn identity(&self) -> u128 {
+        self.identity
+    }
+
+    #[must_use]
+    pub fn selected_paths(&self) -> &[(u128, u128, Arc<[u32]>)] {
+        &self.selected_paths
+    }
+
+    #[must_use]
+    pub const fn turn_activation_bound(&self) -> u64 {
+        self.turn_activation_bound
+    }
+
+    #[must_use]
+    pub fn trace(&self) -> &[FlowTraceRecord] {
+        &self.trace
+    }
+
+    #[must_use]
+    pub fn proposals(&self) -> &[FlowProposalObservation] {
+        &self.proposals
+    }
 }
 
 impl FlowProgramObservation {
@@ -709,13 +766,8 @@ impl FlowProgramObservation {
     }
 
     #[must_use]
-    pub fn trace(&self) -> &[FlowTraceRecord] {
-        &self.trace
-    }
-
-    #[must_use]
-    pub fn proposals(&self) -> &[FlowProposalObservation] {
-        &self.proposals
+    pub fn model_scenarios(&self) -> &[FlowModelScenarioObservation] {
+        &self.model_scenarios
     }
 
     #[must_use]
@@ -756,6 +808,7 @@ impl VerifiedFlowProgram {
                     max_active_turns: actor.max_active_turns,
                     permanent_core_requirement: actor.permanent_core_requirement,
                     handlers: Arc::clone(&actor.handlers),
+                    wired_actor_constructions: Arc::clone(&actor.wired_actor_constructions),
                 })
                 .collect::<Vec<_>>()
                 .into(),
@@ -782,6 +835,7 @@ impl VerifiedFlowProgram {
                     handler: home.handler,
                     suspension_reference: home.suspension_reference,
                     suspension_current_meaning: home.suspension_current_meaning,
+                    program_order: home.program_order,
                     control_path: Arc::clone(&home.control_path),
                     source: home.source.clone(),
                     slot_count: home.slot_count,
@@ -799,6 +853,8 @@ impl VerifiedFlowProgram {
                     sender: template.sender,
                     destination: template.destination,
                     send_ordinal: template.send_ordinal,
+                    program_order: template.program_order,
+                    suspension_home: template.suspension_home,
                     control_path: Arc::clone(&template.control_path),
                     source: template.source.clone(),
                     resource_custody: template
@@ -817,60 +873,74 @@ impl VerifiedFlowProgram {
                 })
                 .collect::<Vec<_>>()
                 .into(),
-            trace: self
-                .trace
+            model_scenarios: self
+                .model_scenarios
                 .iter()
-                .map(|event| FlowTraceRecord {
-                    sequence: event.sequence,
-                    program_order: event.program_order,
-                    causal_predecessor: event.causal_predecessor,
-                    logical_commit: event.logical_commit,
-                    kind: event.kind,
-                    actor: event.actor,
-                    handler: event.handler,
-                    turn_sequence: event.turn_sequence,
-                    proposal: event.proposal,
-                    suspension_home: event.suspension_home,
-                })
+                .map(observe_model_scenario)
                 .collect::<Vec<_>>()
                 .into(),
-            proposals: self
-                .proposals
-                .iter()
-                .map(|proposal| FlowProposalObservation {
-                    template_identity: proposal.template,
-                    key: proposal.key,
-                    arrival_ordinal: proposal.arrival_ordinal,
-                    source: proposal.source.clone(),
-                    outcome: proposal.outcome,
-                    resource_arguments: proposal
-                        .resource_custody
-                        .iter()
-                        .map(|resource| resource.core_reference_identity)
-                        .collect::<Vec<_>>()
-                        .into(),
-                    resource_custody: proposal
-                        .resource_custody
-                        .iter()
-                        .map(|resource| FlowResourceCustodyObservation {
-                            core_reference_identity: resource.core_reference_identity,
-                            core_reference_current_meaning: resource.core_reference_current_meaning,
-                            type_identity: resource.type_identity,
-                            place: Arc::clone(&resource.place),
-                            source_home: resource.source_home,
-                            proposal_home: resource.proposal_home,
-                        })
-                        .collect::<Vec<_>>()
-                        .into(),
-                    before_commit: proposal.before_commit,
-                    after_arbitration: proposal.after_arbitration,
-                    transfer_commit: proposal.transfer_commit,
-                })
-                .collect::<Vec<_>>()
-                .into(),
-            model_case_count: self.model.trace.len() + self.model.proposals.len(),
+            model_case_count: self.model_scenarios.len(),
             model_agrees: self.model.agrees,
         })
+    }
+}
+
+fn observe_model_scenario(scenario: &ModelScenario) -> FlowModelScenarioObservation {
+    FlowModelScenarioObservation {
+        identity: scenario.identity,
+        selected_paths: Arc::clone(&scenario.selected_paths),
+        turn_activation_bound: scenario.turn_activation_bound,
+        trace: scenario
+            .trace
+            .iter()
+            .map(|event| FlowTraceRecord {
+                sequence: event.sequence,
+                program_order: event.program_order,
+                causal_predecessor: event.causal_predecessor,
+                logical_commit: event.logical_commit,
+                kind: event.kind,
+                actor: event.actor,
+                handler: event.handler,
+                turn_sequence: event.turn_sequence,
+                proposal: event.proposal,
+                suspension_home: event.suspension_home,
+            })
+            .collect::<Vec<_>>()
+            .into(),
+        proposals: scenario
+            .proposals
+            .iter()
+            .map(|proposal| FlowProposalObservation {
+                template_identity: proposal.template,
+                key: proposal.key,
+                arrival_ordinal: proposal.arrival_ordinal,
+                source: proposal.source.clone(),
+                outcome: proposal.outcome,
+                resource_arguments: proposal
+                    .resource_custody
+                    .iter()
+                    .map(|resource| resource.core_reference_identity)
+                    .collect::<Vec<_>>()
+                    .into(),
+                resource_custody: proposal
+                    .resource_custody
+                    .iter()
+                    .map(|resource| FlowResourceCustodyObservation {
+                        core_reference_identity: resource.core_reference_identity,
+                        core_reference_current_meaning: resource.core_reference_current_meaning,
+                        type_identity: resource.type_identity,
+                        place: Arc::clone(&resource.place),
+                        source_home: resource.source_home,
+                        proposal_home: resource.proposal_home,
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+                before_commit: proposal.before_commit,
+                after_arbitration: proposal.after_arbitration,
+                transfer_commit: proposal.transfer_commit,
+            })
+            .collect::<Vec<_>>()
+            .into(),
     }
 }
 
@@ -929,6 +999,7 @@ impl FlowModule {
                 max_active_turns: 1,
                 permanent_core_requirement: placement,
                 handlers: handlers.clone().into(),
+                wired_actor_constructions: input.wired_actor_constructions().into(),
             });
             for (kind, bound) in [
                 (FlowRequirementKind::ActorIdentity, 1),
@@ -964,6 +1035,7 @@ impl FlowModule {
                         suspension_reference: site.reference_identity,
                         suspension_current_meaning: site.reference_current_meaning,
                         control_path: Arc::clone(&site.control_path),
+                        program_order: site.program_order,
                         source: site.source.clone(),
                         slot_count: 1,
                         retains_turn_lease: true,
@@ -976,10 +1048,8 @@ impl FlowModule {
         actors.sort_by_key(|actor| actor.identity);
         requirements.sort_by_key(|requirement| requirement.identity);
         homes.sort_by_key(|home| home.identity);
-        let templates = proposal_templates(&actors, core.message_proposals(), cancellation)?;
-        let raw_proposals = representative_proposals(&templates, cancellation)?;
-        let proposals = arbitrate_proposals(&raw_proposals, &actors, cancellation)?;
-        let trace = produce_trace(&actors, &homes, &templates, &proposals, cancellation)?;
+        let templates =
+            proposal_templates(&actors, &homes, core.message_proposals(), cancellation)?;
         let model_contract = ModelContract {
             actors: actors
                 .iter()
@@ -994,29 +1064,23 @@ impl FlowModule {
                 .collect::<Vec<_>>()
                 .into(),
         };
-        let model_proposals = execute_independent_arbitration(&model_contract, cancellation)?;
-        let model_trace =
-            execute_independent_model(&model_contract, &model_proposals, cancellation)?;
+        let model_scenarios =
+            produce_bounded_scenarios(&model_contract, &actors, &homes, &templates, cancellation)?;
+        let independently_modeled = execute_independent_scenarios(&model_contract, cancellation)?;
         let model = ModelResult {
-            agrees: model_trace.as_ref() == trace.as_ref()
-                && model_proposals.as_ref() == proposals.as_ref(),
-            trace: model_trace,
-            proposals: model_proposals,
+            agrees: independently_modeled == model_scenarios,
+            scenarios: independently_modeled,
         };
         if !model.agrees {
             return defect("Flow graph disagrees with compact independent model");
         }
         let fingerprint = fingerprint(
             FlowFingerprintInput {
-                context: planning.context_identity(),
-                planning: planning.fingerprint(),
-                core: core.fingerprint(),
                 actors: &actors,
                 requirements: &requirements,
                 homes: &homes,
                 templates: &templates,
-                trace: &trace,
-                proposals: &proposals,
+                contract: &model_contract,
             },
             cancellation,
         )?;
@@ -1028,9 +1092,8 @@ impl FlowModule {
             requirements: requirements.into(),
             suspension_homes: homes.into(),
             proposal_templates: templates,
-            trace,
-            proposals,
             model_contract,
+            model_scenarios,
             model,
             fingerprint,
             _verified: Verified,
@@ -1073,22 +1136,24 @@ fn requirement_identity(
     hash.update(b"wrela.flow.requirement\0\x01");
     hash.update(&[kind.tag()]);
     hash.update(&actor.to_be_bytes());
-    hash.update(&handler.unwrap_or(0).to_be_bytes());
+    if kind != FlowRequirementKind::SuspensionHome {
+        hash.update(&handler.unwrap_or(0).to_be_bytes());
+    }
     hash.update(&site.unwrap_or(0).to_be_bytes());
     hash.digest128()
 }
 
-fn suspension_home_identity(actor: u128, handler: u128, suspension_reference: u128) -> u128 {
+fn suspension_home_identity(actor: u128, _handler: u128, suspension_reference: u128) -> u128 {
     let mut hash = Xxh3::new();
     hash.update(b"wrela.flow.suspension-home\0\x01");
     hash.update(&actor.to_be_bytes());
-    hash.update(&handler.to_be_bytes());
     hash.update(&suspension_reference.to_be_bytes());
     hash.digest128()
 }
 
 fn proposal_templates(
     actors: &[Actor],
+    homes: &[SuspensionHome],
     messages: Vec<crate::core::FlowCoreMessageProposal>,
     cancellation: &Cancellation,
 ) -> Result<Arc<[ProposalTemplate]>, FlowFailure> {
@@ -1117,7 +1182,31 @@ fn proposal_templates(
             return defect("Core message proposal has no Actor destination");
         };
         for sender in senders.iter().copied() {
-            for destination in destinations.iter().copied() {
+            let sender_actor = actors
+                .iter()
+                .find(|actor| actor.identity == sender)
+                .ok_or_else(|| FlowFailure::Defect(Arc::from("Flow sender Actor vanished")))?;
+            let wired_destinations = destinations
+                .iter()
+                .copied()
+                .filter(|destination| sender_actor.wired_actor_constructions.contains(destination))
+                .collect::<Vec<_>>();
+            if wired_destinations.len() != 1 {
+                return defect("Core message proposal has no unique build-wired Actor destination");
+            }
+            for destination in wired_destinations {
+                let proposal_home = homes
+                    .iter()
+                    .find(|home| {
+                        home.actor == sender
+                            && home.handler == message.sender_handler
+                            && home.suspension_reference == message.operation_reference
+                    })
+                    .ok_or_else(|| {
+                        FlowFailure::Defect(Arc::from(
+                            "MessageProposal has no exact static Suspension Home",
+                        ))
+                    })?;
                 let mut identity = Xxh3::new();
                 identity.update(b"wrela.flow.proposal-template\0\x01");
                 identity.update(&message.operation_reference.to_be_bytes());
@@ -1133,7 +1222,7 @@ fn proposal_templates(
                         type_identity: resource.type_identity,
                         place: Arc::clone(&resource.place),
                         source_home: resource.source_home,
-                        proposal_home: resource.proposal_home,
+                        proposal_home: proposal_home.identity,
                     })
                     .collect::<Vec<_>>();
                 let mut meaning = Xxh3::new();
@@ -1151,6 +1240,8 @@ fn proposal_templates(
                     destination,
                     destination_handler: message.destination_handler,
                     send_ordinal: message.send_ordinal,
+                    program_order: message.program_order,
+                    suspension_home: proposal_home.identity,
                     control_path: Arc::clone(&message.control_path),
                     resource_custody: resource_custody.into(),
                     source: message.source.clone(),
@@ -1163,59 +1254,143 @@ fn proposal_templates(
     Ok(templates.into())
 }
 
-fn representative_proposals(
+const MODEL_TURN_ACTIVATION_BOUND: u64 = 2;
+const MODEL_SCENARIO_BOUND: usize = 16;
+
+fn produce_bounded_scenarios(
+    contract: &ModelContract,
+    actors: &[Actor],
+    homes: &[SuspensionHome],
     templates: &[ProposalTemplate],
     cancellation: &Cancellation,
-) -> Result<Arc<[RawProposal]>, FlowFailure> {
-    let mut eligible_paths = BTreeMap::<u128, Arc<[u32]>>::new();
-    for template in templates {
+) -> Result<Arc<[ModelScenario]>, FlowFailure> {
+    let selections = produce_path_selections(contract, cancellation)?;
+    let mut scenarios = Vec::with_capacity(selections.len());
+    for selected_paths in selections {
         checkpoint(cancellation)?;
-        if !template.control_path.is_empty() {
-            eligible_paths
-                .entry(template.sender)
-                .and_modify(|path| {
-                    if template.control_path.as_ref() < path.as_ref() {
-                        *path = Arc::clone(&template.control_path);
-                    }
+        let mut raw = Vec::new();
+        for template in templates.iter().filter(|template| {
+            template.control_path.is_empty()
+                || selected_paths.iter().any(|(actor, handler, path)| {
+                    *actor == template.sender
+                        && *handler == template.sender_handler
+                        && path.as_ref() == template.control_path.as_ref()
                 })
-                .or_insert_with(|| Arc::clone(&template.control_path));
+        }) {
+            for turn in 0..MODEL_TURN_ACTIVATION_BOUND {
+                raw.push(RawProposal {
+                    template: template.identity,
+                    key: FlowProposalKey {
+                        destination: template.destination,
+                        sender: template.sender,
+                        sender_turn_sequence: turn,
+                        send_ordinal: template.send_ordinal,
+                    },
+                    arrival_ordinal: 0,
+                    operation_reference: template.identity,
+                    operation_current_meaning: template.current_meaning,
+                    control_path: Arc::clone(&template.control_path),
+                    resource_custody: Arc::clone(&template.resource_custody),
+                    source: template.source.clone(),
+                });
+            }
+        }
+        raw.sort_by_key(|proposal| proposal.key);
+        let count = u32::try_from(raw.len()).unwrap_or(u32::MAX);
+        for (index, proposal) in raw.iter_mut().enumerate() {
+            proposal.arrival_ordinal = count
+                .saturating_sub(1)
+                .saturating_sub(u32::try_from(index).unwrap_or(u32::MAX));
+        }
+        let proposals = arbitrate_proposals(&raw, actors, cancellation)?;
+        let trace = produce_trace(
+            actors,
+            homes,
+            templates,
+            &proposals,
+            selected_paths.as_ref(),
+            cancellation,
+        )?;
+        scenarios.push(ModelScenario {
+            identity: model_scenario_identity(&selected_paths),
+            selected_paths,
+            turn_activation_bound: MODEL_TURN_ACTIVATION_BOUND,
+            trace,
+            proposals,
+        });
+    }
+    scenarios.sort_by_key(|scenario| scenario.identity);
+    Ok(scenarios.into())
+}
+
+fn produce_path_selections(
+    contract: &ModelContract,
+    cancellation: &Cancellation,
+) -> Result<Vec<SelectedControlPaths>, FlowFailure> {
+    let mut options = BTreeMap::<(u128, u128), BTreeSet<Arc<[u32]>>>::new();
+    for home in contract.suspension_homes.iter() {
+        checkpoint(cancellation)?;
+        if !home.control_path.is_empty() {
+            options
+                .entry((home.actor, home.handler))
+                .or_default()
+                .insert(Arc::clone(&home.control_path));
+        } else {
+            options.entry((home.actor, home.handler)).or_default();
         }
     }
-    let mut proposals = templates
-        .iter()
-        .filter(|template| {
-            template.control_path.is_empty()
-                || eligible_paths.get(&template.sender) == Some(&template.control_path)
-        })
-        .map(|template| RawProposal {
-            template: template.identity,
-            key: FlowProposalKey {
-                destination: template.destination,
-                sender: template.sender,
-                sender_turn_sequence: 0,
-                send_ordinal: template.send_ordinal,
-            },
-            arrival_ordinal: 0,
-            operation_reference: template.identity,
-            operation_current_meaning: template.current_meaning,
-            control_path: Arc::clone(&template.control_path),
-            resource_custody: Arc::clone(&template.resource_custody),
-            source: template.source.clone(),
-        })
-        .collect::<Vec<_>>();
-    if proposals.len() == 1 {
-        let mut next_turn = proposals[0].clone();
-        next_turn.key.sender_turn_sequence = 1;
-        proposals.push(next_turn);
+    for template in contract.templates.iter() {
+        checkpoint(cancellation)?;
+        if !template.control_path.is_empty() {
+            options
+                .entry((template.sender, template.sender_handler))
+                .or_default()
+                .insert(Arc::clone(&template.control_path));
+        } else {
+            options
+                .entry((template.sender, template.sender_handler))
+                .or_default();
+        }
     }
-    proposals.sort_by_key(|proposal| proposal.key);
-    let count = u32::try_from(proposals.len()).unwrap_or(u32::MAX);
-    for (index, proposal) in proposals.iter_mut().enumerate() {
-        proposal.arrival_ordinal = count
-            .saturating_sub(1)
-            .saturating_sub(u32::try_from(index).unwrap_or(u32::MAX));
+    let mut selections = vec![Vec::new()];
+    for ((actor, handler), paths) in options {
+        let choices = if paths.is_empty() {
+            vec![Arc::from([])]
+        } else {
+            paths.into_iter().collect::<Vec<_>>()
+        };
+        let mut expanded = Vec::new();
+        for selection in &selections {
+            for path in &choices {
+                let mut next = selection.clone();
+                next.push((actor, handler, Arc::clone(path)));
+                expanded.push(next);
+                if expanded.len() > MODEL_SCENARIO_BOUND {
+                    return defect("bounded Flow model exceeds its explicit scenario limit");
+                }
+            }
+        }
+        selections = expanded;
     }
-    Ok(proposals.into())
+    if selections.is_empty() {
+        selections.push(Vec::new());
+    }
+    Ok(selections.into_iter().map(Arc::from).collect())
+}
+
+fn model_scenario_identity(selected_paths: &[SelectedControlPath]) -> u128 {
+    let mut hash = Xxh3::new();
+    hash.update(b"wrela.flow.model-scenario\0\x01");
+    hash.update(&MODEL_TURN_ACTIVATION_BOUND.to_be_bytes());
+    for (actor, handler, path) in selected_paths {
+        hash.update(&actor.to_be_bytes());
+        hash.update(&handler.to_be_bytes());
+        hash.update(&u64::try_from(path.len()).unwrap_or(u64::MAX).to_be_bytes());
+        for part in path.iter() {
+            hash.update(&part.to_be_bytes());
+        }
+    }
+    hash.digest128()
 }
 
 fn arbitrate_proposals(
@@ -1268,106 +1443,146 @@ fn arbitrate_proposals(
     Ok(results.into())
 }
 
-fn execute_independent_arbitration(
+fn execute_independent_scenarios(
     contract: &ModelContract,
     cancellation: &Cancellation,
-) -> Result<Arc<[FlowProposal]>, FlowFailure> {
+) -> Result<Arc<[ModelScenario]>, FlowFailure> {
+    let mut alternatives = BTreeMap::<(u128, u128), Vec<Arc<[u32]>>>::new();
+    for template in contract.templates.iter() {
+        checkpoint(cancellation)?;
+        let paths = alternatives
+            .entry((template.sender, template.sender_handler))
+            .or_default();
+        if !template.control_path.is_empty() && !paths.contains(&template.control_path) {
+            paths.push(Arc::clone(&template.control_path));
+        }
+    }
+    for home in contract.suspension_homes.iter() {
+        checkpoint(cancellation)?;
+        let paths = alternatives.entry((home.actor, home.handler)).or_default();
+        if !home.control_path.is_empty() && !paths.contains(&home.control_path) {
+            paths.push(Arc::clone(&home.control_path));
+        }
+    }
+    for paths in alternatives.values_mut() {
+        paths.sort();
+        if paths.is_empty() {
+            paths.push(Arc::from([]));
+        }
+    }
+    let mut combinations = vec![Vec::new()];
+    for ((actor, handler), paths) in alternatives {
+        let mut next = Vec::new();
+        for path in paths {
+            for prefix in &combinations {
+                let mut combination = prefix.clone();
+                combination.push((actor, handler, Arc::clone(&path)));
+                next.push(combination);
+            }
+        }
+        next.sort();
+        if next.len() > MODEL_SCENARIO_BOUND {
+            return defect("independent Flow model exceeds its explicit scenario limit");
+        }
+        combinations = next;
+    }
+    if combinations.is_empty() {
+        combinations.push(Vec::new());
+    }
     let capacities = contract
         .mailbox_capacities
         .iter()
         .copied()
         .collect::<BTreeMap<_, _>>();
-    let mut branch_choice = BTreeMap::<u128, Arc<[u32]>>::new();
-    for template in contract.templates.iter() {
-        if !template.control_path.is_empty() {
-            let choice = branch_choice
-                .entry(template.sender)
-                .or_insert_with(|| Arc::clone(&template.control_path));
-            if template.control_path.as_ref() < choice.as_ref() {
-                *choice = Arc::clone(&template.control_path);
+    let mut scenarios = Vec::new();
+    for combination in combinations {
+        checkpoint(cancellation)?;
+        let selected_paths: SelectedControlPaths = combination.into();
+        let mut runtime = Vec::new();
+        for turn in 0..MODEL_TURN_ACTIVATION_BOUND {
+            for template in contract.templates.iter() {
+                if !template.control_path.is_empty()
+                    && !selected_paths.iter().any(|(actor, handler, path)| {
+                        *actor == template.sender
+                            && *handler == template.sender_handler
+                            && path.as_ref() == template.control_path.as_ref()
+                    })
+                {
+                    continue;
+                }
+                runtime.push(RawProposal {
+                    template: template.identity,
+                    key: FlowProposalKey {
+                        destination: template.destination,
+                        sender: template.sender,
+                        sender_turn_sequence: turn,
+                        send_ordinal: template.send_ordinal,
+                    },
+                    arrival_ordinal: 0,
+                    operation_reference: template.identity,
+                    operation_current_meaning: template.current_meaning,
+                    control_path: Arc::clone(&template.control_path),
+                    resource_custody: Arc::clone(&template.resource_custody),
+                    source: template.source.clone(),
+                });
             }
         }
-    }
-    let mut runtime = contract
-        .templates
-        .iter()
-        .filter(|template| {
-            template.control_path.is_empty()
-                || branch_choice.get(&template.sender) == Some(&template.control_path)
-        })
-        .map(|template| RawProposal {
-            template: template.identity,
-            key: FlowProposalKey {
-                destination: template.destination,
-                sender: template.sender,
-                sender_turn_sequence: 0,
-                send_ordinal: template.send_ordinal,
-            },
-            arrival_ordinal: 0,
-            operation_reference: template.identity,
-            operation_current_meaning: template.current_meaning,
-            control_path: Arc::clone(&template.control_path),
-            resource_custody: Arc::clone(&template.resource_custody),
-            source: template.source.clone(),
-        })
-        .collect::<Vec<_>>();
-    if runtime.len() == 1 {
-        let mut activation = runtime[0].clone();
-        activation.key.sender_turn_sequence = 1;
-        runtime.push(activation);
-    }
-    runtime.sort_by_key(|proposal| proposal.key);
-    let runtime_count = u32::try_from(runtime.len()).unwrap_or(u32::MAX);
-    for (index, proposal) in runtime.iter_mut().enumerate() {
-        proposal.arrival_ordinal = runtime_count
-            .saturating_sub(1)
-            .saturating_sub(u32::try_from(index).unwrap_or(u32::MAX));
-    }
-    let mut remaining = runtime.iter().collect::<Vec<_>>();
-    let mut occupancy = BTreeMap::<u128, u64>::new();
-    let mut results = Vec::with_capacity(remaining.len());
-    let mut commit = 0_u64;
-    while !remaining.is_empty() {
-        checkpoint(cancellation)?;
-        let (index, proposal) = remaining
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, proposal)| proposal.key)
-            .map(|(index, proposal)| (index, *proposal))
-            .ok_or_else(|| FlowFailure::Defect(Arc::from("model proposal set vanished")))?;
-        remaining.remove(index);
-        let current = occupancy.entry(proposal.key.destination).or_default();
-        let admitted = *current
-            < capacities
-                .get(&proposal.key.destination)
-                .copied()
-                .unwrap_or(0);
-        let transfer_commit = admitted.then_some(commit);
-        if admitted {
-            *current = current.saturating_add(1);
-            commit = commit.saturating_add(1);
+        runtime.sort_by_key(|proposal| proposal.key);
+        let count = u32::try_from(runtime.len()).unwrap_or(u32::MAX);
+        for (index, proposal) in runtime.iter_mut().enumerate() {
+            proposal.arrival_ordinal = count
+                .saturating_sub(1)
+                .saturating_sub(u32::try_from(index).unwrap_or(u32::MAX));
         }
-        results.push(FlowProposal {
-            template: proposal.template,
-            key: proposal.key,
-            arrival_ordinal: proposal.arrival_ordinal,
-            source: proposal.source.clone(),
-            outcome: if admitted {
-                FlowSendOutcome::Admitted
-            } else {
-                FlowSendOutcome::Full
-            },
-            resource_custody: Arc::clone(&proposal.resource_custody),
-            before_commit: FlowCustodian::ProposalHome,
-            after_arbitration: if admitted {
-                FlowCustodian::Mailbox
-            } else {
-                FlowCustodian::ProposalHome
-            },
-            transfer_commit,
+        let mut occupancy = BTreeMap::<u128, u64>::new();
+        let mut commit = 0_u64;
+        let mut proposals = Vec::new();
+        for proposal in runtime {
+            checkpoint(cancellation)?;
+            let current = occupancy.entry(proposal.key.destination).or_default();
+            let admitted = *current
+                < capacities
+                    .get(&proposal.key.destination)
+                    .copied()
+                    .unwrap_or(0);
+            let transfer_commit = admitted.then_some(commit);
+            if admitted {
+                *current = current.saturating_add(1);
+                commit = commit.saturating_add(1);
+            }
+            proposals.push(FlowProposal {
+                template: proposal.template,
+                key: proposal.key,
+                arrival_ordinal: proposal.arrival_ordinal,
+                source: proposal.source,
+                outcome: if admitted {
+                    FlowSendOutcome::Admitted
+                } else {
+                    FlowSendOutcome::Full
+                },
+                resource_custody: proposal.resource_custody,
+                before_commit: FlowCustodian::ProposalHome,
+                after_arbitration: if admitted {
+                    FlowCustodian::Mailbox
+                } else {
+                    FlowCustodian::ProposalHome
+                },
+                transfer_commit,
+            });
+        }
+        let proposals: Arc<[FlowProposal]> = proposals.into();
+        let trace =
+            execute_independent_model(contract, &proposals, selected_paths.as_ref(), cancellation)?;
+        scenarios.push(ModelScenario {
+            identity: model_scenario_identity(&selected_paths),
+            selected_paths,
+            turn_activation_bound: MODEL_TURN_ACTIVATION_BOUND,
+            trace,
+            proposals,
         });
     }
-    Ok(results.into())
+    scenarios.sort_by_key(|scenario| scenario.identity);
+    Ok(scenarios.into())
 }
 
 fn produce_trace(
@@ -1375,147 +1590,227 @@ fn produce_trace(
     homes: &[SuspensionHome],
     templates: &[ProposalTemplate],
     proposals: &[FlowProposal],
+    selected_paths: &[SelectedControlPath],
     cancellation: &Cancellation,
 ) -> Result<Arc<[FlowEvent]>, FlowFailure> {
-    let homes = homes.iter().fold(BTreeMap::new(), |mut selected, home| {
-        selected
-            .entry((home.actor, home.handler))
-            .and_modify(|current: &mut &SuspensionHome| {
-                if (&home.control_path, home.identity) < (&current.control_path, current.identity) {
-                    *current = home;
-                }
-            })
-            .or_insert(home);
-        selected
-    });
-    let templates = templates
+    let templates_by_id = templates
         .iter()
         .map(|template| (template.identity, template))
         .collect::<BTreeMap<_, _>>();
+    let proposal_homes = templates
+        .iter()
+        .map(|template| template.suspension_home)
+        .collect::<BTreeSet<_>>();
+    let mut eligible_homes = homes
+        .iter()
+        .filter(|home| {
+            home.control_path.is_empty()
+                || selected_paths.iter().any(|(actor, handler, path)| {
+                    *actor == home.actor
+                        && *handler == home.handler
+                        && path.as_ref() == home.control_path.as_ref()
+                })
+        })
+        .collect::<Vec<_>>();
+    eligible_homes
+        .sort_by_key(|home| (home.actor, home.handler, home.program_order, home.identity));
+    let append = |events: &mut Vec<FlowEvent>,
+                  kind,
+                  actor,
+                  handler,
+                  turn_sequence,
+                  proposal,
+                  suspension_home,
+                  causal_predecessor,
+                  logical_commit,
+                  program_order| {
+        let sequence = u64::try_from(events.len()).unwrap_or(u64::MAX);
+        events.push(FlowEvent {
+            sequence,
+            program_order,
+            causal_predecessor,
+            logical_commit,
+            kind,
+            actor,
+            handler,
+            turn_sequence,
+            proposal,
+            suspension_home,
+        });
+        sequence
+    };
     let mut events = Vec::new();
     let mut exercised = BTreeSet::new();
+    let mut turns = BTreeMap::<(u128, u128, u64), Vec<&FlowProposal>>::new();
     for proposal in proposals {
-        checkpoint(cancellation)?;
-        let template = templates.get(&proposal.template).ok_or_else(|| {
-            FlowFailure::Defect(Arc::from("runtime proposal has no static template"))
+        let template = templates_by_id.get(&proposal.template).ok_or_else(|| {
+            FlowFailure::Defect(Arc::from("model proposal has no static Flow template"))
         })?;
-        let started = u64::try_from(events.len()).unwrap_or(u64::MAX);
-        events.push(FlowEvent {
-            sequence: started,
-            program_order: 0,
-            causal_predecessor: None,
-            logical_commit: None,
-            kind: FlowEventKind::TurnStarted,
-            actor: proposal.key.sender,
-            handler: template.sender_handler,
-            turn_sequence: proposal.key.sender_turn_sequence,
-            proposal: Some(proposal.key),
-            suspension_home: None,
-        });
-        exercised.insert((proposal.key.sender, template.sender_handler));
-        let proposed = u64::try_from(events.len()).unwrap_or(u64::MAX);
-        events.push(FlowEvent {
-            sequence: proposed,
-            program_order: u64::from(proposal.key.send_ordinal),
-            causal_predecessor: Some(started),
-            logical_commit: None,
-            kind: FlowEventKind::MessageProposed,
-            actor: proposal.key.sender,
-            handler: template.sender_handler,
-            turn_sequence: proposal.key.sender_turn_sequence,
-            proposal: Some(proposal.key),
-            suspension_home: None,
-        });
-        let outcome = u64::try_from(events.len()).unwrap_or(u64::MAX);
-        match proposal.outcome {
-            FlowSendOutcome::Full => events.push(FlowEvent {
-                sequence: outcome,
-                program_order: u64::from(proposal.key.send_ordinal),
-                causal_predecessor: Some(proposed),
-                logical_commit: None,
-                kind: FlowEventKind::MessageFull,
-                actor: proposal.key.sender,
-                handler: template.sender_handler,
-                turn_sequence: proposal.key.sender_turn_sequence,
-                proposal: Some(proposal.key),
-                suspension_home: None,
-            }),
-            FlowSendOutcome::Admitted => {
-                events.push(FlowEvent {
-                    sequence: outcome,
-                    program_order: u64::from(proposal.key.send_ordinal),
-                    causal_predecessor: Some(proposed),
-                    logical_commit: proposal.transfer_commit,
-                    kind: FlowEventKind::MailboxTransferCommitted,
-                    actor: proposal.key.destination,
-                    handler: template.destination_handler,
-                    turn_sequence: proposal.transfer_commit.unwrap_or(0),
-                    proposal: Some(proposal.key),
-                    suspension_home: None,
-                });
-                let receiver_started = u64::try_from(events.len()).unwrap_or(u64::MAX);
-                events.push(FlowEvent {
-                    sequence: receiver_started,
-                    program_order: 0,
-                    causal_predecessor: Some(outcome),
-                    logical_commit: proposal.transfer_commit,
-                    kind: FlowEventKind::TurnStarted,
-                    actor: proposal.key.destination,
-                    handler: template.destination_handler,
-                    turn_sequence: proposal.transfer_commit.unwrap_or(0),
-                    proposal: Some(proposal.key),
-                    suspension_home: None,
-                });
-                exercised.insert((proposal.key.destination, template.destination_handler));
-                let mut previous = receiver_started;
-                if let Some(home) =
-                    homes.get(&(proposal.key.destination, template.destination_handler))
-                {
-                    for kind in [FlowEventKind::TurnSuspended, FlowEventKind::TurnResumed] {
-                        let sequence = u64::try_from(events.len()).unwrap_or(u64::MAX);
-                        events.push(FlowEvent {
-                            sequence,
-                            program_order: 0,
-                            causal_predecessor: Some(previous),
-                            logical_commit: proposal.transfer_commit,
-                            kind,
-                            actor: proposal.key.destination,
-                            handler: template.destination_handler,
-                            turn_sequence: proposal.transfer_commit.unwrap_or(0),
-                            proposal: Some(proposal.key),
-                            suspension_home: Some(home.identity),
-                        });
-                        previous = sequence;
-                    }
+        turns
+            .entry((
+                proposal.key.sender,
+                template.sender_handler,
+                proposal.key.sender_turn_sequence,
+            ))
+            .or_default()
+            .push(proposal);
+    }
+    for ((sender, sender_handler, turn_sequence), mut turn_proposals) in turns {
+        checkpoint(cancellation)?;
+        turn_proposals.sort_by_key(|proposal| proposal.key.send_ordinal);
+        exercised.insert((sender, sender_handler));
+        let first_key = turn_proposals.first().map(|proposal| proposal.key);
+        let mut causal = append(
+            &mut events,
+            FlowEventKind::TurnStarted,
+            sender,
+            sender_handler,
+            turn_sequence,
+            first_key,
+            None,
+            None,
+            None,
+            0,
+        );
+        let mut admitted = Vec::new();
+        for proposal in turn_proposals {
+            let template = templates_by_id[&proposal.template];
+            causal = append(
+                &mut events,
+                FlowEventKind::MessageProposed,
+                sender,
+                sender_handler,
+                turn_sequence,
+                Some(proposal.key),
+                None,
+                Some(causal),
+                None,
+                u64::from(template.program_order),
+            );
+            for kind in [FlowEventKind::TurnSuspended, FlowEventKind::TurnResumed] {
+                causal = append(
+                    &mut events,
+                    kind,
+                    sender,
+                    sender_handler,
+                    turn_sequence,
+                    Some(proposal.key),
+                    Some(template.suspension_home),
+                    Some(causal),
+                    None,
+                    u64::from(template.program_order),
+                );
+            }
+            causal = match proposal.outcome {
+                FlowSendOutcome::Full => append(
+                    &mut events,
+                    FlowEventKind::MessageFull,
+                    sender,
+                    sender_handler,
+                    turn_sequence,
+                    Some(proposal.key),
+                    None,
+                    Some(causal),
+                    None,
+                    u64::from(template.program_order),
+                ),
+                FlowSendOutcome::Admitted => {
+                    admitted.push((proposal, template));
+                    append(
+                        &mut events,
+                        FlowEventKind::MailboxTransferCommitted,
+                        proposal.key.destination,
+                        template.destination_handler,
+                        proposal.transfer_commit.unwrap_or(0),
+                        Some(proposal.key),
+                        None,
+                        Some(causal),
+                        proposal.transfer_commit,
+                        u64::from(template.program_order),
+                    )
                 }
-                let sequence = u64::try_from(events.len()).unwrap_or(u64::MAX);
-                events.push(FlowEvent {
-                    sequence,
-                    program_order: 0,
-                    causal_predecessor: Some(previous),
-                    logical_commit: proposal.transfer_commit,
-                    kind: FlowEventKind::TurnCompleted,
-                    actor: proposal.key.destination,
-                    handler: template.destination_handler,
-                    turn_sequence: proposal.transfer_commit.unwrap_or(0),
-                    proposal: Some(proposal.key),
-                    suspension_home: None,
-                });
+            };
+        }
+        for home in eligible_homes.iter().filter(|home| {
+            home.actor == sender
+                && home.handler == sender_handler
+                && !proposal_homes.contains(&home.identity)
+        }) {
+            for kind in [FlowEventKind::TurnSuspended, FlowEventKind::TurnResumed] {
+                causal = append(
+                    &mut events,
+                    kind,
+                    sender,
+                    sender_handler,
+                    turn_sequence,
+                    first_key,
+                    Some(home.identity),
+                    Some(causal),
+                    None,
+                    u64::from(home.program_order),
+                );
             }
         }
-        let completed = u64::try_from(events.len()).unwrap_or(u64::MAX);
-        events.push(FlowEvent {
-            sequence: completed,
-            program_order: u64::from(proposal.key.send_ordinal).saturating_add(1),
-            causal_predecessor: Some(outcome),
-            logical_commit: proposal.transfer_commit,
-            kind: FlowEventKind::TurnCompleted,
-            actor: proposal.key.sender,
-            handler: template.sender_handler,
-            turn_sequence: proposal.key.sender_turn_sequence,
-            proposal: Some(proposal.key),
-            suspension_home: None,
-        });
+        let sender_completed = append(
+            &mut events,
+            FlowEventKind::TurnCompleted,
+            sender,
+            sender_handler,
+            turn_sequence,
+            first_key,
+            None,
+            Some(causal),
+            None,
+            u64::MAX,
+        );
+        for (proposal, template) in admitted {
+            exercised.insert((proposal.key.destination, template.destination_handler));
+            let receiver_turn = proposal.transfer_commit.unwrap_or(0);
+            let mut receiver_causal = append(
+                &mut events,
+                FlowEventKind::TurnStarted,
+                proposal.key.destination,
+                template.destination_handler,
+                receiver_turn,
+                Some(proposal.key),
+                None,
+                Some(sender_completed),
+                proposal.transfer_commit,
+                0,
+            );
+            for home in eligible_homes.iter().filter(|home| {
+                home.actor == proposal.key.destination
+                    && home.handler == template.destination_handler
+                    && !proposal_homes.contains(&home.identity)
+            }) {
+                for kind in [FlowEventKind::TurnSuspended, FlowEventKind::TurnResumed] {
+                    receiver_causal = append(
+                        &mut events,
+                        kind,
+                        proposal.key.destination,
+                        template.destination_handler,
+                        receiver_turn,
+                        Some(proposal.key),
+                        Some(home.identity),
+                        Some(receiver_causal),
+                        proposal.transfer_commit,
+                        u64::from(home.program_order),
+                    );
+                }
+            }
+            append(
+                &mut events,
+                FlowEventKind::TurnCompleted,
+                proposal.key.destination,
+                template.destination_handler,
+                receiver_turn,
+                Some(proposal.key),
+                None,
+                Some(receiver_causal),
+                proposal.transfer_commit,
+                u64::MAX,
+            );
+        }
     }
     for actor in actors {
         for handler in actor.handlers.iter().copied() {
@@ -1523,31 +1818,58 @@ fn produce_trace(
             if exercised.contains(&(actor.identity, handler)) {
                 continue;
             }
-            let Some(home) = homes
-                .get(&(actor.identity, handler))
-                .map(|home| home.identity)
-            else {
+            let handler_homes = eligible_homes
+                .iter()
+                .copied()
+                .filter(|home| {
+                    home.actor == actor.identity
+                        && home.handler == handler
+                        && !proposal_homes.contains(&home.identity)
+                })
+                .collect::<Vec<_>>();
+            if handler_homes.is_empty() {
                 continue;
-            };
-            for (kind, suspension_home) in [
-                (FlowEventKind::TurnStarted, None),
-                (FlowEventKind::TurnSuspended, Some(home)),
-                (FlowEventKind::TurnResumed, Some(home)),
-                (FlowEventKind::TurnCompleted, None),
-            ] {
-                events.push(FlowEvent {
-                    sequence: u64::try_from(events.len()).unwrap_or(u64::MAX),
-                    program_order: 0,
-                    causal_predecessor: events.last().map(|event| event.sequence),
-                    logical_commit: None,
-                    kind,
-                    actor: actor.identity,
-                    handler,
-                    turn_sequence: 0,
-                    proposal: None,
-                    suspension_home,
-                });
             }
+            let mut causal = append(
+                &mut events,
+                FlowEventKind::TurnStarted,
+                actor.identity,
+                handler,
+                0,
+                None,
+                None,
+                None,
+                None,
+                0,
+            );
+            for home in handler_homes {
+                for kind in [FlowEventKind::TurnSuspended, FlowEventKind::TurnResumed] {
+                    causal = append(
+                        &mut events,
+                        kind,
+                        actor.identity,
+                        handler,
+                        0,
+                        None,
+                        Some(home.identity),
+                        Some(causal),
+                        None,
+                        u64::from(home.program_order),
+                    );
+                }
+            }
+            append(
+                &mut events,
+                FlowEventKind::TurnCompleted,
+                actor.identity,
+                handler,
+                0,
+                None,
+                None,
+                Some(causal),
+                None,
+                u64::MAX,
+            );
         }
     }
     Ok(events.into())
@@ -1556,29 +1878,39 @@ fn produce_trace(
 fn execute_independent_model(
     contract: &ModelContract,
     proposals: &[FlowProposal],
+    selected_paths: &[SelectedControlPath],
     cancellation: &Cancellation,
 ) -> Result<Arc<[FlowEvent]>, FlowFailure> {
-    let selected_homes = contract.suspension_homes.iter().fold(
-        BTreeMap::<(u128, u128), &SuspensionHome>::new(),
-        |mut selected, home| {
-            selected
-                .entry((home.actor, home.handler))
-                .and_modify(|current| {
-                    if (&home.control_path, home.identity)
-                        < (&current.control_path, current.identity)
-                    {
-                        *current = home;
-                    }
-                })
-                .or_insert(home);
-            selected
-        },
-    );
     let templates = contract
         .templates
         .iter()
         .map(|template| (template.identity, template))
         .collect::<BTreeMap<_, _>>();
+    let proposal_homes = contract
+        .templates
+        .iter()
+        .map(|template| template.suspension_home)
+        .collect::<BTreeSet<_>>();
+    let mut homes = contract
+        .suspension_homes
+        .iter()
+        .filter(|home| {
+            home.control_path.is_empty()
+                || selected_paths.iter().any(|selection| {
+                    selection.0 == home.actor
+                        && selection.1 == home.handler
+                        && selection.2.as_ref() == home.control_path.as_ref()
+                })
+        })
+        .collect::<Vec<_>>();
+    homes.sort_by(|left, right| {
+        (left.actor, left.handler, left.program_order, left.identity).cmp(&(
+            right.actor,
+            right.handler,
+            right.program_order,
+            right.identity,
+        ))
+    });
     let append = |observations: &mut Vec<FlowEvent>,
                   kind,
                   actor,
@@ -1606,166 +1938,274 @@ fn execute_independent_model(
     };
     let mut observations = Vec::new();
     let mut exercised = BTreeSet::new();
+    let mut grouped = BTreeMap::<(u128, u128, u64), Vec<&FlowProposal>>::new();
     for proposal in proposals {
-        checkpoint(cancellation)?;
         let template = templates.get(&proposal.template).ok_or_else(|| {
-            FlowFailure::Defect(Arc::from("model runtime proposal has no template"))
+            FlowFailure::Defect(Arc::from("independent model proposal has no template"))
         })?;
-        let start = append(
+        grouped
+            .entry((
+                proposal.key.sender,
+                template.sender_handler,
+                proposal.key.sender_turn_sequence,
+            ))
+            .or_default()
+            .push(proposal);
+    }
+    for ((actor, handler, turn), mut messages) in grouped {
+        checkpoint(cancellation)?;
+        messages.sort_by_key(|message| message.key.send_ordinal);
+        exercised.insert((actor, handler));
+        let first = messages.first().map(|message| message.key);
+        let mut prior = append(
             &mut observations,
             FlowEventKind::TurnStarted,
-            proposal.key.sender,
-            template.sender_handler,
-            proposal.key.sender_turn_sequence,
-            Some(proposal.key),
+            actor,
+            handler,
+            turn,
+            first,
             None,
             None,
             None,
             0,
         );
-        exercised.insert((proposal.key.sender, template.sender_handler));
-        let proposed = append(
-            &mut observations,
-            FlowEventKind::MessageProposed,
-            proposal.key.sender,
-            template.sender_handler,
-            proposal.key.sender_turn_sequence,
-            Some(proposal.key),
-            None,
-            Some(start),
-            None,
-            u64::from(proposal.key.send_ordinal),
-        );
-        let outcome = match proposal.outcome {
-            FlowSendOutcome::Full => append(
+        let mut deliveries = Vec::new();
+        for message in messages {
+            let template = templates[&message.template];
+            prior = append(
                 &mut observations,
-                FlowEventKind::MessageFull,
-                proposal.key.sender,
-                template.sender_handler,
-                proposal.key.sender_turn_sequence,
-                Some(proposal.key),
+                FlowEventKind::MessageProposed,
+                actor,
+                handler,
+                turn,
+                Some(message.key),
                 None,
-                Some(proposed),
+                Some(prior),
                 None,
-                u64::from(proposal.key.send_ordinal),
-            ),
-            FlowSendOutcome::Admitted => {
-                let committed = append(
+                u64::from(template.program_order),
+            );
+            prior = append(
+                &mut observations,
+                FlowEventKind::TurnSuspended,
+                actor,
+                handler,
+                turn,
+                Some(message.key),
+                Some(template.suspension_home),
+                Some(prior),
+                None,
+                u64::from(template.program_order),
+            );
+            prior = append(
+                &mut observations,
+                FlowEventKind::TurnResumed,
+                actor,
+                handler,
+                turn,
+                Some(message.key),
+                Some(template.suspension_home),
+                Some(prior),
+                None,
+                u64::from(template.program_order),
+            );
+            if message.outcome == FlowSendOutcome::Admitted {
+                deliveries.push((message, template));
+                prior = append(
                     &mut observations,
                     FlowEventKind::MailboxTransferCommitted,
-                    proposal.key.destination,
+                    message.key.destination,
                     template.destination_handler,
-                    proposal.transfer_commit.unwrap_or(0),
-                    Some(proposal.key),
+                    message.transfer_commit.unwrap_or(0),
+                    Some(message.key),
                     None,
-                    Some(proposed),
-                    proposal.transfer_commit,
-                    u64::from(proposal.key.send_ordinal),
+                    Some(prior),
+                    message.transfer_commit,
+                    u64::from(template.program_order),
                 );
-                let receiver_start = append(
+            } else {
+                prior = append(
                     &mut observations,
-                    FlowEventKind::TurnStarted,
-                    proposal.key.destination,
-                    template.destination_handler,
-                    proposal.transfer_commit.unwrap_or(0),
-                    Some(proposal.key),
+                    FlowEventKind::MessageFull,
+                    actor,
+                    handler,
+                    turn,
+                    Some(message.key),
                     None,
-                    Some(committed),
-                    proposal.transfer_commit,
-                    0,
-                );
-                exercised.insert((proposal.key.destination, template.destination_handler));
-                let mut causal = receiver_start;
-                if let Some(home) =
-                    selected_homes.get(&(proposal.key.destination, template.destination_handler))
-                {
-                    causal = append(
-                        &mut observations,
-                        FlowEventKind::TurnSuspended,
-                        proposal.key.destination,
-                        template.destination_handler,
-                        proposal.transfer_commit.unwrap_or(0),
-                        Some(proposal.key),
-                        Some(home.identity),
-                        Some(causal),
-                        proposal.transfer_commit,
-                        0,
-                    );
-                    causal = append(
-                        &mut observations,
-                        FlowEventKind::TurnResumed,
-                        proposal.key.destination,
-                        template.destination_handler,
-                        proposal.transfer_commit.unwrap_or(0),
-                        Some(proposal.key),
-                        Some(home.identity),
-                        Some(causal),
-                        proposal.transfer_commit,
-                        0,
-                    );
-                }
-                append(
-                    &mut observations,
-                    FlowEventKind::TurnCompleted,
-                    proposal.key.destination,
-                    template.destination_handler,
-                    proposal.transfer_commit.unwrap_or(0),
-                    Some(proposal.key),
+                    Some(prior),
                     None,
-                    Some(causal),
-                    proposal.transfer_commit,
-                    0,
+                    u64::from(template.program_order),
                 );
-                committed
             }
-        };
-        append(
+        }
+        for home in homes.iter().filter(|home| {
+            home.actor == actor
+                && home.handler == handler
+                && !proposal_homes.contains(&home.identity)
+        }) {
+            prior = append(
+                &mut observations,
+                FlowEventKind::TurnSuspended,
+                actor,
+                handler,
+                turn,
+                first,
+                Some(home.identity),
+                Some(prior),
+                None,
+                u64::from(home.program_order),
+            );
+            prior = append(
+                &mut observations,
+                FlowEventKind::TurnResumed,
+                actor,
+                handler,
+                turn,
+                first,
+                Some(home.identity),
+                Some(prior),
+                None,
+                u64::from(home.program_order),
+            );
+        }
+        let completed = append(
             &mut observations,
             FlowEventKind::TurnCompleted,
-            proposal.key.sender,
-            template.sender_handler,
-            proposal.key.sender_turn_sequence,
-            Some(proposal.key),
+            actor,
+            handler,
+            turn,
+            first,
             None,
-            Some(outcome),
-            proposal.transfer_commit,
-            u64::from(proposal.key.send_ordinal).saturating_add(1),
+            Some(prior),
+            None,
+            u64::MAX,
         );
+        for (message, template) in deliveries {
+            exercised.insert((message.key.destination, template.destination_handler));
+            let receiver_turn = message.transfer_commit.unwrap_or(0);
+            let mut receiver_prior = append(
+                &mut observations,
+                FlowEventKind::TurnStarted,
+                message.key.destination,
+                template.destination_handler,
+                receiver_turn,
+                Some(message.key),
+                None,
+                Some(completed),
+                message.transfer_commit,
+                0,
+            );
+            for home in homes.iter().filter(|home| {
+                home.actor == message.key.destination
+                    && home.handler == template.destination_handler
+                    && !proposal_homes.contains(&home.identity)
+            }) {
+                receiver_prior = append(
+                    &mut observations,
+                    FlowEventKind::TurnSuspended,
+                    message.key.destination,
+                    template.destination_handler,
+                    receiver_turn,
+                    Some(message.key),
+                    Some(home.identity),
+                    Some(receiver_prior),
+                    message.transfer_commit,
+                    u64::from(home.program_order),
+                );
+                receiver_prior = append(
+                    &mut observations,
+                    FlowEventKind::TurnResumed,
+                    message.key.destination,
+                    template.destination_handler,
+                    receiver_turn,
+                    Some(message.key),
+                    Some(home.identity),
+                    Some(receiver_prior),
+                    message.transfer_commit,
+                    u64::from(home.program_order),
+                );
+            }
+            append(
+                &mut observations,
+                FlowEventKind::TurnCompleted,
+                message.key.destination,
+                template.destination_handler,
+                receiver_turn,
+                Some(message.key),
+                None,
+                Some(receiver_prior),
+                message.transfer_commit,
+                u64::MAX,
+            );
+        }
     }
     for (actor, handlers) in contract.actors.iter() {
-        for handler in handlers
-            .iter()
-            .copied()
-            .filter(|handler| selected_homes.contains_key(&(*actor, *handler)))
-        {
+        for handler in handlers.iter().copied() {
             checkpoint(cancellation)?;
             if exercised.contains(&(*actor, handler)) {
                 continue;
             }
-            let home = selected_homes
-                .get(&(*actor, handler))
-                .map(|home| home.identity)
-                .ok_or_else(|| FlowFailure::Defect(Arc::from("model suspension has no Home")))?;
-            for (kind, suspension_home) in [
-                (FlowEventKind::TurnStarted, None),
-                (FlowEventKind::TurnSuspended, Some(home)),
-                (FlowEventKind::TurnResumed, Some(home)),
-                (FlowEventKind::TurnCompleted, None),
-            ] {
-                let causal = observations.last().map(|event| event.sequence);
-                append(
+            let eligible = homes
+                .iter()
+                .copied()
+                .filter(|home| {
+                    home.actor == *actor
+                        && home.handler == handler
+                        && !proposal_homes.contains(&home.identity)
+                })
+                .collect::<Vec<_>>();
+            if eligible.is_empty() {
+                continue;
+            }
+            let mut prior = append(
+                &mut observations,
+                FlowEventKind::TurnStarted,
+                *actor,
+                handler,
+                0,
+                None,
+                None,
+                None,
+                None,
+                0,
+            );
+            for home in eligible {
+                prior = append(
                     &mut observations,
-                    kind,
+                    FlowEventKind::TurnSuspended,
                     *actor,
                     handler,
                     0,
                     None,
-                    suspension_home,
-                    causal,
+                    Some(home.identity),
+                    Some(prior),
                     None,
+                    u64::from(home.program_order),
+                );
+                prior = append(
+                    &mut observations,
+                    FlowEventKind::TurnResumed,
+                    *actor,
+                    handler,
                     0,
+                    None,
+                    Some(home.identity),
+                    Some(prior),
+                    None,
+                    u64::from(home.program_order),
                 );
             }
+            append(
+                &mut observations,
+                FlowEventKind::TurnCompleted,
+                *actor,
+                handler,
+                0,
+                None,
+                None,
+                Some(prior),
+                None,
+                u64::MAX,
+            );
         }
     }
     Ok(observations.into())
@@ -1803,6 +2243,7 @@ fn verify(
                 FlowRequirementKind::PermanentCorePlacement,
             ),
             handlers: actor.handlers().collect::<Vec<_>>().into(),
+            wired_actor_constructions: actor.wired_actor_constructions().into(),
         })
         .collect::<Vec<_>>();
     expected_actors.sort_by_key(|actor| actor.identity);
@@ -1878,41 +2319,39 @@ fn verify(
             return defect("Flow Planning Requirement identity or meaning is invalid");
         }
     }
-    let expected_homes = expected_actors
+    let mut expected_homes = expected_actors
         .iter()
         .flat_map(|actor| {
             suspension_sites
                 .iter()
                 .filter(|site| actor.handlers.contains(&site.handler))
-                .map(|site| {
-                    (
+                .map(|site| SuspensionHome {
+                    identity: suspension_home_identity(
                         actor.identity,
                         site.handler,
                         site.reference_identity,
-                        site.reference_current_meaning,
-                        Arc::clone(&site.control_path),
-                        site.source.clone(),
-                    )
+                    ),
+                    actor: actor.identity,
+                    handler: site.handler,
+                    suspension_reference: site.reference_identity,
+                    suspension_current_meaning: site.reference_current_meaning,
+                    control_path: Arc::clone(&site.control_path),
+                    program_order: site.program_order,
+                    source: site.source.clone(),
+                    slot_count: 1,
+                    retains_turn_lease: true,
+                    requirement: requirement_identity(
+                        actor.identity,
+                        Some(site.handler),
+                        Some(site.reference_identity),
+                        FlowRequirementKind::SuspensionHome,
+                    ),
                 })
                 .collect::<Vec<_>>()
         })
-        .collect::<BTreeSet<_>>();
-    let supplied_homes = candidate
-        .suspension_homes
-        .iter()
-        .map(|home| {
-            (
-                home.actor,
-                home.handler,
-                home.suspension_reference,
-                home.suspension_current_meaning,
-                Arc::clone(&home.control_path),
-                home.source.clone(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    if expected_homes != supplied_homes || expected_homes.len() != candidate.suspension_homes.len()
-    {
+        .collect::<Vec<_>>();
+    expected_homes.sort_by_key(|home| home.identity);
+    if expected_homes.as_slice() != candidate.suspension_homes.as_ref() {
         return defect("Flow suspension has no exact static Suspension Home");
     }
     for home in candidate.suspension_homes.iter() {
@@ -1932,47 +2371,63 @@ fn verify(
             return defect("Flow Suspension Home is invalid");
         }
     }
-    verify_non_reentrant_trace(&candidate.trace, cancellation)?;
-    let expected_trace = produce_trace(
-        &candidate.actors,
-        &candidate.suspension_homes,
-        &candidate.proposal_templates,
-        &candidate.proposals,
+    for scenario in candidate.model_scenarios.iter() {
+        verify_non_reentrant_trace(&scenario.trace, cancellation)?;
+        let expected_trace = produce_trace(
+            &candidate.actors,
+            &candidate.suspension_homes,
+            &candidate.proposal_templates,
+            &scenario.proposals,
+            &scenario.selected_paths,
+            cancellation,
+        )?;
+        if expected_trace != scenario.trace {
+            return defect(
+                "Flow model scenario trace is not the canonical static graph projection",
+            );
+        }
+        verify_proposals(candidate, &scenario.proposals, cancellation)?;
+    }
+    let expected_templates = proposal_templates(
+        &expected_actors,
+        &expected_homes,
+        core.message_proposals(),
         cancellation,
     )?;
-    if expected_trace != candidate.trace {
-        return defect("Flow typed trace is not the canonical graph projection");
-    }
-    let expected_templates =
-        proposal_templates(&expected_actors, core.message_proposals(), cancellation)?;
-    if expected_templates != candidate.model_contract.templates
-        || expected_templates != candidate.proposal_templates
-    {
+    if expected_templates != candidate.proposal_templates {
         return defect("Flow model contract disagrees with Core message proposals");
     }
-    let model_proposals = execute_independent_arbitration(&candidate.model_contract, cancellation)?;
-    let model_trace =
-        execute_independent_model(&candidate.model_contract, &model_proposals, cancellation)?;
-    if model_trace != candidate.model.trace
-        || model_proposals != candidate.model.proposals
-        || candidate.model.trace != candidate.trace
-        || candidate.model.proposals != candidate.proposals
+    let expected_contract = ModelContract {
+        actors: expected_actors
+            .iter()
+            .map(|actor| (actor.identity, Arc::clone(&actor.handlers)))
+            .collect::<Vec<_>>()
+            .into(),
+        suspension_homes: expected_homes.into(),
+        templates: expected_templates,
+        mailbox_capacities: expected_actors
+            .iter()
+            .map(|actor| (actor.identity, actor.mailbox_capacity))
+            .collect::<Vec<_>>()
+            .into(),
+    };
+    if candidate.model_contract != expected_contract {
+        return defect("Flow model contract roster or direct relationship is invalid");
+    }
+    let modeled = execute_independent_scenarios(&candidate.model_contract, cancellation)?;
+    if modeled != candidate.model.scenarios
+        || candidate.model.scenarios != candidate.model_scenarios
         || !candidate.model.agrees
     {
         return defect("Flow compact model and typed trace disagree");
     }
-    verify_proposals(candidate, cancellation)?;
     let expected_fingerprint = fingerprint(
         FlowFingerprintInput {
-            context: candidate.context,
-            planning: candidate.planning_fingerprint,
-            core: candidate.core_fingerprint,
             actors: &candidate.actors,
             requirements: &candidate.requirements,
             homes: &candidate.suspension_homes,
             templates: &candidate.proposal_templates,
-            trace: &candidate.trace,
-            proposals: &candidate.proposals,
+            contract: &candidate.model_contract,
         },
         cancellation,
     )?;
@@ -1984,17 +2439,18 @@ fn verify(
 
 fn verify_proposals(
     candidate: &VerifiedFlowProgram,
+    proposals: &[FlowProposal],
     cancellation: &Cancellation,
 ) -> Result<(), FlowFailure> {
-    let exact_custody =
-        representative_proposals(&candidate.model_contract.templates, cancellation)?
-            .iter()
-            .map(|proposal| (proposal.key, Arc::clone(&proposal.resource_custody)))
-            .collect::<BTreeMap<_, _>>();
+    let exact_custody = candidate
+        .proposal_templates
+        .iter()
+        .map(|template| (template.identity, Arc::clone(&template.resource_custody)))
+        .collect::<BTreeMap<_, _>>();
     let mut previous = None;
     let mut mailbox_resources = BTreeSet::new();
     let mut proposal_resources = BTreeSet::new();
-    for proposal in candidate.proposals.iter() {
+    for proposal in proposals {
         checkpoint(cancellation)?;
         if previous.is_some_and(|key| key >= proposal.key) {
             return defect("Flow proposals are not in canonical logical order");
@@ -2003,7 +2459,7 @@ fn verify_proposals(
         if proposal.before_commit != FlowCustodian::ProposalHome {
             return defect("Flow proposal lost pre-commit Resource custody");
         }
-        if exact_custody.get(&proposal.key).map(Arc::as_ref)
+        if exact_custody.get(&proposal.template).map(Arc::as_ref)
             != Some(proposal.resource_custody.as_ref())
         {
             return defect(
@@ -2049,8 +2505,7 @@ fn verify_proposals(
         .map(|actor| (actor.identity, actor.mailbox_capacity))
         .collect::<BTreeMap<_, _>>();
     let mut admissions = BTreeMap::<u128, u64>::new();
-    for proposal in candidate
-        .proposals
+    for proposal in proposals
         .iter()
         .filter(|proposal| proposal.outcome == FlowSendOutcome::Admitted)
     {
@@ -2118,15 +2573,11 @@ fn verify_non_reentrant_trace(
 }
 
 struct FlowFingerprintInput<'a> {
-    context: u128,
-    planning: u128,
-    core: u128,
     actors: &'a [Actor],
     requirements: &'a [FlowRequirement],
     homes: &'a [SuspensionHome],
     templates: &'a [ProposalTemplate],
-    trace: &'a [FlowEvent],
-    proposals: &'a [FlowProposal],
+    contract: &'a ModelContract,
 }
 
 fn fingerprint(
@@ -2134,32 +2585,28 @@ fn fingerprint(
     cancellation: &Cancellation,
 ) -> Result<u128, FlowFailure> {
     let FlowFingerprintInput {
-        context,
-        planning,
-        core,
         actors,
         requirements,
         homes,
         templates,
-        trace,
-        proposals,
+        contract,
     } = input;
     let mut hash = Xxh3::new();
     hash.update(b"wrela.verified-flow-program\0\x01");
-    hash.update(&context.to_be_bytes());
-    hash.update(&planning.to_be_bytes());
-    hash.update(&core.to_be_bytes());
     for actor in actors {
         checkpoint(cancellation)?;
         hash.update(&actor.identity.to_be_bytes());
-        hash.update(&actor.actor_type_identity.to_be_bytes());
         hash.update(&actor.construction_identity.to_be_bytes());
-        hash.update(&actor.construction_current_meaning.to_be_bytes());
         hash.update(&actor.mailbox_capacity.to_be_bytes());
         hash.update(&[actor.max_active_turns]);
         hash.update(&actor.permanent_core_requirement.to_be_bytes());
-        for handler in actor.handlers.iter() {
-            hash.update(&handler.to_be_bytes());
+        hash.update(
+            &u64::try_from(actor.handlers.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        for construction in actor.wired_actor_constructions.iter() {
+            hash.update(&construction.to_be_bytes());
         }
     }
     for requirement in requirements {
@@ -2171,12 +2618,9 @@ fn fingerprint(
         checkpoint(cancellation)?;
         hash.update(&home.identity.to_be_bytes());
         hash.update(&home.actor.to_be_bytes());
-        hash.update(&home.handler.to_be_bytes());
         hash.update(&home.suspension_reference.to_be_bytes());
         hash.update(&home.suspension_current_meaning.to_be_bytes());
-        hash.update(home.source.path().as_bytes());
-        hash.update(&home.source.start().to_be_bytes());
-        hash.update(&home.source.end().to_be_bytes());
+        hash.update(&home.program_order.to_be_bytes());
         for part in home.control_path.iter() {
             hash.update(&part.to_be_bytes());
         }
@@ -2189,68 +2633,50 @@ fn fingerprint(
         hash.update(&template.identity.to_be_bytes());
         hash.update(&template.current_meaning.to_be_bytes());
         hash.update(&template.sender.to_be_bytes());
-        hash.update(&template.sender_handler.to_be_bytes());
         hash.update(&template.destination.to_be_bytes());
-        hash.update(&template.destination_handler.to_be_bytes());
         hash.update(&template.send_ordinal.to_be_bytes());
+        hash.update(&template.program_order.to_be_bytes());
+        hash.update(&template.suspension_home.to_be_bytes());
         for part in template.control_path.iter() {
             hash.update(&part.to_be_bytes());
         }
         for resource in template.resource_custody.iter() {
             hash.update(&resource.core_reference_identity.to_be_bytes());
             hash.update(&resource.core_reference_current_meaning.to_be_bytes());
-            hash.update(&resource.type_identity.to_be_bytes());
-            hash.update(&resource.source_home.to_be_bytes());
             hash.update(&resource.proposal_home.to_be_bytes());
             for part in resource.place.iter() {
                 hash.update(&part.to_be_bytes());
             }
         }
     }
-    for event in trace {
+    hash.update(b"wrela.flow.model-contract\0\x01");
+    for (actor, handlers) in contract.actors.iter() {
         checkpoint(cancellation)?;
-        hash.update(&event.sequence.to_be_bytes());
-        hash.update(&event.program_order.to_be_bytes());
-        hash.update(&event.causal_predecessor.unwrap_or(u64::MAX).to_be_bytes());
-        hash.update(&event.logical_commit.unwrap_or(u64::MAX).to_be_bytes());
-        hash.update(&[event.kind.tag()]);
-        hash.update(&event.actor.to_be_bytes());
-        hash.update(&event.handler.to_be_bytes());
-        hash.update(&event.turn_sequence.to_be_bytes());
-        if let Some(proposal) = event.proposal {
-            hash.update(&proposal.destination.to_be_bytes());
-            hash.update(&proposal.sender.to_be_bytes());
-            hash.update(&proposal.sender_turn_sequence.to_be_bytes());
-            hash.update(&proposal.send_ordinal.to_be_bytes());
-        }
-        hash.update(&event.suspension_home.unwrap_or(0).to_be_bytes());
+        hash.update(&actor.to_be_bytes());
+        hash.update(
+            &u64::try_from(handlers.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
     }
-    for proposal in proposals {
+    for home in contract.suspension_homes.iter() {
         checkpoint(cancellation)?;
-        hash.update(&proposal.key.destination.to_be_bytes());
-        hash.update(&proposal.key.sender.to_be_bytes());
-        hash.update(&proposal.key.sender_turn_sequence.to_be_bytes());
-        hash.update(&proposal.key.send_ordinal.to_be_bytes());
-        hash.update(&proposal.arrival_ordinal.to_be_bytes());
-        hash.update(&[match proposal.outcome {
-            FlowSendOutcome::Admitted => 1,
-            FlowSendOutcome::Full => 2,
-        }]);
-        hash.update(&[match proposal.after_arbitration {
-            FlowCustodian::ProposalHome => 1,
-            FlowCustodian::Mailbox => 2,
-        }]);
-        hash.update(&proposal.transfer_commit.unwrap_or(u64::MAX).to_be_bytes());
-        for resource in proposal.resource_custody.iter() {
-            hash.update(&resource.core_reference_identity.to_be_bytes());
-            hash.update(&resource.core_reference_current_meaning.to_be_bytes());
-            hash.update(&resource.type_identity.to_be_bytes());
-            hash.update(&resource.source_home.to_be_bytes());
-            hash.update(&resource.proposal_home.to_be_bytes());
-            for part in resource.place.iter() {
-                hash.update(&part.to_be_bytes());
-            }
-        }
+        hash.update(&home.identity.to_be_bytes());
+        hash.update(&home.actor.to_be_bytes());
+        hash.update(&home.suspension_reference.to_be_bytes());
+        hash.update(&home.requirement.to_be_bytes());
+    }
+    for template in contract.templates.iter() {
+        checkpoint(cancellation)?;
+        hash.update(&template.identity.to_be_bytes());
+        hash.update(&template.sender.to_be_bytes());
+        hash.update(&template.destination.to_be_bytes());
+        hash.update(&template.suspension_home.to_be_bytes());
+    }
+    for (actor, capacity) in contract.mailbox_capacities.iter() {
+        checkpoint(cancellation)?;
+        hash.update(&actor.to_be_bytes());
+        hash.update(&capacity.to_be_bytes());
     }
     Ok(hash.digest128())
 }
@@ -2297,6 +2723,8 @@ struct Receiver:
 
 @actor
 struct SenderA:
+    receiver: Receiver
+
     pub async fn deliver(self, receiver: Receiver, take token: Token):
         admission = try_send receiver.receive(take token)
         match admission:
@@ -2308,6 +2736,8 @@ struct SenderA:
 
 @actor
 struct SenderB:
+    receiver: Receiver
+
     pub async fn deliver(self, receiver: Receiver, take token: Token):
         admission = try_send receiver.receive(take token)
         match admission:
@@ -2320,8 +2750,8 @@ struct SenderB:
 @image
 fn build() -> Image:
     receiver = Receiver()
-    left = SenderA()
-    right = SenderB()
+    left = SenderA(receiver=receiver)
+    right = SenderB(receiver=receiver)
     return Image.new(receiver=receiver, left=left, right=right)
 "#;
 
@@ -2364,15 +2794,11 @@ fn build() -> Image:
     fn resign(candidate: &mut VerifiedFlowProgram) {
         candidate.fingerprint = fingerprint(
             FlowFingerprintInput {
-                context: candidate.context,
-                planning: candidate.planning_fingerprint,
-                core: candidate.core_fingerprint,
                 actors: &candidate.actors,
                 requirements: &candidate.requirements,
                 homes: &candidate.suspension_homes,
                 templates: &candidate.proposal_templates,
-                trace: &candidate.trace,
-                proposals: &candidate.proposals,
+                contract: &candidate.model_contract,
             },
             &Cancellation::new(),
         )
@@ -2398,7 +2824,11 @@ fn build() -> Image:
     #[test]
     fn verifier_rejects_single_fault_logical_order_corruption() {
         let (mut candidate, planning, core) = fixture();
-        Arc::make_mut(&mut candidate.proposals).swap(0, 1);
+        let scenario = Arc::make_mut(&mut candidate.model_scenarios)
+            .iter_mut()
+            .find(|scenario| scenario.proposals.len() >= 2)
+            .expect("fixture models competing proposals");
+        Arc::make_mut(&mut scenario.proposals).swap(0, 1);
         resign(&mut candidate);
         assert!(rejected(&candidate, &planning, &core));
     }
@@ -2406,7 +2836,8 @@ fn build() -> Image:
     #[test]
     fn verifier_rejects_single_fault_turn_reentrancy_corruption() {
         let (mut candidate, planning, core) = fixture();
-        Arc::make_mut(&mut candidate.trace)[1].kind = FlowEventKind::TurnStarted;
+        Arc::make_mut(&mut Arc::make_mut(&mut candidate.model_scenarios)[0].trace)[1].kind =
+            FlowEventKind::TurnStarted;
         resign(&mut candidate);
         assert!(rejected(&candidate, &planning, &core));
     }
@@ -2414,7 +2845,16 @@ fn build() -> Image:
     #[test]
     fn verifier_rejects_single_fault_resource_custody_corruption() {
         let (mut candidate, planning, core) = fixture();
-        let admitted = Arc::make_mut(&mut candidate.proposals)
+        let scenario = Arc::make_mut(&mut candidate.model_scenarios)
+            .iter_mut()
+            .find(|scenario| {
+                scenario
+                    .proposals
+                    .iter()
+                    .any(|proposal| proposal.outcome == FlowSendOutcome::Admitted)
+            })
+            .expect("capacity-one fixture models an admission");
+        let admitted = Arc::make_mut(&mut scenario.proposals)
             .iter_mut()
             .find(|proposal| proposal.outcome == FlowSendOutcome::Admitted)
             .expect("capacity-one fixture admits one proposal");
@@ -2474,6 +2914,42 @@ fn build() -> Image:
         home.requirement = candidate.actors[0].permanent_core_requirement;
         resign(&mut candidate);
         assert!(rejected(&candidate, &planning, &core));
+    }
+
+    #[test]
+    fn verifier_rejects_repointed_try_send_suspension_home() {
+        let (mut candidate, planning, core) = fixture();
+        Arc::make_mut(&mut candidate.proposal_templates)[0].suspension_home ^= 1;
+        resign(&mut candidate);
+        assert!(rejected(&candidate, &planning, &core));
+    }
+
+    #[test]
+    fn verifier_rejects_missing_or_repointed_model_contract_rosters() {
+        let (candidate, planning, core) = fixture();
+
+        let mut missing_actor = candidate.clone();
+        Arc::make_mut(&mut missing_actor.model_contract.actors)
+            .first_mut()
+            .expect("fixture has Actor roster")
+            .1 = Arc::from([]);
+        assert!(rejected(&missing_actor, &planning, &core));
+        resign(&mut missing_actor);
+        assert!(rejected(&missing_actor, &planning, &core));
+
+        let mut missing_home = candidate.clone();
+        let mut homes = missing_home.model_contract.suspension_homes.to_vec();
+        homes.pop();
+        missing_home.model_contract.suspension_homes = homes.into();
+        assert!(rejected(&missing_home, &planning, &core));
+        resign(&mut missing_home);
+        assert!(rejected(&missing_home, &planning, &core));
+
+        let mut repointed_capacity = candidate;
+        Arc::make_mut(&mut repointed_capacity.model_contract.mailbox_capacities)[0].0 ^= 1;
+        assert!(rejected(&repointed_capacity, &planning, &core));
+        resign(&mut repointed_capacity);
+        assert!(rejected(&repointed_capacity, &planning, &core));
     }
 
     #[test]

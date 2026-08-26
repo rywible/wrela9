@@ -8,7 +8,7 @@ use xxhash_rust::xxh3::xxh3_128;
 
 use crate::model::{
     BuildKind, BuiltinVariant, DefinitionId, FloatType, IntegerType, PoolId, SpecializationId,
-    TestId, Type, VariantId,
+    TestId, Type, TypeId, VariantId,
 };
 use crate::typed_hir::{
     AccessMode, BinaryOperator, CallTarget, CleanupAction, ClosureId, Expression, ExpressionKind,
@@ -78,6 +78,7 @@ pub(crate) enum Value {
         definition: DefinitionId,
         type_display: Arc<str>,
         fields: Arc<[(Arc<str>, Value)]>,
+        construction: Option<(BuildKind, u128)>,
     },
     TestApplication {
         id: TestId,
@@ -290,6 +291,7 @@ enum Control<'hir> {
     FinishCall {
         target: &'hir CallTarget,
         arguments: &'hir [Expression],
+        result_type: TypeId,
         site: &'hir SourceRange,
     },
     FinishRegisterCleanup {
@@ -374,7 +376,6 @@ pub(crate) struct Engine<'a> {
     compilation_memory: u64,
     constructions: Vec<Construction>,
     construction_keys: BTreeMap<u128, Arc<[u8]>>,
-    construction_coordinates: BTreeMap<Arc<[u8]>, u64>,
     test_applications: Vec<AppliedTest>,
     call_stack: Vec<(u128, String, SourceRange)>,
     semantic_owner_stack: Vec<u128>,
@@ -449,7 +450,6 @@ impl<'a> Engine<'a> {
             compilation_memory: 0,
             constructions: Vec::new(),
             construction_keys: BTreeMap::new(),
-            construction_coordinates: BTreeMap::new(),
             test_applications: Vec::new(),
             call_stack: Vec::new(),
             semantic_owner_stack: Vec::new(),
@@ -487,7 +487,6 @@ impl<'a> Engine<'a> {
         self.current_memory = 0;
         self.constructions.clear();
         self.construction_keys.clear();
-        self.construction_coordinates.clear();
         self.test_applications.clear();
         self.call_stack.clear();
         self.semantic_owner_stack.clear();
@@ -982,6 +981,7 @@ impl<'a> Engine<'a> {
                             controls.push(Control::FinishCall {
                                 target,
                                 arguments,
+                                result_type: expression.type_id,
                                 site: &expression.source,
                             });
                             controls.extend(arguments.iter().rev().map(Control::Expression));
@@ -2112,6 +2112,7 @@ impl<'a> Engine<'a> {
                 Control::FinishCall {
                     target,
                     arguments: argument_expressions,
+                    result_type,
                     site,
                 } => {
                     let arguments = self.pop_values(&mut frames, argument_expressions.len())?;
@@ -2277,6 +2278,30 @@ impl<'a> Engine<'a> {
                             argument_fields,
                             ..
                         } => {
+                            let construction = if program.is_actor_definition(*definition) {
+                                let ownership = argument_expressions
+                                    .iter()
+                                    .map(|argument| argument.access)
+                                    .collect::<Vec<_>>();
+                                let Value::SymbolicHandle { kind, identity } = self.construct(
+                                    BuildKind::Node {
+                                        definition: *definition,
+                                        type_identity: result_type,
+                                    },
+                                    &arguments,
+                                    argument_fields,
+                                    &ownership,
+                                    site,
+                                )?
+                                else {
+                                    return Err(EvalFailure::Defect(Arc::from(
+                                        "Actor construction did not produce a graph handle",
+                                    )));
+                                };
+                                Some((kind, identity))
+                            } else {
+                                None
+                            };
                             let authored = argument_fields
                                 .iter()
                                 .cloned()
@@ -2302,6 +2327,7 @@ impl<'a> Engine<'a> {
                                     definition: *definition,
                                     type_display: type_display.clone(),
                                     fields: fields.into(),
+                                    construction,
                                 },
                             )?;
                         }
@@ -3053,31 +3079,15 @@ impl<'a> Engine<'a> {
         site: &SourceRange,
     ) -> Result<Value, EvalFailure> {
         self.charge(3)?;
-        let mut key = b"wrela.construction\0\x02".to_vec();
-        for (id, _, call_site) in &self.call_stack {
-            key.extend_from_slice(&id.to_be_bytes());
-            key.extend_from_slice(call_site.path().as_bytes());
-            key.extend_from_slice(&call_site.start().to_be_bytes());
-            key.extend_from_slice(&call_site.end().to_be_bytes());
-        }
-        key.push(kind.canonical_tag());
-        if let BuildKind::Node {
-            definition,
-            type_identity,
-        } = kind
-        {
-            key.extend_from_slice(&definition.0.to_be_bytes());
-            key.extend_from_slice(&type_identity.0.to_be_bytes());
-        }
-        key.extend_from_slice(site.path().as_bytes());
-        key.extend_from_slice(&site.start().to_be_bytes());
-        key.extend_from_slice(&site.end().to_be_bytes());
-        let coordinate: Arc<[u8]> = Arc::from(key.clone());
-        let ordinal = self.construction_coordinates.entry(coordinate).or_insert(0);
-        key.extend_from_slice(&ordinal.to_be_bytes());
-        *ordinal = ordinal.checked_add(1).ok_or_else(|| {
-            EvalFailure::Defect(Arc::from("construction coordinate ordinal overflow"))
+        // A Construction Identity names the exact sealed-graph node, not its
+        // diagnostic source spelling. Evaluation order is the authenticated
+        // semantic construction order for this root and remains unchanged by
+        // file moves, comments, or whitespace.
+        let mut key = b"wrela.construction\0\x03".to_vec();
+        let ordinal = u64::try_from(self.constructions.len()).map_err(|_| {
+            EvalFailure::Defect(Arc::from("construction semantic ordinal overflow"))
         })?;
+        key.extend_from_slice(&ordinal.to_be_bytes());
         let identity = xxh3_128(&key);
         let key: Arc<[u8]> = key.into();
         if let Some(previous) = self.construction_keys.get(&identity) {
@@ -3237,6 +3247,7 @@ fn nominal_value(type_: &Type, fields: Vec<(&str, Value)>) -> Result<Value, Eval
     Ok(Value::Struct {
         definition: *definition,
         type_display: Arc::clone(display),
+        construction: None,
         fields: fields
             .into_iter()
             .map(|(name, value)| (Arc::from(name), value))
@@ -3341,6 +3352,7 @@ fn pool_allocation_value(
     let key = Value::Struct {
         definition: DefinitionId(0),
         type_display: Arc::from("Key"),
+        construction: None,
         fields: vec![
             (
                 Arc::from("pool_identity"),
@@ -3434,9 +3446,17 @@ pub(crate) fn visit_construction_handles(value: &Value, visitor: &mut impl FnMut
                 visit_construction_handles(value, visitor);
             }
         }
-        Value::Struct { fields, .. } => {
-            for (_, value) in &**fields {
-                visit_construction_handles(value, visitor);
+        Value::Struct {
+            construction,
+            fields,
+            ..
+        } => {
+            if let Some((kind, identity)) = construction {
+                visitor(*kind, *identity);
+            } else {
+                for (_, value) in &**fields {
+                    visit_construction_handles(value, visitor);
+                }
             }
         }
         Value::Unavailable
@@ -3483,10 +3503,18 @@ pub(crate) fn visit_construction_handles_cancellable(
                 }
             }
         }
-        Value::Struct { fields, .. } => {
-            for (_, value) in fields.iter() {
-                if !visit_construction_handles_cancellable(value, cancellation, visitor) {
-                    return false;
+        Value::Struct {
+            construction,
+            fields,
+            ..
+        } => {
+            if let Some((kind, identity)) = construction {
+                visitor(*kind, *identity);
+            } else {
+                for (_, value) in fields.iter() {
+                    if !visit_construction_handles_cancellable(value, cancellation, visitor) {
+                        return false;
+                    }
                 }
             }
         }
@@ -4050,9 +4078,11 @@ fn unavailable_shape(value: &Value) -> Value {
             definition,
             type_display,
             fields,
+            construction,
         } => Value::Struct {
             definition: *definition,
             type_display: type_display.clone(),
+            construction: *construction,
             fields: fields
                 .iter()
                 .map(|(name, value)| (name.clone(), unavailable_shape(value)))
@@ -4673,6 +4703,7 @@ mod tests {
                 (Arc::from("ticket"), Value::Bool(true)),
                 (Arc::from("other"), Value::Bool(false)),
             ]),
+            construction: None,
         };
 
         let extracted = extract_projected_value(&mut root, std::slice::from_ref(&projection), &[])
@@ -4833,6 +4864,7 @@ mod tests {
                     Value::Bytes(Arc::from(identity.to_be_bytes())),
                 ])),
             )]),
+            construction: None,
         };
         engine
             .retain(value_size(&value))
@@ -4900,6 +4932,7 @@ mod tests {
                     Value::Bytes(Arc::from(3_u128.to_be_bytes())),
                 ),
             ]),
+            construction: None,
         };
         let Value::Struct { fields, .. } = &permit else {
             unreachable!("test Permit")
@@ -4927,6 +4960,7 @@ mod tests {
                     Value::Bytes(Arc::from(identity.to_be_bytes())),
                 ])),
             )]),
+            construction: None,
         };
         assert!(matches!(
             engine.close_compiler_owned_pool(&scope),

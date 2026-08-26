@@ -482,7 +482,7 @@ pub(crate) struct ImagePlanningArchitecture<'a> {
     contract: &'a VerifiedArchitecturePlanningContract,
 }
 
-impl ImagePlanningArchitecture<'_> {
+impl<'a> ImagePlanningArchitecture<'a> {
     pub(crate) const fn identity(self) -> u128 {
         self.contract.identity
     }
@@ -503,6 +503,10 @@ impl ImagePlanningArchitecture<'_> {
         self.contract.facts.cores.len()
     }
 
+    pub(crate) fn cores(self) -> impl ExactSizeIterator<Item = SymbolicCore> + 'a {
+        self.contract.facts.cores.iter().copied()
+    }
+
     pub(crate) const fn capacity(self) -> CapacityRules {
         self.contract.facts.capacity
     }
@@ -521,6 +525,10 @@ impl ImagePlanningArchitecture<'_> {
             .binding_slots
             .iter()
             .any(|slot| slot.kind == binding)
+    }
+
+    pub(crate) fn binding_slots(self) -> impl ExactSizeIterator<Item = BindingSlot> + 'a {
+        self.contract.facts.binding_slots.iter().copied()
     }
 
     pub(crate) fn binding_ordinal(self, binding: BindingKind) -> Option<u8> {

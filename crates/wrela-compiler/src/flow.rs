@@ -1676,6 +1676,10 @@ impl ImagePlanningFlowRequirement<'_> {
     pub(crate) const fn site(self) -> Option<u128> {
         self.0.site
     }
+
+    pub(crate) const fn bound(self) -> u64 {
+        self.0.bound
+    }
 }
 
 impl FlowRequirementRef {

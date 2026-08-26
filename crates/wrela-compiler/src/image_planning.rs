@@ -1733,6 +1733,12 @@ pub(crate) struct VerifiedWholeImageAssignment {
     _verified: Verified,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WholeImageSolveOutcome {
+    Assignment(VerifiedWholeImageAssignment),
+    Conflict(VerifiedPrivateConflict),
+}
+
 impl fmt::Debug for VerifiedWholeImageAssignment {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -2393,6 +2399,297 @@ pub(crate) enum FacilityConfigurationFailure {
     },
 }
 
+fn translate_whole_requirement_set(
+    planning_foundation: &VerifiedPlanningFoundation,
+    core: crate::core::ImagePlanningCoreView<'_>,
+    flow: crate::flow::ImagePlanningFlowView<'_>,
+    cancellation: &Cancellation,
+) -> Result<CanonicalProblem, PlanningFailure> {
+    let architecture = planning_foundation
+        .architecture_contract
+        .for_image_planning();
+    let executables = core
+        .executables()
+        .map(|executable| executable.identity())
+        .collect::<Vec<_>>();
+    let capabilities = [
+        PlanningCapability::TypedTerminalLifecycle,
+        PlanningCapability::PanicPulse,
+        PlanningCapability::GuestShutdownPulse,
+        PlanningCapability::SecondaryCoreStartup,
+        PlanningCapability::PciVirtioModern,
+        PlanningCapability::SplitVirtqueue,
+        PlanningCapability::SharedIntx,
+        PlanningCapability::DmaOwnership,
+        PlanningCapability::MonotonicCounter,
+    ]
+    .into_iter()
+    .filter(|capability| architecture.has_capability(capability.contract_kind()))
+    .map(PlanningCapability::tag)
+    .collect::<BTreeSet<_>>();
+    let actors = flow
+        .actors()
+        .map(|actor| {
+            (
+                actor.identity(),
+                (
+                    actor.mailbox_capacity(),
+                    actor.max_active_turns(),
+                    actor.handlers().collect::<Vec<_>>(),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let total_service_units = architecture.cores().fold(0_u64, |total, core| {
+        total.saturating_add(u64::from(core.maximum_service_units))
+    });
+    let mut requirements =
+        Vec::with_capacity(planning_foundation.requirements.len() + flow.requirements().len());
+    for requirement in planning_foundation.requirements.iter() {
+        checkpoint(cancellation)?;
+        let constraint = match requirement.bounds {
+            RequirementBounds::RealizeExactlyOnce { executable } => {
+                SolverConstraint::Realize { executable }
+            }
+            RequirementBounds::ImageLifetime => {
+                let RequirementOwner::GeneratedRole(role_reference) = requirement.subject else {
+                    return defect("Image-lifetime Requirement is not owned by a generated role");
+                };
+                let executable = planning_foundation
+                    .generated_roles
+                    .iter()
+                    .find(|role| role.reference == role_reference)
+                    .map(|role| role.executable.identity)
+                    .ok_or_else(|| {
+                        PlanningFailure::Defect(Arc::from(
+                            "Image-lifetime Requirement names an unknown generated role",
+                        ))
+                    })?;
+                SolverConstraint::Activation {
+                    executable,
+                    units: 1,
+                    start: 0,
+                    end: 1,
+                }
+            }
+            RequirementBounds::Capability(capability) => SolverConstraint::Capability {
+                capability: capability.tag(),
+            },
+            RequirementBounds::Cardinality { minimum, maximum } => SolverConstraint::Cardinality {
+                selected: u64::from(selected_cardinality(
+                    planning_foundation,
+                    requirement,
+                    architecture,
+                )),
+                minimum: u64::from(minimum),
+                maximum: u64::from(maximum),
+            },
+            RequirementBounds::MaximumServiceUnits(required) => SolverConstraint::Capacity {
+                required: u64::from(required),
+                available: total_service_units,
+            },
+            RequirementBounds::Binding {
+                kind,
+                minimum,
+                maximum,
+            } => SolverConstraint::Binding {
+                subject: requirement.reference.identity,
+                kind: kind.tag(),
+                minimum: u16::try_from(minimum).map_err(|_| {
+                    PlanningFailure::Defect(Arc::from(
+                        "binding minimum exceeds canonical solver width",
+                    ))
+                })?,
+                maximum: u16::try_from(maximum).map_err(|_| {
+                    PlanningFailure::Defect(Arc::from(
+                        "binding maximum exceeds canonical solver width",
+                    ))
+                })?,
+                allow_sharing: false,
+            },
+            RequirementBounds::PoolCapacity {
+                usable,
+                peak_committed,
+                ..
+            } => SolverConstraint::Capacity {
+                required: peak_committed,
+                available: usable,
+            },
+            RequirementBounds::FacilitySharing(FacilitySharing::RegisteredDisjoint {
+                role,
+                maximum_units,
+            }) => SolverConstraint::Capacity {
+                required: u64::from(maximum_units),
+                available: architecture
+                    .facility_share(role.architecture_kind())
+                    .map_or(0, |registration| u64::from(registration.maximum_units)),
+            },
+            RequirementBounds::Reservation { kind, .. } => SolverConstraint::Static {
+                satisfied: architecture.has_reservation(kind.contract_kind()),
+            },
+            RequirementBounds::FacilityCapacity(_)
+            | RequirementBounds::FacilitySharing(FacilitySharing::Exclusive)
+            | RequirementBounds::FacilityEndpoint { .. }
+            | RequirementBounds::FacilityRecovery { .. }
+            | RequirementBounds::FacilityShutdown(_)
+            | RequirementBounds::FacilityReplay { .. }
+            | RequirementBounds::FacilityFlagship(_)
+            | RequirementBounds::FacilityBindingAvailability(_) => {
+                SolverConstraint::Static { satisfied: true }
+            }
+        };
+        requirements.push(SolverRequirement {
+            identity: requirement.reference.identity,
+            source: RequirementSource::Domain,
+            current_meaning: requirement.reference.current_meaning,
+            category: solver_domain_category(requirement.category),
+            constraint,
+        });
+    }
+    for requirement in flow.requirements() {
+        checkpoint(cancellation)?;
+        let actor = actors.get(&requirement.actor()).ok_or_else(|| {
+            PlanningFailure::Defect(Arc::from(
+                "Flow Requirement names an unknown Actor during translation",
+            ))
+        })?;
+        let constraint = match requirement.kind() {
+            FlowRequirementKind::PermanentCorePlacement if actor.2.is_empty() => {
+                SolverConstraint::Static { satisfied: true }
+            }
+            FlowRequirementKind::PermanentCorePlacement => SolverConstraint::AffinityGroup {
+                executables: actor.2.clone().into(),
+            },
+            FlowRequirementKind::MailboxCapacity => SolverConstraint::Capacity {
+                required: requirement.bound(),
+                available: actor.0,
+            },
+            FlowRequirementKind::TurnLease => SolverConstraint::Cardinality {
+                selected: u64::from(actor.1),
+                minimum: 1,
+                maximum: requirement.bound(),
+            },
+            FlowRequirementKind::SuspensionHome | FlowRequirementKind::ActivationStorage => {
+                let executable = requirement.handler().ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from(
+                        "activation Requirement has no handler subject",
+                    ))
+                })?;
+                SolverConstraint::Activation {
+                    executable,
+                    units: u16::try_from(requirement.bound()).map_err(|_| {
+                        PlanningFailure::Defect(Arc::from(
+                            "activation Requirement exceeds canonical solver width",
+                        ))
+                    })?,
+                    start: 0,
+                    end: 1,
+                }
+            }
+            FlowRequirementKind::ServiceStorage => SolverConstraint::Capacity {
+                required: requirement.bound(),
+                available: u64::from(architecture.capacity().maximum_activation_homes),
+            },
+            _ => SolverConstraint::Static { satisfied: true },
+        };
+        requirements.push(SolverRequirement {
+            identity: requirement.reference().identity(),
+            source: RequirementSource::Flow,
+            current_meaning: requirement.reference().current_meaning(),
+            category: solver_flow_category(requirement.kind()),
+            constraint,
+        });
+    }
+    let binding_subjects = requirements
+        .iter()
+        .filter_map(|requirement| match requirement.constraint {
+            SolverConstraint::Binding { subject, .. } => Some(subject),
+            _ => None,
+        })
+        .collect();
+    Ok(CanonicalProblem {
+        name: "whole_image",
+        cores: architecture
+            .cores()
+            .map(|core| CoreResource {
+                identity: core.ordinal,
+            })
+            .collect(),
+        executables,
+        bindings: architecture
+            .binding_slots()
+            .map(|slot| BindingResource {
+                identity: slot.ordinal,
+                kind: architecture_binding_tag(slot.kind),
+                shareable: false,
+            })
+            .collect(),
+        binding_subjects,
+        capabilities,
+        requirements,
+    })
+}
+
+const fn solver_domain_category(category: RequirementCategory) -> SolverRequirementCategory {
+    match category {
+        RequirementCategory::GeneratedRoleRealization => SolverRequirementCategory::RoleRealization,
+        RequirementCategory::ArchitectureCapability => {
+            SolverRequirementCategory::RequiredCapability
+        }
+        RequirementCategory::Cardinality => SolverRequirementCategory::Cardinality,
+        RequirementCategory::Binding => SolverRequirementCategory::Binding,
+        RequirementCategory::CapacityPressure | RequirementCategory::Service => {
+            SolverRequirementCategory::Capacity
+        }
+        RequirementCategory::Lifetime => SolverRequirementCategory::ActivationLifetime,
+        RequirementCategory::LogicalLayout
+        | RequirementCategory::FacilityOwnership
+        | RequirementCategory::Recovery
+        | RequirementCategory::Shutdown
+        | RequirementCategory::Replay
+        | RequirementCategory::Flagship
+        | RequirementCategory::BootAvailability => SolverRequirementCategory::Placement,
+    }
+}
+
+const fn solver_flow_category(kind: FlowRequirementKind) -> SolverRequirementCategory {
+    match kind {
+        FlowRequirementKind::PermanentCorePlacement => SolverRequirementCategory::Affinity,
+        FlowRequirementKind::MailboxCapacity
+        | FlowRequirementKind::ServiceStorage
+        | FlowRequirementKind::ActivationStorage => SolverRequirementCategory::Capacity,
+        FlowRequirementKind::TurnLease
+        | FlowRequirementKind::SuspensionHome
+        | FlowRequirementKind::GroupChildActivationBound
+        | FlowRequirementKind::GroupCancellationAuthority
+        | FlowRequirementKind::GroupOutcomePolicy
+        | FlowRequirementKind::GroupResourceReturnHome
+        | FlowRequirementKind::GroupCleanupOrder
+        | FlowRequirementKind::DeadlineClass
+        | FlowRequirementKind::DeadlineAuthority
+        | FlowRequirementKind::DeadlineSlack
+        | FlowRequirementKind::DeadlineFeasibility
+        | FlowRequirementKind::CancellationCheckpoint
+        | FlowRequirementKind::CancellationObservationWorkBound => {
+            SolverRequirementCategory::ActivationLifetime
+        }
+        _ => SolverRequirementCategory::Placement,
+    }
+}
+
+const fn architecture_binding_tag(kind: BindingKind) -> u8 {
+    match kind {
+        BindingKind::Display => PlanningBinding::Display.tag(),
+        BindingKind::Input => PlanningBinding::Input.tag(),
+        BindingKind::EventStore => PlanningBinding::EventStore.tag(),
+        BindingKind::MonotonicClock => PlanningBinding::MonotonicClock.tag(),
+        BindingKind::Entropy => PlanningBinding::Entropy.tag(),
+        BindingKind::Telemetry => PlanningBinding::Telemetry.tag(),
+        BindingKind::Terminal => PlanningBinding::Terminal.tag(),
+        BindingKind::Panic => PlanningBinding::Panic.tag(),
+    }
+}
+
 impl ImagePlanningModule {
     pub(crate) fn plan(
         &self,
@@ -2642,7 +2939,7 @@ impl ImagePlanningModule {
         core_program: Arc<VerifiedCoreProgram>,
         flow_program: Arc<VerifiedFlowProgram>,
         cancellation: &Cancellation,
-    ) -> Result<VerifiedWholeImageAssignment, PlanningFailure> {
+    ) -> Result<WholeImageSolveOutcome, PlanningFailure> {
         checkpoint(cancellation)?;
         let core = core_program.for_image_planning();
         let flow = flow_program.for_image_planning();
@@ -2686,31 +2983,19 @@ impl ImagePlanningModule {
             .executables()
             .map(|executable| (executable.identity(), executable.current_meaning()))
             .collect::<BTreeMap<_, _>>();
-        let placement_problem = CanonicalProblem {
-            name: "whole_image",
-            cores: (0..architecture.core_count())
-                .map(|ordinal| {
-                    Ok(CoreResource {
-                        identity: u16::try_from(ordinal).map_err(|_| {
-                            PlanningFailure::Defect(Arc::from(
-                                "symbolic core ordinal exceeds the solver schema",
-                            ))
-                        })?,
-                    })
-                })
-                .collect::<Result<Vec<_>, PlanningFailure>>()?,
-            executables: executable_meanings.keys().copied().collect(),
-            bindings: Vec::new(),
-            capabilities: BTreeSet::new(),
-            requirements: Vec::new(),
-        };
-        let CanonicalSolveOutcome::Assignment {
-            placements: solved_placements,
-            ..
-        } = solve_canonical_problem(&placement_problem, cancellation)?
-        else {
-            return defect("unconstrained whole-Image placement produced a conflict");
-        };
+        let placement_problem =
+            translate_whole_requirement_set(&planning_foundation, core, flow, cancellation)?;
+        let (solved_placements, solved_bindings, solved_discharges) =
+            match solve_canonical_problem(&placement_problem, cancellation)? {
+                CanonicalSolveOutcome::Assignment {
+                    placements,
+                    bindings,
+                    discharges,
+                } => (placements, bindings, discharges),
+                CanonicalSolveOutcome::Conflict(conflict) => {
+                    return Ok(WholeImageSolveOutcome::Conflict(conflict));
+                }
+            };
         let placements = solved_placements
             .iter()
             .map(|(executable, core)| ExecutablePlacementObservation {
@@ -2741,7 +3026,30 @@ impl ImagePlanningModule {
             )?;
             domain_kinds.insert(requirement.reference.identity, kind);
         }
-        let bindings = expected_binding_assignments(&planning_foundation, architecture)?;
+        let binding_kinds = planning_foundation
+            .requirements
+            .iter()
+            .filter_map(|requirement| match requirement.bounds {
+                RequirementBounds::Binding { kind, .. } => {
+                    Some((requirement.reference.identity, kind))
+                }
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        let bindings = solved_bindings
+            .iter()
+            .map(|(requirement, slot)| {
+                Ok(BindingAssignmentObservation {
+                    requirement: *requirement,
+                    binding: binding_kinds.get(requirement).copied().ok_or_else(|| {
+                        PlanningFailure::Defect(Arc::from(
+                            "solver binding does not name a binding Requirement",
+                        ))
+                    })?,
+                    slot: *slot,
+                })
+            })
+            .collect::<Result<Vec<_>, PlanningFailure>>()?;
 
         let actor_placements = flow
             .actors()
@@ -2807,6 +3115,14 @@ impl ImagePlanningModule {
                 },
             })
             .collect::<Vec<_>>();
+        if solved_discharges.as_ref()
+            != requirements
+                .iter()
+                .map(|requirement| requirement.identity())
+                .collect::<Vec<_>>()
+        {
+            return defect("canonical solver did not discharge the exact Requirement Set");
+        }
         let requirement_set_fingerprint = whole_requirement_set_fingerprint(
             planning_foundation.fingerprint,
             core.fingerprint(),
@@ -2832,7 +3148,7 @@ impl ImagePlanningModule {
             _verified: Verified,
         };
         verify_whole_image_assignment(&candidate, cancellation)?;
-        Ok(candidate)
+        Ok(WholeImageSolveOutcome::Assignment(candidate))
     }
 }
 
@@ -2873,41 +3189,6 @@ fn selected_cardinality(
         .unwrap_or(u32::MAX),
         RequirementOwner::Pool(_) => 1,
     }
-}
-
-fn expected_binding_assignments(
-    planning_foundation: &VerifiedPlanningFoundation,
-    architecture: crate::architecture_planning::ImagePlanningArchitecture<'_>,
-) -> Result<Vec<BindingAssignmentObservation>, PlanningFailure> {
-    let mut bindings = Vec::new();
-    for requirement in planning_foundation.requirements.iter() {
-        if let RequirementBounds::Binding {
-            kind,
-            minimum,
-            maximum,
-        } = requirement.bounds
-        {
-            if minimum > maximum {
-                return defect("binding requirement has inverted cardinality");
-            }
-            if minimum > 0 {
-                let slot = architecture
-                    .binding_ordinal(kind.contract_kind())
-                    .ok_or_else(|| {
-                        PlanningFailure::Defect(Arc::from(
-                            "admitted binding requirement has no Architecture slot",
-                        ))
-                    })?;
-                bindings.push(BindingAssignmentObservation {
-                    requirement: requirement.reference.identity,
-                    binding: kind,
-                    slot,
-                });
-            }
-        }
-    }
-    bindings.sort_by_key(|binding| (binding.requirement, binding.slot));
-    Ok(bindings)
 }
 
 fn discharge_domain_requirement(
@@ -2962,9 +3243,9 @@ fn discharge_domain_requirement(
             DischargeKind::CapacityProved
         }
         RequirementBounds::MaximumServiceUnits(_)
-        | RequirementBounds::Reservation { .. }
         | RequirementBounds::FacilityCapacity(_)
         | RequirementBounds::FacilitySharing(_) => DischargeKind::CapacityProved,
+        RequirementBounds::Reservation { .. } => DischargeKind::ContractValidated,
         RequirementBounds::FacilityEndpoint { .. }
         | RequirementBounds::FacilityRecovery { .. }
         | RequirementBounds::FacilityShutdown(_)
@@ -3113,11 +3394,22 @@ fn verify_whole_image_assignment(
         .iter()
         .map(|placement| (placement.executable, placement.executable_current_meaning))
         .collect::<Vec<_>>();
+    let core_ordinals = architecture
+        .cores()
+        .map(|core| core.ordinal)
+        .collect::<BTreeSet<_>>();
+    let canonical_core = core_ordinals.iter().next().copied().ok_or_else(|| {
+        PlanningFailure::Defect(Arc::from("assignment verifier found no symbolic core"))
+    })?;
     if actual_executables != expected_executables
         || candidate
             .placements
             .iter()
-            .any(|placement| placement.core != 0)
+            .any(|placement| !core_ordinals.contains(&placement.core))
+        || candidate
+            .placements
+            .iter()
+            .any(|placement| placement.core != canonical_core)
     {
         return defect("whole-Image assignment is not the canonical exact executable placement");
     }
@@ -3125,9 +3417,9 @@ fn verify_whole_image_assignment(
         .iter()
         .map(|(identity, _)| *identity)
         .collect::<BTreeSet<_>>();
-    if candidate.bindings.as_ref()
-        != expected_binding_assignments(&candidate.planning_foundation, architecture)?
-    {
+    let expected_bindings =
+        verifier_binding_assignments(&candidate.planning_foundation, architecture)?;
+    if candidate.bindings.as_ref() != expected_bindings {
         return defect("whole-Image assignment does not contain the canonical exact bindings");
     }
     let mut expected_discharges = candidate
@@ -3139,35 +3431,36 @@ fn verify_whole_image_assignment(
                 source: RequirementSource::Domain,
                 requirement: requirement.reference.identity,
                 requirement_current_meaning: requirement.reference.current_meaning,
-                kind: discharge_domain_requirement(
+                kind: verifier_domain_discharge(
+                    &candidate.planning_foundation,
                     requirement,
                     architecture,
                     &executable_ids,
-                    selected_cardinality(&candidate.planning_foundation, requirement, architecture),
+                    &candidate.bindings,
                 )?,
             })
         })
         .collect::<Result<Vec<_>, PlanningFailure>>()?;
-    expected_discharges.extend(flow.requirements().map(|requirement| {
-        RequirementDischargeObservation {
+    for requirement in flow.requirements() {
+        expected_discharges.push(RequirementDischargeObservation {
             source: RequirementSource::Flow,
             requirement: requirement.reference().identity(),
             requirement_current_meaning: requirement.reference().current_meaning(),
-            kind: discharge_flow_requirement(requirement.kind()),
-        }
-    }));
+            kind: verifier_flow_discharge(flow, requirement, architecture, &candidate.placements)?,
+        });
+    }
     expected_discharges.sort_by_key(|discharge| (discharge.requirement, discharge.source));
     if candidate.discharges.as_ref() != expected_discharges {
         return defect("whole-Image assignment does not discharge every Requirement exactly once");
     }
-    let expected_set = whole_requirement_set_fingerprint(
+    let expected_set = verifier_requirement_set_fingerprint(
         candidate.planning_foundation.fingerprint,
         core.fingerprint(),
         flow.fingerprint(),
         &expected_requirements,
     );
     if expected_set != candidate.requirement_set_fingerprint
-        || whole_assignment_fingerprint(
+        || verifier_assignment_fingerprint(
             expected_set,
             &candidate.placements,
             &candidate.bindings,
@@ -3177,6 +3470,368 @@ fn verify_whole_image_assignment(
         return defect("whole-Image assignment fingerprint or Requirement Set disagrees");
     }
     Ok(())
+}
+
+fn verifier_binding_assignments(
+    foundation: &VerifiedPlanningFoundation,
+    architecture: crate::architecture_planning::ImagePlanningArchitecture<'_>,
+) -> Result<Vec<BindingAssignmentObservation>, PlanningFailure> {
+    let mut requirements = foundation
+        .requirements
+        .iter()
+        .filter_map(|requirement| match requirement.bounds {
+            RequirementBounds::Binding {
+                kind,
+                minimum,
+                maximum,
+            } => Some((requirement.reference.identity, kind, minimum, maximum)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    requirements.sort_by_key(|requirement| requirement.0);
+    let mut occupied = BTreeSet::new();
+    let mut assignments = Vec::new();
+    for (requirement, kind, minimum, maximum) in requirements {
+        if minimum > maximum {
+            return defect("assignment verifier found inverted binding cardinality");
+        }
+        let mut slots = architecture
+            .binding_slots()
+            .filter(|slot| slot.kind == kind.contract_kind())
+            .map(|slot| slot.ordinal)
+            .collect::<Vec<_>>();
+        slots.sort_unstable();
+        let selected = slots
+            .into_iter()
+            .filter(|slot| !occupied.contains(slot))
+            .take(usize::try_from(minimum).unwrap_or(usize::MAX))
+            .collect::<Vec<_>>();
+        if selected.len() != usize::try_from(minimum).unwrap_or(usize::MAX) {
+            return defect("assignment verifier cannot realize exact binding cardinality");
+        }
+        for slot in selected {
+            occupied.insert(slot);
+            assignments.push(BindingAssignmentObservation {
+                requirement,
+                binding: kind,
+                slot,
+            });
+        }
+    }
+    assignments.sort_by_key(|binding| (binding.requirement, binding.slot));
+    Ok(assignments)
+}
+
+fn verifier_selected_cardinality(
+    foundation: &VerifiedPlanningFoundation,
+    requirement: &Requirement,
+    architecture: crate::architecture_planning::ImagePlanningArchitecture<'_>,
+) -> u32 {
+    match requirement.subject {
+        RequirementOwner::GeneratedRole(reference) => foundation
+            .generated_roles
+            .iter()
+            .find(|role| role.reference == reference)
+            .map_or(1, |role| match role.kind {
+                GeneratedRoleKind::Scheduler => {
+                    u32::try_from(architecture.cores().count()).unwrap_or(u32::MAX)
+                }
+                GeneratedRoleKind::TestRuntime => u32::try_from(
+                    foundation
+                        .semantic_program
+                        .for_image_planning()
+                        .test_application_count(),
+                )
+                .unwrap_or(u32::MAX),
+                _ => 1,
+            }),
+        RequirementOwner::Facility(subject) => u32::try_from(
+            foundation
+                .domain_plans
+                .iter()
+                .filter(|plan| {
+                    plan.facility_instance
+                        .as_ref()
+                        .is_some_and(|instance| instance.kind == subject.kind)
+                })
+                .count(),
+        )
+        .unwrap_or(u32::MAX),
+        RequirementOwner::Pool(_) => 1,
+    }
+}
+
+fn verifier_domain_discharge(
+    foundation: &VerifiedPlanningFoundation,
+    requirement: &Requirement,
+    architecture: crate::architecture_planning::ImagePlanningArchitecture<'_>,
+    executable_ids: &BTreeSet<u128>,
+    bindings: &[BindingAssignmentObservation],
+) -> Result<DischargeKind, PlanningFailure> {
+    match &requirement.bounds {
+        RequirementBounds::RealizeExactlyOnce { executable } => executable_ids
+            .contains(executable)
+            .then_some(DischargeKind::ExecutableRealized)
+            .ok_or_else(|| PlanningFailure::Defect(Arc::from("verifier found unrealized role"))),
+        RequirementBounds::ImageLifetime => {
+            let RequirementOwner::GeneratedRole(reference) = requirement.subject else {
+                return defect("verifier found an unowned Image lifetime");
+            };
+            foundation
+                .generated_roles
+                .iter()
+                .any(|role| {
+                    role.reference == reference
+                        && executable_ids.contains(&role.executable.identity)
+                })
+                .then_some(DischargeKind::LifetimeProved)
+                .ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from("verifier found false lifetime evidence"))
+                })
+        }
+        RequirementBounds::Capability(capability) => architecture
+            .has_capability(capability.contract_kind())
+            .then_some(DischargeKind::CapabilityPresent)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("verifier found a missing capability"))
+            }),
+        RequirementBounds::Cardinality { minimum, maximum } => {
+            let selected = verifier_selected_cardinality(foundation, requirement, architecture);
+            (*minimum <= *maximum && (*minimum..=*maximum).contains(&selected))
+                .then_some(DischargeKind::CardinalityProved)
+                .ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from("verifier found false cardinality evidence"))
+                })
+        }
+        RequirementBounds::MaximumServiceUnits(required) => {
+            let available = architecture.cores().fold(0_u64, |total, core| {
+                total.saturating_add(u64::from(core.maximum_service_units))
+            });
+            (u64::from(*required) <= available)
+                .then_some(DischargeKind::CapacityProved)
+                .ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from(
+                        "verifier found false service capacity evidence",
+                    ))
+                })
+        }
+        RequirementBounds::Binding {
+            kind,
+            minimum,
+            maximum,
+        } => {
+            let selected = bindings
+                .iter()
+                .filter(|binding| {
+                    binding.requirement == requirement.reference.identity
+                        && binding.binding == *kind
+                })
+                .count();
+            (*minimum <= *maximum
+                && selected >= usize::try_from(*minimum).unwrap_or(usize::MAX)
+                && selected <= usize::try_from(*maximum).unwrap_or(0)
+                && bindings
+                    .iter()
+                    .filter(|binding| binding.requirement == requirement.reference.identity)
+                    .all(|binding| {
+                        architecture.binding_slots().any(|slot| {
+                            slot.ordinal == binding.slot && slot.kind == kind.contract_kind()
+                        })
+                    }))
+            .then_some(DischargeKind::Bound)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("verifier found false binding evidence"))
+            })
+        }
+        RequirementBounds::Reservation { kind, .. } => architecture
+            .has_reservation(kind.contract_kind())
+            .then_some(DischargeKind::ContractValidated)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from(
+                    "verifier found a missing reservation prerequisite",
+                ))
+            }),
+        RequirementBounds::PoolCapacity {
+            usable,
+            peak_live,
+            peak_reserved,
+            peak_committed,
+            ..
+        } => (peak_live.saturating_add(*peak_reserved) >= *peak_committed
+            && peak_committed <= usable)
+            .then_some(DischargeKind::CapacityProved)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("verifier found false Pool capacity evidence"))
+            }),
+        RequirementBounds::FacilitySharing(FacilitySharing::RegisteredDisjoint {
+            role,
+            maximum_units,
+        }) => architecture
+            .facility_share(role.architecture_kind())
+            .is_some_and(|registration| registration.maximum_units >= *maximum_units)
+            .then_some(DischargeKind::CapacityProved)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("verifier found false Facility sharing evidence"))
+            }),
+        RequirementBounds::FacilityCapacity(_)
+        | RequirementBounds::FacilitySharing(FacilitySharing::Exclusive) => {
+            Ok(DischargeKind::CapacityProved)
+        }
+        RequirementBounds::FacilityEndpoint { .. }
+        | RequirementBounds::FacilityRecovery { .. }
+        | RequirementBounds::FacilityShutdown(_)
+        | RequirementBounds::FacilityReplay { .. }
+        | RequirementBounds::FacilityFlagship(_)
+        | RequirementBounds::FacilityBindingAvailability(_) => Ok(DischargeKind::ContractValidated),
+    }
+}
+
+fn verifier_flow_discharge(
+    flow: crate::flow::ImagePlanningFlowView<'_>,
+    requirement: crate::flow::ImagePlanningFlowRequirement<'_>,
+    architecture: crate::architecture_planning::ImagePlanningArchitecture<'_>,
+    placements: &[ExecutablePlacementObservation],
+) -> Result<DischargeKind, PlanningFailure> {
+    let actor = flow
+        .actors()
+        .find(|actor| actor.identity() == requirement.actor())
+        .ok_or_else(|| PlanningFailure::Defect(Arc::from("verifier found a foreign Flow Actor")))?;
+    if let Some(handler) = requirement.handler()
+        && !placements
+            .iter()
+            .any(|placement| placement.executable == handler)
+    {
+        return defect("verifier found a Flow Requirement with an unrealized handler");
+    }
+    match requirement.kind() {
+        FlowRequirementKind::PermanentCorePlacement => {
+            let mut cores = actor.handlers().filter_map(|handler| {
+                placements
+                    .iter()
+                    .find(|placement| placement.executable == handler)
+                    .map(|placement| placement.core)
+            });
+            let first = cores.next();
+            if cores.any(|core| Some(core) != first) {
+                return defect("verifier found false Actor affinity evidence");
+            }
+            Ok(DischargeKind::Placed)
+        }
+        FlowRequirementKind::MailboxCapacity => (requirement.bound() <= actor.mailbox_capacity())
+            .then_some(DischargeKind::CapacityProved)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("verifier found false Mailbox capacity evidence"))
+            }),
+        FlowRequirementKind::TurnLease => (actor.max_active_turns() == 1
+            && u64::from(actor.max_active_turns()) <= requirement.bound())
+        .then_some(DischargeKind::LifetimeProved)
+        .ok_or_else(|| {
+            PlanningFailure::Defect(Arc::from("verifier found false Turn lifetime evidence"))
+        }),
+        FlowRequirementKind::SuspensionHome | FlowRequirementKind::ActivationStorage => {
+            (requirement.handler().is_some()
+                && requirement.bound()
+                    <= u64::from(architecture.capacity().maximum_activation_homes))
+            .then_some(
+                if requirement.kind() == FlowRequirementKind::ActivationStorage {
+                    DischargeKind::CapacityProved
+                } else {
+                    DischargeKind::LifetimeProved
+                },
+            )
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("verifier found false activation evidence"))
+            })
+        }
+        FlowRequirementKind::ServiceStorage => (requirement.bound()
+            <= u64::from(architecture.capacity().maximum_activation_homes))
+        .then_some(DischargeKind::CapacityProved)
+        .ok_or_else(|| PlanningFailure::Defect(Arc::from("verifier found false storage evidence"))),
+        FlowRequirementKind::ActorIdentity
+        | FlowRequirementKind::ReplyEndpoint
+        | FlowRequirementKind::ReplyReturnPath
+        | FlowRequirementKind::ReplyResponseHome
+        | FlowRequirementKind::ReplyAcyclicWait
+        | FlowRequirementKind::GroupChildActivationBound
+        | FlowRequirementKind::GroupCancellationAuthority
+        | FlowRequirementKind::GroupOutcomePolicy
+        | FlowRequirementKind::GroupResourceReturnHome
+        | FlowRequirementKind::GroupCleanupOrder
+        | FlowRequirementKind::DeadlineClass
+        | FlowRequirementKind::DeadlineAuthority
+        | FlowRequirementKind::DeadlineSlack
+        | FlowRequirementKind::DeadlineFeasibility
+        | FlowRequirementKind::CancellationCheckpoint
+        | FlowRequirementKind::CancellationObservationWorkBound => {
+            Ok(DischargeKind::LifetimeProved)
+        }
+        FlowRequirementKind::LogicalCommitOrder | FlowRequirementKind::ProposalTransport => {
+            Ok(DischargeKind::ContractValidated)
+        }
+    }
+}
+
+fn verifier_requirement_set_fingerprint(
+    planning_fingerprint: u128,
+    core_fingerprint: u128,
+    flow_fingerprint: u128,
+    requirements: &[WholeRequirementRef],
+) -> u128 {
+    let mut verifier = Xxh3::new();
+    verifier.update(b"wrela.complete-requirement-set\0\x01");
+    verifier.update(&planning_fingerprint.to_be_bytes());
+    verifier.update(&core_fingerprint.to_be_bytes());
+    verifier.update(&flow_fingerprint.to_be_bytes());
+    for requirement in requirements {
+        verifier.update(&[if requirement.source() == RequirementSource::Domain {
+            1
+        } else {
+            2
+        }]);
+        verifier.update(&requirement.identity().to_be_bytes());
+        verifier.update(&requirement.current_meaning().to_be_bytes());
+    }
+    verifier.digest128()
+}
+
+fn verifier_assignment_fingerprint(
+    requirement_set_fingerprint: u128,
+    placements: &[ExecutablePlacementObservation],
+    bindings: &[BindingAssignmentObservation],
+    discharges: &[RequirementDischargeObservation],
+) -> u128 {
+    let mut verifier = Xxh3::new();
+    verifier.update(b"wrela.whole-image-assignment\0\x01");
+    verifier.update(&requirement_set_fingerprint.to_be_bytes());
+    for placement in placements {
+        verifier.update(&placement.executable.to_be_bytes());
+        verifier.update(&placement.executable_current_meaning.to_be_bytes());
+        verifier.update(&placement.core.to_be_bytes());
+    }
+    for binding in bindings {
+        verifier.update(&binding.requirement.to_be_bytes());
+        verifier.update(&[binding.binding.tag(), binding.slot]);
+    }
+    for discharge in discharges {
+        verifier.update(&[if discharge.source == RequirementSource::Domain {
+            1
+        } else {
+            2
+        }]);
+        verifier.update(&discharge.requirement.to_be_bytes());
+        verifier.update(&discharge.requirement_current_meaning.to_be_bytes());
+        verifier.update(&[match discharge.kind {
+            DischargeKind::ExecutableRealized => 1,
+            DischargeKind::Placed => 2,
+            DischargeKind::Bound => 3,
+            DischargeKind::CapacityProved => 4,
+            DischargeKind::CapabilityPresent => 5,
+            DischargeKind::CardinalityProved => 6,
+            DischargeKind::LifetimeProved => 7,
+            DischargeKind::ContractValidated => 8,
+        }]);
+    }
+    verifier.digest128()
 }
 
 fn validate_facility_cardinality(
@@ -7840,6 +8495,7 @@ struct CanonicalProblem {
     cores: Vec<CoreResource>,
     executables: Vec<u128>,
     bindings: Vec<BindingResource>,
+    binding_subjects: Vec<u128>,
     capabilities: BTreeSet<u8>,
     requirements: Vec<SolverRequirement>,
 }
@@ -7859,6 +8515,8 @@ struct BindingResource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SolverRequirement {
     identity: u128,
+    source: RequirementSource,
+    current_meaning: u128,
     category: SolverRequirementCategory,
     constraint: SolverConstraint,
 }
@@ -7888,14 +8546,23 @@ enum SolverConstraint {
         capability: u8,
     },
     Cardinality {
-        selected: u16,
-        minimum: u16,
-        maximum: u16,
+        selected: u64,
+        minimum: u64,
+        maximum: u64,
     },
     Binding {
         subject: u128,
         kind: u8,
+        minimum: u16,
+        maximum: u16,
         allow_sharing: bool,
+    },
+    Capacity {
+        required: u64,
+        available: u64,
+    },
+    Static {
+        satisfied: bool,
     },
     CoreCapacity {
         core: u16,
@@ -7908,6 +8575,9 @@ enum SolverConstraint {
     Affinity {
         left: u128,
         right: u128,
+    },
+    AffinityGroup {
+        executables: Arc<[u128]>,
     },
     Separation {
         left: u128,
@@ -7935,9 +8605,15 @@ enum CanonicalSolveOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct VerifiedPrivateConflict {
+pub(crate) struct VerifiedPrivateConflict {
     code: ConflictCode,
     requirements: Arc<[u128]>,
+}
+
+impl VerifiedPrivateConflict {
+    pub(crate) fn requirement_count(&self) -> usize {
+        self.requirements.len()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7964,22 +8640,22 @@ fn solve_canonical_problem(
     if let Some((placements, bindings)) =
         search_canonical_assignment(&puzzle, &all, cancellation, &mut explored)?
     {
+        let mut discharges = puzzle
+            .requirements
+            .iter()
+            .map(|requirement| requirement.identity)
+            .collect::<Vec<_>>();
+        discharges.sort_unstable();
         return Ok(CanonicalSolveOutcome::Assignment {
             placements: placements.into(),
             bindings: bindings.into(),
-            discharges: puzzle
-                .requirements
-                .iter()
-                .map(|requirement| requirement.identity)
-                .collect::<Vec<_>>()
-                .into(),
+            discharges: discharges.into(),
         });
     }
     if puzzle.requirements.len() > MAX_CONFLICT_REQUIREMENTS {
         return defect("solver conflict minimization exhausted its authenticated finite bound");
     }
     let conflict = minimum_conflict(&puzzle, cancellation, &mut explored)?;
-    verify_private_conflict(&puzzle, &conflict, cancellation)?;
     Ok(CanonicalSolveOutcome::Conflict(conflict))
 }
 
@@ -7988,6 +8664,7 @@ fn canonicalize_problem(puzzle: &CanonicalProblem) -> Result<CanonicalProblem, P
     puzzle.cores.sort_unstable();
     puzzle.executables.sort_unstable();
     puzzle.bindings.sort_unstable();
+    puzzle.binding_subjects.sort_unstable();
     puzzle
         .requirements
         .sort_by_key(|requirement| (requirement.category, requirement.identity));
@@ -8006,10 +8683,65 @@ fn canonicalize_problem(puzzle: &CanonicalProblem) -> Result<CanonicalProblem, P
     if puzzle.cores.is_empty()
         || puzzle.cores.windows(2).any(|pair| pair[0] == pair[1])
         || puzzle.executables.windows(2).any(|pair| pair[0] == pair[1])
+        || puzzle
+            .binding_subjects
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
         || binding_identity_count != puzzle.bindings.len()
         || requirement_identity_count != puzzle.requirements.len()
     {
         return defect("canonical solver problem is malformed or contains duplicate identities");
+    }
+    for requirement in &puzzle.requirements {
+        let malformed = match &requirement.constraint {
+            SolverConstraint::Cardinality {
+                minimum, maximum, ..
+            } => minimum > maximum,
+            SolverConstraint::Binding {
+                subject,
+                minimum,
+                maximum,
+                ..
+            } => minimum > maximum || !puzzle.binding_subjects.contains(subject),
+            SolverConstraint::CoreCapacity { core, .. } => !puzzle
+                .cores
+                .iter()
+                .any(|candidate| candidate.identity == *core),
+            SolverConstraint::AllowedCores { executable, cores } => {
+                !puzzle.executables.contains(executable)
+                    || cores.is_empty()
+                    || cores.iter().any(|core| {
+                        !puzzle
+                            .cores
+                            .iter()
+                            .any(|candidate| candidate.identity == *core)
+                    })
+            }
+            SolverConstraint::Affinity { left, right }
+            | SolverConstraint::Separation { left, right } => {
+                !puzzle.executables.contains(left) || !puzzle.executables.contains(right)
+            }
+            SolverConstraint::AffinityGroup { executables } => {
+                executables.is_empty()
+                    || executables
+                        .iter()
+                        .any(|executable| !puzzle.executables.contains(executable))
+            }
+            SolverConstraint::Exclusive { executable } => !puzzle.executables.contains(executable),
+            SolverConstraint::Activation {
+                executable,
+                units,
+                start,
+                end,
+            } => !puzzle.executables.contains(executable) || *units == 0 || start >= end,
+            SolverConstraint::Realize { .. }
+            | SolverConstraint::Capability { .. }
+            | SolverConstraint::Capacity { .. }
+            | SolverConstraint::Static { .. } => false,
+        };
+        if malformed {
+            return defect("canonical solver Requirement has a malformed or dangling subject");
+        }
     }
     Ok(puzzle)
 }
@@ -8023,114 +8755,123 @@ fn search_canonical_assignment(
     if !static_constraints_hold(puzzle, active) {
         return Ok(None);
     }
-    let mut placements = Vec::with_capacity(puzzle.executables.len());
-    search_placements(puzzle, active, 0, &mut placements, cancellation, explored)
-}
-
-fn search_placements(
-    puzzle: &CanonicalProblem,
-    active: &[usize],
-    executable_ordinal: usize,
-    placements: &mut Vec<(u128, u16)>,
-    cancellation: &Cancellation,
-    explored: &mut usize,
-) -> CandidateSearch {
-    checkpoint(cancellation)?;
-    *explored = explored.saturating_add(1);
-    if *explored > MAX_SOLVER_EXPLORATION_STATES {
-        return defect("canonical solver exploration exhausted its bounded state budget");
+    let binding_requirements = active
+        .iter()
+        .flat_map(|ordinal| match &puzzle.requirements[*ordinal].constraint {
+            SolverConstraint::Binding {
+                subject,
+                kind,
+                minimum,
+                allow_sharing,
+                ..
+            } => vec![(*subject, *kind, *allow_sharing); usize::from(*minimum)],
+            _ => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let binding_choices = binding_requirements
+        .iter()
+        .map(|(_, kind, _)| {
+            puzzle
+                .bindings
+                .iter()
+                .filter(|slot| slot.kind == *kind)
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    if binding_choices.iter().any(Vec::is_empty) {
+        return Ok(None);
     }
-    if executable_ordinal == puzzle.executables.len() {
-        if !placement_constraints_hold(puzzle, active, placements) {
-            return Ok(None);
+    let placement_radices = vec![puzzle.cores.len(); puzzle.executables.len()];
+    let mut placement_digits = vec![0; puzzle.executables.len()];
+    loop {
+        checkpoint(cancellation)?;
+        *explored = explored.saturating_add(1);
+        if *explored > MAX_SOLVER_EXPLORATION_STATES {
+            return defect("canonical solver exploration exhausted its bounded state budget");
         }
-        let binding_requirements = active
+        let placements = puzzle
+            .executables
             .iter()
-            .filter_map(|ordinal| match &puzzle.requirements[*ordinal].constraint {
-                SolverConstraint::Binding {
-                    subject,
-                    kind,
-                    allow_sharing,
-                } => Some((*subject, *kind, *allow_sharing)),
-                _ => None,
-            })
+            .zip(&placement_digits)
+            .map(|(executable, digit)| (*executable, puzzle.cores[*digit].identity))
             .collect::<Vec<_>>();
-        let mut bindings = Vec::with_capacity(binding_requirements.len());
-        return search_bindings(
-            puzzle,
-            &binding_requirements,
-            0,
-            &mut bindings,
-            placements,
-            cancellation,
-            explored,
-        );
-    }
-    let executable = puzzle.executables[executable_ordinal];
-    for core in &puzzle.cores {
-        placements.push((executable, core.identity));
-        if let Some(solution) = search_placements(
-            puzzle,
-            active,
-            executable_ordinal + 1,
-            placements,
-            cancellation,
-            explored,
-        )? {
-            return Ok(Some(solution));
+        if placement_constraints_hold(puzzle, active, &placements) {
+            if binding_requirements.is_empty() {
+                return Ok(Some((placements, Vec::new())));
+            }
+            let binding_radices = binding_choices.iter().map(Vec::len).collect::<Vec<_>>();
+            let mut binding_digits = vec![0; binding_requirements.len()];
+            loop {
+                checkpoint(cancellation)?;
+                *explored = explored.saturating_add(1);
+                if *explored > MAX_SOLVER_EXPLORATION_STATES {
+                    return defect(
+                        "canonical binding exploration exhausted its bounded state budget",
+                    );
+                }
+                let bindings = binding_requirements
+                    .iter()
+                    .zip(&binding_digits)
+                    .enumerate()
+                    .map(|(ordinal, ((subject, _, _), digit))| {
+                        (*subject, binding_choices[ordinal][*digit].identity)
+                    })
+                    .collect::<Vec<_>>();
+                if binding_candidate_compatible(
+                    &binding_requirements,
+                    &binding_choices,
+                    &binding_digits,
+                ) {
+                    return Ok(Some((placements, bindings)));
+                }
+                if !advance_digits(&mut binding_digits, &binding_radices) {
+                    break;
+                }
+            }
         }
-        placements.pop();
+        if !advance_digits(&mut placement_digits, &placement_radices) {
+            break;
+        }
     }
     Ok(None)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn search_bindings(
-    puzzle: &CanonicalProblem,
+fn binding_candidate_compatible(
     requirements: &[(u128, u8, bool)],
-    ordinal: usize,
-    bindings: &mut Vec<(u128, u8)>,
-    placements: &[(u128, u16)],
-    cancellation: &Cancellation,
-    explored: &mut usize,
-) -> CandidateSearch {
-    checkpoint(cancellation)?;
-    *explored = explored.saturating_add(1);
-    if *explored > MAX_SOLVER_EXPLORATION_STATES {
-        return defect("canonical binding exploration exhausted its bounded state budget");
-    }
-    if ordinal == requirements.len() {
-        return Ok(Some((placements.to_vec(), bindings.clone())));
-    }
-    let (subject, kind, allow_sharing) = requirements[ordinal];
-    for slot in puzzle.bindings.iter().filter(|slot| slot.kind == kind) {
-        let compatible = bindings.iter().all(|(other_subject, other_slot)| {
-            *other_slot != slot.identity
-                || (*other_subject == subject)
-                || (allow_sharing
-                    && slot.shareable
-                    && requirements
-                        .iter()
-                        .find(|(candidate, _, _)| candidate == other_subject)
-                        .is_some_and(|(_, _, other_sharing)| *other_sharing))
-        });
-        if compatible {
-            bindings.push((subject, slot.identity));
-            if let Some(solution) = search_bindings(
-                puzzle,
-                requirements,
-                ordinal + 1,
-                bindings,
-                placements,
-                cancellation,
-                explored,
-            )? {
-                return Ok(Some(solution));
+    choices: &[Vec<BindingResource>],
+    digits: &[usize],
+) -> bool {
+    for left in 0..requirements.len() {
+        for right in left + 1..requirements.len() {
+            let left_slot = choices[left][digits[left]];
+            let right_slot = choices[right][digits[right]];
+            if left_slot.identity != right_slot.identity {
+                continue;
             }
-            bindings.pop();
+            let (left_subject, _, left_sharing) = requirements[left];
+            let (right_subject, _, right_sharing) = requirements[right];
+            if left_subject == right_subject
+                || !left_sharing
+                || !right_sharing
+                || !left_slot.shareable
+            {
+                return false;
+            }
         }
     }
-    Ok(None)
+    true
+}
+
+fn advance_digits(digits: &mut [usize], radices: &[usize]) -> bool {
+    for ordinal in (0..digits.len()).rev() {
+        if digits[ordinal] + 1 < radices[ordinal] {
+            digits[ordinal] += 1;
+            digits[ordinal + 1..].fill(0);
+            return true;
+        }
+    }
+    false
 }
 
 fn static_constraints_hold(puzzle: &CanonicalProblem, active: &[usize]) -> bool {
@@ -8144,11 +8885,17 @@ fn static_constraints_hold(puzzle: &CanonicalProblem, active: &[usize]) -> bool 
                 minimum,
                 maximum,
             } => minimum <= selected && selected <= maximum,
+            SolverConstraint::Capacity {
+                required,
+                available,
+            } => required <= available,
+            SolverConstraint::Static { satisfied } => *satisfied,
             SolverConstraint::Activation { start, end, .. } => start < end,
             SolverConstraint::Binding { .. }
             | SolverConstraint::CoreCapacity { .. }
             | SolverConstraint::AllowedCores { .. }
             | SolverConstraint::Affinity { .. }
+            | SolverConstraint::AffinityGroup { .. }
             | SolverConstraint::Separation { .. }
             | SolverConstraint::Exclusive { .. } => true,
         })
@@ -8172,6 +8919,16 @@ fn placement_constraints_hold(
             }
             SolverConstraint::Affinity { left, right } => {
                 if placed.get(left) != placed.get(right) {
+                    return false;
+                }
+            }
+            SolverConstraint::AffinityGroup { executables } => {
+                let mut cores = executables
+                    .iter()
+                    .filter_map(|executable| placed.get(executable));
+                if let Some(first) = cores.next()
+                    && cores.any(|core| core != first)
+                {
                     return false;
                 }
             }
@@ -8207,6 +8964,8 @@ fn placement_constraints_hold(
             SolverConstraint::Realize { .. }
             | SolverConstraint::Capability { .. }
             | SolverConstraint::Cardinality { .. }
+            | SolverConstraint::Capacity { .. }
+            | SolverConstraint::Static { .. }
             | SolverConstraint::Binding { .. }
             | SolverConstraint::Activation { .. } => {}
         }
@@ -8259,6 +9018,16 @@ const fn intervals_overlap(
 }
 
 fn minimum_conflict(
+    puzzle: &CanonicalProblem,
+    cancellation: &Cancellation,
+    explored: &mut usize,
+) -> Result<VerifiedPrivateConflict, PlanningFailure> {
+    let conflict = find_minimum_conflict(puzzle, cancellation, explored)?;
+    verify_private_conflict(puzzle, &conflict, cancellation)?;
+    Ok(conflict)
+}
+
+fn find_minimum_conflict(
     puzzle: &CanonicalProblem,
     cancellation: &Cancellation,
     explored: &mut usize,
@@ -8343,6 +9112,11 @@ fn verify_private_conflict(
     conflict: &VerifiedPrivateConflict,
     cancellation: &Cancellation,
 ) -> Result<(), PlanningFailure> {
+    let mut canonical_explored = 0;
+    let expected = find_minimum_conflict(puzzle, cancellation, &mut canonical_explored)?;
+    if conflict != &expected {
+        return defect("private conflict is not the canonical minimum witness and code");
+    }
     let active = conflict
         .requirements
         .iter()
@@ -8377,18 +9151,19 @@ fn verify_private_conflict(
 
 #[cfg(test)]
 fn independently_enumerate_tiny_puzzle(puzzle: &CanonicalProblem) -> CanonicalSolveOutcome {
-    let puzzle = canonicalize_problem(puzzle).expect("named oracle puzzle is well formed");
+    let puzzle = oracle_canonicalize_problem(puzzle);
     let all = (0..puzzle.requirements.len()).collect::<Vec<_>>();
     if let Some((placements, bindings)) = oracle_first_assignment(&puzzle, &all) {
+        let mut discharges = puzzle
+            .requirements
+            .iter()
+            .map(|requirement| requirement.identity)
+            .collect::<Vec<_>>();
+        discharges.sort_unstable();
         return CanonicalSolveOutcome::Assignment {
             placements: placements.into(),
             bindings: bindings.into(),
-            discharges: puzzle
-                .requirements
-                .iter()
-                .map(|requirement| requirement.identity)
-                .collect::<Vec<_>>()
-                .into(),
+            discharges: discharges.into(),
         };
     }
     for size in 1..=puzzle.requirements.len() {
@@ -8397,7 +9172,7 @@ fn independently_enumerate_tiny_puzzle(puzzle: &CanonicalProblem) -> CanonicalSo
             if oracle_first_assignment(&puzzle, &combination).is_none() {
                 let first = puzzle.requirements[combination[0]].category;
                 return CanonicalSolveOutcome::Conflict(VerifiedPrivateConflict {
-                    code: conflict_code(
+                    code: oracle_conflict_code(
                         first,
                         combination
                             .iter()
@@ -8410,12 +9185,103 @@ fn independently_enumerate_tiny_puzzle(puzzle: &CanonicalProblem) -> CanonicalSo
                         .into(),
                 });
             }
-            if !advance_combination(&mut combination, puzzle.requirements.len()) {
+            if !oracle_advance_combination(&mut combination, puzzle.requirements.len()) {
                 break;
             }
         }
     }
     unreachable!("finite infeasible oracle puzzle has a conflict")
+}
+
+#[cfg(test)]
+fn oracle_canonicalize_problem(puzzle: &CanonicalProblem) -> CanonicalProblem {
+    let mut canonical = puzzle.clone();
+    canonical.cores.sort_by_key(|core| core.identity);
+    canonical.executables.sort_unstable();
+    canonical.binding_subjects.sort_unstable();
+    canonical
+        .bindings
+        .sort_by_key(|binding| (binding.identity, binding.kind, binding.shareable));
+    canonical
+        .requirements
+        .sort_by_key(|requirement| (requirement.category, requirement.identity));
+    assert!(!canonical.cores.is_empty(), "oracle puzzle has a core");
+    assert_eq!(
+        canonical
+            .cores
+            .iter()
+            .map(|core| core.identity)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        canonical.cores.len(),
+        "oracle core identities are unique"
+    );
+    assert_eq!(
+        canonical
+            .requirements
+            .iter()
+            .map(|requirement| requirement.identity)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        canonical.requirements.len(),
+        "oracle Requirement identities are unique"
+    );
+    assert_eq!(
+        canonical
+            .binding_subjects
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len(),
+        canonical.binding_subjects.len(),
+        "oracle binding subjects are unique"
+    );
+    canonical
+}
+
+#[cfg(test)]
+fn oracle_advance_combination(combination: &mut [usize], length: usize) -> bool {
+    for position in (0..combination.len()).rev() {
+        let last_allowed = length - (combination.len() - position);
+        if combination[position] < last_allowed {
+            combination[position] += 1;
+            for following in position + 1..combination.len() {
+                combination[following] = combination[following - 1] + 1;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+fn oracle_conflict_code(
+    first: SolverRequirementCategory,
+    categories: impl Iterator<Item = SolverRequirementCategory>,
+) -> ConflictCode {
+    let present = categories.collect::<BTreeSet<_>>();
+    let selected = [
+        SolverRequirementCategory::RequiredCapability,
+        SolverRequirementCategory::Cardinality,
+        SolverRequirementCategory::RoleRealization,
+        SolverRequirementCategory::Binding,
+        SolverRequirementCategory::Capacity,
+    ]
+    .into_iter()
+    .find(|category| present.contains(category))
+    .unwrap_or(first);
+    match selected {
+        SolverRequirementCategory::RoleRealization => ConflictCode::RoleClosure,
+        SolverRequirementCategory::RequiredCapability => ConflictCode::MissingCapability,
+        SolverRequirementCategory::Cardinality => ConflictCode::Cardinality,
+        SolverRequirementCategory::Binding => ConflictCode::Binding,
+        SolverRequirementCategory::Capacity => ConflictCode::Capacity,
+        SolverRequirementCategory::Placement => ConflictCode::Placement,
+        SolverRequirementCategory::Affinity => ConflictCode::Affinity,
+        SolverRequirementCategory::Separation => ConflictCode::Separation,
+        SolverRequirementCategory::Exclusivity => ConflictCode::Exclusivity,
+        SolverRequirementCategory::ActivationLifetime => ConflictCode::ActivationLifetime,
+    }
 }
 
 #[cfg(test)]
@@ -8428,13 +9294,15 @@ fn oracle_first_assignment(
         placement_radix.checked_pow(u32::try_from(puzzle.executables.len()).ok()?)?;
     let binding_requirements = active
         .iter()
-        .filter_map(|ordinal| match puzzle.requirements[*ordinal].constraint {
+        .flat_map(|ordinal| match puzzle.requirements[*ordinal].constraint {
             SolverConstraint::Binding {
                 subject,
                 kind,
+                minimum,
                 allow_sharing,
-            } => Some((subject, kind, allow_sharing)),
-            _ => None,
+                ..
+            } => vec![(subject, kind, allow_sharing); usize::from(minimum)],
+            _ => Vec::new(),
         })
         .collect::<Vec<_>>();
     let binding_radix = puzzle.bindings.len().max(1);
@@ -8512,25 +9380,44 @@ fn oracle_candidate_feasible(
             SolverConstraint::Binding {
                 subject,
                 kind,
+                minimum,
+                maximum,
                 allow_sharing,
             } => {
-                let Some(slot) = bindings
+                let selected = bindings
                     .iter()
-                    .find(|(candidate, _)| candidate == subject)
-                    .and_then(|(_, slot)| {
-                        puzzle
-                            .bindings
-                            .iter()
-                            .find(|candidate| candidate.identity == *slot)
-                    })
-                else {
-                    return false;
-                };
-                if slot.kind != *kind {
+                    .filter(|(candidate, _)| candidate == subject)
+                    .collect::<Vec<_>>();
+                if selected.len() < usize::from(*minimum) || selected.len() > usize::from(*maximum)
+                {
                     return false;
                 }
-                for (other, other_slot) in bindings.iter().filter(|(other, _)| other != subject) {
-                    if *other_slot == slot.identity {
+                for (_, selected_slot) in selected {
+                    let Some(slot) = puzzle
+                        .bindings
+                        .iter()
+                        .find(|candidate| candidate.identity == *selected_slot)
+                    else {
+                        return false;
+                    };
+                    if slot.kind != *kind {
+                        return false;
+                    }
+                    if bindings
+                        .iter()
+                        .filter(|(candidate, candidate_slot)| {
+                            candidate == subject && candidate_slot == selected_slot
+                        })
+                        .count()
+                        != 1
+                    {
+                        return false;
+                    }
+                    for (other, other_slot) in bindings.iter().filter(|(other, _)| other != subject)
+                    {
+                        if *other_slot != slot.identity {
+                            continue;
+                        }
                         let other_shared = active.iter().any(|other_ordinal| {
                             matches!(
                                 puzzle.requirements[*other_ordinal].constraint,
@@ -8545,6 +9432,19 @@ fn oracle_candidate_feasible(
                             return false;
                         }
                     }
+                }
+            }
+            SolverConstraint::Capacity {
+                required,
+                available,
+            } => {
+                if required > available {
+                    return false;
+                }
+            }
+            SolverConstraint::Static { satisfied } => {
+                if !satisfied {
+                    return false;
                 }
             }
             SolverConstraint::CoreCapacity { core, maximum } => {
@@ -8588,6 +9488,14 @@ fn oracle_candidate_feasible(
                     return false;
                 }
             }
+            SolverConstraint::AffinityGroup { executables } => {
+                let mut cores = executables.iter().map(|executable| core_of(*executable));
+                if let Some(first) = cores.next()
+                    && cores.any(|core| core != first)
+                {
+                    return false;
+                }
+            }
             SolverConstraint::Separation { left, right } => {
                 if core_of(*left) == core_of(*right) {
                     return false;
@@ -8619,7 +9527,7 @@ fn oracle_candidate_feasible(
                                 ..
                             } if other != *executable
                                 && core_of(other) == Some(core)
-                                && intervals_overlap(start, end, other_start, other_end)
+                                && start < other_end && other_start < end
                         )
                     }) {
                         return false;
@@ -8644,6 +9552,8 @@ fn solver_requirement(
 ) -> SolverRequirement {
     SolverRequirement {
         identity,
+        source: RequirementSource::Domain,
+        current_meaning: identity,
         category,
         constraint,
     }
@@ -8676,6 +9586,7 @@ fn named_tiny_solver_puzzles() -> Vec<CanonicalProblem> {
         cores,
         executables,
         bindings: Vec::new(),
+        binding_subjects: Vec::new(),
         capabilities: BTreeSet::new(),
         requirements,
     };
@@ -8724,6 +9635,7 @@ fn named_tiny_solver_puzzles() -> Vec<CanonicalProblem> {
                     shareable: false,
                 },
             ],
+            binding_subjects: vec![100, 200],
             capabilities: BTreeSet::new(),
             requirements: vec![
                 solver_requirement(
@@ -8732,6 +9644,8 @@ fn named_tiny_solver_puzzles() -> Vec<CanonicalProblem> {
                     SolverConstraint::Binding {
                         subject: 100,
                         kind: 1,
+                        minimum: 1,
+                        maximum: 1,
                         allow_sharing: false,
                     },
                 ),
@@ -8741,6 +9655,8 @@ fn named_tiny_solver_puzzles() -> Vec<CanonicalProblem> {
                     SolverConstraint::Binding {
                         subject: 200,
                         kind: 1,
+                        minimum: 1,
+                        maximum: 1,
                         allow_sharing: false,
                     },
                 ),
@@ -8810,6 +9726,7 @@ fn named_tiny_solver_puzzles() -> Vec<CanonicalProblem> {
                 kind: 1,
                 shareable: true,
             }],
+            binding_subjects: vec![100, 200],
             capabilities: BTreeSet::new(),
             requirements: vec![
                 solver_requirement(
@@ -8818,6 +9735,8 @@ fn named_tiny_solver_puzzles() -> Vec<CanonicalProblem> {
                     SolverConstraint::Binding {
                         subject: 100,
                         kind: 1,
+                        minimum: 1,
+                        maximum: 1,
                         allow_sharing: true,
                     },
                 ),
@@ -8827,6 +9746,8 @@ fn named_tiny_solver_puzzles() -> Vec<CanonicalProblem> {
                     SolverConstraint::Binding {
                         subject: 200,
                         kind: 1,
+                        minimum: 1,
+                        maximum: 1,
                         allow_sharing: true,
                     },
                 ),
@@ -8941,9 +9862,13 @@ fn build() -> Image:
                 .derive(foundation.for_flow(), core.for_flow(), &Cancellation::new())
                 .expect("Flow fixture verifies"),
         );
-        ImagePlanningModule
+        let outcome = ImagePlanningModule
             .solve(foundation, core, flow, &Cancellation::new())
-            .expect("whole-Image assignment verifies")
+            .expect("whole-Image assignment verifies");
+        let WholeImageSolveOutcome::Assignment(assignment) = outcome else {
+            panic!("fixture Requirement Set is feasible");
+        };
+        assignment
     }
 
     fn pool_fixture() -> VerifiedPlanningFoundation {
@@ -10342,6 +11267,77 @@ fn build() -> Image:
             verify_whole_image_assignment(&candidate, &Cancellation::new()),
             Err(PlanningFailure::Defect(_))
         ));
+
+        let mut candidate = assignment_fixture();
+        let mut requirements = candidate.requirements.to_vec();
+        let WholeRequirementRef::Domain(reference) = requirements
+            .iter_mut()
+            .find(|requirement| matches!(requirement, WholeRequirementRef::Domain(_)))
+            .expect("fixture has a Domain Requirement")
+        else {
+            unreachable!()
+        };
+        reference.current_meaning ^= 1;
+        candidate.requirements = requirements.into();
+        candidate.requirement_set_fingerprint = whole_requirement_set_fingerprint(
+            candidate.planning_foundation.fingerprint,
+            candidate.core_program.for_image_planning().fingerprint(),
+            candidate.flow_program.for_image_planning().fingerprint(),
+            &candidate.requirements,
+        );
+        candidate.fingerprint = whole_assignment_fingerprint(
+            candidate.requirement_set_fingerprint,
+            &candidate.placements,
+            &candidate.bindings,
+            &candidate.discharges,
+        );
+        assert!(matches!(
+            verify_whole_image_assignment(&candidate, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        for false_kind in [DischargeKind::CapacityProved, DischargeKind::LifetimeProved] {
+            let mut candidate = assignment_fixture();
+            let mut discharges = candidate.discharges.to_vec();
+            let discharge = discharges
+                .iter_mut()
+                .find(|discharge| discharge.kind == false_kind)
+                .expect("fixture covers capacity and lifetime evidence");
+            discharge.kind = DischargeKind::ContractValidated;
+            candidate.discharges = discharges.into();
+            candidate.fingerprint = whole_assignment_fingerprint(
+                candidate.requirement_set_fingerprint,
+                &candidate.placements,
+                &candidate.bindings,
+                &candidate.discharges,
+            );
+            assert!(matches!(
+                verify_whole_image_assignment(&candidate, &Cancellation::new()),
+                Err(PlanningFailure::Defect(_))
+            ));
+        }
+
+        let mut candidate = assignment_fixture();
+        let mut foundation = (*candidate.planning_foundation).clone();
+        let mut requirements = foundation.requirements.to_vec();
+        let binding = requirements
+            .iter_mut()
+            .find(|requirement| matches!(requirement.bounds, RequirementBounds::Binding { .. }))
+            .unwrap();
+        let RequirementBounds::Binding { kind, .. } = binding.bounds else {
+            unreachable!()
+        };
+        binding.bounds = RequirementBounds::Binding {
+            kind,
+            minimum: 2,
+            maximum: 2,
+        };
+        foundation.requirements = requirements.into();
+        candidate.planning_foundation = Arc::new(foundation);
+        assert!(matches!(
+            verify_whole_image_assignment(&candidate, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
     }
 
     #[test]
@@ -10362,6 +11358,7 @@ fn build() -> Image:
             cores: vec![CoreResource { identity: 0 }],
             executables: vec![1],
             bindings: Vec::new(),
+            binding_subjects: Vec::new(),
             capabilities: BTreeSet::new(),
             requirements: (0..=MAX_CONFLICT_REQUIREMENTS)
                 .map(|ordinal| {
@@ -10400,6 +11397,7 @@ fn build() -> Image:
                     shareable: false,
                 },
             ],
+            binding_subjects: Vec::new(),
             capabilities: BTreeSet::new(),
             requirements: Vec::new(),
         };
@@ -10413,6 +11411,7 @@ fn build() -> Image:
             cores: vec![CoreResource { identity: 0 }],
             executables: vec![1],
             bindings: Vec::new(),
+            binding_subjects: Vec::new(),
             capabilities: BTreeSet::from([1]),
             requirements: vec![
                 solver_requirement(
@@ -10430,6 +11429,368 @@ fn build() -> Image:
         assert!(matches!(
             solve_canonical_problem(&duplicate_requirement, &Cancellation::new()),
             Err(PlanningFailure::Defect(_))
+        ));
+
+        let exact_two = CanonicalProblem {
+            name: "two_exact_bindings",
+            cores: vec![CoreResource { identity: 0 }],
+            executables: vec![1],
+            bindings: vec![
+                BindingResource {
+                    identity: 0,
+                    kind: 1,
+                    shareable: false,
+                },
+                BindingResource {
+                    identity: 1,
+                    kind: 1,
+                    shareable: false,
+                },
+            ],
+            binding_subjects: vec![10],
+            capabilities: BTreeSet::new(),
+            requirements: vec![solver_requirement(
+                1,
+                SolverRequirementCategory::Binding,
+                SolverConstraint::Binding {
+                    subject: 10,
+                    kind: 1,
+                    minimum: 2,
+                    maximum: 2,
+                    allow_sharing: false,
+                },
+            )],
+        };
+        let CanonicalSolveOutcome::Assignment { bindings, .. } =
+            solve_canonical_problem(&exact_two, &Cancellation::new()).unwrap()
+        else {
+            panic!("two exact slots are feasible");
+        };
+        assert_eq!(bindings.as_ref(), [(10, 0), (10, 1)]);
+    }
+
+    #[test]
+    fn production_translation_uses_the_exact_typed_requirement_set_and_architecture_resources() {
+        let candidate = assignment_fixture();
+        let problem = translate_whole_requirement_set(
+            &candidate.planning_foundation,
+            candidate.core_program.for_image_planning(),
+            candidate.flow_program.for_image_planning(),
+            &Cancellation::new(),
+        )
+        .expect("verified authorities translate");
+
+        assert_eq!(problem.requirements.len(), candidate.requirements.len());
+        assert_eq!(
+            problem
+                .requirements
+                .iter()
+                .map(|requirement| requirement.identity)
+                .collect::<BTreeSet<_>>(),
+            candidate
+                .requirements
+                .iter()
+                .map(|requirement| requirement.identity())
+                .collect()
+        );
+        assert!(!problem.bindings.is_empty());
+        assert!(!problem.capabilities.is_empty());
+        assert!(
+            problem.requirements.iter().any(|requirement| matches!(
+                requirement.constraint,
+                SolverConstraint::Realize { .. }
+            ))
+        );
+        assert!(
+            problem.requirements.iter().any(|requirement| matches!(
+                requirement.constraint,
+                SolverConstraint::Binding { .. }
+            ))
+        );
+        assert!(problem.requirements.iter().any(|requirement| matches!(
+            requirement.constraint,
+            SolverConstraint::Cardinality { .. }
+        )));
+        assert!(problem.requirements.iter().any(|requirement| matches!(
+            requirement.constraint,
+            SolverConstraint::Activation { .. }
+        )));
+    }
+
+    #[test]
+    fn canonical_solver_rejects_dangling_and_inverted_constraints_as_defects() {
+        let malformed = [
+            SolverConstraint::AllowedCores {
+                executable: 99,
+                cores: Arc::from([0]),
+            },
+            SolverConstraint::CoreCapacity {
+                core: 99,
+                maximum: 1,
+            },
+            SolverConstraint::Affinity { left: 1, right: 99 },
+            SolverConstraint::Binding {
+                subject: 1,
+                kind: 1,
+                minimum: 2,
+                maximum: 1,
+                allow_sharing: false,
+            },
+            SolverConstraint::Binding {
+                subject: 99,
+                kind: 1,
+                minimum: 1,
+                maximum: 1,
+                allow_sharing: false,
+            },
+            SolverConstraint::Activation {
+                executable: 99,
+                units: 1,
+                start: 1,
+                end: 1,
+            },
+        ];
+        for (ordinal, constraint) in malformed.into_iter().enumerate() {
+            let problem = CanonicalProblem {
+                name: "malformed_typed_subject",
+                cores: vec![CoreResource { identity: 0 }],
+                executables: vec![1],
+                bindings: vec![BindingResource {
+                    identity: 0,
+                    kind: 1,
+                    shareable: false,
+                }],
+                binding_subjects: vec![1],
+                capabilities: BTreeSet::new(),
+                requirements: vec![solver_requirement(
+                    u128::try_from(ordinal + 1).unwrap(),
+                    SolverRequirementCategory::Placement,
+                    constraint,
+                )],
+            };
+            assert!(matches!(
+                solve_canonical_problem(&problem, &Cancellation::new()),
+                Err(PlanningFailure::Defect(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn production_solve_retains_a_verified_binding_conflict_instead_of_a_defect() {
+        let candidate = assignment_fixture();
+        let mut foundation = (*candidate.planning_foundation).clone();
+        let mut requirements = foundation.requirements.to_vec();
+        let binding = requirements
+            .iter_mut()
+            .find(|requirement| {
+                matches!(
+                    requirement.bounds,
+                    RequirementBounds::Binding {
+                        kind: PlanningBinding::Terminal,
+                        ..
+                    }
+                )
+            })
+            .expect("fixture has the Terminal binding Requirement");
+        let conflict_requirement = binding.reference.identity;
+        binding.bounds = RequirementBounds::Binding {
+            kind: PlanningBinding::Terminal,
+            minimum: 2,
+            maximum: 2,
+        };
+        foundation.requirements = requirements.into();
+
+        let outcome = ImagePlanningModule
+            .solve(
+                Arc::new(foundation),
+                Arc::clone(&candidate.core_program),
+                Arc::clone(&candidate.flow_program),
+                &Cancellation::new(),
+            )
+            .expect("valid infeasibility is a solve outcome");
+        let WholeImageSolveOutcome::Conflict(conflict) = outcome else {
+            panic!("one Terminal slot cannot satisfy two exact bindings");
+        };
+        assert_eq!(conflict.code, ConflictCode::Binding);
+        assert_eq!(conflict.requirements.as_ref(), [conflict_requirement]);
+    }
+
+    #[test]
+    fn canonical_solver_handles_an_authenticated_large_closure_without_host_recursion() {
+        let problem = CanonicalProblem {
+            name: "maximum_generated_closure",
+            cores: vec![CoreResource { identity: 0 }],
+            executables: (1..=16_384).collect(),
+            bindings: Vec::new(),
+            binding_subjects: Vec::new(),
+            capabilities: BTreeSet::new(),
+            requirements: Vec::new(),
+        };
+        let CanonicalSolveOutcome::Assignment { placements, .. } =
+            solve_canonical_problem(&problem, &Cancellation::new()).expect("bounded assignment")
+        else {
+            panic!("one core admits the unconstrained finite closure");
+        };
+        assert_eq!(placements.len(), 16_384);
+
+        let cancellation = Cancellation::new();
+        cancellation.cancel();
+        assert!(matches!(
+            solve_canonical_problem(&problem, &cancellation),
+            Err(PlanningFailure::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn private_conflict_verifier_rejects_wrong_code_and_noncanonical_irreducible_witness() {
+        let problem = CanonicalProblem {
+            name: "two_independent_missing_capabilities",
+            cores: vec![CoreResource { identity: 0 }],
+            executables: vec![1],
+            bindings: Vec::new(),
+            binding_subjects: Vec::new(),
+            capabilities: BTreeSet::new(),
+            requirements: vec![
+                solver_requirement(
+                    1,
+                    SolverRequirementCategory::RequiredCapability,
+                    SolverConstraint::Capability { capability: 1 },
+                ),
+                solver_requirement(
+                    2,
+                    SolverRequirementCategory::RequiredCapability,
+                    SolverConstraint::Capability { capability: 2 },
+                ),
+            ],
+        };
+        let canonical = canonicalize_problem(&problem).unwrap();
+        let wrong_code = VerifiedPrivateConflict {
+            code: ConflictCode::Binding,
+            requirements: Arc::from([1]),
+        };
+        assert!(matches!(
+            verify_private_conflict(&canonical, &wrong_code, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+        let noncanonical = VerifiedPrivateConflict {
+            code: ConflictCode::MissingCapability,
+            requirements: Arc::from([2]),
+        };
+        assert!(matches!(
+            verify_private_conflict(&canonical, &noncanonical, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+    }
+
+    #[test]
+    fn translated_production_constraints_change_placement_and_infeasibility() {
+        let candidate = assignment_fixture();
+        let translated = || {
+            translate_whole_requirement_set(
+                &candidate.planning_foundation,
+                candidate.core_program.for_image_planning(),
+                candidate.flow_program.for_image_planning(),
+                &Cancellation::new(),
+            )
+            .unwrap()
+        };
+        let baseline = solve_canonical_problem(&translated(), &Cancellation::new()).unwrap();
+        assert!(matches!(baseline, CanonicalSolveOutcome::Assignment { .. }));
+
+        let mut placement = translated();
+        let selected = placement
+            .requirements
+            .iter()
+            .find_map(|requirement| match requirement.constraint {
+                SolverConstraint::Activation { executable, .. } => Some(executable),
+                _ => None,
+            })
+            .unwrap();
+        let lifetime = placement
+            .requirements
+            .iter_mut()
+            .find(|requirement| {
+                matches!(
+                    requirement.constraint,
+                    SolverConstraint::Activation { executable, .. } if executable == selected
+                )
+            })
+            .unwrap();
+        lifetime.constraint = SolverConstraint::AllowedCores {
+            executable: selected,
+            cores: Arc::from([1]),
+        };
+        let CanonicalSolveOutcome::Assignment { placements, .. } =
+            solve_canonical_problem(&placement, &Cancellation::new()).unwrap()
+        else {
+            panic!("authenticated secondary core is feasible");
+        };
+        assert_eq!(
+            placements
+                .iter()
+                .find(|(executable, _)| *executable == selected)
+                .unwrap()
+                .1,
+            1
+        );
+
+        let mut separation = translated();
+        let left = separation.executables[0];
+        let right = separation.executables[1];
+        separation
+            .requirements
+            .iter_mut()
+            .find(|requirement| matches!(requirement.constraint, SolverConstraint::Static { .. }))
+            .unwrap()
+            .constraint = SolverConstraint::Separation { left, right };
+        let CanonicalSolveOutcome::Assignment { placements, .. } =
+            solve_canonical_problem(&separation, &Cancellation::new()).unwrap()
+        else {
+            panic!("four cores can separate two executables");
+        };
+        assert_ne!(
+            placements.iter().find(|(id, _)| *id == left).unwrap().1,
+            placements.iter().find(|(id, _)| *id == right).unwrap().1
+        );
+
+        let mut capability = translated();
+        let required_capability = capability
+            .requirements
+            .iter()
+            .find_map(|requirement| match requirement.constraint {
+                SolverConstraint::Capability { capability } => Some(capability),
+                _ => None,
+            })
+            .unwrap();
+        capability.capabilities.remove(&required_capability);
+        assert!(matches!(
+            solve_canonical_problem(&capability, &Cancellation::new()).unwrap(),
+            CanonicalSolveOutcome::Conflict(VerifiedPrivateConflict {
+                code: ConflictCode::MissingCapability,
+                ..
+            })
+        ));
+
+        let mut one_short = translated();
+        let capacity = one_short
+            .requirements
+            .iter_mut()
+            .find(|requirement| matches!(requirement.constraint, SolverConstraint::Capacity { required, available } if required == available && required > 0))
+            .unwrap();
+        let SolverConstraint::Capacity {
+            required,
+            available,
+        } = &mut capacity.constraint
+        else {
+            unreachable!()
+        };
+        *available = required.saturating_sub(1);
+        assert!(matches!(
+            solve_canonical_problem(&one_short, &Cancellation::new()).unwrap(),
+            CanonicalSolveOutcome::Conflict(VerifiedPrivateConflict {
+                code: ConflictCode::Capacity,
+                ..
+            })
         ));
     }
 }

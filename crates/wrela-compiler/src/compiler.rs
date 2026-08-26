@@ -15,7 +15,8 @@ use crate::core::{CoreFailure, CoreProgramObservation, VerifiedCoreProgram};
 use crate::flow::{FlowFailure, FlowProgramObservation, VerifiedFlowProgram};
 use crate::image_planning::{
     PlanningFailure, PlanningFoundationObservation, VerifiedPlanningFoundation,
-    VerifiedWholeImageAssignment, WholeImageAssignmentObservation,
+    VerifiedPrivateConflict, VerifiedWholeImageAssignment, WholeImageAssignmentObservation,
+    WholeImageSolveOutcome,
 };
 use crate::syntax;
 use crate::typed_hir::AuthorityContext;
@@ -2389,6 +2390,7 @@ impl AcceptedCompilation {
 pub struct RejectedCompilation {
     diagnostics: Arc<[Diagnostic]>,
     inspection: Inspection,
+    planning_conflict: Option<Arc<VerifiedPrivateConflict>>,
 }
 
 impl RejectedCompilation {
@@ -2618,6 +2620,7 @@ impl Compiler {
                     syntax,
                     ..Inspection::default()
                 },
+                planning_conflict: None,
             });
         };
 
@@ -3026,6 +3029,7 @@ impl Compiler {
             _ => None,
         };
 
+        let mut whole_image_conflict = None;
         let whole_image_assignment = match (
             planning_foundation.as_ref(),
             core_program.as_ref(),
@@ -3038,7 +3042,24 @@ impl Compiler {
                     Arc::clone(flow),
                     cancellation,
                 ) {
-                    Ok(assignment) => Some(Arc::new(assignment)),
+                    Ok(WholeImageSolveOutcome::Assignment(assignment)) => {
+                        Some(Arc::new(assignment))
+                    }
+                    Ok(WholeImageSolveOutcome::Conflict(conflict)) => {
+                        diagnostics.push(
+                            Diagnostic::new(
+                                "admission.whole_image_conflict",
+                                SourceRange::new("<planning>", 0, 0),
+                                RecoveryAction::None,
+                            )
+                            .with_unsigned_parameter(
+                                "requirement_count",
+                                u128::try_from(conflict.requirement_count()).unwrap_or(u128::MAX),
+                            ),
+                        );
+                        whole_image_conflict = Some(Arc::new(conflict));
+                        None
+                    }
                     Err(PlanningFailure::Cancelled) => return CompilationOutcome::Cancelled,
                     Err(PlanningFailure::Defect(evidence)) => {
                         return CompilationOutcome::Defect(Defect::new(
@@ -3211,6 +3232,7 @@ impl Compiler {
             CompilationOutcome::Rejected(RejectedCompilation {
                 diagnostics: diagnostics.into(),
                 inspection,
+                planning_conflict: whole_image_conflict,
             })
         }
     }

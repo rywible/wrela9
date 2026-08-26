@@ -1283,3 +1283,67 @@ fn whole_image_solver_places_every_executable_and_discharges_every_requirement_o
         required_bindings.get(&binding.requirement()) == Some(&binding.binding())
     }));
 }
+
+#[test]
+fn compiler_assignment_enforces_actor_handler_affinity_and_flow_capacity() {
+    let source = br#"@actor
+struct Receiver:
+    pub async fn first(self):
+        pass
+
+    pub async fn second(self):
+        pass
+
+@image
+fn build() -> Image:
+    receiver = Receiver()
+    return Image.new(receiver=receiver)
+"#;
+    let outcome = Compiler::open(CompilerInstallation::layer1())
+        .unwrap()
+        .compile(
+            CompilationRequest::new(
+                ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+                Root::Image,
+            )
+            .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+            .with_inspection(InspectSelection::all()),
+            &Cancellation::new(),
+        );
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("bounded Actor Image must admit: {outcome:#?}");
+    };
+    let flow = accepted.inspection().flow_program().unwrap();
+    let assignment = accepted.inspection().whole_image_assignment().unwrap();
+    let actor = flow
+        .actors()
+        .iter()
+        .find(|actor| actor.handlers().len() == 2)
+        .unwrap();
+    let handler_cores = actor
+        .handlers()
+        .iter()
+        .map(|handler| {
+            assignment
+                .placements()
+                .iter()
+                .find(|placement| placement.executable() == *handler)
+                .unwrap()
+                .core()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(handler_cores.len(), 1, "one Actor has one permanent core");
+    assert!(assignment.discharges().iter().any(|discharge| {
+        discharge.requirement() == actor.permanent_core_requirement()
+            && discharge.kind() == wrela_compiler::DischargeKind::Placed
+    }));
+    assert!(
+        flow.requirements()
+            .iter()
+            .filter(|requirement| requirement.actor() == actor.identity())
+            .all(|requirement| assignment
+                .discharges()
+                .iter()
+                .any(|discharge| discharge.requirement() == requirement.identity()))
+    );
+}

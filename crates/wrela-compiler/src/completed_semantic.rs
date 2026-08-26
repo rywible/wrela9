@@ -426,10 +426,7 @@ impl<'a> CorePlanningSemanticProgram<'a> {
                     .iter()
                     .find(|test| test.id.identity == reference.identity)?
                     .id;
-                CoreSourceExecutableBody::Test {
-                    body: self.program.program.test_body(id)?,
-                    source: &self.program.program.test(id)?.source,
-                }
+                CoreSourceExecutableBody::Test(self.program.program.test_body_with_signature(id)?)
             }
             CoreSourceExecutableKind::ClosureBody => CoreSourceExecutableBody::Closure(
                 self.program
@@ -461,10 +458,7 @@ pub(crate) struct CoreSourceExecutableInput<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum CoreSourceExecutableBody<'a> {
     Specialization(&'a crate::typed_hir::HirFunction),
-    Test {
-        body: &'a [crate::typed_hir::Statement],
-        source: &'a crate::SourceRange,
-    },
+    Test(&'a crate::typed_hir::HirTest),
     Closure(&'a crate::typed_hir::HirClosure),
 }
 

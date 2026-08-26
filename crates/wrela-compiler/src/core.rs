@@ -10,7 +10,7 @@ use crate::completed_semantic::{
     CoreSourceExecutableBody, CoreSourceExecutableInput, CoreSourceExecutableKind,
 };
 use crate::image_planning::{CorePlanningInput, ExecutableRef, GeneratedRole};
-use crate::model::{IntegerType, SpecializationId};
+use crate::model::{IntegerType, SpecializationId, Type};
 use crate::typed_hir::{
     BinaryOperator, CallTarget, Expression, ExpressionKind, HirMatchPattern, Literal, Place,
     PlaceProjection, Statement,
@@ -63,6 +63,7 @@ pub enum CoreOperationKind {
     Expect,
     Branch,
     Loop,
+    LoopBack,
     Match,
     Cleanup,
     PoolScope,
@@ -98,14 +99,51 @@ impl CoreOperationKind {
             Self::Expect => 20,
             Self::Branch => 21,
             Self::Loop => 22,
-            Self::Match => 23,
-            Self::Cleanup => 24,
-            Self::PoolScope => 25,
-            Self::Break => 26,
-            Self::Continue => 27,
-            Self::Pass => 28,
-            Self::Suspension => 29,
-            Self::GeneratedRole => 30,
+            Self::LoopBack => 23,
+            Self::Match => 24,
+            Self::Cleanup => 25,
+            Self::PoolScope => 26,
+            Self::Break => 27,
+            Self::Continue => 28,
+            Self::Pass => 29,
+            Self::Suspension => 30,
+            Self::GeneratedRole => 31,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CoreAccessLaw {
+    None,
+    CopyValue,
+    SharedLoan,
+    ExclusiveLoan,
+    Move,
+    CleanupCapture,
+}
+
+impl CoreAccessLaw {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::CopyValue => 1,
+            Self::SharedLoan => 2,
+            Self::ExclusiveLoan => 3,
+            Self::Move => 4,
+            Self::CleanupCapture => 5,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CoreRewriteKind {
+    EliminatedPass,
+}
+
+impl CoreRewriteKind {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::EliminatedPass => 1,
         }
     }
 }
@@ -139,6 +177,7 @@ enum FailureLaw {
     CheckBeforeSuccess,
     PropagateInOrder,
     TerminalPanic,
+    RecordTestFailure,
 }
 
 impl FailureLaw {
@@ -148,6 +187,7 @@ impl FailureLaw {
             Self::CheckBeforeSuccess => 1,
             Self::PropagateInOrder => 2,
             Self::TerminalPanic => 3,
+            Self::RecordTestFailure => 4,
         }
     }
 }
@@ -168,9 +208,35 @@ struct Operation {
     successors: Arc<[RegionId]>,
     details: Arc<[u128]>,
     effect: EffectBoundary,
+    access: CoreAccessLaw,
     failure: FailureLaw,
     provenance: SourceRange,
-    oracle: Option<OracleInstruction>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CoreType {
+    identity: u128,
+    shape: Arc<[u8]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CoreParameter {
+    local: u32,
+    type_: CoreType,
+    access: CoreAccessLaw,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CoreSignature {
+    parameters: Arc<[CoreParameter]>,
+    return_type: CoreType,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RewriteWitness {
+    kind: CoreRewriteKind,
+    provenance: SourceRange,
+    source_order: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,25 +270,10 @@ struct CoreExecutable {
     entry: RegionId,
     regions: Arc<[Region]>,
     facts: ExecutableFacts,
-    parameter_count: usize,
+    signature: CoreSignature,
+    rewrites: Arc<[RewriteWitness]>,
     source_definition: Option<u128>,
     fingerprint: u128,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum OracleInstruction {
-    Literal(CanonicalValue),
-    Read(u32),
-    Store { local: u32, value: ValueId },
-    Binary(BinaryOperator),
-    ShortCircuit(BinaryOperator),
-    UnaryNegate,
-    UnaryNot,
-    Return(Option<ValueId>),
-    Panic,
-    Assert(ValueId),
-    Branch(ValueId),
-    Pass,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -274,6 +325,34 @@ pub struct CoreExecutableObservation {
     region_count: usize,
     may_panic: bool,
     effectful: bool,
+    parameters: Arc<[CoreParameterObservation]>,
+    return_type_identity: u128,
+    access_laws: Arc<[CoreAccessLaw]>,
+    rewrites: Arc<[CoreRewriteKind]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreParameterObservation {
+    local_identity: u32,
+    type_identity: u128,
+    access: CoreAccessLaw,
+}
+
+impl CoreParameterObservation {
+    #[must_use]
+    pub const fn local_identity(&self) -> u32 {
+        self.local_identity
+    }
+
+    #[must_use]
+    pub const fn type_identity(&self) -> u128 {
+        self.type_identity
+    }
+
+    #[must_use]
+    pub const fn access(&self) -> CoreAccessLaw {
+        self.access
+    }
 }
 
 impl CoreExecutableObservation {
@@ -315,6 +394,26 @@ impl CoreExecutableObservation {
     #[must_use]
     pub const fn effectful(&self) -> bool {
         self.effectful
+    }
+
+    #[must_use]
+    pub fn parameters(&self) -> &[CoreParameterObservation] {
+        &self.parameters
+    }
+
+    #[must_use]
+    pub const fn return_type_identity(&self) -> u128 {
+        self.return_type_identity
+    }
+
+    #[must_use]
+    pub fn access_laws(&self) -> &[CoreAccessLaw] {
+        &self.access_laws
+    }
+
+    #[must_use]
+    pub fn rewrites(&self) -> &[CoreRewriteKind] {
+        &self.rewrites
     }
 }
 
@@ -392,6 +491,35 @@ impl VerifiedCoreProgram {
                     region_count: executable.regions.len(),
                     may_panic: executable.facts.may_panic,
                     effectful: !executable.facts.pure,
+                    parameters: executable
+                        .signature
+                        .parameters
+                        .iter()
+                        .map(|parameter| CoreParameterObservation {
+                            local_identity: parameter.local,
+                            type_identity: parameter.type_.identity,
+                            access: parameter.access,
+                        })
+                        .collect::<Vec<_>>()
+                        .into(),
+                    return_type_identity: executable.signature.return_type.identity,
+                    access_laws: executable
+                        .regions
+                        .iter()
+                        .flat_map(|region| {
+                            region.operations.iter().filter_map(|operation| {
+                                (operation.access != CoreAccessLaw::None)
+                                    .then_some(operation.access)
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into(),
+                    rewrites: executable
+                        .rewrites
+                        .iter()
+                        .map(|witness| witness.kind)
+                        .collect::<Vec<_>>()
+                        .into(),
                 })
                 .collect::<Vec<_>>()
                 .into(),
@@ -423,6 +551,10 @@ pub(crate) struct CustodyCoreView<'a> {
 
 #[allow(dead_code)]
 impl CustodyCoreView<'_> {
+    pub(crate) fn executables(&self) -> impl ExactSizeIterator<Item = CoreExecutableIndex<'_>> {
+        self.core.executables.iter().map(CoreExecutableIndex)
+    }
+
     pub(crate) fn ownership_boundaries(&self) -> impl Iterator<Item = (u128, usize)> + '_ {
         self.core.executables.iter().map(|executable| {
             let count = executable
@@ -443,6 +575,10 @@ pub(crate) struct FlowCoreView<'a> {
 
 #[allow(dead_code)]
 impl FlowCoreView<'_> {
+    pub(crate) fn executables(&self) -> impl ExactSizeIterator<Item = CoreExecutableIndex<'_>> {
+        self.core.executables.iter().map(CoreExecutableIndex)
+    }
+
     pub(crate) fn suspending_executables(&self) -> impl Iterator<Item = u128> + '_ {
         self.core
             .executables
@@ -459,11 +595,147 @@ pub(crate) struct BackendCoreView<'a> {
 
 #[allow(dead_code)]
 impl BackendCoreView<'_> {
+    pub(crate) fn executables(&self) -> impl ExactSizeIterator<Item = CoreExecutableIndex<'_>> {
+        self.core.executables.iter().map(CoreExecutableIndex)
+    }
+
     pub(crate) fn executable_identities(&self) -> impl ExactSizeIterator<Item = u128> + '_ {
         self.core
             .executables
             .iter()
             .map(|executable| executable.reference.identity)
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) struct CoreExecutableIndex<'a>(&'a CoreExecutable);
+
+#[allow(dead_code)]
+impl<'a> CoreExecutableIndex<'a> {
+    pub(crate) fn identity(self) -> u128 {
+        self.0.reference.identity
+    }
+
+    pub(crate) fn context(self) -> u128 {
+        self.0.reference.context
+    }
+
+    pub(crate) fn parameters(self) -> impl ExactSizeIterator<Item = CoreParameterIndex<'a>> {
+        self.0.signature.parameters.iter().map(CoreParameterIndex)
+    }
+
+    pub(crate) fn return_type_identity(self) -> u128 {
+        self.0.signature.return_type.identity
+    }
+
+    pub(crate) fn regions(self) -> impl ExactSizeIterator<Item = CoreRegionIndex<'a>> {
+        self.0.regions.iter().map(CoreRegionIndex)
+    }
+
+    pub(crate) fn rewrites(self) -> impl ExactSizeIterator<Item = CoreRewriteIndex<'a>> {
+        self.0.rewrites.iter().map(CoreRewriteIndex)
+    }
+
+    pub(crate) fn facts(self) -> (bool, bool, bool, bool) {
+        (
+            self.0.facts.pure,
+            self.0.facts.may_panic,
+            self.0.facts.suspends,
+            self.0.facts.ownership_transfer,
+        )
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) struct CoreParameterIndex<'a>(&'a CoreParameter);
+
+#[allow(dead_code)]
+impl CoreParameterIndex<'_> {
+    pub(crate) fn local(self) -> u32 {
+        self.0.local
+    }
+
+    pub(crate) fn type_identity(self) -> u128 {
+        self.0.type_.identity
+    }
+
+    pub(crate) fn access(self) -> CoreAccessLaw {
+        self.0.access
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) struct CoreRegionIndex<'a>(&'a Region);
+
+#[allow(dead_code)]
+impl<'a> CoreRegionIndex<'a> {
+    pub(crate) fn identity(self) -> u32 {
+        self.0.identity.0
+    }
+
+    pub(crate) fn operations(self) -> impl ExactSizeIterator<Item = CoreOperationIndex<'a>> {
+        self.0.operations.iter().map(CoreOperationIndex)
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) struct CoreOperationIndex<'a>(&'a Operation);
+
+#[allow(dead_code)]
+impl<'a> CoreOperationIndex<'a> {
+    pub(crate) fn identity(self) -> u32 {
+        self.0.identity
+    }
+
+    pub(crate) fn kind(self) -> CoreOperationKind {
+        self.0.kind
+    }
+
+    pub(crate) fn result(self) -> Option<u32> {
+        self.0.result.map(|value| value.0)
+    }
+
+    pub(crate) fn type_identity(self) -> Option<u128> {
+        self.0.type_identity
+    }
+
+    pub(crate) fn operands(self) -> impl ExactSizeIterator<Item = u32> + 'a {
+        self.0.operands.iter().map(|value| value.0)
+    }
+
+    pub(crate) fn successors(self) -> impl ExactSizeIterator<Item = u32> + 'a {
+        self.0.successors.iter().map(|region| region.0)
+    }
+
+    pub(crate) fn details(self) -> &'a [u128] {
+        &self.0.details
+    }
+
+    pub(crate) fn laws(self) -> (CoreAccessLaw, u8, u8) {
+        (self.0.access, self.0.effect.tag(), self.0.failure.tag())
+    }
+
+    pub(crate) fn provenance(self) -> &'a SourceRange {
+        &self.0.provenance
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) struct CoreRewriteIndex<'a>(&'a RewriteWitness);
+
+#[allow(dead_code)]
+impl<'a> CoreRewriteIndex<'a> {
+    pub(crate) fn kind(self) -> CoreRewriteKind {
+        self.0.kind
+    }
+
+    pub(crate) fn provenance(self) -> &'a SourceRange {
+        &self.0.provenance
     }
 }
 
@@ -504,7 +776,7 @@ impl CoreModule {
                         "Core generated demand has no authenticated role",
                     ))
                 })?;
-            executables.push(produce_generated_executable(*addition, role));
+            executables.push(produce_generated_executable(*addition, role, cancellation)?);
         }
         executables
             .sort_by_key(|executable| (executable.reference.kind, executable.reference.identity));
@@ -545,7 +817,9 @@ fn produce_source_executable(
         identity: input.reference.identity(),
         current_meaning: input.reference.current_meaning(),
     };
-    let (owner, provenance, parameters, source_definition, facts, regions) = match input.body {
+    let (owner, provenance, signature, source_definition, facts, regions, rewrites) = match input
+        .body
+    {
         CoreSourceExecutableBody::Specialization(function) => {
             let upstream = semantic
                 .specialization_facts(SpecializationId(reference.identity))
@@ -553,10 +827,17 @@ fn produce_source_executable(
             let mut lowerer = ProducerLowerer::new(cancellation);
             let entry = lowerer.lower_block(&function.body)?;
             debug_assert_eq!(entry, RegionId(0));
+            let (regions, rewrites) = lowerer.finish();
             (
                 function.id.0,
                 function.source.clone(),
-                function.parameters.len(),
+                signature(
+                    function
+                        .parameters
+                        .iter()
+                        .map(|(local, type_, access)| (local.0, type_, core_access(*access))),
+                    &function.return_type,
+                ),
                 Some(function.id.0),
                 ExecutableFacts {
                     pure: upstream.pure,
@@ -565,35 +846,49 @@ fn produce_source_executable(
                     ownership_transfer: upstream.ownership_transfer,
                     evaluator_eligible: upstream.evaluator_eligible,
                 },
-                lowerer.finish(),
+                regions,
+                rewrites,
             )
         }
-        CoreSourceExecutableBody::Test { body, source } => {
+        CoreSourceExecutableBody::Test(test) => {
             let mut lowerer = ProducerLowerer::new(cancellation);
-            let entry = lowerer.lower_block(body)?;
+            let entry = lowerer.lower_block(&test.body)?;
             debug_assert_eq!(entry, RegionId(0));
-            let regions = lowerer.finish();
+            let (regions, rewrites) = lowerer.finish();
             (
                 reference.identity,
-                source.clone(),
-                0,
+                test.source.clone(),
+                signature(
+                    test.parameters
+                        .iter()
+                        .map(|(local, type_, access)| (local.0, type_, core_access(*access))),
+                    &Type::Unit,
+                ),
                 None,
                 facts_from_regions(&regions),
                 regions,
+                rewrites,
             )
         }
         CoreSourceExecutableBody::Closure(closure) => {
             let mut lowerer = ProducerLowerer::new(cancellation);
             let entry = lowerer.lower_expression_body(&closure.body)?;
             debug_assert_eq!(entry, RegionId(0));
-            let regions = lowerer.finish();
+            let (regions, rewrites) = lowerer.finish();
             (
                 closure.id.0,
                 closure.source.clone(),
-                closure.parameters.len(),
+                signature(
+                    closure
+                        .parameters
+                        .iter()
+                        .map(|(local, type_)| (local.0, type_, CoreAccessLaw::CopyValue)),
+                    &closure.return_type,
+                ),
                 None,
                 facts_from_regions(&regions),
                 regions,
+                rewrites,
             )
         }
     };
@@ -604,15 +899,20 @@ fn produce_source_executable(
         entry: RegionId(0),
         regions,
         facts,
-        parameter_count: parameters,
+        signature,
+        rewrites,
         source_definition,
         fingerprint: 0,
     };
-    executable.fingerprint = producer_executable_fingerprint(&executable);
+    executable.fingerprint = producer_executable_fingerprint(&executable, cancellation)?;
     Ok(executable)
 }
 
-fn produce_generated_executable(executable: ExecutableRef, role: &GeneratedRole) -> CoreExecutable {
+fn produce_generated_executable(
+    executable: ExecutableRef,
+    role: &GeneratedRole,
+    cancellation: &Cancellation,
+) -> Result<CoreExecutable, CoreFailure> {
     let provenance = SourceRange::new("<generated:mandatory-image>", 0, 0);
     let mut details = vec![
         role.reference().identity(),
@@ -639,7 +939,7 @@ fn produce_generated_executable(executable: ExecutableRef, role: &GeneratedRole)
         effect: EffectBoundary::None,
         failure: FailureLaw::None,
         provenance: provenance.clone(),
-        oracle: None,
+        access: CoreAccessLaw::None,
     };
     let mut core = CoreExecutable {
         reference: ExecutableReference {
@@ -662,12 +962,13 @@ fn produce_generated_executable(executable: ExecutableRef, role: &GeneratedRole)
             ownership_transfer: false,
             evaluator_eligible: false,
         },
-        parameter_count: 0,
+        signature: signature(std::iter::empty(), &Type::Unit),
+        rewrites: Arc::from([]),
         source_definition: None,
         fingerprint: 0,
     };
-    core.fingerprint = producer_executable_fingerprint(&core);
-    core
+    core.fingerprint = producer_executable_fingerprint(&core, cancellation)?;
+    Ok(core)
 }
 
 const fn generated_role_tag(kind: crate::image_planning::GeneratedRoleKind) -> u8 {
@@ -689,11 +990,47 @@ const fn source_kind(kind: CoreSourceExecutableKind) -> CoreExecutableKind {
     }
 }
 
+fn core_type(type_: &Type) -> CoreType {
+    let shape = type_.canonical_key();
+    CoreType {
+        identity: xxh3_128(&shape),
+        shape,
+    }
+}
+
+fn signature<'a>(
+    parameters: impl IntoIterator<Item = (u32, &'a Type, CoreAccessLaw)>,
+    return_type: &Type,
+) -> CoreSignature {
+    CoreSignature {
+        parameters: parameters
+            .into_iter()
+            .map(|(local, type_, access)| CoreParameter {
+                local,
+                type_: core_type(type_),
+                access,
+            })
+            .collect::<Vec<_>>()
+            .into(),
+        return_type: core_type(return_type),
+    }
+}
+
+const fn core_access(access: crate::typed_hir::AccessMode) -> CoreAccessLaw {
+    match access {
+        crate::typed_hir::AccessMode::Copy => CoreAccessLaw::CopyValue,
+        crate::typed_hir::AccessMode::Read => CoreAccessLaw::SharedLoan,
+        crate::typed_hir::AccessMode::Mut => CoreAccessLaw::ExclusiveLoan,
+        crate::typed_hir::AccessMode::Move => CoreAccessLaw::Move,
+    }
+}
+
 struct ProducerLowerer<'a> {
     cancellation: &'a Cancellation,
     regions: Vec<Region>,
     next_value: u32,
     next_operation: u32,
+    rewrites: Vec<RewriteWitness>,
 }
 
 impl<'a> ProducerLowerer<'a> {
@@ -703,11 +1040,12 @@ impl<'a> ProducerLowerer<'a> {
             regions: Vec::new(),
             next_value: 0,
             next_operation: 0,
+            rewrites: Vec::new(),
         }
     }
 
-    fn finish(self) -> Arc<[Region]> {
-        self.regions.into()
+    fn finish(self) -> (Arc<[Region]>, Arc<[RewriteWitness]>) {
+        (self.regions.into(), self.rewrites.into())
     }
 
     fn lower_expression_body(&mut self, expression: &Expression) -> Result<RegionId, CoreFailure> {
@@ -725,7 +1063,7 @@ impl<'a> ProducerLowerer<'a> {
             EffectBoundary::None,
             FailureLaw::None,
             expression.source.clone(),
-            Some(OracleInstruction::Return(Some(value))),
+            CoreAccessLaw::None,
         );
         self.install_region(region, operations);
         Ok(region)
@@ -769,7 +1107,7 @@ impl<'a> ProducerLowerer<'a> {
         effect: EffectBoundary,
         failure: FailureLaw,
         provenance: SourceRange,
-        oracle: Option<OracleInstruction>,
+        access: CoreAccessLaw,
     ) {
         let identity = self.next_operation;
         self.next_operation = self.next_operation.saturating_add(1);
@@ -782,9 +1120,9 @@ impl<'a> ProducerLowerer<'a> {
             successors: successors.into_iter().collect::<Vec<_>>().into(),
             details: details.into_iter().collect::<Vec<_>>().into(),
             effect,
+            access,
             failure,
             provenance,
-            oracle,
         });
     }
 
@@ -816,7 +1154,7 @@ impl<'a> ProducerLowerer<'a> {
                     EffectBoundary::None,
                     FailureLaw::None,
                     source.clone(),
-                    Some(OracleInstruction::Return(value)),
+                    CoreAccessLaw::None,
                 );
             }
             Statement::Panic { value, source } => {
@@ -832,7 +1170,7 @@ impl<'a> ProducerLowerer<'a> {
                     EffectBoundary::None,
                     FailureLaw::TerminalPanic,
                     source.clone(),
-                    Some(OracleInstruction::Panic),
+                    CoreAccessLaw::None,
                 );
             }
             Statement::Assert { condition, source } | Statement::Expect { condition, source } => {
@@ -851,9 +1189,13 @@ impl<'a> ProducerLowerer<'a> {
                     [],
                     [],
                     EffectBoundary::None,
-                    FailureLaw::CheckBeforeSuccess,
+                    if kind == CoreOperationKind::Assert {
+                        FailureLaw::TerminalPanic
+                    } else {
+                        FailureLaw::RecordTestFailure
+                    },
                     source.clone(),
-                    (kind == CoreOperationKind::Assert).then_some(OracleInstruction::Assert(value)),
+                    CoreAccessLaw::None,
                 );
             }
             Statement::Initialize {
@@ -885,13 +1227,7 @@ impl<'a> ProducerLowerer<'a> {
                     EffectBoundary::LocalMutation,
                     FailureLaw::CheckBeforeSuccess,
                     source.clone(),
-                    place
-                        .projections
-                        .is_empty()
-                        .then_some(OracleInstruction::Store {
-                            local: place.local.0,
-                            value,
-                        }),
+                    CoreAccessLaw::None,
                 );
             }
             Statement::Evaluate(expression) => {
@@ -917,7 +1253,7 @@ impl<'a> ProducerLowerer<'a> {
                     EffectBoundary::None,
                     FailureLaw::None,
                     source.clone(),
-                    Some(OracleInstruction::Branch(condition)),
+                    CoreAccessLaw::None,
                 );
             }
             Statement::IfPattern {
@@ -941,7 +1277,7 @@ impl<'a> ProducerLowerer<'a> {
                     EffectBoundary::Ownership,
                     FailureLaw::None,
                     source.clone(),
-                    None,
+                    CoreAccessLaw::None,
                 );
             }
             Statement::For {
@@ -963,7 +1299,7 @@ impl<'a> ProducerLowerer<'a> {
                     EffectBoundary::Ownership,
                     FailureLaw::None,
                     source.clone(),
-                    None,
+                    CoreAccessLaw::None,
                 );
             }
             Statement::While {
@@ -972,20 +1308,43 @@ impl<'a> ProducerLowerer<'a> {
                 max_iterations,
                 source,
             } => {
-                let condition = self.lower_expression(condition, operations)?;
-                let body = self.lower_block(body)?;
+                let condition_region = self.reserve_region();
+                let body_region = self.reserve_region();
+                let exit_region = self.reserve_region();
+                let mut condition_operations = Vec::new();
+                let condition_value =
+                    self.lower_expression(condition, &mut condition_operations)?;
+                self.install_region(condition_region, condition_operations);
+                let mut body_operations = Vec::new();
+                for statement in body.iter() {
+                    self.lower_statement(statement, &mut body_operations)?;
+                }
+                self.push_operation(
+                    &mut body_operations,
+                    CoreOperationKind::LoopBack,
+                    None,
+                    None,
+                    [],
+                    [condition_region],
+                    [],
+                    EffectBoundary::None,
+                    FailureLaw::None,
+                    source.clone(),
+                    CoreAccessLaw::None,
+                );
+                self.install_region(body_region, body_operations);
                 self.push_operation(
                     operations,
                     CoreOperationKind::Loop,
                     None,
                     None,
-                    [condition],
-                    [body],
+                    [condition_value],
+                    [condition_region, body_region, exit_region],
                     [u128::from(*max_iterations)],
                     EffectBoundary::None,
                     FailureLaw::None,
                     source.clone(),
-                    None,
+                    CoreAccessLaw::None,
                 );
             }
             Statement::Break(source) | Statement::Continue(source) => {
@@ -1005,7 +1364,7 @@ impl<'a> ProducerLowerer<'a> {
                     EffectBoundary::None,
                     FailureLaw::None,
                     source.clone(),
-                    None,
+                    CoreAccessLaw::None,
                 );
             }
             Statement::Match {
@@ -1045,7 +1404,7 @@ impl<'a> ProducerLowerer<'a> {
                     EffectBoundary::Ownership,
                     FailureLaw::None,
                     source.clone(),
-                    None,
+                    CoreAccessLaw::None,
                 );
             }
             Statement::Defer { action, source } => {
@@ -1068,7 +1427,7 @@ impl<'a> ProducerLowerer<'a> {
                     EffectBoundary::Ownership,
                     FailureLaw::CheckBeforeSuccess,
                     source.clone(),
-                    None,
+                    CoreAccessLaw::None,
                 );
             }
             Statement::WithPool {
@@ -1090,22 +1449,14 @@ impl<'a> ProducerLowerer<'a> {
                     EffectBoundary::Ownership,
                     FailureLaw::CheckBeforeSuccess,
                     source.clone(),
-                    None,
+                    CoreAccessLaw::None,
                 );
             }
-            Statement::Pass(source) => self.push_operation(
-                operations,
-                CoreOperationKind::Pass,
-                None,
-                None,
-                [],
-                [],
-                [],
-                EffectBoundary::None,
-                FailureLaw::None,
-                source.clone(),
-                Some(OracleInstruction::Pass),
-            ),
+            Statement::Pass(source) => self.rewrites.push(RewriteWitness {
+                kind: CoreRewriteKind::EliminatedPass,
+                provenance: source.clone(),
+                source_order: u32::try_from(self.rewrites.len()).unwrap_or(u32::MAX),
+            }),
         }
         Ok(())
     }
@@ -1119,14 +1470,18 @@ impl<'a> ProducerLowerer<'a> {
         let result = self.value();
         let type_identity = Some(expression.type_id.0);
         let source = expression.source.clone();
-        let (kind, operands, details, effect, failure, oracle) = match &expression.kind {
+        let operation_access = if matches!(expression.kind, ExpressionKind::CleanupCapture(_)) {
+            CoreAccessLaw::CleanupCapture
+        } else {
+            core_access(expression.access)
+        };
+        let (kind, operands, details, effect, failure) = match &expression.kind {
             ExpressionKind::Literal(literal) => (
                 CoreOperationKind::Literal,
                 vec![],
                 literal_details(literal),
                 EffectBoundary::None,
                 FailureLaw::None,
-                Some(OracleInstruction::Literal(canonical_literal(literal))),
             ),
             ExpressionKind::Read(place) => (
                 CoreOperationKind::Read,
@@ -1138,10 +1493,6 @@ impl<'a> ProducerLowerer<'a> {
                     EffectBoundary::None
                 },
                 FailureLaw::CheckBeforeSuccess,
-                place
-                    .projections
-                    .is_empty()
-                    .then_some(OracleInstruction::Read(place.local.0)),
             ),
             ExpressionKind::Constant(identity) => (
                 CoreOperationKind::Constant,
@@ -1149,7 +1500,6 @@ impl<'a> ProducerLowerer<'a> {
                 vec![identity.0],
                 EffectBoundary::None,
                 FailureLaw::PropagateInOrder,
-                None,
             ),
             ExpressionKind::FunctionValue {
                 definition,
@@ -1160,7 +1510,6 @@ impl<'a> ProducerLowerer<'a> {
                 vec![definition.0, specialization.map_or(0, |value| value.0)],
                 EffectBoundary::None,
                 FailureLaw::None,
-                None,
             ),
             ExpressionKind::Closure(closure) => (
                 CoreOperationKind::ClosureValue,
@@ -1168,7 +1517,6 @@ impl<'a> ProducerLowerer<'a> {
                 vec![closure.id.0],
                 EffectBoundary::None,
                 FailureLaw::None,
-                None,
             ),
             ExpressionKind::CleanupCapture(capture) => (
                 CoreOperationKind::Read,
@@ -1176,7 +1524,6 @@ impl<'a> ProducerLowerer<'a> {
                 vec![u128::from(capture.0), u128::MAX],
                 EffectBoundary::Ownership,
                 FailureLaw::None,
-                None,
             ),
             ExpressionKind::Call { target, arguments } => {
                 let mut operands = Vec::new();
@@ -1200,7 +1547,6 @@ impl<'a> ProducerLowerer<'a> {
                     call_target_details(target),
                     effect,
                     FailureLaw::PropagateInOrder,
-                    None,
                 )
             }
             ExpressionKind::Array(values) | ExpressionKind::Tuple(values) => {
@@ -1217,7 +1563,6 @@ impl<'a> ProducerLowerer<'a> {
                     ))],
                     EffectBoundary::Ownership,
                     FailureLaw::PropagateInOrder,
-                    None,
                 )
             }
             ExpressionKind::RepeatedArray { value, length } => (
@@ -1226,7 +1571,6 @@ impl<'a> ProducerLowerer<'a> {
                 vec![2, u128::from(*length)],
                 EffectBoundary::Ownership,
                 FailureLaw::PropagateInOrder,
-                None,
             ),
             ExpressionKind::Index { value, index } => (
                 CoreOperationKind::Index,
@@ -1237,7 +1581,6 @@ impl<'a> ProducerLowerer<'a> {
                 vec![],
                 EffectBoundary::None,
                 FailureLaw::CheckBeforeSuccess,
-                None,
             ),
             ExpressionKind::Positive(value) => (
                 CoreOperationKind::Unary,
@@ -1245,7 +1588,6 @@ impl<'a> ProducerLowerer<'a> {
                 vec![1],
                 EffectBoundary::None,
                 FailureLaw::None,
-                None,
             ),
             ExpressionKind::Negate(value) => (
                 CoreOperationKind::Unary,
@@ -1253,7 +1595,6 @@ impl<'a> ProducerLowerer<'a> {
                 vec![2],
                 EffectBoundary::None,
                 FailureLaw::CheckBeforeSuccess,
-                Some(OracleInstruction::UnaryNegate),
             ),
             ExpressionKind::BitNot(value) => (
                 CoreOperationKind::Unary,
@@ -1261,7 +1602,6 @@ impl<'a> ProducerLowerer<'a> {
                 vec![3],
                 EffectBoundary::None,
                 FailureLaw::None,
-                None,
             ),
             ExpressionKind::Not(value) => (
                 CoreOperationKind::Unary,
@@ -1269,7 +1609,6 @@ impl<'a> ProducerLowerer<'a> {
                 vec![4],
                 EffectBoundary::None,
                 FailureLaw::None,
-                Some(OracleInstruction::UnaryNot),
             ),
             ExpressionKind::Await(value) => (
                 CoreOperationKind::Suspension,
@@ -1277,7 +1616,6 @@ impl<'a> ProducerLowerer<'a> {
                 vec![],
                 EffectBoundary::Suspension,
                 FailureLaw::PropagateInOrder,
-                None,
             ),
             ExpressionKind::Propagate(value) => (
                 CoreOperationKind::Propagate,
@@ -1285,7 +1623,6 @@ impl<'a> ProducerLowerer<'a> {
                 vec![],
                 EffectBoundary::Ownership,
                 FailureLaw::PropagateInOrder,
-                None,
             ),
             ExpressionKind::Is { value, pattern } => (
                 CoreOperationKind::PatternTest,
@@ -1293,7 +1630,6 @@ impl<'a> ProducerLowerer<'a> {
                 pattern_details(pattern),
                 EffectBoundary::Ownership,
                 FailureLaw::None,
-                None,
             ),
             ExpressionKind::Binary {
                 operator,
@@ -1318,7 +1654,7 @@ impl<'a> ProducerLowerer<'a> {
                         EffectBoundary::None,
                         FailureLaw::None,
                         source,
-                        Some(OracleInstruction::ShortCircuit(*operator)),
+                        operation_access,
                     );
                     return Ok(result);
                 }
@@ -1336,7 +1672,6 @@ impl<'a> ProducerLowerer<'a> {
                     } else {
                         FailureLaw::None
                     },
-                    Some(OracleInstruction::Binary(*operator)),
                 )
             }
         };
@@ -1351,7 +1686,7 @@ impl<'a> ProducerLowerer<'a> {
             effect,
             failure,
             source,
-            oracle,
+            operation_access,
         );
         Ok(result)
     }
@@ -1367,7 +1702,12 @@ fn facts_from_regions(regions: &[Region]) -> ExecutableFacts {
         evaluator_eligible: true,
     };
     for operation in operations {
-        facts.may_panic |= operation.failure != FailureLaw::None;
+        facts.may_panic |= matches!(
+            operation.failure,
+            FailureLaw::CheckBeforeSuccess
+                | FailureLaw::PropagateInOrder
+                | FailureLaw::TerminalPanic
+        );
         facts.suspends |= operation.effect == EffectBoundary::Suspension;
         facts.ownership_transfer |= operation.effect == EffectBoundary::Ownership;
         facts.pure &= !matches!(
@@ -1423,28 +1763,20 @@ fn literal_details(literal: &Literal) -> Vec<u128> {
         Literal::Float { kind, bits } => {
             vec![4, u128::from(kind.canonical_tag()), u128::from(*bits)]
         }
-        Literal::Text(value) => vec![5, xxh3_128(value.as_bytes())],
+        Literal::Text(value) => exact_bytes_details(5, value.as_bytes()),
         Literal::Scalar(value) => vec![6, u128::from(u32::from(*value))],
-        Literal::Bytes(value) => vec![7, xxh3_128(value)],
+        Literal::Bytes(value) => exact_bytes_details(7, value),
     }
 }
 
-fn canonical_literal(literal: &Literal) -> CanonicalValue {
-    match literal {
-        Literal::Unit => CanonicalValue::Unit,
-        Literal::Bool(value) => CanonicalValue::Bool(*value),
-        Literal::Integer { kind, value } => CanonicalValue::Integer {
-            type_name: Arc::from(kind.name()),
-            value: *value,
-        },
-        Literal::Float { kind, bits } => CanonicalValue::Float {
-            type_name: Arc::from(kind.name()),
-            bits: *bits,
-        },
-        Literal::Text(value) => CanonicalValue::Text(value.clone()),
-        Literal::Scalar(value) => CanonicalValue::Scalar(*value),
-        Literal::Bytes(value) => CanonicalValue::Bytes(value.clone()),
+fn exact_bytes_details(tag: u128, bytes: &[u8]) -> Vec<u128> {
+    let mut details = vec![tag, bytes.len() as u128];
+    for chunk in bytes.chunks(16) {
+        let mut packed = [0_u8; 16];
+        packed[..chunk.len()].copy_from_slice(chunk);
+        details.push(u128::from_be_bytes(packed));
     }
+    details
 }
 
 fn call_target_details(target: &CallTarget) -> Vec<u128> {
@@ -1621,11 +1953,14 @@ const fn operator_tag(operator: BinaryOperator) -> u8 {
     }
 }
 
-fn producer_executable_fingerprint(executable: &CoreExecutable) -> u128 {
+fn producer_executable_fingerprint(
+    executable: &CoreExecutable,
+    cancellation: &Cancellation,
+) -> Result<u128, CoreFailure> {
     let mut hash = Xxh3::new();
     hash.update(b"wrela.core.executable\0\x01");
-    encode_executable(&mut hash, executable);
-    hash.digest128()
+    encode_executable(&mut hash, executable, cancellation)?;
+    Ok(hash.digest128())
 }
 
 fn producer_fingerprint(
@@ -1648,7 +1983,12 @@ fn producer_fingerprint(
     Ok(hash.digest128())
 }
 
-fn encode_executable(hash: &mut Xxh3, executable: &CoreExecutable) {
+fn encode_executable(
+    hash: &mut Xxh3,
+    executable: &CoreExecutable,
+    cancellation: &Cancellation,
+) -> Result<(), CoreFailure> {
+    checkpoint(cancellation)?;
     hash.update(&[executable.reference.kind.tag()]);
     for value in [
         executable.reference.context,
@@ -1660,7 +2000,16 @@ fn encode_executable(hash: &mut Xxh3, executable: &CoreExecutable) {
     }
     encode_source(hash, &executable.provenance);
     hash.update(&executable.entry.0.to_be_bytes());
-    hash.update(&(executable.parameter_count as u64).to_be_bytes());
+    hash.update(&(executable.signature.parameters.len() as u64).to_be_bytes());
+    for parameter in executable.signature.parameters.iter() {
+        checkpoint(cancellation)?;
+        hash.update(&parameter.local.to_be_bytes());
+        hash.update(&parameter.type_.identity.to_be_bytes());
+        encode_bytes(&mut *hash, &parameter.type_.shape);
+        hash.update(&[parameter.access.tag()]);
+    }
+    hash.update(&executable.signature.return_type.identity.to_be_bytes());
+    encode_bytes(&mut *hash, &executable.signature.return_type.shape);
     hash.update(&executable.source_definition.unwrap_or(0).to_be_bytes());
     hash.update(&[
         u8::from(executable.facts.pure),
@@ -1670,12 +2019,15 @@ fn encode_executable(hash: &mut Xxh3, executable: &CoreExecutable) {
         u8::from(executable.facts.evaluator_eligible),
     ]);
     for region in executable.regions.iter() {
+        checkpoint(cancellation)?;
         hash.update(&region.identity.0.to_be_bytes());
         for operation in region.operations.iter() {
+            checkpoint(cancellation)?;
             hash.update(&operation.identity.to_be_bytes());
             hash.update(&[
                 operation.kind.tag(),
                 operation.effect.tag(),
+                operation.access.tag(),
                 operation.failure.tag(),
             ]);
             hash.update(
@@ -1686,19 +2038,29 @@ fn encode_executable(hash: &mut Xxh3, executable: &CoreExecutable) {
             );
             hash.update(&operation.type_identity.unwrap_or(0).to_be_bytes());
             for operand in operation.operands.iter() {
+                checkpoint(cancellation)?;
                 hash.update(&operand.0.to_be_bytes());
             }
             hash.update(b"|");
             for successor in operation.successors.iter() {
+                checkpoint(cancellation)?;
                 hash.update(&successor.0.to_be_bytes());
             }
             hash.update(b"|");
             for detail in operation.details.iter() {
+                checkpoint(cancellation)?;
                 hash.update(&detail.to_be_bytes());
             }
             encode_source(hash, &operation.provenance);
         }
     }
+    for rewrite in executable.rewrites.iter() {
+        checkpoint(cancellation)?;
+        hash.update(&[rewrite.kind.tag()]);
+        hash.update(&rewrite.source_order.to_be_bytes());
+        encode_source(hash, &rewrite.provenance);
+    }
+    Ok(())
 }
 
 fn encode_source(hash: &mut Xxh3, source: &SourceRange) {
@@ -1721,7 +2083,7 @@ fn verify(
         return defect("Core program mixes compilation or planning contexts");
     }
     let semantic = input.completed_semantic_program();
-    let mut expected = Vec::new();
+    let mut expected_references = Vec::new();
     for reference in input.exact_source_executables() {
         checkpoint(cancellation)?;
         let source = semantic
@@ -1737,14 +2099,8 @@ fn verify(
             .ok_or_else(|| {
                 CoreFailure::Defect(Arc::from("Core verifier found a missing realization"))
             })?;
-        if independent_hir_trace(source, cancellation)? != candidate_trace(supplied) {
-            return defect("Core operation graph contradicts independent Typed HIR reconstruction");
-        }
-        expected.push(reconstruct_source_executable(
-            source,
-            semantic,
-            cancellation,
-        )?);
+        VerifierLowerer::verify_source(source, semantic, supplied, cancellation)?;
+        expected_references.push((source_kind(reference.kind()), reference.identity()));
     }
     for addition in input.generated_executable_additions() {
         checkpoint(cancellation)?;
@@ -1753,10 +2109,16 @@ fn verify(
             .iter()
             .find(|role| role.executable().identity() == addition.identity())
             .ok_or_else(|| CoreFailure::Defect(Arc::from("Core verifier found a dangling role")))?;
-        expected.push(reconstruct_generated_executable(*addition, role));
+        verify_generated_executable(*addition, role, candidate, cancellation)?;
+        expected_references.push((CoreExecutableKind::Generated, addition.identity()));
     }
-    expected.sort_by_key(|executable| (executable.reference.kind, executable.reference.identity));
-    if candidate.executables.as_ref() != expected.as_slice() {
+    expected_references.sort_unstable();
+    let supplied_references = candidate
+        .executables
+        .iter()
+        .map(|executable| (executable.reference.kind, executable.reference.identity))
+        .collect::<Vec<_>>();
+    if supplied_references != expected_references {
         return defect(
             "Core executable realization is missing, extra, duplicate, wrong-kind, stale, or semantically false",
         );
@@ -1782,92 +2144,197 @@ fn verify(
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct AuditToken {
-    kind: CoreOperationKind,
-    type_identity: Option<u128>,
-    source: SourceRange,
-    operand_count: usize,
-    successor_count: usize,
+struct VerifierLowerer<'a> {
+    cancellation: &'a Cancellation,
+    regions: Vec<Region>,
+    next_value: u32,
+    next_operation: u32,
+    rewrites: Vec<RewriteWitness>,
 }
 
-fn candidate_trace(executable: &CoreExecutable) -> Vec<AuditToken> {
-    let mut operations = executable
-        .regions
-        .iter()
-        .flat_map(|region| region.operations.iter())
-        .collect::<Vec<_>>();
-    operations.sort_by_key(|operation| operation.identity);
-    operations
-        .into_iter()
-        .map(|operation| AuditToken {
-            kind: operation.kind,
-            type_identity: operation.type_identity,
-            source: operation.provenance.clone(),
-            operand_count: operation.operands.len(),
-            successor_count: operation.successors.len(),
+struct VerifierReconstruction {
+    regions: Arc<[Region]>,
+    rewrites: Arc<[RewriteWitness]>,
+}
+
+impl<'a> VerifierLowerer<'a> {
+    fn reconstruct(
+        body: CoreSourceExecutableBody<'_>,
+        cancellation: &'a Cancellation,
+    ) -> Result<VerifierReconstruction, CoreFailure> {
+        let mut lowerer = Self {
+            cancellation,
+            regions: Vec::new(),
+            next_value: 0,
+            next_operation: 0,
+            rewrites: Vec::new(),
+        };
+        let entry = match body {
+            CoreSourceExecutableBody::Specialization(function) => {
+                lowerer.reconstruct_block(&function.body)?
+            }
+            CoreSourceExecutableBody::Test(test) => lowerer.reconstruct_block(&test.body)?,
+            CoreSourceExecutableBody::Closure(closure) => {
+                lowerer.reconstruct_expression_body(&closure.body)?
+            }
+        };
+        if entry != RegionId(0) {
+            return defect("Core verifier reconstructed a noncanonical entry");
+        }
+        Ok(VerifierReconstruction {
+            regions: lowerer.regions.into(),
+            rewrites: lowerer.rewrites.into(),
         })
-        .collect()
-}
-
-fn independent_hir_trace(
-    source: CoreSourceExecutableInput<'_>,
-    cancellation: &Cancellation,
-) -> Result<Vec<AuditToken>, CoreFailure> {
-    let mut trace = Vec::new();
-    match source.body {
-        CoreSourceExecutableBody::Specialization(function) => {
-            audit_statements(&function.body, cancellation, &mut trace)?;
-        }
-        CoreSourceExecutableBody::Test { body, .. } => {
-            audit_statements(body, cancellation, &mut trace)?;
-        }
-        CoreSourceExecutableBody::Closure(closure) => {
-            audit_expression(&closure.body, cancellation, &mut trace)?;
-            trace.push(AuditToken {
-                kind: CoreOperationKind::Return,
-                type_identity: None,
-                source: closure.body.source.clone(),
-                operand_count: 1,
-                successor_count: 0,
-            });
-        }
     }
-    Ok(trace)
-}
 
-fn audit_statements(
-    statements: &[Statement],
-    cancellation: &Cancellation,
-    trace: &mut Vec<AuditToken>,
-) -> Result<(), CoreFailure> {
-    for statement in statements {
-        checkpoint(cancellation)?;
+    fn reserve_region(&mut self) -> RegionId {
+        let identity = RegionId(u32::try_from(self.regions.len()).unwrap_or(u32::MAX));
+        self.regions.push(Region {
+            identity,
+            operations: Arc::from([]),
+        });
+        identity
+    }
+
+    fn install_region(&mut self, identity: RegionId, operations: Vec<Operation>) {
+        self.regions[identity.0 as usize].operations = operations.into();
+    }
+
+    fn value(&mut self) -> ValueId {
+        let identity = ValueId(self.next_value);
+        self.next_value = self.next_value.saturating_add(1);
+        identity
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        &mut self,
+        operations: &mut Vec<Operation>,
+        kind: CoreOperationKind,
+        result: Option<ValueId>,
+        type_identity: Option<u128>,
+        operands: impl IntoIterator<Item = ValueId>,
+        successors: impl IntoIterator<Item = RegionId>,
+        details: impl IntoIterator<Item = u128>,
+        effect: EffectBoundary,
+        failure: FailureLaw,
+        provenance: SourceRange,
+        access: CoreAccessLaw,
+    ) {
+        let identity = self.next_operation;
+        self.next_operation = self.next_operation.saturating_add(1);
+        operations.push(Operation {
+            identity,
+            kind,
+            result,
+            type_identity,
+            operands: operands.into_iter().collect::<Vec<_>>().into(),
+            successors: successors.into_iter().collect::<Vec<_>>().into(),
+            details: details.into_iter().collect::<Vec<_>>().into(),
+            effect,
+            access,
+            failure,
+            provenance,
+        });
+    }
+
+    fn reconstruct_expression_body(
+        &mut self,
+        expression: &Expression,
+    ) -> Result<RegionId, CoreFailure> {
+        let region = self.reserve_region();
+        let mut operations = Vec::new();
+        let value = self.reconstruct_expression(expression, &mut operations)?;
+        self.emit(
+            &mut operations,
+            CoreOperationKind::Return,
+            None,
+            None,
+            [value],
+            [],
+            [],
+            EffectBoundary::None,
+            FailureLaw::None,
+            expression.source.clone(),
+            CoreAccessLaw::None,
+        );
+        self.install_region(region, operations);
+        Ok(region)
+    }
+
+    fn reconstruct_block(&mut self, statements: &[Statement]) -> Result<RegionId, CoreFailure> {
+        checkpoint(self.cancellation)?;
+        let region = self.reserve_region();
+        let mut operations = Vec::new();
+        for statement in statements {
+            checkpoint(self.cancellation)?;
+            self.reconstruct_statement(statement, &mut operations)?;
+        }
+        self.install_region(region, operations);
+        Ok(region)
+    }
+
+    fn reconstruct_statement(
+        &mut self,
+        statement: &Statement,
+        operations: &mut Vec<Operation>,
+    ) -> Result<(), CoreFailure> {
         match statement {
             Statement::Return { value, source } => {
-                if let Some(value) = value {
-                    audit_expression(value, cancellation, trace)?;
-                }
-                audit_push(
-                    trace,
+                let value = value
+                    .as_ref()
+                    .map(|value| self.reconstruct_expression(value, operations))
+                    .transpose()?;
+                self.emit(
+                    operations,
                     CoreOperationKind::Return,
                     None,
-                    source,
-                    usize::from(value.is_some()),
-                    0,
+                    None,
+                    value,
+                    [],
+                    [],
+                    EffectBoundary::None,
+                    FailureLaw::None,
+                    source.clone(),
+                    CoreAccessLaw::None,
                 );
             }
             Statement::Panic { value, source } => {
-                audit_expression(value, cancellation, trace)?;
-                audit_push(trace, CoreOperationKind::TerminalPanic, None, source, 1, 0);
+                let value = self.reconstruct_expression(value, operations)?;
+                self.emit(
+                    operations,
+                    CoreOperationKind::TerminalPanic,
+                    None,
+                    None,
+                    [value],
+                    [],
+                    [],
+                    EffectBoundary::None,
+                    FailureLaw::TerminalPanic,
+                    source.clone(),
+                    CoreAccessLaw::None,
+                );
             }
-            Statement::Assert { condition, source } => {
-                audit_expression(condition, cancellation, trace)?;
-                audit_push(trace, CoreOperationKind::Assert, None, source, 1, 0);
-            }
-            Statement::Expect { condition, source } => {
-                audit_expression(condition, cancellation, trace)?;
-                audit_push(trace, CoreOperationKind::Expect, None, source, 1, 0);
+            Statement::Assert { condition, source } | Statement::Expect { condition, source } => {
+                let value = self.reconstruct_expression(condition, operations)?;
+                let (kind, failure) = if matches!(statement, Statement::Assert { .. }) {
+                    (CoreOperationKind::Assert, FailureLaw::TerminalPanic)
+                } else {
+                    (CoreOperationKind::Expect, FailureLaw::RecordTestFailure)
+                };
+                self.emit(
+                    operations,
+                    kind,
+                    None,
+                    None,
+                    [value],
+                    [],
+                    [],
+                    EffectBoundary::None,
+                    failure,
+                    source.clone(),
+                    CoreAccessLaw::None,
+                );
             }
             Statement::Initialize {
                 place,
@@ -1879,110 +2346,228 @@ fn audit_statements(
                 value,
                 source,
             } => {
-                audit_place_indexes(place, cancellation, trace)?;
-                audit_expression(value, cancellation, trace)?;
-                let index_count = place
-                    .projections
-                    .iter()
-                    .filter(|projection| matches!(projection, PlaceProjection::Index { .. }))
-                    .count();
-                audit_push(
-                    trace,
+                let mut operands = self.reconstruct_place_indexes(place, operations)?;
+                operands.push(self.reconstruct_expression(value, operations)?);
+                let mut details = verifier_place_details(place);
+                details.push(u128::from(matches!(
+                    statement,
+                    Statement::Initialize { .. }
+                )));
+                self.emit(
+                    operations,
                     CoreOperationKind::Store,
                     None,
-                    source,
-                    index_count + 1,
-                    0,
+                    None,
+                    operands,
+                    [],
+                    details,
+                    EffectBoundary::LocalMutation,
+                    FailureLaw::CheckBeforeSuccess,
+                    source.clone(),
+                    CoreAccessLaw::None,
                 );
             }
-            Statement::Evaluate(expression) => audit_expression(expression, cancellation, trace)?,
+            Statement::Evaluate(expression) => {
+                self.reconstruct_expression(expression, operations)?;
+            }
             Statement::If {
                 condition,
                 then_branch,
                 else_branch,
                 source,
             } => {
-                audit_expression(condition, cancellation, trace)?;
-                audit_statements(then_branch, cancellation, trace)?;
-                audit_statements(else_branch, cancellation, trace)?;
-                audit_push(trace, CoreOperationKind::Branch, None, source, 1, 2);
+                let condition = self.reconstruct_expression(condition, operations)?;
+                let then_region = self.reconstruct_block(then_branch)?;
+                let else_region = self.reconstruct_block(else_branch)?;
+                self.emit(
+                    operations,
+                    CoreOperationKind::Branch,
+                    None,
+                    None,
+                    [condition],
+                    [then_region, else_region],
+                    [],
+                    EffectBoundary::None,
+                    FailureLaw::None,
+                    source.clone(),
+                    CoreAccessLaw::None,
+                );
             }
             Statement::IfPattern {
                 value,
+                pattern,
                 then_branch,
                 else_branch,
                 source,
-                ..
             } => {
-                audit_expression(value, cancellation, trace)?;
-                audit_statements(then_branch, cancellation, trace)?;
-                audit_statements(else_branch, cancellation, trace)?;
-                audit_push(trace, CoreOperationKind::Branch, None, source, 1, 2);
+                let value = self.reconstruct_expression(value, operations)?;
+                let then_region = self.reconstruct_block(then_branch)?;
+                let else_region = self.reconstruct_block(else_branch)?;
+                self.emit(
+                    operations,
+                    CoreOperationKind::Branch,
+                    None,
+                    None,
+                    [value],
+                    [then_region, else_region],
+                    verifier_pattern_details(pattern),
+                    EffectBoundary::Ownership,
+                    FailureLaw::None,
+                    source.clone(),
+                    CoreAccessLaw::None,
+                );
             }
             Statement::For {
+                pattern,
                 iterable,
                 body,
                 source,
-                ..
             } => {
-                audit_expression(iterable, cancellation, trace)?;
-                audit_statements(body, cancellation, trace)?;
-                audit_push(trace, CoreOperationKind::Loop, None, source, 1, 1);
+                let iterable = self.reconstruct_expression(iterable, operations)?;
+                let body = self.reconstruct_block(body)?;
+                self.emit(
+                    operations,
+                    CoreOperationKind::Loop,
+                    None,
+                    None,
+                    [iterable],
+                    [body],
+                    verifier_pattern_details(pattern),
+                    EffectBoundary::Ownership,
+                    FailureLaw::None,
+                    source.clone(),
+                    CoreAccessLaw::None,
+                );
             }
             Statement::While {
                 condition,
                 body,
+                max_iterations,
                 source,
-                ..
             } => {
-                audit_expression(condition, cancellation, trace)?;
-                audit_statements(body, cancellation, trace)?;
-                audit_push(trace, CoreOperationKind::Loop, None, source, 1, 1);
+                let condition_region = self.reserve_region();
+                let body_region = self.reserve_region();
+                let exit_region = self.reserve_region();
+                let mut condition_operations = Vec::new();
+                let condition_value =
+                    self.reconstruct_expression(condition, &mut condition_operations)?;
+                self.install_region(condition_region, condition_operations);
+                let mut body_operations = Vec::new();
+                for statement in body.iter() {
+                    checkpoint(self.cancellation)?;
+                    self.reconstruct_statement(statement, &mut body_operations)?;
+                }
+                self.emit(
+                    &mut body_operations,
+                    CoreOperationKind::LoopBack,
+                    None,
+                    None,
+                    [],
+                    [condition_region],
+                    [],
+                    EffectBoundary::None,
+                    FailureLaw::None,
+                    source.clone(),
+                    CoreAccessLaw::None,
+                );
+                self.install_region(body_region, body_operations);
+                self.emit(
+                    operations,
+                    CoreOperationKind::Loop,
+                    None,
+                    None,
+                    [condition_value],
+                    [condition_region, body_region, exit_region],
+                    [u128::from(*max_iterations)],
+                    EffectBoundary::None,
+                    FailureLaw::None,
+                    source.clone(),
+                    CoreAccessLaw::None,
+                );
             }
-            Statement::Break(source) => {
-                audit_push(trace, CoreOperationKind::Break, None, source, 0, 0)
-            }
-            Statement::Continue(source) => {
-                audit_push(trace, CoreOperationKind::Continue, None, source, 0, 0)
+            Statement::Break(source) | Statement::Continue(source) => {
+                let kind = if matches!(statement, Statement::Break(_)) {
+                    CoreOperationKind::Break
+                } else {
+                    CoreOperationKind::Continue
+                };
+                self.emit(
+                    operations,
+                    kind,
+                    None,
+                    None,
+                    [],
+                    [],
+                    [],
+                    EffectBoundary::None,
+                    FailureLaw::None,
+                    source.clone(),
+                    CoreAccessLaw::None,
+                );
             }
             Statement::Match {
                 value,
                 cases,
                 source,
             } => {
-                audit_expression(value, cancellation, trace)?;
-                let mut operands = 1;
+                let value = self.reconstruct_expression(value, operations)?;
+                let mut successors = Vec::new();
+                let mut details = vec![u128::try_from(cases.len()).unwrap_or(u128::MAX)];
                 for case in cases.iter() {
+                    checkpoint(self.cancellation)?;
+                    let case_region = self.reserve_region();
+                    let mut case_operations = Vec::new();
                     if let Some(guard) = &case.guard {
-                        audit_expression(guard, cancellation, trace)?;
-                        operands += 1;
+                        let guard = self.reconstruct_expression(guard, &mut case_operations)?;
+                        details.push(u128::from(guard.0));
+                    } else {
+                        details.push(u128::MAX);
                     }
-                    audit_statements(&case.body, cancellation, trace)?;
+                    if let Some(pattern) = &case.pattern {
+                        details.extend(verifier_pattern_details(pattern));
+                    }
+                    for statement in case.body.iter() {
+                        self.reconstruct_statement(statement, &mut case_operations)?;
+                    }
+                    self.install_region(case_region, case_operations);
+                    successors.push(case_region);
                 }
-                // Guards are retained as exact ordered Value references in the detail
-                // catalog rather than ordinary operation operands.
-                let _ = operands;
-                audit_push(
-                    trace,
+                self.emit(
+                    operations,
                     CoreOperationKind::Match,
                     None,
-                    source,
-                    1,
-                    cases.len(),
+                    None,
+                    [value],
+                    successors,
+                    details,
+                    EffectBoundary::Ownership,
+                    FailureLaw::None,
+                    source.clone(),
+                    CoreAccessLaw::None,
                 );
             }
             Statement::Defer { action, source } => {
+                let mut captures = Vec::new();
                 for capture in action.captures.iter() {
-                    audit_expression(&capture.expression, cancellation, trace)?;
+                    checkpoint(self.cancellation)?;
+                    captures.push(self.reconstruct_expression(&capture.expression, operations)?);
                 }
-                audit_expression(&action.expression, cancellation, trace)?;
-                audit_push(
-                    trace,
+                let action_region = self.reserve_region();
+                let mut action_operations = Vec::new();
+                self.reconstruct_expression(&action.expression, &mut action_operations)?;
+                self.install_region(action_region, action_operations);
+                self.emit(
+                    operations,
                     CoreOperationKind::Cleanup,
                     None,
-                    source,
-                    action.captures.len(),
-                    1,
+                    None,
+                    captures,
+                    [action_region],
+                    [],
+                    EffectBoundary::Ownership,
+                    FailureLaw::CheckBeforeSuccess,
+                    source.clone(),
+                    CoreAccessLaw::None,
                 );
             }
             Statement::WithPool {
@@ -1991,184 +2576,696 @@ fn audit_statements(
                 body,
                 source,
             } => {
-                audit_expression(scope, cancellation, trace)?;
-                audit_place_indexes(binding, cancellation, trace)?;
-                audit_statements(body, cancellation, trace)?;
-                audit_push(trace, CoreOperationKind::PoolScope, None, source, 1, 1);
+                let scope = self.reconstruct_expression(scope, operations)?;
+                let body = self.reconstruct_block(body)?;
+                self.emit(
+                    operations,
+                    CoreOperationKind::PoolScope,
+                    None,
+                    None,
+                    [scope],
+                    [body],
+                    verifier_place_details(binding),
+                    EffectBoundary::Ownership,
+                    FailureLaw::CheckBeforeSuccess,
+                    source.clone(),
+                    CoreAccessLaw::None,
+                );
             }
-            Statement::Pass(source) => {
-                audit_push(trace, CoreOperationKind::Pass, None, source, 0, 0)
+            Statement::Pass(source) => self.rewrites.push(RewriteWitness {
+                kind: CoreRewriteKind::EliminatedPass,
+                provenance: source.clone(),
+                source_order: u32::try_from(self.rewrites.len()).unwrap_or(u32::MAX),
+            }),
+        }
+        Ok(())
+    }
+
+    fn reconstruct_expression(
+        &mut self,
+        expression: &Expression,
+        operations: &mut Vec<Operation>,
+    ) -> Result<ValueId, CoreFailure> {
+        checkpoint(self.cancellation)?;
+        let result = self.value();
+        let type_identity = Some(expression.type_id.0);
+        let provenance = expression.source.clone();
+        let access = if matches!(expression.kind, ExpressionKind::CleanupCapture(_)) {
+            CoreAccessLaw::CleanupCapture
+        } else {
+            verifier_access(expression.access)
+        };
+        let (kind, operands, details, effect, failure) = match &expression.kind {
+            ExpressionKind::Literal(literal) => (
+                CoreOperationKind::Literal,
+                vec![],
+                verifier_literal_details(literal),
+                EffectBoundary::None,
+                FailureLaw::None,
+            ),
+            ExpressionKind::Read(place) => (
+                CoreOperationKind::Read,
+                self.reconstruct_place_indexes(place, operations)?,
+                verifier_place_details(place),
+                if expression.access == crate::typed_hir::AccessMode::Move {
+                    EffectBoundary::Ownership
+                } else {
+                    EffectBoundary::None
+                },
+                FailureLaw::CheckBeforeSuccess,
+            ),
+            ExpressionKind::Constant(identity) => (
+                CoreOperationKind::Constant,
+                vec![],
+                vec![identity.0],
+                EffectBoundary::None,
+                FailureLaw::PropagateInOrder,
+            ),
+            ExpressionKind::FunctionValue {
+                definition,
+                specialization,
+            } => (
+                CoreOperationKind::FunctionValue,
+                vec![],
+                vec![definition.0, specialization.map_or(0, |value| value.0)],
+                EffectBoundary::None,
+                FailureLaw::None,
+            ),
+            ExpressionKind::Closure(closure) => (
+                CoreOperationKind::ClosureValue,
+                vec![],
+                vec![closure.id.0],
+                EffectBoundary::None,
+                FailureLaw::None,
+            ),
+            ExpressionKind::CleanupCapture(capture) => (
+                CoreOperationKind::Read,
+                vec![],
+                vec![u128::from(capture.0), u128::MAX],
+                EffectBoundary::Ownership,
+                FailureLaw::None,
+            ),
+            ExpressionKind::Call { target, arguments } => {
+                let mut operands = Vec::new();
+                if let CallTarget::Callable { value } = target {
+                    operands.push(self.reconstruct_expression(value, operations)?);
+                }
+                for argument in arguments.iter() {
+                    checkpoint(self.cancellation)?;
+                    operands.push(self.reconstruct_expression(argument, operations)?);
+                }
+                let (kind, effect) = if matches!(target, CallTarget::Build { .. }) {
+                    (
+                        CoreOperationKind::BuildConstruction,
+                        EffectBoundary::BuildConstruction,
+                    )
+                } else {
+                    (CoreOperationKind::Call, EffectBoundary::Call)
+                };
+                (
+                    kind,
+                    operands,
+                    verifier_call_target_details(target),
+                    effect,
+                    FailureLaw::PropagateInOrder,
+                )
+            }
+            ExpressionKind::Array(values) | ExpressionKind::Tuple(values) => {
+                let mut operands = Vec::new();
+                for value in values.iter() {
+                    checkpoint(self.cancellation)?;
+                    operands.push(self.reconstruct_expression(value, operations)?);
+                }
+                (
+                    CoreOperationKind::Aggregate,
+                    operands,
+                    vec![u128::from(matches!(
+                        expression.kind,
+                        ExpressionKind::Tuple(_)
+                    ))],
+                    EffectBoundary::Ownership,
+                    FailureLaw::PropagateInOrder,
+                )
+            }
+            ExpressionKind::RepeatedArray { value, length } => (
+                CoreOperationKind::Aggregate,
+                vec![self.reconstruct_expression(value, operations)?],
+                vec![2, u128::from(*length)],
+                EffectBoundary::Ownership,
+                FailureLaw::PropagateInOrder,
+            ),
+            ExpressionKind::Index { value, index } => (
+                CoreOperationKind::Index,
+                vec![
+                    self.reconstruct_expression(value, operations)?,
+                    self.reconstruct_expression(index, operations)?,
+                ],
+                vec![],
+                EffectBoundary::None,
+                FailureLaw::CheckBeforeSuccess,
+            ),
+            ExpressionKind::Positive(value) => (
+                CoreOperationKind::Unary,
+                vec![self.reconstruct_expression(value, operations)?],
+                vec![1],
+                EffectBoundary::None,
+                FailureLaw::None,
+            ),
+            ExpressionKind::Negate(value) => (
+                CoreOperationKind::Unary,
+                vec![self.reconstruct_expression(value, operations)?],
+                vec![2],
+                EffectBoundary::None,
+                FailureLaw::CheckBeforeSuccess,
+            ),
+            ExpressionKind::BitNot(value) => (
+                CoreOperationKind::Unary,
+                vec![self.reconstruct_expression(value, operations)?],
+                vec![3],
+                EffectBoundary::None,
+                FailureLaw::None,
+            ),
+            ExpressionKind::Not(value) => (
+                CoreOperationKind::Unary,
+                vec![self.reconstruct_expression(value, operations)?],
+                vec![4],
+                EffectBoundary::None,
+                FailureLaw::None,
+            ),
+            ExpressionKind::Await(value) => (
+                CoreOperationKind::Suspension,
+                vec![self.reconstruct_expression(value, operations)?],
+                vec![],
+                EffectBoundary::Suspension,
+                FailureLaw::PropagateInOrder,
+            ),
+            ExpressionKind::Propagate(value) => (
+                CoreOperationKind::Propagate,
+                vec![self.reconstruct_expression(value, operations)?],
+                vec![],
+                EffectBoundary::Ownership,
+                FailureLaw::PropagateInOrder,
+            ),
+            ExpressionKind::Is { value, pattern } => (
+                CoreOperationKind::PatternTest,
+                vec![self.reconstruct_expression(value, operations)?],
+                verifier_pattern_details(pattern),
+                EffectBoundary::Ownership,
+                FailureLaw::None,
+            ),
+            ExpressionKind::Binary {
+                operator,
+                left,
+                right,
+            } => {
+                let kind = binary_kind(*operator);
+                if kind == CoreOperationKind::ShortCircuit {
+                    let left = self.reconstruct_expression(left, operations)?;
+                    let right_region = self.reserve_region();
+                    let mut right_operations = Vec::new();
+                    let right = self.reconstruct_expression(right, &mut right_operations)?;
+                    self.install_region(right_region, right_operations);
+                    self.emit(
+                        operations,
+                        kind,
+                        Some(result),
+                        type_identity,
+                        [left, right],
+                        [right_region],
+                        [u128::from(operator_tag(*operator))],
+                        EffectBoundary::None,
+                        FailureLaw::None,
+                        provenance,
+                        access,
+                    );
+                    return Ok(result);
+                }
+                (
+                    kind,
+                    vec![
+                        self.reconstruct_expression(left, operations)?,
+                        self.reconstruct_expression(right, operations)?,
+                    ],
+                    vec![u128::from(operator_tag(*operator))],
+                    EffectBoundary::None,
+                    if kind == CoreOperationKind::CheckedArithmetic {
+                        FailureLaw::CheckBeforeSuccess
+                    } else {
+                        FailureLaw::None
+                    },
+                )
+            }
+        };
+        self.emit(
+            operations,
+            kind,
+            Some(result),
+            type_identity,
+            operands,
+            [],
+            details,
+            effect,
+            failure,
+            provenance,
+            access,
+        );
+        Ok(result)
+    }
+
+    fn reconstruct_place_indexes(
+        &mut self,
+        place: &Place,
+        operations: &mut Vec<Operation>,
+    ) -> Result<Vec<ValueId>, CoreFailure> {
+        let mut values = Vec::new();
+        for projection in place.projections.iter() {
+            checkpoint(self.cancellation)?;
+            if let PlaceProjection::Index { index, .. } = projection {
+                values.push(self.reconstruct_expression(index, operations)?);
+            }
+        }
+        Ok(values)
+    }
+}
+
+fn verifier_place_details(place: &Place) -> Vec<u128> {
+    let mut details = vec![u128::from(place.local.0)];
+    for projection in place.projections.iter() {
+        match projection {
+            PlaceProjection::Field {
+                definition, name, ..
+            } => details.extend([1, definition.0, xxh3_128(name.as_bytes())]),
+            PlaceProjection::Index { index, .. } => {
+                details.extend([2, index.type_id.0]);
             }
         }
     }
-    Ok(())
+    details
 }
 
-fn audit_expression(
-    expression: &Expression,
+fn verifier_literal_details(literal: &Literal) -> Vec<u128> {
+    match literal {
+        Literal::Unit => vec![1],
+        Literal::Bool(value) => vec![2, u128::from(*value)],
+        Literal::Integer { kind, value } => {
+            vec![3, u128::from(kind.canonical_tag()), *value as u128]
+        }
+        Literal::Float { kind, bits } => {
+            vec![4, u128::from(kind.canonical_tag()), u128::from(*bits)]
+        }
+        Literal::Text(value) => verifier_exact_bytes_details(5, value.as_bytes()),
+        Literal::Scalar(value) => vec![6, u128::from(u32::from(*value))],
+        Literal::Bytes(value) => verifier_exact_bytes_details(7, value),
+    }
+}
+
+fn verifier_exact_bytes_details(tag: u128, bytes: &[u8]) -> Vec<u128> {
+    let mut details = vec![tag, bytes.len() as u128];
+    for chunk in bytes.chunks(16) {
+        let mut packed = [0_u8; 16];
+        packed[..chunk.len()].copy_from_slice(chunk);
+        details.push(u128::from_be_bytes(packed));
+    }
+    details
+}
+
+fn verifier_call_target_details(target: &CallTarget) -> Vec<u128> {
+    match target {
+        CallTarget::Callable { .. } => vec![1],
+        CallTarget::TemplateFunction { definition, .. } => vec![2, definition.0],
+        CallTarget::Function {
+            definition,
+            specialization,
+            argument_order,
+            argument_parameters,
+        } => {
+            let mut values = vec![3, definition.0, specialization.0];
+            values.extend(argument_order.iter().map(|value| u128::from(*value)));
+            values.extend(argument_parameters.iter().map(|value| value.0));
+            values
+        }
+        CallTarget::Build { primitive, labels } => {
+            let mut values = vec![4, primitive.identity, primitive.definition.0];
+            values.extend(labels.iter().map(|label| xxh3_128(label.as_bytes())));
+            values
+        }
+        CallTarget::BuiltinVariant(variant) => vec![5, u128::from(variant.canonical_tag())],
+        CallTarget::UserVariant {
+            id,
+            variant_order,
+            argument_order,
+            argument_parameters,
+            ..
+        } => {
+            let mut values = vec![6, id.variant, u128::from(*variant_order)];
+            values.extend(argument_order.iter().map(|value| u128::from(*value)));
+            values.extend(argument_parameters.iter().map(|value| value.0));
+            values
+        }
+        CallTarget::Interface {
+            interface,
+            alternatives,
+            argument_order,
+            argument_parameters,
+        } => {
+            let mut values = vec![7, interface.0];
+            for (witness, definition, specialization) in alternatives.iter() {
+                values.extend([witness.0, definition.0, specialization.0]);
+            }
+            values.extend(argument_order.iter().map(|value| u128::from(*value)));
+            values.extend(argument_parameters.iter().map(|value| value.0));
+            values
+        }
+        CallTarget::Struct {
+            definition,
+            argument_field_definitions,
+            ..
+        } => {
+            let mut values = vec![8, definition.0];
+            values.extend(argument_field_definitions.iter().map(|field| field.0));
+            values
+        }
+        CallTarget::Test {
+            id,
+            argument_order,
+            argument_parameters,
+        } => {
+            let mut values = vec![9, id.identity];
+            values.extend(argument_order.iter().map(|value| u128::from(*value)));
+            values.extend(argument_parameters.iter().map(|value| value.0));
+            values
+        }
+    }
+}
+
+fn verifier_pattern_details(pattern: &HirMatchPattern) -> Vec<u128> {
+    fn encode(pattern: &HirMatchPattern, output: &mut Vec<u128>) {
+        match pattern {
+            HirMatchPattern::Wildcard => output.push(1),
+            HirMatchPattern::Literal(literal) => {
+                output.push(2);
+                output.extend(verifier_literal_details(literal));
+            }
+            HirMatchPattern::Variant { id, payload } => {
+                output.extend([3, id.variant, payload.len() as u128]);
+                payload.iter().for_each(|pattern| encode(pattern, output));
+            }
+            HirMatchPattern::Struct { definition, fields } => {
+                output.extend([4, definition.0, fields.len() as u128]);
+                fields.iter().for_each(|pattern| encode(pattern, output));
+            }
+            HirMatchPattern::Tuple(values) => {
+                output.extend([5, values.len() as u128]);
+                values.iter().for_each(|pattern| encode(pattern, output));
+            }
+            HirMatchPattern::FixedArray(values) => {
+                output.extend([6, values.len() as u128]);
+                values.iter().for_each(|pattern| encode(pattern, output));
+            }
+            HirMatchPattern::Or(values) => {
+                output.extend([7, values.len() as u128]);
+                values.iter().for_each(|pattern| encode(pattern, output));
+            }
+            HirMatchPattern::Binding {
+                local,
+                type_id,
+                access,
+                ..
+            } => output.extend([
+                8,
+                u128::from(local.0),
+                type_id.0,
+                u128::from(verifier_access_tag(*access)),
+            ]),
+        }
+    }
+
+    let mut output = Vec::new();
+    encode(pattern, &mut output);
+    output
+}
+
+const fn verifier_access_tag(access: crate::typed_hir::AccessMode) -> u8 {
+    match access {
+        crate::typed_hir::AccessMode::Copy => 1,
+        crate::typed_hir::AccessMode::Read => 2,
+        crate::typed_hir::AccessMode::Mut => 3,
+        crate::typed_hir::AccessMode::Move => 4,
+    }
+}
+
+fn verify_generated_executable(
+    reference: ExecutableRef,
+    role: &GeneratedRole,
+    candidate: &VerifiedCoreProgram,
     cancellation: &Cancellation,
-    trace: &mut Vec<AuditToken>,
 ) -> Result<(), CoreFailure> {
     checkpoint(cancellation)?;
-    let (kind, operand_count) = match &expression.kind {
-        ExpressionKind::Literal(_) => (CoreOperationKind::Literal, 0),
-        ExpressionKind::Read(place) => {
-            audit_place_indexes(place, cancellation, trace)?;
-            (
-                CoreOperationKind::Read,
-                place
-                    .projections
-                    .iter()
-                    .filter(|projection| matches!(projection, PlaceProjection::Index { .. }))
-                    .count(),
-            )
-        }
-        ExpressionKind::Constant(_) => (CoreOperationKind::Constant, 0),
-        ExpressionKind::FunctionValue { .. } => (CoreOperationKind::FunctionValue, 0),
-        ExpressionKind::Closure(closure) => {
-            let _ = closure;
-            (CoreOperationKind::ClosureValue, 0)
-        }
-        ExpressionKind::CleanupCapture(_) => (CoreOperationKind::Read, 0),
-        ExpressionKind::Call { target, arguments } => {
-            let callable = if let CallTarget::Callable { value } = target {
-                audit_expression(value, cancellation, trace)?;
-                1
-            } else {
-                0
-            };
-            for argument in arguments.iter() {
-                audit_expression(argument, cancellation, trace)?;
-            }
-            (
-                if matches!(target, CallTarget::Build { .. }) {
-                    CoreOperationKind::BuildConstruction
-                } else {
-                    CoreOperationKind::Call
-                },
-                callable + arguments.len(),
-            )
-        }
-        ExpressionKind::Array(values) | ExpressionKind::Tuple(values) => {
-            for value in values.iter() {
-                audit_expression(value, cancellation, trace)?;
-            }
-            (CoreOperationKind::Aggregate, values.len())
-        }
-        ExpressionKind::RepeatedArray { value, .. } => {
-            audit_expression(value, cancellation, trace)?;
-            (CoreOperationKind::Aggregate, 1)
-        }
-        ExpressionKind::Index { value, index } => {
-            audit_expression(value, cancellation, trace)?;
-            audit_expression(index, cancellation, trace)?;
-            (CoreOperationKind::Index, 2)
-        }
-        ExpressionKind::Positive(value)
-        | ExpressionKind::Negate(value)
-        | ExpressionKind::BitNot(value)
-        | ExpressionKind::Not(value) => {
-            audit_expression(value, cancellation, trace)?;
-            (CoreOperationKind::Unary, 1)
-        }
-        ExpressionKind::Await(value) => {
-            audit_expression(value, cancellation, trace)?;
-            (CoreOperationKind::Suspension, 1)
-        }
-        ExpressionKind::Propagate(value) => {
-            audit_expression(value, cancellation, trace)?;
-            (CoreOperationKind::Propagate, 1)
-        }
-        ExpressionKind::Is { value, .. } => {
-            audit_expression(value, cancellation, trace)?;
-            (CoreOperationKind::PatternTest, 1)
-        }
-        ExpressionKind::Binary {
-            operator,
-            left,
-            right,
-        } => {
-            audit_expression(left, cancellation, trace)?;
-            audit_expression(right, cancellation, trace)?;
-            let kind = binary_kind(*operator);
-            audit_push(
-                trace,
-                kind,
-                Some(expression.type_id.0),
-                &expression.source,
-                2,
-                usize::from(kind == CoreOperationKind::ShortCircuit),
-            );
-            return Ok(());
-        }
+    let supplied = candidate
+        .executables
+        .iter()
+        .find(|executable| {
+            executable.reference.kind == CoreExecutableKind::Generated
+                && executable.reference.identity == reference.identity()
+        })
+        .ok_or_else(|| {
+            CoreFailure::Defect(Arc::from(
+                "Core verifier found a missing generated realization",
+            ))
+        })?;
+    let mut details = vec![
+        role.reference().identity(),
+        role.reference().current_meaning(),
+        role.owner().identity(),
+        role.generator().identity(),
+        u128::from(role.local_key()),
+        role.provenance().identity(),
+        u128::from(verifier_generated_role_tag(role.kind())),
+    ];
+    for dependency in role.dependencies() {
+        checkpoint(cancellation)?;
+        details.extend([dependency.identity(), dependency.current_meaning()]);
+    }
+    let provenance = SourceRange::new("<generated:mandatory-image>", 0, 0);
+    let Some(operation) = supplied
+        .regions
+        .first()
+        .and_then(|region| region.operations.first())
+    else {
+        return defect("Core generated executable has no role operation");
     };
-    audit_push(
-        trace,
-        kind,
-        Some(expression.type_id.0),
-        &expression.source,
-        operand_count,
-        0,
-    );
-    Ok(())
-}
-
-fn audit_place_indexes(
-    place: &Place,
-    cancellation: &Cancellation,
-    trace: &mut Vec<AuditToken>,
-) -> Result<(), CoreFailure> {
-    for projection in place.projections.iter() {
-        if let PlaceProjection::Index { index, .. } = projection {
-            audit_expression(index, cancellation, trace)?;
-        }
+    if supplied.reference.context != reference.context()
+        || supplied.reference.current_meaning != reference.current_meaning()
+        || supplied.semantic_owner != role.owner().identity()
+        || supplied.provenance != provenance
+        || supplied.entry != RegionId(0)
+        || supplied.regions.len() != 1
+        || supplied.regions[0].identity != RegionId(0)
+        || supplied.regions[0].operations.len() != 1
+        || operation.identity != 0
+        || operation.kind != CoreOperationKind::GeneratedRole
+        || operation.result.is_some()
+        || operation.type_identity.is_some()
+        || !operation.operands.is_empty()
+        || !operation.successors.is_empty()
+        || operation.details.as_ref() != details
+        || operation.effect != EffectBoundary::None
+        || operation.access != CoreAccessLaw::None
+        || operation.failure != FailureLaw::None
+        || operation.provenance != provenance
+        || !supplied.signature.parameters.is_empty()
+        || !verifier_type_matches(&supplied.signature.return_type, &Type::Unit)
+        || !supplied.rewrites.is_empty()
+        || supplied.source_definition.is_some()
+        || supplied.facts
+            != (ExecutableFacts {
+                pure: false,
+                may_panic: role.kind() == crate::image_planning::GeneratedRoleKind::Panic,
+                suspends: false,
+                ownership_transfer: false,
+                evaluator_eligible: false,
+            })
+    {
+        return defect("Core generated executable contradicts its authenticated role");
+    }
+    if supplied.fingerprint != verifier_executable_fingerprint(supplied, cancellation)? {
+        return defect("Core generated executable fingerprint is false");
     }
     Ok(())
 }
 
-fn audit_push(
-    trace: &mut Vec<AuditToken>,
-    kind: CoreOperationKind,
-    type_identity: Option<u128>,
-    source: &SourceRange,
-    operand_count: usize,
-    successor_count: usize,
-) {
-    trace.push(AuditToken {
-        kind,
-        type_identity,
-        source: source.clone(),
-        operand_count,
-        successor_count,
-    });
+const fn verifier_generated_role_tag(kind: crate::image_planning::GeneratedRoleKind) -> u8 {
+    match kind {
+        crate::image_planning::GeneratedRoleKind::Boot => 1,
+        crate::image_planning::GeneratedRoleKind::Scheduler => 2,
+        crate::image_planning::GeneratedRoleKind::Terminal => 3,
+        crate::image_planning::GeneratedRoleKind::Panic => 4,
+        crate::image_planning::GeneratedRoleKind::Shutdown => 5,
+        crate::image_planning::GeneratedRoleKind::TestRuntime => 6,
+    }
 }
 
-// The verifier deliberately reconstructs through a fresh lowering instance and a
-// distinct canonical byte encoding. Candidate data is never trusted as expected data.
-fn reconstruct_source_executable(
-    input: CoreSourceExecutableInput<'_>,
-    semantic: crate::completed_semantic::CorePlanningSemanticProgram<'_>,
+impl VerifierLowerer<'_> {
+    fn verify_source(
+        input: CoreSourceExecutableInput<'_>,
+        semantic: crate::completed_semantic::CorePlanningSemanticProgram<'_>,
+        supplied: &CoreExecutable,
+        cancellation: &Cancellation,
+    ) -> Result<(), CoreFailure> {
+        checkpoint(cancellation)?;
+        let (owner, provenance, parameters, return_type, source_definition, facts) = match input
+            .body
+        {
+            CoreSourceExecutableBody::Specialization(function) => {
+                let facts = semantic
+                    .specialization_facts(SpecializationId(input.reference.identity()))
+                    .ok_or_else(|| {
+                        CoreFailure::Defect(Arc::from("Core verifier found missing solved facts"))
+                    })?;
+                (
+                    function.id.0,
+                    &function.source,
+                    function.parameters.as_slice(),
+                    &function.return_type,
+                    Some(function.id.0),
+                    Some(facts),
+                )
+            }
+            CoreSourceExecutableBody::Test(test) => (
+                input.reference.identity(),
+                &test.source,
+                test.parameters.as_slice(),
+                &Type::Unit,
+                None,
+                None,
+            ),
+            CoreSourceExecutableBody::Closure(closure) => {
+                if supplied.signature.parameters.len() != closure.parameters.len()
+                    || supplied
+                        .signature
+                        .parameters
+                        .iter()
+                        .zip(closure.parameters.iter())
+                        .any(|(actual, (local, type_))| {
+                            actual.local != local.0
+                                || actual.access != CoreAccessLaw::CopyValue
+                                || !verifier_type_matches(&actual.type_, type_)
+                        })
+                {
+                    return defect("Core Closure signature is false");
+                }
+                (
+                    closure.id.0,
+                    &closure.source,
+                    &[][..],
+                    &closure.return_type,
+                    None,
+                    None,
+                )
+            }
+        };
+        if supplied.reference.context != input.reference.context()
+            || supplied.reference.kind != source_kind(input.reference.kind())
+            || supplied.reference.identity != input.reference.identity()
+            || supplied.reference.current_meaning != input.reference.current_meaning()
+            || supplied.semantic_owner != owner
+            || &supplied.provenance != provenance
+            || supplied.source_definition != source_definition
+            || !verifier_type_matches(&supplied.signature.return_type, return_type)
+        {
+            return defect("Core executable header or return meaning is false");
+        }
+        if !matches!(input.body, CoreSourceExecutableBody::Closure(_))
+            && (supplied.signature.parameters.len() != parameters.len()
+                || supplied.signature.parameters.iter().zip(parameters).any(
+                    |(actual, (local, type_, access))| {
+                        actual.local != local.0
+                            || actual.access != verifier_access(*access)
+                            || !verifier_type_matches(&actual.type_, type_)
+                    },
+                ))
+        {
+            return defect("Core executable parameter signature is false");
+        }
+        let reconstruction = VerifierLowerer::reconstruct(input.body, cancellation)?;
+        if supplied.entry != RegionId(0) || supplied.regions != reconstruction.regions {
+            return defect(
+                "Core operation graph contradicts exact independent Typed HIR reconstruction",
+            );
+        }
+        if supplied.rewrites != reconstruction.rewrites {
+            return defect("Core canonical rewrite witness is false, missing, or misassociated");
+        }
+        let expected_facts = if let Some(facts) = facts {
+            ExecutableFacts {
+                pure: facts.pure,
+                may_panic: facts.may_panic,
+                suspends: facts.suspends,
+                ownership_transfer: facts.ownership_transfer,
+                evaluator_eligible: facts.evaluator_eligible,
+            }
+        } else {
+            verifier_facts_from_regions(&reconstruction.regions)
+        };
+        if supplied.facts != expected_facts {
+            return defect("Core solved executable facts are false");
+        }
+        let expected_fingerprint = verifier_executable_fingerprint(supplied, cancellation)?;
+        if supplied.fingerprint != expected_fingerprint {
+            return defect("Core executable fingerprint is false");
+        }
+        Ok(())
+    }
+}
+
+fn verifier_facts_from_regions(regions: &[Region]) -> ExecutableFacts {
+    let mut facts = ExecutableFacts {
+        pure: true,
+        may_panic: false,
+        suspends: false,
+        ownership_transfer: false,
+        evaluator_eligible: true,
+    };
+    for operation in regions.iter().flat_map(|region| region.operations.iter()) {
+        facts.may_panic |= matches!(
+            operation.failure,
+            FailureLaw::CheckBeforeSuccess
+                | FailureLaw::PropagateInOrder
+                | FailureLaw::TerminalPanic
+        );
+        facts.suspends |= operation.effect == EffectBoundary::Suspension;
+        facts.ownership_transfer |= operation.effect == EffectBoundary::Ownership;
+        facts.pure &= !matches!(
+            operation.effect,
+            EffectBoundary::BuildConstruction | EffectBoundary::Suspension
+        );
+    }
+    facts.evaluator_eligible = facts.pure && !facts.suspends;
+    facts
+}
+
+fn verifier_type_matches(actual: &CoreType, expected: &Type) -> bool {
+    let shape = expected.canonical_key();
+    actual.identity == xxh3_128(&shape) && actual.shape == shape
+}
+
+const fn verifier_access(access: crate::typed_hir::AccessMode) -> CoreAccessLaw {
+    match access {
+        crate::typed_hir::AccessMode::Copy => CoreAccessLaw::CopyValue,
+        crate::typed_hir::AccessMode::Read => CoreAccessLaw::SharedLoan,
+        crate::typed_hir::AccessMode::Mut => CoreAccessLaw::ExclusiveLoan,
+        crate::typed_hir::AccessMode::Move => CoreAccessLaw::Move,
+    }
+}
+
+fn verifier_executable_fingerprint(
+    executable: &CoreExecutable,
     cancellation: &Cancellation,
-) -> Result<CoreExecutable, CoreFailure> {
-    let mut reconstructed = produce_source_executable(input, semantic, cancellation)?;
-    reconstructed.fingerprint = verifier_executable_fingerprint(&reconstructed);
-    Ok(reconstructed)
-}
-
-fn reconstruct_generated_executable(
-    executable: ExecutableRef,
-    role: &GeneratedRole,
-) -> CoreExecutable {
-    let mut reconstructed = produce_generated_executable(executable, role);
-    reconstructed.fingerprint = verifier_executable_fingerprint(&reconstructed);
-    reconstructed
-}
-
-fn verifier_executable_fingerprint(executable: &CoreExecutable) -> u128 {
+) -> Result<u128, CoreFailure> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"wrela.core.executable\0\x01");
-    verifier_encode_executable(&mut bytes, executable);
-    xxh3_128(&bytes)
+    verifier_encode_executable(&mut bytes, executable, cancellation)?;
+    Ok(xxh3_128(&bytes))
 }
 
 fn verifier_fingerprint(
@@ -2183,7 +3280,9 @@ fn verifier_fingerprint(
     bytes.extend_from_slice(&candidate.source_demand_identity.to_be_bytes());
     for executable in candidate.executables.iter() {
         checkpoint(cancellation)?;
-        bytes.extend_from_slice(&verifier_executable_fingerprint(executable).to_be_bytes());
+        bytes.extend_from_slice(
+            &verifier_executable_fingerprint(executable, cancellation)?.to_be_bytes(),
+        );
     }
     bytes.extend_from_slice(&(candidate.oracle.cases as u64).to_be_bytes());
     bytes.push(u8::from(candidate.oracle.agrees));
@@ -2191,7 +3290,12 @@ fn verifier_fingerprint(
     Ok(xxh3_128(&bytes))
 }
 
-fn verifier_encode_executable(bytes: &mut Vec<u8>, executable: &CoreExecutable) {
+fn verifier_encode_executable(
+    bytes: &mut Vec<u8>,
+    executable: &CoreExecutable,
+    cancellation: &Cancellation,
+) -> Result<(), CoreFailure> {
+    checkpoint(cancellation)?;
     bytes.push(executable.reference.kind.tag());
     bytes.extend_from_slice(&executable.reference.context.to_be_bytes());
     bytes.extend_from_slice(&executable.reference.identity.to_be_bytes());
@@ -2199,7 +3303,18 @@ fn verifier_encode_executable(bytes: &mut Vec<u8>, executable: &CoreExecutable) 
     bytes.extend_from_slice(&executable.semantic_owner.to_be_bytes());
     verifier_encode_source(bytes, &executable.provenance);
     bytes.extend_from_slice(&executable.entry.0.to_be_bytes());
-    bytes.extend_from_slice(&(executable.parameter_count as u64).to_be_bytes());
+    bytes.extend_from_slice(&(executable.signature.parameters.len() as u64).to_be_bytes());
+    for parameter in executable.signature.parameters.iter() {
+        checkpoint(cancellation)?;
+        bytes.extend_from_slice(&parameter.local.to_be_bytes());
+        bytes.extend_from_slice(&parameter.type_.identity.to_be_bytes());
+        bytes.extend_from_slice(&(parameter.type_.shape.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(&parameter.type_.shape);
+        bytes.push(parameter.access.tag());
+    }
+    bytes.extend_from_slice(&executable.signature.return_type.identity.to_be_bytes());
+    bytes.extend_from_slice(&(executable.signature.return_type.shape.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(&executable.signature.return_type.shape);
     bytes.extend_from_slice(&executable.source_definition.unwrap_or(0).to_be_bytes());
     bytes.extend([
         u8::from(executable.facts.pure),
@@ -2209,12 +3324,15 @@ fn verifier_encode_executable(bytes: &mut Vec<u8>, executable: &CoreExecutable) 
         u8::from(executable.facts.evaluator_eligible),
     ]);
     for region in executable.regions.iter() {
+        checkpoint(cancellation)?;
         bytes.extend_from_slice(&region.identity.0.to_be_bytes());
         for operation in region.operations.iter() {
+            checkpoint(cancellation)?;
             bytes.extend_from_slice(&operation.identity.to_be_bytes());
             bytes.extend([
                 operation.kind.tag(),
                 operation.effect.tag(),
+                operation.access.tag(),
                 operation.failure.tag(),
             ]);
             bytes.extend_from_slice(
@@ -2224,23 +3342,33 @@ fn verifier_encode_executable(bytes: &mut Vec<u8>, executable: &CoreExecutable) 
                     .to_be_bytes(),
             );
             bytes.extend_from_slice(&operation.type_identity.unwrap_or(0).to_be_bytes());
-            operation
-                .operands
-                .iter()
-                .for_each(|value| bytes.extend_from_slice(&value.0.to_be_bytes()));
+            operation.operands.iter().try_for_each(|value| {
+                checkpoint(cancellation)?;
+                bytes.extend_from_slice(&value.0.to_be_bytes());
+                Ok::<_, CoreFailure>(())
+            })?;
             bytes.push(b'|');
-            operation
-                .successors
-                .iter()
-                .for_each(|region| bytes.extend_from_slice(&region.0.to_be_bytes()));
+            operation.successors.iter().try_for_each(|region| {
+                checkpoint(cancellation)?;
+                bytes.extend_from_slice(&region.0.to_be_bytes());
+                Ok::<_, CoreFailure>(())
+            })?;
             bytes.push(b'|');
-            operation
-                .details
-                .iter()
-                .for_each(|value| bytes.extend_from_slice(&value.to_be_bytes()));
+            operation.details.iter().try_for_each(|value| {
+                checkpoint(cancellation)?;
+                bytes.extend_from_slice(&value.to_be_bytes());
+                Ok::<_, CoreFailure>(())
+            })?;
             verifier_encode_source(bytes, &operation.provenance);
         }
     }
+    for rewrite in executable.rewrites.iter() {
+        checkpoint(cancellation)?;
+        bytes.push(rewrite.kind.tag());
+        bytes.extend_from_slice(&rewrite.source_order.to_be_bytes());
+        verifier_encode_source(bytes, &rewrite.provenance);
+    }
+    Ok(())
 }
 
 fn verifier_encode_source(bytes: &mut Vec<u8>, source: &SourceRange) {
@@ -2275,6 +3403,20 @@ fn validate_graphs(
         }
         let mut operations = BTreeSet::new();
         let mut values = BTreeSet::new();
+        let legal_loop_backs = executable
+            .regions
+            .iter()
+            .flat_map(|region| {
+                region.operations.iter().filter_map(|operation| {
+                    if operation.kind == CoreOperationKind::Loop && operation.successors.len() == 3
+                    {
+                        Some((operation.successors[1], operation.successors[0]))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect::<BTreeSet<_>>();
         for region in executable.regions.iter() {
             for operation in region.operations.iter() {
                 checkpoint(cancellation)?;
@@ -2286,9 +3428,19 @@ fn validate_graphs(
                     return defect("Core operation graph has duplicate identities");
                 }
                 if operation.successors.iter().any(|successor| {
-                    !region_ids.contains(successor) || successor.0 <= region.identity.0
+                    !region_ids.contains(successor)
+                        || (successor.0 <= region.identity.0
+                            && !(operation.kind == CoreOperationKind::LoopBack
+                                && legal_loop_backs.contains(&(region.identity, *successor))))
                 }) {
                     return defect("Core operation has a dangling or malformed control target");
+                }
+                if operation.kind == CoreOperationKind::LoopBack
+                    && (operation.successors.len() != 1
+                        || !operation.operands.is_empty()
+                        || operation.result.is_some())
+                {
+                    return defect("Core loop backedge has a malformed recurrence law");
                 }
             }
         }
@@ -2322,11 +3474,19 @@ fn run_oracle(
     for executable in candidate.executables.iter() {
         checkpoint(cancellation)?;
         if executable.reference.kind != CoreExecutableKind::SourceSpecialization
-            || executable.parameter_count != 0
+            || !executable.signature.parameters.is_empty()
             || !executable.facts.pure
             || !executable.facts.evaluator_eligible
-            || !oracle_supported(executable)
         {
+            continue;
+        }
+        let mut support_budget = OracleBudget::new(candidate, cancellation);
+        if !oracle_supported(
+            candidate,
+            executable,
+            &mut BTreeSet::new(),
+            &mut support_budget,
+        )? {
             continue;
         }
         let source_reference = input
@@ -2343,7 +3503,8 @@ fn run_oracle(
         let CoreSourceExecutableBody::Specialization(function) = source.body else {
             return defect("oracle specialization has the wrong source kind");
         };
-        let core_outcome = oracle_execute(executable);
+        let mut work = OracleBudget::new(candidate, cancellation);
+        let core_outcome = oracle_execute(candidate, executable, &[], &mut work)?;
         let evaluator = crate::evaluator::Engine::new(semantic.verified_program(), cancellation)
             .evaluate_function(function.id)
             .outcome;
@@ -2372,158 +3533,485 @@ fn run_oracle(
 enum CompactOutcome {
     Completed(CanonicalValue),
     Panicked(EvaluationPanicKind, SourceRange),
-    Unsupported,
 }
 
-fn oracle_supported(executable: &CoreExecutable) -> bool {
-    executable
+struct OracleBudget<'a> {
+    remaining: u64,
+    cancellation: &'a Cancellation,
+}
+
+impl<'a> OracleBudget<'a> {
+    fn new(candidate: &VerifiedCoreProgram, cancellation: &'a Cancellation) -> Self {
+        let graph_work = candidate
+            .executables
+            .iter()
+            .flat_map(|executable| executable.regions.iter())
+            .map(|region| region.operations.len() as u64)
+            .sum::<u64>();
+        Self {
+            remaining: graph_work.saturating_mul(128).saturating_add(1_024),
+            cancellation,
+        }
+    }
+
+    fn step(&mut self) -> Result<(), CoreFailure> {
+        checkpoint(self.cancellation)?;
+        if self.remaining == 0 {
+            return defect("Core semantic oracle exceeded its logical work budget");
+        }
+        self.remaining -= 1;
+        Ok(())
+    }
+}
+
+fn oracle_supported(
+    candidate: &VerifiedCoreProgram,
+    executable: &CoreExecutable,
+    visiting: &mut BTreeSet<u128>,
+    budget: &mut OracleBudget<'_>,
+) -> Result<bool, CoreFailure> {
+    budget.step()?;
+    if !visiting.insert(executable.reference.identity) {
+        return Ok(false);
+    }
+    for operation in executable
         .regions
         .iter()
         .flat_map(|region| region.operations.iter())
-        .all(|operation| operation.oracle.is_some())
+    {
+        budget.step()?;
+        let supported = match operation.kind {
+            CoreOperationKind::Literal => {
+                canonical_literal_from_details(&operation.details).is_some()
+            }
+            CoreOperationKind::Read => operation.details.len() == 1,
+            CoreOperationKind::Store => operation.details.len() == 2,
+            CoreOperationKind::Unary => matches!(operation.details.as_ref(), [1..=4]),
+            CoreOperationKind::CheckedArithmetic | CoreOperationKind::Binary => operation
+                .details
+                .first()
+                .and_then(|tag| operator_from_tag(*tag))
+                .is_some_and(|operator| {
+                    !matches!(
+                        operator,
+                        BinaryOperator::Range | BinaryOperator::RangeInclusive
+                    )
+                }),
+            CoreOperationKind::ShortCircuit => operation
+                .details
+                .first()
+                .and_then(|tag| operator_from_tag(*tag))
+                .is_some_and(|operator| {
+                    matches!(operator, BinaryOperator::And | BinaryOperator::Or)
+                }),
+            CoreOperationKind::Return
+            | CoreOperationKind::TerminalPanic
+            | CoreOperationKind::Assert
+            | CoreOperationKind::Expect
+            | CoreOperationKind::Branch
+            | CoreOperationKind::Loop
+            | CoreOperationKind::LoopBack
+            | CoreOperationKind::Break
+            | CoreOperationKind::Continue => true,
+            CoreOperationKind::FunctionValue => operation.details.len() == 2,
+            CoreOperationKind::Call => {
+                let Some(target) = direct_call_target(operation) else {
+                    visiting.remove(&executable.reference.identity);
+                    return Ok(false);
+                };
+                let Some(target) = candidate.executables.iter().find(|candidate| {
+                    candidate.reference.kind == CoreExecutableKind::SourceSpecialization
+                        && candidate.reference.identity == target
+                }) else {
+                    visiting.remove(&executable.reference.identity);
+                    return Ok(false);
+                };
+                oracle_supported(candidate, target, visiting, budget)?
+            }
+            CoreOperationKind::Pass
+            | CoreOperationKind::Constant
+            | CoreOperationKind::ClosureValue
+            | CoreOperationKind::BuildConstruction
+            | CoreOperationKind::Aggregate
+            | CoreOperationKind::Index
+            | CoreOperationKind::Propagate
+            | CoreOperationKind::PatternTest
+            | CoreOperationKind::Match
+            | CoreOperationKind::Cleanup
+            | CoreOperationKind::PoolScope
+            | CoreOperationKind::Suspension
+            | CoreOperationKind::GeneratedRole => false,
+        };
+        if !supported {
+            visiting.remove(&executable.reference.identity);
+            return Ok(false);
+        }
+    }
+    visiting.remove(&executable.reference.identity);
+    Ok(true)
 }
 
 enum Signal {
     Continue,
     Return(CanonicalValue),
     Panic(EvaluationPanicKind, SourceRange),
+    Break,
+    ContinueLoop,
+    LoopBack,
 }
 
-fn oracle_execute(executable: &CoreExecutable) -> CompactOutcome {
+fn oracle_execute(
+    candidate: &VerifiedCoreProgram,
+    executable: &CoreExecutable,
+    arguments: &[CanonicalValue],
+    budget: &mut OracleBudget<'_>,
+) -> Result<CompactOutcome, CoreFailure> {
     let mut values = BTreeMap::new();
-    let mut locals = BTreeMap::new();
-    match oracle_region(executable, executable.entry, &mut values, &mut locals) {
-        Some(Signal::Return(value)) => CompactOutcome::Completed(value),
-        Some(Signal::Panic(kind, site)) => CompactOutcome::Panicked(kind, site),
-        Some(Signal::Continue) => CompactOutcome::Completed(CanonicalValue::Unit),
-        None => CompactOutcome::Unsupported,
-    }
+    let mut locals = executable
+        .signature
+        .parameters
+        .iter()
+        .zip(arguments)
+        .map(|(parameter, value)| (parameter.local, value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let signal = oracle_region(
+        candidate,
+        executable,
+        executable.entry,
+        &mut values,
+        &mut locals,
+        budget,
+    )?;
+    Ok(match signal {
+        Signal::Return(value) => CompactOutcome::Completed(value),
+        Signal::Panic(kind, site) => CompactOutcome::Panicked(kind, site),
+        Signal::Continue => CompactOutcome::Completed(CanonicalValue::Unit),
+        Signal::Break | Signal::ContinueLoop | Signal::LoopBack => {
+            return defect("Core semantic oracle observed loop control outside a loop");
+        }
+    })
 }
 
 fn oracle_region(
+    candidate: &VerifiedCoreProgram,
     executable: &CoreExecutable,
     region: RegionId,
     values: &mut BTreeMap<ValueId, CanonicalValue>,
     locals: &mut BTreeMap<u32, CanonicalValue>,
-) -> Option<Signal> {
-    let region = executable.regions.get(region.0 as usize)?;
+    budget: &mut OracleBudget<'_>,
+) -> Result<Signal, CoreFailure> {
+    budget.step()?;
+    let region = executable
+        .regions
+        .get(region.0 as usize)
+        .ok_or_else(|| CoreFailure::Defect(Arc::from("Core oracle region is dangling")))?;
     for operation in region.operations.iter() {
-        let instruction = operation.oracle.as_ref()?;
-        match instruction {
-            OracleInstruction::Literal(value) => {
-                values.insert(operation.result?, value.clone());
+        budget.step()?;
+        match operation.kind {
+            CoreOperationKind::Literal => {
+                let value =
+                    canonical_literal_from_details(&operation.details).ok_or_else(|| {
+                        CoreFailure::Defect(Arc::from("unsupported literal entered Core oracle"))
+                    })?;
+                values.insert(required_result(operation)?, value);
             }
-            OracleInstruction::Read(local) => {
-                values.insert(operation.result?, locals.get(local)?.clone());
+            CoreOperationKind::Read => {
+                let local = u32::try_from(operation.details[0])
+                    .map_err(|_| CoreFailure::Defect(Arc::from("Core local identity overflows")))?;
+                let value = locals.get(&local).cloned().ok_or_else(|| {
+                    CoreFailure::Defect(Arc::from("Core oracle reads an unavailable local"))
+                })?;
+                values.insert(required_result(operation)?, value);
             }
-            OracleInstruction::Store { local, value } => {
-                locals.insert(*local, values.get(value)?.clone());
+            CoreOperationKind::Store => {
+                let local = u32::try_from(operation.details[0])
+                    .map_err(|_| CoreFailure::Defect(Arc::from("Core local identity overflows")))?;
+                let value = required_operand(
+                    operation,
+                    operation.operands.len().saturating_sub(1),
+                    values,
+                )?;
+                locals.insert(local, value);
             }
-            OracleInstruction::Binary(operator) => {
-                let [left, right] = operation.operands.as_ref() else {
-                    return None;
-                };
+            CoreOperationKind::CheckedArithmetic | CoreOperationKind::Binary => {
+                let operator = operator_from_tag(operation.details[0])
+                    .ok_or_else(|| CoreFailure::Defect(Arc::from("Core binary law is invalid")))?;
                 match oracle_binary(
-                    *operator,
-                    values.get(left)?,
-                    values.get(right)?,
+                    operator,
+                    &required_operand(operation, 0, values)?,
+                    &required_operand(operation, 1, values)?,
                     &operation.provenance,
                 ) {
                     Ok(value) => {
-                        values.insert(operation.result?, value);
+                        values.insert(required_result(operation)?, value);
                     }
-                    Err(signal) => return Some(signal),
+                    Err(signal) => return Ok(signal),
                 }
             }
-            OracleInstruction::ShortCircuit(operator) => {
-                let [left, right] = operation.operands.as_ref() else {
-                    return None;
+            CoreOperationKind::ShortCircuit => {
+                let operator = operator_from_tag(operation.details[0]).ok_or_else(|| {
+                    CoreFailure::Defect(Arc::from("Core short-circuit law is invalid"))
+                })?;
+                let CanonicalValue::Bool(left_value) = required_operand(operation, 0, values)?
+                else {
+                    return defect("Core short-circuit operand is not bool");
                 };
-                let CanonicalValue::Bool(left_value) = values.get(left)? else {
-                    return None;
-                };
-                let skip = (*operator == BinaryOperator::And && !*left_value)
-                    || (*operator == BinaryOperator::Or && *left_value);
+                let skip = (operator == BinaryOperator::And && !left_value)
+                    || (operator == BinaryOperator::Or && left_value);
                 if skip {
-                    values.insert(operation.result?, CanonicalValue::Bool(*left_value));
+                    values.insert(
+                        required_result(operation)?,
+                        CanonicalValue::Bool(left_value),
+                    );
                 } else {
-                    match oracle_region(executable, operation.successors[0], values, locals)? {
+                    match oracle_region(
+                        candidate,
+                        executable,
+                        operation.successors[0],
+                        values,
+                        locals,
+                        budget,
+                    )? {
                         Signal::Continue => {}
-                        signal => return Some(signal),
+                        signal => return Ok(signal),
                     }
-                    values.insert(operation.result?, values.get(right)?.clone());
+                    let right = required_operand(operation, 1, values)?;
+                    values.insert(required_result(operation)?, right);
                 }
             }
-            OracleInstruction::UnaryNegate => {
-                let [operand] = operation.operands.as_ref() else {
-                    return None;
-                };
-                let CanonicalValue::Integer { type_name, value } = values.get(operand)? else {
-                    return None;
-                };
-                let value = value.checked_neg().ok_or_else(|| {
-                    Signal::Panic(
-                        EvaluationPanicKind::IntegerOverflow,
-                        operation.provenance.clone(),
-                    )
-                });
-                match value {
-                    Ok(value) => {
-                        values.insert(
-                            operation.result?,
-                            CanonicalValue::Integer {
-                                type_name: type_name.clone(),
-                                value,
-                            },
-                        );
-                    }
-                    Err(signal) => return Some(signal),
-                }
+            CoreOperationKind::Unary => {
+                let value = oracle_unary(
+                    operation.details[0],
+                    required_operand(operation, 0, values)?,
+                    &operation.provenance,
+                )?;
+                values.insert(required_result(operation)?, value);
             }
-            OracleInstruction::UnaryNot => {
-                let [operand] = operation.operands.as_ref() else {
-                    return None;
+            CoreOperationKind::Return => {
+                let value = if operation.operands.is_empty() {
+                    CanonicalValue::Unit
+                } else {
+                    required_operand(operation, 0, values)?
                 };
-                let CanonicalValue::Bool(value) = values.get(operand)? else {
-                    return None;
-                };
-                values.insert(operation.result?, CanonicalValue::Bool(!value));
+                return Ok(Signal::Return(value));
             }
-            OracleInstruction::Return(value) => {
-                let value = match value {
-                    Some(value) => values.get(value)?.clone(),
-                    None => CanonicalValue::Unit,
-                };
-                return Some(Signal::Return(value));
-            }
-            OracleInstruction::Panic => {
-                return Some(Signal::Panic(
+            CoreOperationKind::TerminalPanic => {
+                return Ok(Signal::Panic(
                     EvaluationPanicKind::Explicit,
                     operation.provenance.clone(),
                 ));
             }
-            OracleInstruction::Assert(condition) => {
-                if values.get(condition) != Some(&CanonicalValue::Bool(true)) {
-                    return Some(Signal::Panic(
+            CoreOperationKind::Assert => {
+                if required_operand(operation, 0, values)? != CanonicalValue::Bool(true) {
+                    return Ok(Signal::Panic(
                         EvaluationPanicKind::AssertionFailed,
                         operation.provenance.clone(),
                     ));
                 }
             }
-            OracleInstruction::Branch(condition) => {
-                let CanonicalValue::Bool(condition) = values.get(condition)? else {
-                    return None;
+            CoreOperationKind::Expect => {}
+            CoreOperationKind::Branch => {
+                let CanonicalValue::Bool(condition) = required_operand(operation, 0, values)?
+                else {
+                    return defect("Core branch operand is not bool");
                 };
-                let successor = operation.successors[usize::from(!*condition)];
-                match oracle_region(executable, successor, values, locals)? {
+                let successor = operation.successors[usize::from(!condition)];
+                match oracle_region(candidate, executable, successor, values, locals, budget)? {
                     Signal::Continue => {}
-                    signal => return Some(signal),
+                    signal => return Ok(signal),
                 }
             }
-            OracleInstruction::Pass => {}
+            CoreOperationKind::Loop => {
+                let max = u64::try_from(operation.details[0]).unwrap_or(u64::MAX);
+                let [condition_region, body_region, _exit_region] = operation.successors.as_ref()
+                else {
+                    return defect("Core while law has malformed regions");
+                };
+                let condition_value = *operation.operands.first().ok_or_else(|| {
+                    CoreFailure::Defect(Arc::from("Core while has no condition value"))
+                })?;
+                for iteration in 0..=max {
+                    budget.step()?;
+                    match oracle_region(
+                        candidate,
+                        executable,
+                        *condition_region,
+                        values,
+                        locals,
+                        budget,
+                    )? {
+                        Signal::Continue => {}
+                        signal => return Ok(signal),
+                    }
+                    let CanonicalValue::Bool(condition) =
+                        values.get(&condition_value).cloned().ok_or_else(|| {
+                            CoreFailure::Defect(Arc::from("Core while condition is unavailable"))
+                        })?
+                    else {
+                        return defect("Core while condition is not bool");
+                    };
+                    if !condition {
+                        break;
+                    }
+                    if iteration == max {
+                        return defect("Core while exceeded its verified maximum iterations");
+                    }
+                    match oracle_region(
+                        candidate,
+                        executable,
+                        *body_region,
+                        values,
+                        locals,
+                        budget,
+                    )? {
+                        Signal::Continue | Signal::ContinueLoop | Signal::LoopBack => {}
+                        Signal::Break => {
+                            break;
+                        }
+                        signal => return Ok(signal),
+                    }
+                }
+            }
+            CoreOperationKind::LoopBack => return Ok(Signal::LoopBack),
+            CoreOperationKind::Break => return Ok(Signal::Break),
+            CoreOperationKind::Continue => return Ok(Signal::ContinueLoop),
+            CoreOperationKind::FunctionValue => {
+                let identity = *operation.details.get(1).ok_or_else(|| {
+                    CoreFailure::Defect(Arc::from("Core function value is malformed"))
+                })?;
+                values.insert(
+                    required_result(operation)?,
+                    CanonicalValue::Function { identity },
+                );
+            }
+            CoreOperationKind::Call => {
+                let target = direct_call_target(operation).ok_or_else(|| {
+                    CoreFailure::Defect(Arc::from("unsupported call entered Core oracle"))
+                })?;
+                let target = candidate
+                    .executables
+                    .iter()
+                    .find(|candidate| {
+                        candidate.reference.kind == CoreExecutableKind::SourceSpecialization
+                            && candidate.reference.identity == target
+                    })
+                    .ok_or_else(|| CoreFailure::Defect(Arc::from("Core call target is missing")))?;
+                let arguments = operation
+                    .operands
+                    .iter()
+                    .map(|value| {
+                        values.get(value).cloned().ok_or_else(|| {
+                            CoreFailure::Defect(Arc::from("Core call argument is unavailable"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                match oracle_execute(candidate, target, &arguments, budget)? {
+                    CompactOutcome::Completed(value) => {
+                        values.insert(required_result(operation)?, value);
+                    }
+                    CompactOutcome::Panicked(kind, site) => return Ok(Signal::Panic(kind, site)),
+                }
+            }
+            _ => return defect("unsupported operation entered Core semantic oracle"),
         }
     }
-    Some(Signal::Continue)
+    Ok(Signal::Continue)
+}
+
+fn required_result(operation: &Operation) -> Result<ValueId, CoreFailure> {
+    operation
+        .result
+        .ok_or_else(|| CoreFailure::Defect(Arc::from("Core value operation has no result")))
+}
+
+fn required_operand(
+    operation: &Operation,
+    index: usize,
+    values: &BTreeMap<ValueId, CanonicalValue>,
+) -> Result<CanonicalValue, CoreFailure> {
+    operation
+        .operands
+        .get(index)
+        .and_then(|value| values.get(value))
+        .cloned()
+        .ok_or_else(|| CoreFailure::Defect(Arc::from("Core operand is unavailable")))
+}
+
+fn direct_call_target(operation: &Operation) -> Option<u128> {
+    matches!(operation.details.as_ref(), [3, ..])
+        .then(|| operation.details.get(2).copied())
+        .flatten()
+}
+
+fn canonical_literal_from_details(details: &[u128]) -> Option<CanonicalValue> {
+    match details {
+        [1] => Some(CanonicalValue::Unit),
+        [2, value] => Some(CanonicalValue::Bool(*value != 0)),
+        [3, kind, value] => Some(CanonicalValue::Integer {
+            type_name: Arc::from(integer_from_tag(u8::try_from(*kind).ok()?)?.name()),
+            value: *value as i128,
+        }),
+        [4, kind, bits] => Some(CanonicalValue::Float {
+            type_name: Arc::from(float_name(u8::try_from(*kind).ok()?)?),
+            bits: u64::try_from(*bits).ok()?,
+        }),
+        [5, length, chunks @ ..] => {
+            let bytes = unpack_exact_bytes(*length, chunks)?;
+            Some(CanonicalValue::Text(Arc::from(
+                String::from_utf8(bytes).ok()?,
+            )))
+        }
+        [6, value] => Some(CanonicalValue::Scalar(char::from_u32(
+            u32::try_from(*value).ok()?,
+        )?)),
+        [7, length, chunks @ ..] => Some(CanonicalValue::Bytes(
+            unpack_exact_bytes(*length, chunks)?.into(),
+        )),
+        _ => None,
+    }
+}
+
+fn unpack_exact_bytes(length: u128, chunks: &[u128]) -> Option<Vec<u8>> {
+    let length = usize::try_from(length).ok()?;
+    if chunks.len() != length.div_ceil(16) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(chunks.len() * 16);
+    for chunk in chunks {
+        bytes.extend_from_slice(&chunk.to_be_bytes());
+    }
+    bytes.truncate(length);
+    Some(bytes)
+}
+
+fn oracle_unary(
+    tag: u128,
+    value: CanonicalValue,
+    site: &SourceRange,
+) -> Result<CanonicalValue, CoreFailure> {
+    match (tag, value) {
+        (1, value) => Ok(value),
+        (2, CanonicalValue::Integer { type_name, value }) => {
+            let value = value
+                .checked_neg()
+                .filter(|value| integer_kind(&type_name).is_ok_and(|kind| kind.fits(*value)));
+            value
+                .map(|value| CanonicalValue::Integer { type_name, value })
+                .ok_or_else(|| {
+                    CoreFailure::Defect(Arc::from(format!(
+                        "oracle panic:{}:{}",
+                        panic_tag(EvaluationPanicKind::IntegerOverflow),
+                        site.start()
+                    )))
+                })
+        }
+        (3, CanonicalValue::Integer { type_name, value }) => Ok(CanonicalValue::Integer {
+            type_name,
+            value: !value,
+        }),
+        (4, CanonicalValue::Bool(value)) => Ok(CanonicalValue::Bool(!value)),
+        _ => defect("Core unary law and operand disagree"),
+    }
 }
 
 fn oracle_binary(
@@ -2558,6 +4046,30 @@ fn oracle_binary(
                     ));
                 }
                 BinaryOperator::Remainder => left.checked_rem(*right),
+                BinaryOperator::BitAnd => {
+                    return Ok(CanonicalValue::Integer {
+                        type_name: type_name.clone(),
+                        value: *left & *right,
+                    });
+                }
+                BinaryOperator::BitOr => {
+                    return Ok(CanonicalValue::Integer {
+                        type_name: type_name.clone(),
+                        value: *left | *right,
+                    });
+                }
+                BinaryOperator::BitXor => {
+                    return Ok(CanonicalValue::Integer {
+                        type_name: type_name.clone(),
+                        value: *left ^ *right,
+                    });
+                }
+                BinaryOperator::ShiftLeft => u32::try_from(*right)
+                    .ok()
+                    .and_then(|shift| left.checked_shl(shift)),
+                BinaryOperator::ShiftRight => u32::try_from(*right)
+                    .ok()
+                    .and_then(|shift| left.checked_shr(shift)),
                 BinaryOperator::Equal => return Ok(CanonicalValue::Bool(left == right)),
                 BinaryOperator::NotEqual => return Ok(CanonicalValue::Bool(left != right)),
                 BinaryOperator::Less => return Ok(CanonicalValue::Bool(left < right)),
@@ -2586,7 +4098,104 @@ fn oracle_binary(
             BinaryOperator::NotEqual => Ok(CanonicalValue::Bool(left != right)),
             _ => Err(Signal::Continue),
         },
+        (
+            CanonicalValue::Float {
+                type_name,
+                bits: left,
+            },
+            CanonicalValue::Float { bits: right, .. },
+        ) => {
+            let (left, right, encode): (f64, f64, fn(f64) -> u64) = match type_name.as_ref() {
+                "f16" => (
+                    half::f16::from_bits(*left as u16).to_f64(),
+                    half::f16::from_bits(*right as u16).to_f64(),
+                    |value| u64::from(half::f16::from_f64(value).to_bits()),
+                ),
+                "f32" => (
+                    f64::from(f32::from_bits(*left as u32)),
+                    f64::from(f32::from_bits(*right as u32)),
+                    |value| u64::from((value as f32).to_bits()),
+                ),
+                "f64" => (f64::from_bits(*left), f64::from_bits(*right), f64::to_bits),
+                _ => return Err(Signal::Continue),
+            };
+            let value = match operator {
+                BinaryOperator::Add => left + right,
+                BinaryOperator::Subtract => left - right,
+                BinaryOperator::Multiply => left * right,
+                BinaryOperator::Divide => left / right,
+                BinaryOperator::Remainder => left % right,
+                BinaryOperator::Equal => return Ok(CanonicalValue::Bool(left == right)),
+                BinaryOperator::NotEqual => return Ok(CanonicalValue::Bool(left != right)),
+                BinaryOperator::Less => return Ok(CanonicalValue::Bool(left < right)),
+                BinaryOperator::LessEqual => return Ok(CanonicalValue::Bool(left <= right)),
+                BinaryOperator::Greater => return Ok(CanonicalValue::Bool(left > right)),
+                BinaryOperator::GreaterEqual => return Ok(CanonicalValue::Bool(left >= right)),
+                _ => return Err(Signal::Continue),
+            };
+            Ok(CanonicalValue::Float {
+                type_name: type_name.clone(),
+                bits: if value.is_nan() {
+                    match type_name.as_ref() {
+                        "f16" => 0x7e00,
+                        "f32" => 0x7fc0_0000,
+                        _ => 0x7ff8_0000_0000_0000,
+                    }
+                } else {
+                    encode(value)
+                },
+            })
+        }
         _ => Err(Signal::Continue),
+    }
+}
+
+const fn integer_from_tag(tag: u8) -> Option<IntegerType> {
+    match tag {
+        0x01 => Some(IntegerType::U8),
+        0x02 => Some(IntegerType::U16),
+        0x03 => Some(IntegerType::U32),
+        0x04 => Some(IntegerType::U64),
+        0x11 => Some(IntegerType::I8),
+        0x12 => Some(IntegerType::I16),
+        0x13 => Some(IntegerType::I32),
+        0x14 => Some(IntegerType::I64),
+        _ => None,
+    }
+}
+
+const fn float_name(tag: u8) -> Option<&'static str> {
+    match tag {
+        0x21 => Some("f16"),
+        0x22 => Some("f32"),
+        0x23 => Some("f64"),
+        _ => None,
+    }
+}
+
+const fn operator_from_tag(tag: u128) -> Option<BinaryOperator> {
+    match tag {
+        1 => Some(BinaryOperator::Range),
+        2 => Some(BinaryOperator::RangeInclusive),
+        3 => Some(BinaryOperator::Add),
+        4 => Some(BinaryOperator::Subtract),
+        5 => Some(BinaryOperator::Multiply),
+        6 => Some(BinaryOperator::Divide),
+        7 => Some(BinaryOperator::Remainder),
+        8 => Some(BinaryOperator::BitAnd),
+        9 => Some(BinaryOperator::BitOr),
+        10 => Some(BinaryOperator::BitXor),
+        11 => Some(BinaryOperator::ShiftLeft),
+        12 => Some(BinaryOperator::ShiftRight),
+        13 => Some(BinaryOperator::And),
+        14 => Some(BinaryOperator::Or),
+        15 => Some(BinaryOperator::Equal),
+        16 => Some(BinaryOperator::NotEqual),
+        17 => Some(BinaryOperator::Less),
+        18 => Some(BinaryOperator::LessEqual),
+        19 => Some(BinaryOperator::Greater),
+        20 => Some(BinaryOperator::GreaterEqual),
+        _ => None,
     }
 }
 
@@ -2628,7 +4237,6 @@ fn encode_oracle_outcome(hash: &mut Xxh3, outcome: &CompactOutcome) {
             hash.update(&[2, panic_tag(*kind)]);
             encode_source(hash, site);
         }
-        CompactOutcome::Unsupported => hash.update(&[3]),
     }
 }
 
@@ -2808,6 +4416,77 @@ fn build() -> Image:
         )
     }
 
+    fn resign(
+        candidate: &mut VerifiedCoreProgram,
+        planning: &crate::image_planning::VerifiedPlanningFoundation,
+    ) {
+        let cancellation = Cancellation::new();
+        let mut executables = candidate.executables.to_vec();
+        for executable in &mut executables {
+            executable.fingerprint =
+                verifier_executable_fingerprint(executable, &cancellation).expect("fingerprint");
+        }
+        candidate.executables = executables.into();
+        candidate.oracle = run_oracle(candidate, planning.for_core(), &cancellation)
+            .expect("corruption remains oracle-executable");
+        candidate.fingerprint =
+            verifier_fingerprint(candidate, &cancellation).expect("program fingerprint");
+    }
+
+    fn resign_fingerprints_only(candidate: &mut VerifiedCoreProgram) {
+        let cancellation = Cancellation::new();
+        let mut executables = candidate.executables.to_vec();
+        for executable in &mut executables {
+            executable.fingerprint =
+                verifier_executable_fingerprint(executable, &cancellation).expect("fingerprint");
+        }
+        candidate.executables = executables.into();
+        candidate.fingerprint =
+            verifier_fingerprint(candidate, &cancellation).expect("program fingerprint");
+    }
+
+    fn corrupt_source_operation(
+        core: &VerifiedCoreProgram,
+        kind: CoreOperationKind,
+        mutator: impl FnOnce(&mut Operation),
+    ) -> VerifiedCoreProgram {
+        let mut candidate = core.clone();
+        let mut executables = candidate.executables.to_vec();
+        let source = executables
+            .iter_mut()
+            .find(|executable| {
+                executable.reference.kind == CoreExecutableKind::SourceSpecialization
+                    && executable.regions.iter().any(|region| {
+                        region
+                            .operations
+                            .iter()
+                            .any(|operation| operation.kind == kind)
+                    })
+            })
+            .expect("source operation executable");
+        let mut regions = source.regions.to_vec();
+        let region = regions
+            .iter_mut()
+            .find(|region| {
+                region
+                    .operations
+                    .iter()
+                    .any(|operation| operation.kind == kind)
+            })
+            .expect("source operation region");
+        let mut operations = region.operations.to_vec();
+        let operation = operations
+            .iter_mut()
+            .find(|operation| operation.kind == kind)
+            .expect("source operation");
+        mutator(operation);
+        region.operations = operations.into();
+        source.regions = regions.into();
+        candidate.executables = executables.into();
+        resign_fingerprints_only(&mut candidate);
+        candidate
+    }
+
     #[test]
     fn verifier_rejects_missing_extra_duplicate_and_mixed_context_realization() {
         let (core, planning) = fixture();
@@ -2917,5 +4596,155 @@ fn build() -> Image:
         let mut false_fingerprint = core.clone();
         false_fingerprint.fingerprint ^= 1;
         assert!(rejected(&false_fingerprint, &planning));
+    }
+
+    #[test]
+    fn verifier_independently_rejects_resigned_access_type_and_rewrite_corruptions() {
+        let (core, planning) = fixture();
+
+        let mut false_access = core.clone();
+        let mut executables = false_access.executables.to_vec();
+        let source = executables
+            .iter_mut()
+            .find(|executable| {
+                executable.reference.kind == CoreExecutableKind::SourceSpecialization
+            })
+            .expect("source executable");
+        let mut regions = source.regions.to_vec();
+        let region = regions
+            .iter_mut()
+            .find(|region| !region.operations.is_empty())
+            .expect("operation region");
+        let mut operations = region.operations.to_vec();
+        operations[0].access = CoreAccessLaw::Move;
+        region.operations = operations.into();
+        source.regions = regions.into();
+        false_access.executables = executables.into();
+        resign(&mut false_access, &planning);
+        assert!(rejected(&false_access, &planning));
+
+        let mut false_type = core.clone();
+        let mut executables = false_type.executables.to_vec();
+        let source = executables
+            .iter_mut()
+            .find(|executable| {
+                executable.reference.kind == CoreExecutableKind::SourceSpecialization
+            })
+            .expect("source executable");
+        source.signature.return_type.identity ^= 1;
+        false_type.executables = executables.into();
+        resign(&mut false_type, &planning);
+        assert!(rejected(&false_type, &planning));
+
+        let mut false_rewrite = core.clone();
+        let mut executables = false_rewrite.executables.to_vec();
+        let source = executables
+            .iter_mut()
+            .find(|executable| {
+                executable.reference.kind == CoreExecutableKind::SourceSpecialization
+            })
+            .expect("source executable");
+        source.rewrites = Arc::from([RewriteWitness {
+            kind: CoreRewriteKind::EliminatedPass,
+            provenance: source.provenance.clone(),
+            source_order: 0,
+        }]);
+        false_rewrite.executables = executables.into();
+        resign(&mut false_rewrite, &planning);
+        assert!(rejected(&false_rewrite, &planning));
+    }
+
+    #[test]
+    fn verifier_independently_rejects_every_resigned_source_operation_field() {
+        let (core, planning) = fixture();
+        let mut corruptions = Vec::new();
+
+        let candidate =
+            corrupt_source_operation(&core, CoreOperationKind::CheckedArithmetic, |operation| {
+                let mut operands = operation.operands.to_vec();
+                operands.swap(0, 1);
+                operation.operands = operands.into();
+            });
+        corruptions.push(("operand identity/order", rejected(&candidate, &planning)));
+
+        let candidate = corrupt_source_operation(&core, CoreOperationKind::Branch, |operation| {
+            let mut successors = operation.successors.to_vec();
+            successors.swap(0, 1);
+            operation.successors = successors.into();
+        });
+        corruptions.push(("successor identity/order", rejected(&candidate, &planning)));
+
+        let candidate = corrupt_source_operation(&core, CoreOperationKind::Branch, |operation| {
+            operation.details = Arc::from([99]);
+        });
+        corruptions.push(("details", rejected(&candidate, &planning)));
+
+        let candidate = corrupt_source_operation(&core, CoreOperationKind::Branch, |operation| {
+            operation.effect = EffectBoundary::Call;
+        });
+        corruptions.push(("effect", rejected(&candidate, &planning)));
+
+        let candidate = corrupt_source_operation(&core, CoreOperationKind::Branch, |operation| {
+            operation.failure = FailureLaw::RecordTestFailure;
+        });
+        corruptions.push(("failure", rejected(&candidate, &planning)));
+
+        let candidate = corrupt_source_operation(&core, CoreOperationKind::Branch, |operation| {
+            operation.result = Some(ValueId(u32::MAX - 1));
+        });
+        corruptions.push(("result identity", rejected(&candidate, &planning)));
+
+        let candidate = corrupt_source_operation(&core, CoreOperationKind::Literal, |operation| {
+            operation.type_identity = operation.type_identity.map(|identity| identity ^ 1);
+        });
+        corruptions.push(("value type identity", rejected(&candidate, &planning)));
+
+        let candidate = corrupt_source_operation(&core, CoreOperationKind::Branch, |operation| {
+            operation.identity = operation.identity.saturating_add(100);
+        });
+        corruptions.push(("operation identity", rejected(&candidate, &planning)));
+
+        let candidate = corrupt_source_operation(&core, CoreOperationKind::Branch, |operation| {
+            operation.provenance = SourceRange::new("src/false.wr", 0, 1);
+        });
+        corruptions.push(("provenance", rejected(&candidate, &planning)));
+
+        assert!(
+            corruptions.iter().all(|(_, rejected)| *rejected),
+            "unrejected corruptions: {corruptions:?}"
+        );
+    }
+
+    #[test]
+    fn verification_cancels_mid_artifact_and_purpose_views_index_one_authoritative_graph() {
+        let (core, planning) = fixture();
+        let cancellation = Cancellation::new();
+        cancellation.cancel_after_private_polls(7);
+        assert_eq!(
+            verify(&core, planning.for_core(), &cancellation),
+            Err(CoreFailure::Cancelled)
+        );
+
+        assert_eq!(
+            core.for_custody().executables().len(),
+            core.executables.len()
+        );
+        assert_eq!(core.for_flow().executables().len(), core.executables.len());
+        let backend = core.for_backend();
+        let indexed = backend.executables().collect::<Vec<_>>();
+        assert_eq!(indexed.len(), core.executables.len());
+        assert!(
+            indexed
+                .iter()
+                .all(|executable| executable.context() == core.context)
+        );
+        assert!(indexed.iter().any(|executable| {
+            executable.regions().any(|region| {
+                region.operations().any(|operation| {
+                    operation.identity() < u32::MAX
+                        && operation.provenance().path() == "src/image.wr"
+                })
+            })
+        }));
     }
 }

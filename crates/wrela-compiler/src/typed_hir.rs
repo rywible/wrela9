@@ -790,7 +790,7 @@ pub(crate) struct HirFunction {
     pub(crate) module_display: String,
     pub(crate) modifier: crate::syntax::FunctionModifier,
     pub(crate) parameters: Vec<(LocalId, Type, AccessMode)>,
-    parameter_type_ids: Arc<[TypeId]>,
+    pub(crate) parameter_type_ids: Arc<[TypeId]>,
     pub(crate) parameter_definitions: Arc<[DefinitionId]>,
     pub(crate) return_type: Type,
     pub(crate) body: Arc<[Statement]>,
@@ -808,11 +808,11 @@ pub(crate) struct HirConstant {
 }
 
 #[derive(Clone, Debug)]
-struct HirTest {
-    parameters: Vec<(LocalId, Type, AccessMode)>,
-    parameter_type_ids: Arc<[TypeId]>,
-    body: Arc<[Statement]>,
-    source: SourceRange,
+pub(crate) struct HirTest {
+    pub(crate) parameters: Vec<(LocalId, Type, AccessMode)>,
+    pub(crate) parameter_type_ids: Arc<[TypeId]>,
+    pub(crate) body: Arc<[Statement]>,
+    pub(crate) source: SourceRange,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -822,7 +822,7 @@ pub(crate) struct ClosureId(pub(crate) u128);
 pub(crate) struct HirClosure {
     pub(crate) id: ClosureId,
     pub(crate) parameters: Arc<[(LocalId, Type)]>,
-    parameter_type_ids: Arc<[TypeId]>,
+    pub(crate) parameter_type_ids: Arc<[TypeId]>,
     pub(crate) captures: Arc<[(LocalId, Type)]>,
     capture_type_ids: Arc<[TypeId]>,
     pub(crate) return_type: Type,
@@ -1511,6 +1511,10 @@ impl VerifiedProgram {
 
     pub(crate) fn test_body(&self, id: TestId) -> Option<&[Statement]> {
         self._test_bodies.get(&id).map(|test| test.body.as_ref())
+    }
+
+    pub(crate) fn test_body_with_signature(&self, id: TestId) -> Option<&HirTest> {
+        self._test_bodies.get(&id)
     }
 
     pub(crate) fn expected_evaluation_roots(

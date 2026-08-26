@@ -60,12 +60,16 @@ pub use image_planning::{
     FacilityBindingAvailability, FacilityContractObservation, FacilityDomainPlanObservation,
     FacilityEndpointOwnership, FacilityFlagshipRule, FacilityKind, FacilityLossPolicy,
     FacilityReplayAuthority, FacilityReplayRule, FacilitySemanticCapacity, FacilitySharedRole,
-    FacilitySharing, FacilityShutdown, GeneratedRoleKind, GeneratedRoleObservation, PlannerKind,
+    FacilitySharing, FacilityShutdown, GeneratedRoleKind, GeneratedRoleObservation, LayoutCostKind,
+    LayoutCostObservation, LayoutLocalKey, LogicalAllocationObservation,
+    LogicalImageLayoutObservation, LogicalLifetime, LogicalProtection, LogicalRegionKind,
+    LogicalRegionObservation, LogicalReservationKind, LogicalReservationObservation, PlannerKind,
     PlannerObservation, PlanningBinding, PlanningCapability, PlanningFoundationObservation,
     PlanningMultiplicity, PlanningReservation, PoolAdmissionEvidenceObservation,
     PoolModelObservation, PoolObservation, RequirementBounds, RequirementCategory,
     RequirementDischargeObservation, RequirementObservation, RequirementProvenance,
     RequirementSource, RequirementSubject, ServiceClassKind, ServiceClassObservation,
-    ServiceCoreObservation, ServicePlanObservation, WholeImageAssignmentObservation,
+    ServiceCoreObservation, ServicePlanObservation, StorageEnvelopeKind,
+    WholeImageAssignmentObservation,
 };
 pub use typed_hir::PoolOperation;

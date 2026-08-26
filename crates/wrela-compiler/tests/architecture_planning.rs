@@ -76,7 +76,7 @@ fn current_aarch64_selection_authenticates_the_planning_contract() {
     );
     assert_eq!(
         contract.fingerprint(),
-        175_701_671_043_734_796_576_676_741_447_065_263_159
+        25_050_859_001_709_894_488_791_727_024_515_932_124
     );
     assert_eq!(contract.symbolic_core_count(), 4);
     assert_eq!(contract.page_quantum_bytes(), 4096);

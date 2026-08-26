@@ -5,9 +5,9 @@ use wrela_compiler::{
     CompilerInstallation, DiagnosticValue, FacilityBindingAvailability, FacilityEndpointOwnership,
     FacilityFlagshipRule, FacilityKind, FacilityLossPolicy, FacilityReplayAuthority,
     FacilityReplayRule, FacilitySemanticCapacity, FacilitySharedRole, FacilitySharing,
-    FacilityShutdown, GeneratedRoleKind, IdentityDomain, InspectSelection, PlannerKind,
-    PlanningBinding, PlanningCapability, ProjectFile, ProjectSnapshot, RequirementBounds,
-    RequirementCategory, Root,
+    FacilityShutdown, GeneratedRoleKind, IdentityDomain, InspectSelection, LayoutCostKind,
+    LogicalProtection, LogicalRegionKind, PlannerKind, PlanningBinding, PlanningCapability,
+    ProjectFile, ProjectSnapshot, RequirementBounds, RequirementCategory, Root,
 };
 
 fn deployment_request(inspection: InspectSelection) -> CompilationRequest {
@@ -1086,6 +1086,14 @@ fn planning_inspection_is_output_only_and_compiler_use_is_deterministic() {
         first.service_plan_fingerprint(),
         repeated.service_plan_fingerprint()
     );
+    assert_eq!(
+        without.logical_image_layout_fingerprint(),
+        first.logical_image_layout_fingerprint()
+    );
+    assert_eq!(
+        first.logical_image_layout_fingerprint(),
+        repeated.logical_image_layout_fingerprint()
+    );
     assert!(without.inspection().planning_foundation().is_none());
     assert_eq!(
         first
@@ -1120,6 +1128,7 @@ fn planning_inspection_is_output_only_and_compiler_use_is_deterministic() {
             accepted.planning_foundation_fingerprint(),
             accepted.whole_image_assignment_fingerprint(),
             accepted.service_plan_fingerprint(),
+            accepted.logical_image_layout_fingerprint(),
             accepted
                 .inspection()
                 .planning_foundation()
@@ -1134,6 +1143,11 @@ fn planning_inspection_is_output_only_and_compiler_use_is_deterministic() {
                 .inspection()
                 .service_plan()
                 .expect("planning Service Plan selected")
+                .clone(),
+            accepted
+                .inspection()
+                .logical_image_layout()
+                .expect("planning Logical Image Layout selected")
                 .clone(),
         )
     };
@@ -1253,6 +1267,7 @@ fn rejected_and_cancelled_compiles_publish_no_planning_foundation() {
     };
     assert!(rejected.inspection().planning_foundation().is_none());
     assert!(rejected.inspection().whole_image_assignment().is_none());
+    assert!(rejected.inspection().logical_image_layout().is_none());
 
     let cancellation = Cancellation::new();
     cancellation.cancel();
@@ -1498,6 +1513,144 @@ fn compiler_planning_inspection_reports_the_verified_deterministic_service_plan(
             && class.maximum_cancellation_response_units()
                 <= class.maximum_cancellation_delay_units()
     }));
+}
+
+#[test]
+fn compiler_constructs_the_complete_canonical_logical_image_layout() {
+    let accepted = accepted(deployment_request(InspectSelection::planning()));
+    let inspection = accepted.inspection();
+    let assignment = inspection.whole_image_assignment().unwrap();
+    let service = inspection.service_plan().unwrap();
+    let layout = inspection
+        .logical_image_layout()
+        .expect("planning inspection includes the verified Logical Image Layout");
+
+    assert_eq!(layout.phase_schema(), "wrela.logical-image-layout.v1");
+    assert_eq!(
+        layout.whole_image_assignment_fingerprint(),
+        assignment.fingerprint()
+    );
+    assert_eq!(layout.service_plan_fingerprint(), service.fingerprint());
+    assert_eq!(
+        layout
+            .regions()
+            .iter()
+            .map(|region| (region.kind(), region.protection()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                LogicalRegionKind::BootReservation,
+                LogicalProtection::Sealed
+            ),
+            (
+                LogicalRegionKind::Executable,
+                LogicalProtection::ReadExecute
+            ),
+            (
+                LogicalRegionKind::ImmutableData,
+                LogicalProtection::ReadOnlyNoExecute,
+            ),
+            (
+                LogicalRegionKind::PerCoreMutable,
+                LogicalProtection::ReadWriteNoExecute,
+            ),
+            (
+                LogicalRegionKind::SharedMutable,
+                LogicalProtection::ReadWriteNoExecute,
+            ),
+            (
+                LogicalRegionKind::DmaOwned,
+                LogicalProtection::DmaVisibleReadWriteNoExecute,
+            ),
+        ]
+    );
+    assert!(
+        layout
+            .regions()
+            .windows(2)
+            .all(|pair| pair[0].end() <= pair[1].start())
+    );
+    assert!(layout.allocations().windows(2).all(|pair| {
+        (pair[0].region(), pair[0].requirement(), pair[0].local_key())
+            < (pair[1].region(), pair[1].requirement(), pair[1].local_key())
+    }));
+    assert!(layout.allocations().iter().all(|allocation| {
+        allocation.start() % allocation.alignment() == 0
+            && allocation.end() - allocation.start() == allocation.envelope_bytes()
+    }));
+    let requirements = inspection.planning_foundation().unwrap().requirements();
+    assert!(
+        layout
+            .allocations()
+            .iter()
+            .filter(|allocation| allocation.dma_owned())
+            .all(|allocation| requirements.iter().any(|requirement| {
+                requirement.reference() == allocation.requirement()
+                    && matches!(
+                        requirement.bounds(),
+                        RequirementBounds::Binding {
+                            kind: PlanningBinding::Display
+                                | PlanningBinding::Input
+                                | PlanningBinding::EventStore
+                                | PlanningBinding::Entropy
+                                | PlanningBinding::Telemetry
+                                | PlanningBinding::Terminal,
+                            minimum: 1..,
+                            ..
+                        }
+                    )
+            }))
+    );
+    assert_eq!(
+        layout
+            .reservations()
+            .iter()
+            .filter(|reservation| reservation.is_guard())
+            .count(),
+        17,
+        "one null guard and four stack guards for each of four symbolic cores"
+    );
+    assert_eq!(
+        layout
+            .reservations()
+            .iter()
+            .filter(|reservation| reservation.requirement().is_some())
+            .count(),
+        6,
+        "Boot, terminal, and per-core Panic reservations retain their exact RequirementRefs"
+    );
+    assert!(
+        layout
+            .ledger()
+            .iter()
+            .any(|entry| entry.kind() == LayoutCostKind::EnvelopePayload)
+    );
+    assert!(layout.ledger().iter().any(|entry| {
+        entry.kind() == LayoutCostKind::EnvelopePayload
+            && entry.requirement().is_some()
+            && entry.envelope().is_some()
+            && entry.multiplicity() > 1
+    }));
+    assert!(
+        layout
+            .ledger()
+            .iter()
+            .any(|entry| entry.kind() == LayoutCostKind::Guard)
+    );
+    assert_eq!(
+        layout
+            .ledger()
+            .iter()
+            .map(|entry| entry.bytes())
+            .sum::<u64>(),
+        layout.reserved_bytes()
+    );
+    assert!(layout.reserved_bytes() <= layout.total_ram_bytes());
+    assert_eq!(layout.total_ram_bytes(), 128 * 1024 * 1024);
+    assert_eq!(
+        accepted.logical_image_layout_fingerprint(),
+        Some(layout.fingerprint())
+    );
 }
 
 #[test]

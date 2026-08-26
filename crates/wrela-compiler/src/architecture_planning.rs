@@ -174,6 +174,64 @@ impl ArchitecturePlanningModule {
     }
 
     #[cfg(test)]
+    pub(crate) fn authenticate_private_synthetic_with_ram_bounds(
+        &self,
+        core_capacities: &[u32],
+        minimum_ram_bytes: u64,
+        maximum_ram_bytes: u64,
+        cancellation: &Cancellation,
+    ) -> Result<VerifiedArchitecturePlanningContract, ContractFailure> {
+        let mut facts = producer_current_aarch64_facts();
+        facts.capacity.minimum_ram_bytes = minimum_ram_bytes;
+        facts.capacity.maximum_ram_bytes = maximum_ram_bytes;
+        facts.cores = core_capacities
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(ordinal, maximum_service_units)| SymbolicCore {
+                ordinal: u16::try_from(ordinal).unwrap_or(u16::MAX),
+                role: if ordinal == 0 {
+                    CoreRole::Primary
+                } else {
+                    CoreRole::Secondary
+                },
+                maximum_service_units,
+            })
+            .collect::<Vec<_>>()
+            .into();
+        facts.service.maximum_cycle_units = core_capacities
+            .iter()
+            .copied()
+            .try_fold(0_u32, u32::checked_add)
+            .ok_or_else(|| ContractFailure::malformed("synthetic service capacity overflow"))?;
+        let facts = reconstruct_and_validate(&facts, cancellation)?;
+        let identity = canonical_identity(
+            ArchitectureProfile::CurrentAarch64,
+            CURRENT_AARCH64_CONTRACT_VERSION,
+        );
+        Ok(VerifiedArchitecturePlanningContract {
+            profile: ArchitectureProfile::CurrentAarch64,
+            identity,
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            version: CURRENT_AARCH64_CONTRACT_VERSION,
+            fingerprint: canonical_fingerprint(
+                ArchitectureProfile::CurrentAarch64,
+                CONTRACT_SCHEMA_VERSION,
+                CURRENT_AARCH64_CONTRACT_VERSION,
+                identity,
+                &facts,
+            ),
+            distribution_input_receipt: canonical_distribution_input_receipt(
+                self.context,
+                CONTRACT_SCHEMA_VERSION,
+            ),
+            distribution_digest: self.context.distribution_digest,
+            facts,
+            _verified: Verified,
+        })
+    }
+
+    #[cfg(test)]
     fn authenticate_private_synthetic_with_optional_cancellation_limit(
         &self,
         core_capacities: &[u32],
@@ -510,7 +568,7 @@ impl VerifiedArchitecturePlanningContract {
     }
 
     pub(crate) const fn for_logical_layout(&self) -> LogicalLayoutArchitecture<'_> {
-        LogicalLayoutArchitecture { facts: &self.facts }
+        LogicalLayoutArchitecture { contract: self }
     }
 
     pub(crate) const fn for_image_planning(&self) -> ImagePlanningArchitecture<'_> {
@@ -710,41 +768,53 @@ impl ServiceArchitecture<'_> {
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LogicalLayoutArchitecture<'a> {
-    facts: &'a ContractFacts,
+    contract: &'a VerifiedArchitecturePlanningContract,
 }
 
 #[allow(dead_code)]
 impl LogicalLayoutArchitecture<'_> {
+    pub(crate) const fn identity(&self) -> u128 {
+        self.contract.identity
+    }
+
+    pub(crate) const fn fingerprint(&self) -> u128 {
+        self.contract.fingerprint
+    }
+
+    pub(crate) fn core_count(&self) -> usize {
+        self.contract.facts.cores.len()
+    }
+
     pub(crate) const fn capacity(&self) -> CapacityRules {
-        self.facts.capacity
+        self.contract.facts.capacity
     }
 
     pub(crate) const fn alignment(&self) -> AlignmentRules {
-        self.facts.alignment
+        self.contract.facts.alignment
     }
 
     pub(crate) const fn page(&self) -> PageRules {
-        self.facts.page
+        self.contract.facts.page
     }
 
     pub(crate) const fn guards(&self) -> GuardRules {
-        self.facts.guards
+        self.contract.facts.guards
     }
 
     pub(crate) fn reservations(&self) -> &[ReservationRule] {
-        &self.facts.reservations
+        &self.contract.facts.reservations
     }
 
     pub(crate) fn envelopes(&self) -> &[EnvelopeRule] {
-        &self.facts.envelopes
+        &self.contract.facts.envelopes
     }
 
     pub(crate) fn regions(&self) -> &[RegionRule] {
-        &self.facts.regions
+        &self.contract.facts.regions
     }
 
     pub(crate) const fn dma(&self) -> DmaRules {
-        self.facts.dma
+        self.contract.facts.dma
     }
 }
 
@@ -900,6 +970,7 @@ pub(crate) enum ReservationMultiplicity {
 pub(crate) struct EnvelopeRule {
     pub(crate) kind: EnvelopeKind,
     pub(crate) region: RegionKind,
+    pub(crate) instance_bytes: u64,
     pub(crate) maximum_bytes: u64,
     pub(crate) alignment: u64,
     pub(crate) protection: ProtectionClass,
@@ -1183,6 +1254,7 @@ fn producer_current_aarch64_facts() -> ContractFacts {
             envelope(
                 EnvelopeKind::Executable,
                 RegionKind::Executable,
+                2304,
                 64 * 1024 * 1024,
                 4096,
                 ProtectionClass::ReadExecute,
@@ -1191,6 +1263,7 @@ fn producer_current_aarch64_facts() -> ContractFacts {
             envelope(
                 EnvelopeKind::ImmutableData,
                 RegionKind::ImmutableData,
+                3584,
                 64 * 1024 * 1024,
                 4096,
                 ProtectionClass::ReadOnly,
@@ -1199,6 +1272,7 @@ fn producer_current_aarch64_facts() -> ContractFacts {
             envelope(
                 EnvelopeKind::PerCoreState,
                 RegionKind::PerCoreMutable,
+                1536,
                 16 * 1024 * 1024,
                 64,
                 ProtectionClass::ReadWrite,
@@ -1207,6 +1281,7 @@ fn producer_current_aarch64_facts() -> ContractFacts {
             envelope(
                 EnvelopeKind::SharedState,
                 RegionKind::SharedMutable,
+                640,
                 256 * 1024 * 1024,
                 64,
                 ProtectionClass::ReadWrite,
@@ -1215,6 +1290,7 @@ fn producer_current_aarch64_facts() -> ContractFacts {
             envelope(
                 EnvelopeKind::DmaState,
                 RegionKind::DmaOwned,
+                4096,
                 256 * 1024 * 1024,
                 4096,
                 ProtectionClass::DeviceOwned,
@@ -1223,6 +1299,7 @@ fn producer_current_aarch64_facts() -> ContractFacts {
             envelope(
                 EnvelopeKind::NormalStack,
                 RegionKind::PerCoreMutable,
+                8192,
                 8 * 1024 * 1024,
                 4096,
                 ProtectionClass::ReadWrite,
@@ -1231,6 +1308,7 @@ fn producer_current_aarch64_facts() -> ContractFacts {
             envelope(
                 EnvelopeKind::InterruptStack,
                 RegionKind::PerCoreMutable,
+                4096,
                 2 * 1024 * 1024,
                 4096,
                 ProtectionClass::ReadWrite,
@@ -1239,6 +1317,7 @@ fn producer_current_aarch64_facts() -> ContractFacts {
             envelope(
                 EnvelopeKind::AsyncFrame,
                 RegionKind::SharedMutable,
+                1280,
                 1024 * 1024,
                 64,
                 ProtectionClass::ReadWrite,
@@ -1398,6 +1477,7 @@ fn verifier_current_aarch64_facts() -> ContractFacts {
             EnvelopeRule {
                 kind: EnvelopeKind::Executable,
                 region: RegionKind::Executable,
+                instance_bytes: 2304,
                 maximum_bytes: 67_108_864,
                 alignment: 4096,
                 protection: ProtectionClass::ReadExecute,
@@ -1406,6 +1486,7 @@ fn verifier_current_aarch64_facts() -> ContractFacts {
             EnvelopeRule {
                 kind: EnvelopeKind::ImmutableData,
                 region: RegionKind::ImmutableData,
+                instance_bytes: 3584,
                 maximum_bytes: 67_108_864,
                 alignment: 4096,
                 protection: ProtectionClass::ReadOnly,
@@ -1414,6 +1495,7 @@ fn verifier_current_aarch64_facts() -> ContractFacts {
             EnvelopeRule {
                 kind: EnvelopeKind::PerCoreState,
                 region: RegionKind::PerCoreMutable,
+                instance_bytes: 1536,
                 maximum_bytes: 16_777_216,
                 alignment: 64,
                 protection: ProtectionClass::ReadWrite,
@@ -1422,6 +1504,7 @@ fn verifier_current_aarch64_facts() -> ContractFacts {
             EnvelopeRule {
                 kind: EnvelopeKind::SharedState,
                 region: RegionKind::SharedMutable,
+                instance_bytes: 640,
                 maximum_bytes: 268_435_456,
                 alignment: 64,
                 protection: ProtectionClass::ReadWrite,
@@ -1430,6 +1513,7 @@ fn verifier_current_aarch64_facts() -> ContractFacts {
             EnvelopeRule {
                 kind: EnvelopeKind::DmaState,
                 region: RegionKind::DmaOwned,
+                instance_bytes: 4096,
                 maximum_bytes: 268_435_456,
                 alignment: 4096,
                 protection: ProtectionClass::DeviceOwned,
@@ -1438,6 +1522,7 @@ fn verifier_current_aarch64_facts() -> ContractFacts {
             EnvelopeRule {
                 kind: EnvelopeKind::NormalStack,
                 region: RegionKind::PerCoreMutable,
+                instance_bytes: 8192,
                 maximum_bytes: 8_388_608,
                 alignment: 4096,
                 protection: ProtectionClass::ReadWrite,
@@ -1446,6 +1531,7 @@ fn verifier_current_aarch64_facts() -> ContractFacts {
             EnvelopeRule {
                 kind: EnvelopeKind::InterruptStack,
                 region: RegionKind::PerCoreMutable,
+                instance_bytes: 4096,
                 maximum_bytes: 2_097_152,
                 alignment: 4096,
                 protection: ProtectionClass::ReadWrite,
@@ -1454,6 +1540,7 @@ fn verifier_current_aarch64_facts() -> ContractFacts {
             EnvelopeRule {
                 kind: EnvelopeKind::AsyncFrame,
                 region: RegionKind::SharedMutable,
+                instance_bytes: 1280,
                 maximum_bytes: 1_048_576,
                 alignment: 64,
                 protection: ProtectionClass::ReadWrite,
@@ -1582,6 +1669,7 @@ fn verifier_current_aarch64_facts() -> ContractFacts {
 const fn envelope(
     kind: EnvelopeKind,
     region: RegionKind,
+    instance_bytes: u64,
     maximum_bytes: u64,
     alignment: u64,
     protection: ProtectionClass,
@@ -1590,6 +1678,7 @@ const fn envelope(
     EnvelopeRule {
         kind,
         region,
+        instance_bytes,
         maximum_bytes,
         alignment,
         protection,
@@ -1883,7 +1972,9 @@ fn reconstruct_and_validate(
             .windows(2)
             .any(|pair| pair[0].kind >= pair[1].kind)
         || source.envelopes.iter().any(|rule| {
-            rule.maximum_bytes == 0
+            rule.instance_bytes == 0
+                || rule.maximum_bytes == 0
+                || rule.instance_bytes > rule.maximum_bytes
                 || !rule.alignment.is_power_of_two()
                 || rule.alignment > source.alignment.maximum_envelope_bytes
                 || rule.dma_owned != (rule.region == RegionKind::DmaOwned)
@@ -2085,6 +2176,7 @@ fn canonical_fingerprint(
     hash_len(&mut hasher, facts.envelopes.len());
     for rule in &*facts.envelopes {
         hasher.update(&[envelope_tag(rule.kind), region_tag(rule.region)]);
+        hasher.update(&rule.instance_bytes.to_be_bytes());
         hasher.update(&rule.maximum_bytes.to_be_bytes());
         hasher.update(&rule.alignment.to_be_bytes());
         hasher.update(&[protection_tag(rule.protection), u8::from(rule.dma_owned)]);

@@ -14,10 +14,11 @@ use crate::architecture_planning::{
 use crate::core::{CoreFailure, CoreProgramObservation, VerifiedCoreProgram};
 use crate::flow::{FlowFailure, FlowProgramObservation, VerifiedFlowProgram};
 use crate::image_planning::{
-    PlanningFailure, PlanningFoundationObservation, ServicePlanObservation, ServicePlanOutcome,
-    VerifiedPlanningFoundation, VerifiedPrivateConflict, VerifiedServiceConflict,
-    VerifiedServicePlan, VerifiedWholeImageAssignment, WholeImageAssignmentObservation,
-    WholeImageSolveOutcome,
+    LogicalImageLayoutObservation, LogicalLayoutOutcome, PlanningFailure,
+    PlanningFoundationObservation, ServicePlanObservation, ServicePlanOutcome,
+    VerifiedLayoutConflict, VerifiedLogicalImageLayout, VerifiedPlanningFoundation,
+    VerifiedPrivateConflict, VerifiedServiceConflict, VerifiedServicePlan,
+    VerifiedWholeImageAssignment, WholeImageAssignmentObservation, WholeImageSolveOutcome,
 };
 use crate::syntax;
 use crate::typed_hir::AuthorityContext;
@@ -1177,6 +1178,7 @@ pub struct Inspection {
     flow_program: Option<FlowProgramObservation>,
     whole_image_assignment: Option<WholeImageAssignmentObservation>,
     service_plan: Option<ServicePlanObservation>,
+    logical_image_layout: Option<LogicalImageLayoutObservation>,
 }
 
 impl Inspection {
@@ -1298,6 +1300,11 @@ impl Inspection {
     #[must_use]
     pub const fn service_plan(&self) -> Option<&ServicePlanObservation> {
         self.service_plan.as_ref()
+    }
+
+    #[must_use]
+    pub const fn logical_image_layout(&self) -> Option<&LogicalImageLayoutObservation> {
+        self.logical_image_layout.as_ref()
     }
 }
 
@@ -2329,6 +2336,7 @@ pub struct AcceptedCompilation {
     flow_program: Option<Arc<VerifiedFlowProgram>>,
     whole_image_assignment: Option<Arc<VerifiedWholeImageAssignment>>,
     service_plan: Option<Arc<VerifiedServicePlan>>,
+    logical_image_layout: Option<Arc<VerifiedLogicalImageLayout>>,
 }
 
 impl AcceptedCompilation {
@@ -2376,6 +2384,13 @@ impl AcceptedCompilation {
         self.service_plan.as_ref().map(|plan| plan.fingerprint())
     }
 
+    #[must_use]
+    pub fn logical_image_layout_fingerprint(&self) -> Option<u128> {
+        self.logical_image_layout
+            .as_ref()
+            .map(|layout| layout.fingerprint())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn completed_semantic_program(
         &self,
@@ -2405,6 +2420,7 @@ pub struct RejectedCompilation {
     inspection: Inspection,
     planning_conflict: Option<Arc<VerifiedPrivateConflict>>,
     service_conflict: Option<Arc<VerifiedServiceConflict>>,
+    layout_conflict: Option<Arc<VerifiedLayoutConflict>>,
 }
 
 impl RejectedCompilation {
@@ -2636,6 +2652,7 @@ impl Compiler {
                 },
                 planning_conflict: None,
                 service_conflict: None,
+                layout_conflict: None,
             });
         };
 
@@ -3139,6 +3156,54 @@ impl Compiler {
             None => None,
         };
 
+        let mut layout_conflict = None;
+        let logical_image_layout = match service_plan.as_ref() {
+            Some(service) => match self
+                .distribution
+                .image_planning()
+                .logical_layout(Arc::clone(service), cancellation)
+            {
+                Ok(LogicalLayoutOutcome::Layout(layout)) => Some(Arc::new(layout)),
+                Ok(LogicalLayoutOutcome::Conflict(conflict)) => {
+                    diagnostics.push(
+                        Diagnostic::new(
+                            "admission.logical_layout_fit",
+                            SourceRange::new("<planning>", 0, 0),
+                            RecoveryAction::None,
+                        )
+                        .with_unsigned_parameter(
+                            "requirement_count",
+                            u128::try_from(conflict.requirement_count()).unwrap_or(u128::MAX),
+                        )
+                        .with_unsigned_parameter(
+                            "required_bytes",
+                            u128::from(conflict.required_bytes()),
+                        )
+                        .with_unsigned_parameter(
+                            "available_bytes",
+                            u128::from(conflict.available_bytes()),
+                        ),
+                    );
+                    layout_conflict = Some(Arc::new(conflict));
+                    None
+                }
+                Err(PlanningFailure::Cancelled) => return CompilationOutcome::Cancelled,
+                Err(PlanningFailure::Defect(evidence)) => {
+                    return CompilationOutcome::Defect(Defect::new(
+                        "Logical Image Layout",
+                        evidence,
+                    ));
+                }
+                Err(_) => {
+                    return CompilationOutcome::Defect(Defect::new(
+                        "Logical Image Layout",
+                        "logical layout returned a pre-Service planning failure",
+                    ));
+                }
+            },
+            None => None,
+        };
+
         let Some(unreachable_project_syntax) = parse_unreachable_project_syntax(
             &request.project,
             &parsed_sources,
@@ -3277,6 +3342,13 @@ impl Compiler {
             } else {
                 None
             },
+            logical_image_layout: if request.inspection.planning {
+                logical_image_layout
+                    .as_ref()
+                    .map(|layout| layout.observation())
+            } else {
+                None
+            },
         };
 
         if diagnostics.is_empty() {
@@ -3295,6 +3367,7 @@ impl Compiler {
                 flow_program,
                 whole_image_assignment,
                 service_plan,
+                logical_image_layout,
             })
         } else {
             CompilationOutcome::Rejected(RejectedCompilation {
@@ -3302,6 +3375,7 @@ impl Compiler {
                 inspection,
                 planning_conflict: whole_image_conflict,
                 service_conflict,
+                layout_conflict,
             })
         }
     }

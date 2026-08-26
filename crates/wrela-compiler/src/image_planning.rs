@@ -8,8 +8,9 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::architecture_planning::{
-    BindingKind, FacilitySharedRoleKind, ReservationKind, ReservationMultiplicity,
-    VerifiedArchitecturePlanningContract, VmAbiCapability,
+    BindingKind, EnvelopeKind, FacilitySharedRoleKind, ProtectionClass, RegionKind,
+    ReservationKind, ReservationMultiplicity, VerifiedArchitecturePlanningContract,
+    VmAbiCapability,
 };
 use crate::completed_semantic::{
     CompletedSemanticProgram, CorePlanningSemanticProgram, CoreSourceExecutableBody,
@@ -10879,6 +10880,464 @@ pub(crate) enum ServicePlanOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogicalRegionKind {
+    BootReservation,
+    Executable,
+    ImmutableData,
+    PerCoreMutable,
+    SharedMutable,
+    DmaOwned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicalProtection {
+    Sealed,
+    ReadExecute,
+    ReadOnlyNoExecute,
+    ReadWriteNoExecute,
+    DmaVisibleReadWriteNoExecute,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StorageEnvelopeKind {
+    Executable,
+    ImmutableData,
+    PerCoreState,
+    SharedState,
+    DmaState,
+    NormalStack,
+    InterruptStack,
+    AsyncFrame,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogicalLifetime {
+    Image,
+    Activation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LayoutLocalKey {
+    envelope: StorageEnvelopeKind,
+    ordinal: u32,
+}
+
+impl LayoutLocalKey {
+    #[must_use]
+    pub const fn envelope(self) -> StorageEnvelopeKind {
+        self.envelope
+    }
+
+    #[must_use]
+    pub const fn ordinal(self) -> u32 {
+        self.ordinal
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalRegionObservation {
+    kind: LogicalRegionKind,
+    protection: LogicalProtection,
+    start: u64,
+    end: u64,
+}
+
+impl LogicalRegionObservation {
+    #[must_use]
+    pub const fn kind(&self) -> LogicalRegionKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn protection(&self) -> LogicalProtection {
+        self.protection
+    }
+
+    #[must_use]
+    pub const fn start(&self) -> u64 {
+        self.start
+    }
+
+    #[must_use]
+    pub const fn end(&self) -> u64 {
+        self.end
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalAllocationObservation {
+    requirement_source: RequirementSource,
+    requirement: u128,
+    local_key: LayoutLocalKey,
+    envelope: StorageEnvelopeKind,
+    region: LogicalRegionKind,
+    lifetime: LogicalLifetime,
+    start: u64,
+    end: u64,
+    alignment: u64,
+    dma_owned: bool,
+}
+
+impl LogicalAllocationObservation {
+    #[must_use]
+    pub const fn requirement_source(&self) -> RequirementSource {
+        self.requirement_source
+    }
+
+    #[must_use]
+    pub const fn requirement(&self) -> u128 {
+        self.requirement
+    }
+
+    #[must_use]
+    pub const fn local_key(&self) -> LayoutLocalKey {
+        self.local_key
+    }
+
+    #[must_use]
+    pub const fn envelope(&self) -> StorageEnvelopeKind {
+        self.envelope
+    }
+
+    #[must_use]
+    pub const fn region(&self) -> LogicalRegionKind {
+        self.region
+    }
+
+    #[must_use]
+    pub const fn lifetime(&self) -> LogicalLifetime {
+        self.lifetime
+    }
+
+    #[must_use]
+    pub const fn start(&self) -> u64 {
+        self.start
+    }
+
+    #[must_use]
+    pub const fn end(&self) -> u64 {
+        self.end
+    }
+
+    #[must_use]
+    pub const fn alignment(&self) -> u64 {
+        self.alignment
+    }
+
+    #[must_use]
+    pub const fn envelope_bytes(&self) -> u64 {
+        self.end - self.start
+    }
+
+    #[must_use]
+    pub const fn dma_owned(&self) -> bool {
+        self.dma_owned
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogicalReservationKind {
+    Architecture,
+    NullGuard,
+    NormalStackBeforeGuard,
+    NormalStackAfterGuard,
+    InterruptStackBeforeGuard,
+    InterruptStackAfterGuard,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalReservationObservation {
+    kind: LogicalReservationKind,
+    structural_ordinal: u32,
+    requirement_source: Option<RequirementSource>,
+    requirement: Option<u128>,
+    region: LogicalRegionKind,
+    start: u64,
+    end: u64,
+}
+
+impl LogicalReservationObservation {
+    #[must_use]
+    pub const fn kind(&self) -> LogicalReservationKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn structural_ordinal(&self) -> u32 {
+        self.structural_ordinal
+    }
+
+    #[must_use]
+    pub const fn requirement_source(&self) -> Option<RequirementSource> {
+        self.requirement_source
+    }
+
+    #[must_use]
+    pub const fn requirement(&self) -> Option<u128> {
+        self.requirement
+    }
+
+    #[must_use]
+    pub const fn region(&self) -> LogicalRegionKind {
+        self.region
+    }
+
+    #[must_use]
+    pub const fn start(&self) -> u64 {
+        self.start
+    }
+
+    #[must_use]
+    pub const fn end(&self) -> u64 {
+        self.end
+    }
+
+    #[must_use]
+    pub const fn is_guard(&self) -> bool {
+        !matches!(self.kind, LogicalReservationKind::Architecture)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LayoutCostKind {
+    EnvelopePayload,
+    AllocationAlignment,
+    ArchitectureReservation,
+    Guard,
+    RegionAlignment,
+    RegionRounding,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutCostObservation {
+    kind: LayoutCostKind,
+    region: LogicalRegionKind,
+    requirement_source: Option<RequirementSource>,
+    requirement: Option<u128>,
+    envelope: Option<StorageEnvelopeKind>,
+    multiplicity: u32,
+    bytes: u64,
+}
+
+impl LayoutCostObservation {
+    #[must_use]
+    pub const fn kind(&self) -> LayoutCostKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn region(&self) -> LogicalRegionKind {
+        self.region
+    }
+
+    #[must_use]
+    pub const fn requirement_source(&self) -> Option<RequirementSource> {
+        self.requirement_source
+    }
+
+    #[must_use]
+    pub const fn requirement(&self) -> Option<u128> {
+        self.requirement
+    }
+
+    #[must_use]
+    pub const fn envelope(&self) -> Option<StorageEnvelopeKind> {
+        self.envelope
+    }
+
+    #[must_use]
+    pub const fn multiplicity(&self) -> u32 {
+        self.multiplicity
+    }
+
+    #[must_use]
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalImageLayoutObservation {
+    fingerprint: u128,
+    architecture_contract_identity: u128,
+    architecture_contract_fingerprint: u128,
+    requirement_set_fingerprint: u128,
+    whole_image_assignment_fingerprint: u128,
+    service_plan_fingerprint: u128,
+    regions: Arc<[LogicalRegionObservation]>,
+    allocations: Arc<[LogicalAllocationObservation]>,
+    reservations: Arc<[LogicalReservationObservation]>,
+    ledger: Arc<[LayoutCostObservation]>,
+    reserved_bytes: u64,
+    total_ram_bytes: u64,
+}
+
+impl LogicalImageLayoutObservation {
+    #[must_use]
+    pub const fn phase_schema(&self) -> &'static str {
+        "wrela.logical-image-layout.v1"
+    }
+
+    #[must_use]
+    pub const fn fingerprint(&self) -> u128 {
+        self.fingerprint
+    }
+
+    #[must_use]
+    pub const fn architecture_contract_identity(&self) -> u128 {
+        self.architecture_contract_identity
+    }
+
+    #[must_use]
+    pub const fn architecture_contract_fingerprint(&self) -> u128 {
+        self.architecture_contract_fingerprint
+    }
+
+    #[must_use]
+    pub const fn requirement_set_fingerprint(&self) -> u128 {
+        self.requirement_set_fingerprint
+    }
+
+    #[must_use]
+    pub const fn whole_image_assignment_fingerprint(&self) -> u128 {
+        self.whole_image_assignment_fingerprint
+    }
+
+    #[must_use]
+    pub const fn service_plan_fingerprint(&self) -> u128 {
+        self.service_plan_fingerprint
+    }
+
+    #[must_use]
+    pub fn regions(&self) -> &[LogicalRegionObservation] {
+        &self.regions
+    }
+
+    #[must_use]
+    pub fn allocations(&self) -> &[LogicalAllocationObservation] {
+        &self.allocations
+    }
+
+    #[must_use]
+    pub fn reservations(&self) -> &[LogicalReservationObservation] {
+        &self.reservations
+    }
+
+    #[must_use]
+    pub fn ledger(&self) -> &[LayoutCostObservation] {
+        &self.ledger
+    }
+
+    #[must_use]
+    pub const fn reserved_bytes(&self) -> u64 {
+        self.reserved_bytes
+    }
+
+    #[must_use]
+    pub const fn total_ram_bytes(&self) -> u64 {
+        self.total_ram_bytes
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct VerifiedLogicalImageLayout {
+    service_plan: Arc<VerifiedServicePlan>,
+    regions: Arc<[LogicalRegionObservation]>,
+    allocations: Arc<[LogicalAllocationObservation]>,
+    reservations: Arc<[LogicalReservationObservation]>,
+    reserved_bytes: u64,
+    total_ram_bytes: u64,
+    fingerprint: u128,
+    _verified: Verified,
+}
+
+impl fmt::Debug for VerifiedLogicalImageLayout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedLogicalImageLayout")
+            .field("fingerprint", &format_args!("{:032x}", self.fingerprint))
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for VerifiedLogicalImageLayout {
+    fn eq(&self, other: &Self) -> bool {
+        self.fingerprint == other.fingerprint
+            && self.service_plan.fingerprint == other.service_plan.fingerprint
+    }
+}
+
+impl Eq for VerifiedLogicalImageLayout {}
+
+impl VerifiedLogicalImageLayout {
+    pub(crate) const fn fingerprint(&self) -> u128 {
+        self.fingerprint
+    }
+
+    pub(crate) fn observation(&self) -> LogicalImageLayoutObservation {
+        let assignment = &self.service_plan.assignment;
+        let architecture = assignment
+            .planning_foundation
+            .architecture_contract
+            .for_logical_layout();
+        LogicalImageLayoutObservation {
+            fingerprint: self.fingerprint,
+            architecture_contract_identity: architecture.identity(),
+            architecture_contract_fingerprint: architecture.fingerprint(),
+            requirement_set_fingerprint: assignment.requirement_set_fingerprint,
+            whole_image_assignment_fingerprint: assignment.fingerprint,
+            service_plan_fingerprint: self.service_plan.fingerprint,
+            regions: Arc::clone(&self.regions),
+            allocations: Arc::clone(&self.allocations),
+            reservations: Arc::clone(&self.reservations),
+            ledger: derive_layout_cost_ledger(self),
+            reserved_bytes: self.reserved_bytes,
+            total_ram_bytes: self.total_ram_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LayoutConflictCode {
+    RamFit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedLayoutConflict {
+    code: LayoutConflictCode,
+    contract_fingerprint: u128,
+    requirement_set_fingerprint: u128,
+    required_bytes: u64,
+    available_bytes: u64,
+    requirements: Arc<[u128]>,
+}
+
+impl VerifiedLayoutConflict {
+    #[cfg(test)]
+    pub(crate) const fn code(&self) -> LayoutConflictCode {
+        self.code
+    }
+
+    pub(crate) const fn required_bytes(&self) -> u64 {
+        self.required_bytes
+    }
+
+    pub(crate) const fn available_bytes(&self) -> u64 {
+        self.available_bytes
+    }
+
+    pub(crate) fn requirement_count(&self) -> usize {
+        self.requirements.len()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum LogicalLayoutOutcome {
+    Layout(VerifiedLogicalImageLayout),
+    Conflict(VerifiedLayoutConflict),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ServiceConflictCode {
     CycleCapacity,
     MaximumDelay,
@@ -13112,6 +13571,1601 @@ fn verify_service_plan_against(
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LayoutDemand {
+    requirement_source: RequirementSource,
+    requirement: u128,
+    envelope: StorageEnvelopeKind,
+    lifetime: LogicalLifetime,
+    count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LayoutExtents {
+    regions: Vec<LogicalRegionObservation>,
+    allocations: Vec<LogicalAllocationObservation>,
+    reservations: Vec<LogicalReservationObservation>,
+    reserved_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingLayoutItem {
+    Allocation {
+        demand: usize,
+        ordinal: u32,
+    },
+    Reservation {
+        kind: LogicalReservationKind,
+        structural_ordinal: u32,
+        requirement_source: Option<RequirementSource>,
+        requirement: Option<u128>,
+        region: LogicalRegionKind,
+        bytes: u64,
+        alignment: u64,
+        sort_identity: u128,
+        sort_local: u8,
+        sort_position: u8,
+    },
+}
+
+impl ImagePlanningModule {
+    pub(crate) fn logical_layout(
+        &self,
+        service_plan: Arc<VerifiedServicePlan>,
+        cancellation: &Cancellation,
+    ) -> Result<LogicalLayoutOutcome, PlanningFailure> {
+        checkpoint(cancellation)?;
+        let demands = produce_layout_demands(&service_plan, cancellation)?;
+        let architecture = service_plan
+            .assignment
+            .planning_foundation
+            .architecture_contract
+            .for_logical_layout();
+        let allocation_count = demands.iter().try_fold(0_u64, |total, demand| {
+            total.checked_add(u64::from(demand.count)).ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("Logical Image Layout allocation count overflow"))
+            })
+        })?;
+        if allocation_count > u64::from(architecture.capacity().maximum_allocations) {
+            return defect("Logical Image Layout exceeds the finite allocation bound");
+        }
+        let extents = produce_layout_extents(&service_plan, &demands, cancellation)?;
+        let reserved_bytes = extents.reserved_bytes;
+        let total_ram_bytes = reserved_bytes.max(architecture.capacity().minimum_ram_bytes);
+        if total_ram_bytes > architecture.capacity().maximum_ram_bytes {
+            let mut requirements = demands
+                .iter()
+                .map(|demand| demand.requirement)
+                .collect::<Vec<_>>();
+            requirements.sort_unstable();
+            requirements.dedup();
+            let conflict = VerifiedLayoutConflict {
+                code: LayoutConflictCode::RamFit,
+                contract_fingerprint: architecture.fingerprint(),
+                requirement_set_fingerprint: service_plan.assignment.requirement_set_fingerprint,
+                required_bytes: total_ram_bytes,
+                available_bytes: architecture.capacity().maximum_ram_bytes,
+                requirements: requirements.into(),
+            };
+            verify_layout_conflict(&service_plan, &conflict, cancellation)?;
+            return Ok(LogicalLayoutOutcome::Conflict(conflict));
+        }
+        let fingerprint = layout_fingerprint(
+            &service_plan,
+            &extents.regions,
+            &extents.allocations,
+            &extents.reservations,
+            reserved_bytes,
+            total_ram_bytes,
+        );
+        let layout = VerifiedLogicalImageLayout {
+            service_plan,
+            regions: extents.regions.into(),
+            allocations: extents.allocations.into(),
+            reservations: extents.reservations.into(),
+            reserved_bytes,
+            total_ram_bytes,
+            fingerprint,
+            _verified: Verified,
+        };
+        verify_logical_layout(&layout, cancellation)?;
+        Ok(LogicalLayoutOutcome::Layout(layout))
+    }
+}
+
+fn produce_layout_demands(
+    service_plan: &VerifiedServicePlan,
+    cancellation: &Cancellation,
+) -> Result<Vec<LayoutDemand>, PlanningFailure> {
+    let assignment = &service_plan.assignment;
+    let foundation = &assignment.planning_foundation;
+    let flow = assignment.flow_program.for_image_planning();
+    let mut demands = Vec::new();
+
+    for placement in assignment.placements.iter() {
+        checkpoint(cancellation)?;
+        let reference = foundation
+            .requirements
+            .iter()
+            .find_map(|requirement| match requirement.bounds {
+                RequirementBounds::RealizeExactlyOnce { executable }
+                    if executable == placement.executable =>
+                {
+                    Some(WholeRequirementRef::Domain(requirement.reference))
+                }
+                _ => None,
+            })
+            .or_else(|| {
+                flow.requirements()
+                    .filter(|requirement| requirement.handler() == Some(placement.executable))
+                    .min_by_key(|requirement| requirement.reference().identity())
+                    .map(|requirement| WholeRequirementRef::Flow(requirement.reference()))
+            })
+            .or_else(|| {
+                foundation.requirements.iter().find_map(|requirement| {
+                    matches!(
+                        requirement.bounds,
+                        RequirementBounds::RealizeExactlyOnce { .. }
+                    )
+                    .then_some(WholeRequirementRef::Domain(requirement.reference))
+                })
+            })
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from(
+                    "logical executable has no structural Planning Requirement",
+                ))
+            })?;
+        for envelope in [
+            StorageEnvelopeKind::Executable,
+            StorageEnvelopeKind::ImmutableData,
+        ] {
+            demands.push(LayoutDemand {
+                requirement_source: reference.source(),
+                requirement: reference.identity(),
+                envelope,
+                lifetime: LogicalLifetime::Image,
+                count: 1,
+            });
+        }
+    }
+
+    let scheduler_requirement = foundation
+        .generated_roles
+        .iter()
+        .find(|role| role.kind == GeneratedRoleKind::Scheduler)
+        .and_then(|role| {
+            foundation.requirements.iter().find_map(|requirement| {
+                matches!(
+                    requirement.bounds,
+                    RequirementBounds::RealizeExactlyOnce { executable }
+                        if executable == role.executable.identity
+                )
+                .then_some(requirement.reference)
+            })
+        })
+        .ok_or_else(|| {
+            PlanningFailure::Defect(Arc::from(
+                "Logical Image Layout cannot bind per-core envelopes to Scheduler realization",
+            ))
+        })?;
+    let core_count = u32::try_from(
+        foundation
+            .architecture_contract
+            .for_logical_layout()
+            .core_count(),
+    )
+    .map_err(|_| PlanningFailure::Defect(Arc::from("logical core count exceeds schema")))?;
+    for envelope in [
+        StorageEnvelopeKind::PerCoreState,
+        StorageEnvelopeKind::NormalStack,
+        StorageEnvelopeKind::InterruptStack,
+    ] {
+        demands.push(LayoutDemand {
+            requirement_source: RequirementSource::Domain,
+            requirement: scheduler_requirement.identity,
+            envelope,
+            lifetime: LogicalLifetime::Image,
+            count: core_count,
+        });
+    }
+
+    for requirement in foundation.requirements.iter() {
+        checkpoint(cancellation)?;
+        let (envelope, count) = match requirement.bounds {
+            RequirementBounds::PoolCapacity { usable, .. } => (
+                StorageEnvelopeKind::SharedState,
+                u32::try_from(usable).map_err(|_| {
+                    PlanningFailure::Defect(Arc::from("Pool layout multiplicity exceeds schema"))
+                })?,
+            ),
+            RequirementBounds::FacilityCapacity(_) => (StorageEnvelopeKind::SharedState, 1),
+            RequirementBounds::Binding { kind, minimum, .. }
+                if minimum > 0
+                    && matches!(
+                        kind,
+                        PlanningBinding::Display
+                            | PlanningBinding::Input
+                            | PlanningBinding::EventStore
+                            | PlanningBinding::Entropy
+                            | PlanningBinding::Telemetry
+                            | PlanningBinding::Terminal
+                    ) =>
+            {
+                (StorageEnvelopeKind::DmaState, minimum)
+            }
+            _ => continue,
+        };
+        demands.push(LayoutDemand {
+            requirement_source: RequirementSource::Domain,
+            requirement: requirement.reference.identity,
+            envelope,
+            lifetime: LogicalLifetime::Image,
+            count,
+        });
+    }
+    for requirement in flow.requirements() {
+        checkpoint(cancellation)?;
+        let (envelope, lifetime) = match requirement.kind() {
+            FlowRequirementKind::MailboxCapacity => {
+                (StorageEnvelopeKind::SharedState, LogicalLifetime::Image)
+            }
+            FlowRequirementKind::ServiceStorage | FlowRequirementKind::ActivationStorage => {
+                (StorageEnvelopeKind::AsyncFrame, LogicalLifetime::Activation)
+            }
+            _ => continue,
+        };
+        let count = u32::try_from(requirement.bound()).map_err(|_| {
+            PlanningFailure::Defect(Arc::from("Flow layout multiplicity exceeds schema"))
+        })?;
+        demands.push(LayoutDemand {
+            requirement_source: RequirementSource::Flow,
+            requirement: requirement.reference().identity(),
+            envelope,
+            lifetime,
+            count,
+        });
+    }
+    demands.sort_by_key(|demand| {
+        (
+            demand.requirement,
+            demand.requirement_source,
+            demand.envelope,
+        )
+    });
+    let mut canonical: Vec<LayoutDemand> = Vec::with_capacity(demands.len());
+    for demand in demands {
+        if let Some(previous) = canonical.last_mut()
+            && previous.requirement_source == demand.requirement_source
+            && previous.requirement == demand.requirement
+            && previous.envelope == demand.envelope
+            && previous.lifetime == demand.lifetime
+        {
+            previous.count = previous.count.checked_add(demand.count).ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("layout demand multiplicity overflow"))
+            })?;
+        } else {
+            canonical.push(demand);
+        }
+    }
+    if canonical.iter().any(|demand| demand.count == 0) {
+        return defect("Logical Image Layout received zero finite multiplicity");
+    }
+    Ok(canonical)
+}
+
+fn produce_layout_extents(
+    service_plan: &VerifiedServicePlan,
+    demands: &[LayoutDemand],
+    cancellation: &Cancellation,
+) -> Result<LayoutExtents, PlanningFailure> {
+    let architecture = service_plan
+        .assignment
+        .planning_foundation
+        .architecture_contract
+        .for_logical_layout();
+    let mut pending = Vec::new();
+    for (demand, value) in demands.iter().enumerate() {
+        for ordinal in 0..value.count {
+            checkpoint(cancellation)?;
+            pending.push(PendingLayoutItem::Allocation { demand, ordinal });
+        }
+    }
+    for (rule_ordinal, rule) in architecture.reservations().iter().enumerate() {
+        let requirement = service_plan
+            .assignment
+            .planning_foundation
+            .requirements
+            .iter()
+            .find_map(|requirement| match requirement.bounds {
+                RequirementBounds::Reservation { kind, .. }
+                    if kind.contract_kind() == rule.kind =>
+                {
+                    Some(requirement.reference.identity)
+                }
+                _ => None,
+            });
+        let count = match rule.multiplicity {
+            ReservationMultiplicity::Once => 1,
+            ReservationMultiplicity::PerCore => architecture.core_count(),
+        };
+        for ordinal in 0..count {
+            checkpoint(cancellation)?;
+            let rule_ordinal = u32::try_from(rule_ordinal).map_err(|_| {
+                PlanningFailure::Defect(Arc::from("reservation rule ordinal exceeds schema"))
+            })?;
+            let instance = u32::try_from(ordinal).map_err(|_| {
+                PlanningFailure::Defect(Arc::from("reservation instance exceeds schema"))
+            })?;
+            let structural_ordinal = rule_ordinal
+                .checked_mul(65_536)
+                .and_then(|base| base.checked_add(instance))
+                .ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from("reservation structural ordinal overflow"))
+                })?;
+            pending.push(PendingLayoutItem::Reservation {
+                kind: LogicalReservationKind::Architecture,
+                structural_ordinal,
+                requirement_source: requirement.map(|_| RequirementSource::Domain),
+                requirement,
+                region: logical_region(rule.region),
+                bytes: rule.bytes,
+                alignment: rule.alignment,
+                sort_identity: u128::from(rule_ordinal as u64),
+                sort_local: u8::try_from(ordinal).unwrap_or(u8::MAX),
+                sort_position: 1,
+            });
+        }
+    }
+    let page = architecture.page().quantum_bytes;
+    pending.push(PendingLayoutItem::Reservation {
+        kind: LogicalReservationKind::NullGuard,
+        structural_ordinal: 0,
+        requirement_source: None,
+        requirement: None,
+        region: LogicalRegionKind::BootReservation,
+        bytes: checked_mul(page, u64::from(architecture.guards().null_pages))?,
+        alignment: page,
+        sort_identity: 0,
+        sort_local: 0,
+        sort_position: 0,
+    });
+    let scheduler_requirement = demands
+        .iter()
+        .find(|demand| demand.envelope == StorageEnvelopeKind::NormalStack)
+        .map(|demand| demand.requirement)
+        .ok_or_else(|| PlanningFailure::Defect(Arc::from("layout has no stack requirement")))?;
+    for core in 0..architecture.core_count() {
+        let core = u32::try_from(core)
+            .map_err(|_| PlanningFailure::Defect(Arc::from("logical core ordinal overflow")))?;
+        for (kind, pages, envelope, position) in [
+            (
+                LogicalReservationKind::NormalStackBeforeGuard,
+                architecture.guards().normal_stack_before_pages,
+                StorageEnvelopeKind::NormalStack,
+                0_u8,
+            ),
+            (
+                LogicalReservationKind::NormalStackAfterGuard,
+                architecture.guards().normal_stack_after_pages,
+                StorageEnvelopeKind::NormalStack,
+                2,
+            ),
+            (
+                LogicalReservationKind::InterruptStackBeforeGuard,
+                architecture.guards().interrupt_stack_before_pages,
+                StorageEnvelopeKind::InterruptStack,
+                0,
+            ),
+            (
+                LogicalReservationKind::InterruptStackAfterGuard,
+                architecture.guards().interrupt_stack_after_pages,
+                StorageEnvelopeKind::InterruptStack,
+                2,
+            ),
+        ] {
+            pending.push(PendingLayoutItem::Reservation {
+                kind,
+                structural_ordinal: core,
+                requirement_source: None,
+                requirement: None,
+                region: LogicalRegionKind::PerCoreMutable,
+                bytes: checked_mul(page, u64::from(pages))?,
+                alignment: page,
+                sort_identity: scheduler_requirement,
+                sort_local: storage_envelope_tag(envelope),
+                sort_position: position,
+            });
+        }
+    }
+
+    let mut regions = Vec::new();
+    let mut allocations = Vec::new();
+    let mut reservations = Vec::new();
+    let mut cursor = 0_u64;
+    for region_rule in architecture.regions() {
+        checkpoint(cancellation)?;
+        let kind = logical_region(region_rule.kind);
+        let start = align_up(cursor, region_rule.alignment)?;
+        cursor = start;
+        let mut members = pending
+            .iter()
+            .copied()
+            .filter(|item| pending_region(*item, demands, architecture) == kind)
+            .collect::<Vec<_>>();
+        members.sort_by_key(|item| pending_sort_key(*item, demands));
+        for member in members {
+            checkpoint(cancellation)?;
+            match member {
+                PendingLayoutItem::Allocation { demand, ordinal } => {
+                    let demand = &demands[demand];
+                    let rule = envelope_rule(architecture, demand.envelope)?;
+                    cursor = align_up(cursor, rule.alignment)?;
+                    let end = checked_add(cursor, rule.instance_bytes)?;
+                    allocations.push(LogicalAllocationObservation {
+                        requirement_source: demand.requirement_source,
+                        requirement: demand.requirement,
+                        local_key: LayoutLocalKey {
+                            envelope: demand.envelope,
+                            ordinal,
+                        },
+                        envelope: demand.envelope,
+                        region: kind,
+                        lifetime: demand.lifetime,
+                        start: cursor,
+                        end,
+                        alignment: rule.alignment,
+                        dma_owned: rule.dma_owned,
+                    });
+                    cursor = end;
+                }
+                PendingLayoutItem::Reservation {
+                    kind: reservation_kind,
+                    structural_ordinal,
+                    requirement_source,
+                    requirement,
+                    bytes,
+                    alignment,
+                    ..
+                } => {
+                    cursor = align_up(cursor, alignment)?;
+                    let end = checked_add(cursor, bytes)?;
+                    reservations.push(LogicalReservationObservation {
+                        kind: reservation_kind,
+                        structural_ordinal,
+                        requirement_source,
+                        requirement,
+                        region: kind,
+                        start: cursor,
+                        end,
+                    });
+                    cursor = end;
+                }
+            }
+        }
+        let end = align_up(cursor, architecture.page().quantum_bytes)?;
+        regions.push(LogicalRegionObservation {
+            kind,
+            protection: logical_protection(region_rule.protection),
+            start,
+            end,
+        });
+        cursor = end;
+    }
+    Ok(LayoutExtents {
+        regions,
+        allocations,
+        reservations,
+        reserved_bytes: cursor,
+    })
+}
+
+fn pending_region(
+    item: PendingLayoutItem,
+    demands: &[LayoutDemand],
+    architecture: crate::architecture_planning::LogicalLayoutArchitecture<'_>,
+) -> LogicalRegionKind {
+    match item {
+        PendingLayoutItem::Allocation { demand, .. } => {
+            envelope_rule(architecture, demands[demand].envelope)
+                .map_or(LogicalRegionKind::BootReservation, |rule| {
+                    logical_region(rule.region)
+                })
+        }
+        PendingLayoutItem::Reservation { region, .. } => region,
+    }
+}
+
+fn pending_sort_key(item: PendingLayoutItem, demands: &[LayoutDemand]) -> (u128, u8, u32, u8) {
+    match item {
+        PendingLayoutItem::Allocation { demand, ordinal } => (
+            demands[demand].requirement,
+            storage_envelope_tag(demands[demand].envelope),
+            ordinal,
+            1,
+        ),
+        PendingLayoutItem::Reservation {
+            sort_identity,
+            sort_local,
+            sort_position,
+            structural_ordinal,
+            ..
+        } => (sort_identity, sort_local, structural_ordinal, sort_position),
+    }
+}
+
+fn envelope_rule(
+    architecture: crate::architecture_planning::LogicalLayoutArchitecture<'_>,
+    envelope: StorageEnvelopeKind,
+) -> Result<crate::architecture_planning::EnvelopeRule, PlanningFailure> {
+    architecture
+        .envelopes()
+        .iter()
+        .copied()
+        .find(|rule| logical_envelope(rule.kind) == envelope)
+        .ok_or_else(|| PlanningFailure::Defect(Arc::from("missing Storage Envelope schema")))
+}
+
+fn logical_region(kind: RegionKind) -> LogicalRegionKind {
+    match kind {
+        RegionKind::BootReservation => LogicalRegionKind::BootReservation,
+        RegionKind::Executable => LogicalRegionKind::Executable,
+        RegionKind::ImmutableData => LogicalRegionKind::ImmutableData,
+        RegionKind::PerCoreMutable => LogicalRegionKind::PerCoreMutable,
+        RegionKind::SharedMutable => LogicalRegionKind::SharedMutable,
+        RegionKind::DmaOwned => LogicalRegionKind::DmaOwned,
+    }
+}
+
+fn logical_envelope(kind: EnvelopeKind) -> StorageEnvelopeKind {
+    match kind {
+        EnvelopeKind::Executable => StorageEnvelopeKind::Executable,
+        EnvelopeKind::ImmutableData => StorageEnvelopeKind::ImmutableData,
+        EnvelopeKind::PerCoreState => StorageEnvelopeKind::PerCoreState,
+        EnvelopeKind::SharedState => StorageEnvelopeKind::SharedState,
+        EnvelopeKind::DmaState => StorageEnvelopeKind::DmaState,
+        EnvelopeKind::NormalStack => StorageEnvelopeKind::NormalStack,
+        EnvelopeKind::InterruptStack => StorageEnvelopeKind::InterruptStack,
+        EnvelopeKind::AsyncFrame => StorageEnvelopeKind::AsyncFrame,
+    }
+}
+
+const fn logical_protection(protection: ProtectionClass) -> LogicalProtection {
+    match protection {
+        ProtectionClass::Reserved => LogicalProtection::Sealed,
+        ProtectionClass::ReadExecute => LogicalProtection::ReadExecute,
+        ProtectionClass::ReadOnly => LogicalProtection::ReadOnlyNoExecute,
+        ProtectionClass::ReadWrite => LogicalProtection::ReadWriteNoExecute,
+        ProtectionClass::DeviceOwned => LogicalProtection::DmaVisibleReadWriteNoExecute,
+    }
+}
+
+fn align_up(value: u64, alignment: u64) -> Result<u64, PlanningFailure> {
+    if !alignment.is_power_of_two() {
+        return defect("Logical Image Layout received invalid alignment");
+    }
+    let mask = alignment - 1;
+    value
+        .checked_add(mask)
+        .map(|sum| sum & !mask)
+        .ok_or_else(|| {
+            PlanningFailure::Defect(Arc::from("Logical Image Layout alignment overflow"))
+        })
+}
+
+fn checked_add(left: u64, right: u64) -> Result<u64, PlanningFailure> {
+    left.checked_add(right)
+        .ok_or_else(|| PlanningFailure::Defect(Arc::from("Logical Image Layout extent overflow")))
+}
+
+fn checked_mul(left: u64, right: u64) -> Result<u64, PlanningFailure> {
+    left.checked_mul(right).ok_or_else(|| {
+        PlanningFailure::Defect(Arc::from("Logical Image Layout multiplicity overflow"))
+    })
+}
+
+fn layout_fingerprint(
+    service_plan: &VerifiedServicePlan,
+    regions: &[LogicalRegionObservation],
+    allocations: &[LogicalAllocationObservation],
+    reservations: &[LogicalReservationObservation],
+    reserved_bytes: u64,
+    total_ram_bytes: u64,
+) -> u128 {
+    let architecture = service_plan
+        .assignment
+        .planning_foundation
+        .architecture_contract
+        .for_logical_layout();
+    let mut hash = Xxh3::new();
+    hash.update(b"wrela.logical-image-layout\0\x01");
+    hash.update(&architecture.identity().to_be_bytes());
+    hash.update(&architecture.fingerprint().to_be_bytes());
+    hash.update(
+        &service_plan
+            .assignment
+            .requirement_set_fingerprint
+            .to_be_bytes(),
+    );
+    hash.update(&service_plan.assignment.fingerprint.to_be_bytes());
+    hash.update(&service_plan.fingerprint.to_be_bytes());
+    hash_layout_extents(
+        &mut hash,
+        regions,
+        allocations,
+        reservations,
+        reserved_bytes,
+        total_ram_bytes,
+    );
+    hash.digest128()
+}
+
+fn hash_layout_extents(
+    hash: &mut Xxh3,
+    regions: &[LogicalRegionObservation],
+    allocations: &[LogicalAllocationObservation],
+    reservations: &[LogicalReservationObservation],
+    reserved_bytes: u64,
+    total_ram_bytes: u64,
+) {
+    hash.update(
+        &u64::try_from(regions.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for region in regions {
+        hash.update(&[
+            logical_region_tag(region.kind),
+            logical_protection_tag(region.protection),
+        ]);
+        hash.update(&region.start.to_be_bytes());
+        hash.update(&region.end.to_be_bytes());
+    }
+    hash.update(
+        &u64::try_from(allocations.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for allocation in allocations {
+        hash.update(&[requirement_source_tag(allocation.requirement_source)]);
+        hash.update(&allocation.requirement.to_be_bytes());
+        hash.update(&[storage_envelope_tag(allocation.envelope)]);
+        hash.update(&allocation.local_key.ordinal.to_be_bytes());
+        hash.update(&[
+            logical_region_tag(allocation.region),
+            lifetime_tag(allocation.lifetime),
+        ]);
+        hash.update(&allocation.start.to_be_bytes());
+        hash.update(&allocation.end.to_be_bytes());
+        hash.update(&allocation.alignment.to_be_bytes());
+        hash.update(&[u8::from(allocation.dma_owned)]);
+    }
+    hash.update(
+        &u64::try_from(reservations.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for reservation in reservations {
+        hash.update(&[reservation_observation_tag(reservation.kind)]);
+        hash.update(&reservation.structural_ordinal.to_be_bytes());
+        hash.update(&[reservation
+            .requirement_source
+            .map_or(0, requirement_source_tag)]);
+        hash.update(&reservation.requirement.unwrap_or(0).to_be_bytes());
+        hash.update(&[logical_region_tag(reservation.region)]);
+        hash.update(&reservation.start.to_be_bytes());
+        hash.update(&reservation.end.to_be_bytes());
+    }
+    hash.update(&reserved_bytes.to_be_bytes());
+    hash.update(&total_ram_bytes.to_be_bytes());
+}
+
+fn verifier_layout_fingerprint(layout: &VerifiedLogicalImageLayout) -> u128 {
+    let architecture = layout
+        .service_plan
+        .assignment
+        .planning_foundation
+        .architecture_contract
+        .for_logical_layout();
+    let mut verifier = Xxh3::new();
+    verifier.update(b"wrela.logical-image-layout\0\x01");
+    for value in [
+        architecture.identity(),
+        architecture.fingerprint(),
+        layout.service_plan.assignment.requirement_set_fingerprint,
+        layout.service_plan.assignment.fingerprint,
+        layout.service_plan.fingerprint,
+    ] {
+        verifier.update(&value.to_be_bytes());
+    }
+    verifier.update(
+        &u64::try_from(layout.regions.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for region in layout.regions.iter() {
+        verifier.update(&[
+            match region.kind {
+                LogicalRegionKind::BootReservation => 1,
+                LogicalRegionKind::Executable => 2,
+                LogicalRegionKind::ImmutableData => 3,
+                LogicalRegionKind::PerCoreMutable => 4,
+                LogicalRegionKind::SharedMutable => 5,
+                LogicalRegionKind::DmaOwned => 6,
+            },
+            match region.protection {
+                LogicalProtection::Sealed => 1,
+                LogicalProtection::ReadExecute => 2,
+                LogicalProtection::ReadOnlyNoExecute => 3,
+                LogicalProtection::ReadWriteNoExecute => 4,
+                LogicalProtection::DmaVisibleReadWriteNoExecute => 5,
+            },
+        ]);
+        verifier.update(&region.start.to_be_bytes());
+        verifier.update(&region.end.to_be_bytes());
+    }
+    verifier.update(
+        &u64::try_from(layout.allocations.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for allocation in layout.allocations.iter() {
+        verifier.update(&[match allocation.requirement_source {
+            RequirementSource::Domain => 1,
+            RequirementSource::Flow => 2,
+        }]);
+        verifier.update(&allocation.requirement.to_be_bytes());
+        verifier.update(&[match allocation.envelope {
+            StorageEnvelopeKind::Executable => 1,
+            StorageEnvelopeKind::ImmutableData => 2,
+            StorageEnvelopeKind::PerCoreState => 3,
+            StorageEnvelopeKind::SharedState => 4,
+            StorageEnvelopeKind::DmaState => 5,
+            StorageEnvelopeKind::NormalStack => 6,
+            StorageEnvelopeKind::InterruptStack => 7,
+            StorageEnvelopeKind::AsyncFrame => 8,
+        }]);
+        verifier.update(&allocation.local_key.ordinal.to_be_bytes());
+        verifier.update(&[
+            match allocation.region {
+                LogicalRegionKind::BootReservation => 1,
+                LogicalRegionKind::Executable => 2,
+                LogicalRegionKind::ImmutableData => 3,
+                LogicalRegionKind::PerCoreMutable => 4,
+                LogicalRegionKind::SharedMutable => 5,
+                LogicalRegionKind::DmaOwned => 6,
+            },
+            match allocation.lifetime {
+                LogicalLifetime::Image => 1,
+                LogicalLifetime::Activation => 2,
+            },
+        ]);
+        verifier.update(&allocation.start.to_be_bytes());
+        verifier.update(&allocation.end.to_be_bytes());
+        verifier.update(&allocation.alignment.to_be_bytes());
+        verifier.update(&[u8::from(allocation.dma_owned)]);
+    }
+    verifier.update(
+        &u64::try_from(layout.reservations.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for reservation in layout.reservations.iter() {
+        verifier.update(&[match reservation.kind {
+            LogicalReservationKind::Architecture => 1,
+            LogicalReservationKind::NullGuard => 2,
+            LogicalReservationKind::NormalStackBeforeGuard => 3,
+            LogicalReservationKind::NormalStackAfterGuard => 4,
+            LogicalReservationKind::InterruptStackBeforeGuard => 5,
+            LogicalReservationKind::InterruptStackAfterGuard => 6,
+        }]);
+        verifier.update(&reservation.structural_ordinal.to_be_bytes());
+        verifier.update(&[match reservation.requirement_source {
+            None => 0,
+            Some(RequirementSource::Domain) => 1,
+            Some(RequirementSource::Flow) => 2,
+        }]);
+        verifier.update(&reservation.requirement.unwrap_or(0).to_be_bytes());
+        verifier.update(&[match reservation.region {
+            LogicalRegionKind::BootReservation => 1,
+            LogicalRegionKind::Executable => 2,
+            LogicalRegionKind::ImmutableData => 3,
+            LogicalRegionKind::PerCoreMutable => 4,
+            LogicalRegionKind::SharedMutable => 5,
+            LogicalRegionKind::DmaOwned => 6,
+        }]);
+        verifier.update(&reservation.start.to_be_bytes());
+        verifier.update(&reservation.end.to_be_bytes());
+    }
+    verifier.update(&layout.reserved_bytes.to_be_bytes());
+    verifier.update(&layout.total_ram_bytes.to_be_bytes());
+    verifier.digest128()
+}
+
+fn verify_logical_layout(
+    layout: &VerifiedLogicalImageLayout,
+    cancellation: &Cancellation,
+) -> Result<(), PlanningFailure> {
+    checkpoint(cancellation)?;
+    verify_service_plan_against(
+        &production_service_problem(&layout.service_plan.assignment, cancellation)?,
+        &layout.service_plan,
+        cancellation,
+    )?;
+    let architecture = layout
+        .service_plan
+        .assignment
+        .planning_foundation
+        .architecture_contract
+        .for_logical_layout();
+    let verifier_demands = verifier_layout_demands(&layout.service_plan, cancellation)?;
+    let extents = verifier_layout_extents(&layout.service_plan, &verifier_demands, cancellation)?;
+    let reserved_bytes = extents.reserved_bytes;
+    let total_ram_bytes = reserved_bytes.max(architecture.capacity().minimum_ram_bytes);
+    if layout.regions.as_ref() != extents.regions
+        || layout.allocations.as_ref() != extents.allocations
+        || layout.reservations.as_ref() != extents.reservations
+        || layout.reserved_bytes != reserved_bytes
+        || layout.total_ram_bytes != total_ram_bytes
+        || total_ram_bytes > architecture.capacity().maximum_ram_bytes
+    {
+        return defect("Logical Image Layout verifier reconstruction disagrees");
+    }
+    let exact_requirements = layout
+        .service_plan
+        .assignment
+        .requirements
+        .iter()
+        .map(|reference| (reference.source(), reference.identity()))
+        .collect::<BTreeSet<_>>();
+    for allocation in layout.allocations.iter() {
+        checkpoint(cancellation)?;
+        if !exact_requirements.contains(&(allocation.requirement_source, allocation.requirement)) {
+            return defect("Logical Image Layout allocation has a foreign RequirementRef");
+        }
+        let rule = envelope_rule(architecture, allocation.envelope)?;
+        let region = architecture
+            .regions()
+            .iter()
+            .find(|region| logical_region(region.kind) == allocation.region)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("layout allocation region missing"))
+            })?;
+        if allocation.start % allocation.alignment != 0
+            || allocation.alignment != rule.alignment
+            || allocation.end.checked_sub(allocation.start) != Some(rule.instance_bytes)
+            || allocation.region != logical_region(rule.region)
+            || allocation.dma_owned != rule.dma_owned
+            || logical_protection(region.protection)
+                != if rule.dma_owned {
+                    LogicalProtection::DmaVisibleReadWriteNoExecute
+                } else {
+                    logical_protection(rule.protection)
+                }
+        {
+            return defect("Logical Image Layout envelope policy does not reconstruct");
+        }
+    }
+    for reservation in layout.reservations.iter() {
+        checkpoint(cancellation)?;
+        match (reservation.requirement_source, reservation.requirement) {
+            (Some(source), Some(requirement))
+                if reservation.kind == LogicalReservationKind::Architecture
+                    && exact_requirements.contains(&(source, requirement)) => {}
+            (None, None) => {}
+            _ => {
+                return defect(
+                    "Logical Image Layout reservation has malformed RequirementRef coverage",
+                );
+            }
+        }
+    }
+    let mut extents = layout
+        .allocations
+        .iter()
+        .map(|allocation| (allocation.start, allocation.end))
+        .chain(
+            layout
+                .reservations
+                .iter()
+                .map(|reservation| (reservation.start, reservation.end)),
+        )
+        .collect::<Vec<_>>();
+    extents.sort_unstable();
+    let dma = architecture.dma();
+    let dma_bytes = layout
+        .allocations
+        .iter()
+        .filter(|allocation| allocation.dma_owned)
+        .try_fold(0_u64, |total, allocation| {
+            total.checked_add(allocation.envelope_bytes())
+        });
+    if extents.iter().any(|(start, end)| start >= end)
+        || extents.windows(2).any(|pair| pair[0].1 > pair[1].0)
+        || layout
+            .regions
+            .windows(2)
+            .any(|pair| pair[0].end > pair[1].start)
+        || layout
+            .regions
+            .last()
+            .is_none_or(|region| region.end != layout.reserved_bytes)
+        || derive_layout_cost_ledger(layout)
+            .iter()
+            .try_fold(0_u64, |total, entry| total.checked_add(entry.bytes))
+            != Some(layout.reserved_bytes)
+        || layout.fingerprint != verifier_layout_fingerprint(layout)
+        || dma_bytes.is_none_or(|bytes| bytes > dma.maximum_total_bytes)
+        || layout.allocations.iter().any(|allocation| {
+            allocation.dma_owned
+                && (allocation.envelope_bytes() > dma.maximum_buffer_bytes
+                    || allocation.alignment < dma.required_alignment)
+        })
+    {
+        return defect("Logical Image Layout bounds, overlap, ledger, or fingerprint is invalid");
+    }
+    Ok(())
+}
+
+fn verifier_layout_demands(
+    service_plan: &VerifiedServicePlan,
+    cancellation: &Cancellation,
+) -> Result<Vec<LayoutDemand>, PlanningFailure> {
+    // The verifier reconstructs demand from owning authorities rather than consuming the
+    // producer's demand table.
+    let assignment = &service_plan.assignment;
+    let foundation = &assignment.planning_foundation;
+    let flow = assignment.flow_program.for_image_planning();
+    let mut result = Vec::new();
+    for placement in assignment.placements.iter() {
+        checkpoint(cancellation)?;
+        let domain = foundation.requirements.iter().find_map(|requirement| {
+            if matches!(requirement.bounds, RequirementBounds::RealizeExactlyOnce { executable } if executable == placement.executable) {
+                Some(requirement.reference)
+            } else {
+                None
+            }
+        });
+        let reference = domain
+            .map(WholeRequirementRef::Domain)
+            .or_else(|| {
+                flow.requirements()
+                    .filter(|requirement| requirement.handler() == Some(placement.executable))
+                    .map(|requirement| requirement.reference())
+                    .min_by_key(|reference| reference.identity())
+                    .map(WholeRequirementRef::Flow)
+            })
+            .or_else(|| {
+                foundation.requirements.iter().find_map(|requirement| {
+                    matches!(
+                        requirement.bounds,
+                        RequirementBounds::RealizeExactlyOnce { .. }
+                    )
+                    .then_some(WholeRequirementRef::Domain(requirement.reference))
+                })
+            })
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("verifier cannot bind executable envelope"))
+            })?;
+        result.extend([
+            LayoutDemand {
+                requirement_source: reference.source(),
+                requirement: reference.identity(),
+                envelope: StorageEnvelopeKind::Executable,
+                lifetime: LogicalLifetime::Image,
+                count: 1,
+            },
+            LayoutDemand {
+                requirement_source: reference.source(),
+                requirement: reference.identity(),
+                envelope: StorageEnvelopeKind::ImmutableData,
+                lifetime: LogicalLifetime::Image,
+                count: 1,
+            },
+        ]);
+    }
+    let scheduler = foundation
+        .generated_roles
+        .iter()
+        .find(|role| role.kind == GeneratedRoleKind::Scheduler)
+        .ok_or_else(|| PlanningFailure::Defect(Arc::from("verifier found no Scheduler role")))?;
+    let scheduler_requirement = foundation
+        .requirements
+        .iter()
+        .find(|requirement| matches!(requirement.bounds, RequirementBounds::RealizeExactlyOnce { executable } if executable == scheduler.executable.identity))
+        .ok_or_else(|| PlanningFailure::Defect(Arc::from("verifier found no Scheduler realization")))?;
+    let core_count = u32::try_from(
+        foundation
+            .architecture_contract
+            .for_logical_layout()
+            .core_count(),
+    )
+    .map_err(|_| PlanningFailure::Defect(Arc::from("verifier core count overflow")))?;
+    for envelope in [
+        StorageEnvelopeKind::PerCoreState,
+        StorageEnvelopeKind::NormalStack,
+        StorageEnvelopeKind::InterruptStack,
+    ] {
+        result.push(LayoutDemand {
+            requirement_source: RequirementSource::Domain,
+            requirement: scheduler_requirement.reference.identity,
+            envelope,
+            lifetime: LogicalLifetime::Image,
+            count: core_count,
+        });
+    }
+    for requirement in foundation.requirements.iter() {
+        let derived = match requirement.bounds {
+            RequirementBounds::PoolCapacity { usable, .. } => Some((
+                StorageEnvelopeKind::SharedState,
+                u32::try_from(usable).map_err(|_| {
+                    PlanningFailure::Defect(Arc::from("verifier Pool multiplicity overflow"))
+                })?,
+            )),
+            RequirementBounds::FacilityCapacity(_) => Some((StorageEnvelopeKind::SharedState, 1)),
+            RequirementBounds::Binding { kind, minimum, .. }
+                if minimum != 0
+                    && matches!(
+                        kind,
+                        PlanningBinding::Display
+                            | PlanningBinding::Input
+                            | PlanningBinding::EventStore
+                            | PlanningBinding::Entropy
+                            | PlanningBinding::Telemetry
+                            | PlanningBinding::Terminal
+                    ) =>
+            {
+                Some((StorageEnvelopeKind::DmaState, minimum))
+            }
+            _ => None,
+        };
+        if let Some((envelope, count)) = derived {
+            result.push(LayoutDemand {
+                requirement_source: RequirementSource::Domain,
+                requirement: requirement.reference.identity,
+                envelope,
+                lifetime: LogicalLifetime::Image,
+                count,
+            });
+        }
+    }
+    for requirement in flow.requirements() {
+        let derived = match requirement.kind() {
+            FlowRequirementKind::MailboxCapacity => {
+                Some((StorageEnvelopeKind::SharedState, LogicalLifetime::Image))
+            }
+            FlowRequirementKind::ServiceStorage | FlowRequirementKind::ActivationStorage => {
+                Some((StorageEnvelopeKind::AsyncFrame, LogicalLifetime::Activation))
+            }
+            _ => None,
+        };
+        if let Some((envelope, lifetime)) = derived {
+            result.push(LayoutDemand {
+                requirement_source: RequirementSource::Flow,
+                requirement: requirement.reference().identity(),
+                envelope,
+                lifetime,
+                count: u32::try_from(requirement.bound()).map_err(|_| {
+                    PlanningFailure::Defect(Arc::from("verifier Flow multiplicity overflow"))
+                })?,
+            });
+        }
+    }
+    result.sort_by(|left, right| {
+        left.requirement
+            .cmp(&right.requirement)
+            .then(left.requirement_source.cmp(&right.requirement_source))
+            .then(left.envelope.cmp(&right.envelope))
+    });
+    let mut canonical: Vec<LayoutDemand> = Vec::with_capacity(result.len());
+    for demand in result {
+        match canonical.last_mut() {
+            Some(previous)
+                if previous.requirement_source == demand.requirement_source
+                    && previous.requirement == demand.requirement
+                    && previous.envelope == demand.envelope
+                    && previous.lifetime == demand.lifetime =>
+            {
+                previous.count = previous.count.checked_add(demand.count).ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from(
+                        "verifier layout demand multiplicity overflow",
+                    ))
+                })?;
+            }
+            _ => canonical.push(demand),
+        }
+    }
+    Ok(canonical)
+}
+
+fn verifier_layout_extents(
+    service_plan: &VerifiedServicePlan,
+    demands: &[LayoutDemand],
+    cancellation: &Cancellation,
+) -> Result<LayoutExtents, PlanningFailure> {
+    #[derive(Clone, Copy)]
+    enum VerifierItem {
+        Allocation {
+            demand: usize,
+            ordinal: u32,
+        },
+        Reservation {
+            kind: LogicalReservationKind,
+            ordinal: u32,
+            requirement_source: Option<RequirementSource>,
+            requirement: Option<u128>,
+            region: LogicalRegionKind,
+            bytes: u64,
+            alignment: u64,
+            identity: u128,
+            local: u8,
+            position: u8,
+        },
+    }
+
+    let architecture = service_plan
+        .assignment
+        .planning_foundation
+        .architecture_contract
+        .for_logical_layout();
+    let mut items = Vec::new();
+    for (demand_index, demand) in demands.iter().enumerate() {
+        for ordinal in 0..demand.count {
+            checkpoint(cancellation)?;
+            items.push(VerifierItem::Allocation {
+                demand: demand_index,
+                ordinal,
+            });
+        }
+    }
+    for (rule_index, rule) in architecture.reservations().iter().enumerate() {
+        let requirement = service_plan
+            .assignment
+            .planning_foundation
+            .requirements
+            .iter()
+            .find_map(|candidate| match candidate.bounds {
+                RequirementBounds::Reservation { kind, .. }
+                    if kind.contract_kind() == rule.kind =>
+                {
+                    Some(candidate.reference.identity)
+                }
+                _ => None,
+            });
+        let multiplicity = match rule.multiplicity {
+            ReservationMultiplicity::Once => 1,
+            ReservationMultiplicity::PerCore => architecture.core_count(),
+        };
+        for instance in 0..multiplicity {
+            let rule_index = u32::try_from(rule_index).map_err(|_| {
+                PlanningFailure::Defect(Arc::from(
+                    "verifier reservation rule ordinal exceeds schema",
+                ))
+            })?;
+            let instance = u32::try_from(instance).map_err(|_| {
+                PlanningFailure::Defect(Arc::from("verifier reservation instance exceeds schema"))
+            })?;
+            let ordinal = rule_index
+                .checked_mul(65_536)
+                .and_then(|base| base.checked_add(instance))
+                .ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from(
+                        "verifier reservation structural ordinal overflow",
+                    ))
+                })?;
+            items.push(VerifierItem::Reservation {
+                kind: LogicalReservationKind::Architecture,
+                ordinal,
+                requirement_source: requirement.map(|_| RequirementSource::Domain),
+                requirement,
+                region: logical_region(rule.region),
+                bytes: rule.bytes,
+                alignment: rule.alignment,
+                identity: u128::from(rule_index),
+                local: u8::try_from(instance).unwrap_or(u8::MAX),
+                position: 1,
+            });
+        }
+    }
+    let page_bytes = architecture.page().quantum_bytes;
+    items.push(VerifierItem::Reservation {
+        kind: LogicalReservationKind::NullGuard,
+        ordinal: 0,
+        requirement_source: None,
+        requirement: None,
+        region: LogicalRegionKind::BootReservation,
+        bytes: page_bytes
+            .checked_mul(u64::from(architecture.guards().null_pages))
+            .ok_or_else(|| PlanningFailure::Defect(Arc::from("verifier null guard overflow")))?,
+        alignment: page_bytes,
+        identity: 0,
+        local: 0,
+        position: 0,
+    });
+    let scheduler_requirement = demands
+        .iter()
+        .find(|demand| demand.envelope == StorageEnvelopeKind::NormalStack)
+        .map(|demand| demand.requirement)
+        .ok_or_else(|| PlanningFailure::Defect(Arc::from("verifier found no stack requirement")))?;
+    for core_index in 0..architecture.core_count() {
+        let core = u32::try_from(core_index)
+            .map_err(|_| PlanningFailure::Defect(Arc::from("verifier core ordinal overflow")))?;
+        let guard_specs = [
+            (
+                LogicalReservationKind::NormalStackBeforeGuard,
+                architecture.guards().normal_stack_before_pages,
+                StorageEnvelopeKind::NormalStack,
+                0_u8,
+            ),
+            (
+                LogicalReservationKind::NormalStackAfterGuard,
+                architecture.guards().normal_stack_after_pages,
+                StorageEnvelopeKind::NormalStack,
+                2,
+            ),
+            (
+                LogicalReservationKind::InterruptStackBeforeGuard,
+                architecture.guards().interrupt_stack_before_pages,
+                StorageEnvelopeKind::InterruptStack,
+                0,
+            ),
+            (
+                LogicalReservationKind::InterruptStackAfterGuard,
+                architecture.guards().interrupt_stack_after_pages,
+                StorageEnvelopeKind::InterruptStack,
+                2,
+            ),
+        ];
+        for (kind, pages, envelope, position) in guard_specs {
+            items.push(VerifierItem::Reservation {
+                kind,
+                ordinal: core,
+                requirement_source: None,
+                requirement: None,
+                region: LogicalRegionKind::PerCoreMutable,
+                bytes: page_bytes.checked_mul(u64::from(pages)).ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from("verifier stack guard overflow"))
+                })?,
+                alignment: page_bytes,
+                identity: scheduler_requirement,
+                local: storage_envelope_tag(envelope),
+                position,
+            });
+        }
+    }
+
+    let item_region = |item: VerifierItem| -> Result<LogicalRegionKind, PlanningFailure> {
+        match item {
+            VerifierItem::Allocation { demand, .. } => Ok(logical_region(
+                envelope_rule(architecture, demands[demand].envelope)?.region,
+            )),
+            VerifierItem::Reservation { region, .. } => Ok(region),
+        }
+    };
+    let item_key = |item: VerifierItem| match item {
+        VerifierItem::Allocation { demand, ordinal } => (
+            demands[demand].requirement,
+            storage_envelope_tag(demands[demand].envelope),
+            ordinal,
+            1,
+        ),
+        VerifierItem::Reservation {
+            identity,
+            local,
+            position,
+            ordinal,
+            ..
+        } => (identity, local, ordinal, position),
+    };
+
+    let mut regions = Vec::new();
+    let mut allocations = Vec::new();
+    let mut reservations = Vec::new();
+    let mut position = 0_u64;
+    for contract_region in architecture.regions() {
+        checkpoint(cancellation)?;
+        let kind = logical_region(contract_region.kind);
+        position = align_up(position, contract_region.alignment)?;
+        let start = position;
+        let mut selected = items
+            .iter()
+            .copied()
+            .filter_map(|item| match item_region(item) {
+                Ok(item_kind) if item_kind == kind => Some(Ok(item)),
+                Ok(_) => None,
+                Err(failure) => Some(Err(failure)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        selected.sort_by_key(|item| item_key(*item));
+        for item in selected {
+            match item {
+                VerifierItem::Allocation { demand, ordinal } => {
+                    let demand = &demands[demand];
+                    let rule = envelope_rule(architecture, demand.envelope)?;
+                    position = align_up(position, rule.alignment)?;
+                    let end = position.checked_add(rule.instance_bytes).ok_or_else(|| {
+                        PlanningFailure::Defect(Arc::from("verifier allocation extent overflow"))
+                    })?;
+                    allocations.push(LogicalAllocationObservation {
+                        requirement_source: demand.requirement_source,
+                        requirement: demand.requirement,
+                        local_key: LayoutLocalKey {
+                            envelope: demand.envelope,
+                            ordinal,
+                        },
+                        envelope: demand.envelope,
+                        region: kind,
+                        lifetime: demand.lifetime,
+                        start: position,
+                        end,
+                        alignment: rule.alignment,
+                        dma_owned: rule.dma_owned,
+                    });
+                    position = end;
+                }
+                VerifierItem::Reservation {
+                    kind: reservation_kind,
+                    ordinal,
+                    requirement_source,
+                    requirement,
+                    bytes,
+                    alignment,
+                    ..
+                } => {
+                    position = align_up(position, alignment)?;
+                    let end = position.checked_add(bytes).ok_or_else(|| {
+                        PlanningFailure::Defect(Arc::from("verifier reservation extent overflow"))
+                    })?;
+                    reservations.push(LogicalReservationObservation {
+                        kind: reservation_kind,
+                        structural_ordinal: ordinal,
+                        requirement_source,
+                        requirement,
+                        region: kind,
+                        start: position,
+                        end,
+                    });
+                    position = end;
+                }
+            }
+        }
+        position = align_up(position, page_bytes)?;
+        regions.push(LogicalRegionObservation {
+            kind,
+            protection: logical_protection(contract_region.protection),
+            start,
+            end: position,
+        });
+    }
+    Ok(LayoutExtents {
+        regions,
+        allocations,
+        reservations,
+        reserved_bytes: position,
+    })
+}
+
+fn verify_layout_conflict(
+    service_plan: &VerifiedServicePlan,
+    conflict: &VerifiedLayoutConflict,
+    cancellation: &Cancellation,
+) -> Result<(), PlanningFailure> {
+    checkpoint(cancellation)?;
+    let architecture = service_plan
+        .assignment
+        .planning_foundation
+        .architecture_contract
+        .for_logical_layout();
+    let demands = verifier_layout_demands(service_plan, cancellation)?;
+    let reserved_bytes =
+        verifier_layout_extents(service_plan, &demands, cancellation)?.reserved_bytes;
+    let required_bytes = reserved_bytes.max(architecture.capacity().minimum_ram_bytes);
+    let mut requirements = demands
+        .iter()
+        .map(|demand| demand.requirement)
+        .collect::<Vec<_>>();
+    requirements.sort_unstable();
+    requirements.dedup();
+    if conflict.code != LayoutConflictCode::RamFit
+        || conflict.contract_fingerprint != architecture.fingerprint()
+        || conflict.requirement_set_fingerprint
+            != service_plan.assignment.requirement_set_fingerprint
+        || conflict.required_bytes <= conflict.available_bytes
+        || conflict.required_bytes != required_bytes
+        || conflict.available_bytes != architecture.capacity().maximum_ram_bytes
+        || conflict.requirements.as_ref() != requirements
+    {
+        return defect("Logical Image Layout fit conflict does not verify");
+    }
+    Ok(())
+}
+
+fn derive_layout_cost_ledger(layout: &VerifiedLogicalImageLayout) -> Arc<[LayoutCostObservation]> {
+    let mut ledger = Vec::new();
+    let mut prior_region_end = 0_u64;
+    for region in layout.regions.iter() {
+        if region.start > prior_region_end {
+            ledger.push(LayoutCostObservation {
+                kind: LayoutCostKind::RegionAlignment,
+                region: region.kind,
+                requirement_source: None,
+                requirement: None,
+                envelope: None,
+                multiplicity: 1,
+                bytes: region.start - prior_region_end,
+            });
+        }
+        let mut cursor = region.start;
+        let mut members = layout
+            .allocations
+            .iter()
+            .filter(|allocation| allocation.region == region.kind)
+            .map(|allocation| {
+                (
+                    allocation.start,
+                    allocation.end,
+                    Some((allocation.requirement_source, allocation.requirement)),
+                    Some(allocation.envelope),
+                    LayoutCostKind::EnvelopePayload,
+                )
+            })
+            .chain(
+                layout
+                    .reservations
+                    .iter()
+                    .filter(|reservation| reservation.region == region.kind)
+                    .map(|reservation| {
+                        (
+                            reservation.start,
+                            reservation.end,
+                            reservation.requirement_source.zip(reservation.requirement),
+                            None,
+                            if reservation.is_guard() {
+                                LayoutCostKind::Guard
+                            } else {
+                                LayoutCostKind::ArchitectureReservation
+                            },
+                        )
+                    }),
+            )
+            .collect::<Vec<_>>();
+        members.sort_by_key(|member| (member.0, member.1));
+        for (start, end, requirement, envelope, kind) in members {
+            if start > cursor {
+                ledger.push(LayoutCostObservation {
+                    kind: LayoutCostKind::AllocationAlignment,
+                    region: region.kind,
+                    requirement_source: requirement.map(|value| value.0),
+                    requirement: requirement.map(|value| value.1),
+                    envelope: None,
+                    multiplicity: 1,
+                    bytes: start - cursor,
+                });
+            }
+            ledger.push(LayoutCostObservation {
+                kind,
+                region: region.kind,
+                requirement_source: requirement.map(|value| value.0),
+                requirement: requirement.map(|value| value.1),
+                envelope,
+                multiplicity: 1,
+                bytes: end - start,
+            });
+            cursor = end;
+        }
+        if region.end > cursor {
+            ledger.push(LayoutCostObservation {
+                kind: LayoutCostKind::RegionRounding,
+                region: region.kind,
+                requirement_source: None,
+                requirement: None,
+                envelope: None,
+                multiplicity: 1,
+                bytes: region.end - cursor,
+            });
+        }
+        prior_region_end = region.end;
+    }
+    let mut payloads = BTreeMap::<
+        (
+            LogicalRegionKind,
+            RequirementSource,
+            u128,
+            StorageEnvelopeKind,
+        ),
+        (u32, u64),
+    >::new();
+    let mut overhead = Vec::new();
+    for entry in ledger {
+        if entry.kind == LayoutCostKind::EnvelopePayload {
+            let key = (
+                entry.region,
+                entry
+                    .requirement_source
+                    .expect("payload has RequirementRef"),
+                entry.requirement.expect("payload has RequirementRef"),
+                entry.envelope.expect("payload has Storage Envelope"),
+            );
+            let aggregate = payloads.entry(key).or_insert((0, 0));
+            aggregate.0 = aggregate.0.saturating_add(entry.multiplicity);
+            aggregate.1 = aggregate.1.saturating_add(entry.bytes);
+        } else {
+            overhead.push(entry);
+        }
+    }
+    overhead.extend(payloads.into_iter().map(
+        |((region, source, requirement, envelope), (multiplicity, bytes))| LayoutCostObservation {
+            kind: LayoutCostKind::EnvelopePayload,
+            region,
+            requirement_source: Some(source),
+            requirement: Some(requirement),
+            envelope: Some(envelope),
+            multiplicity,
+            bytes,
+        },
+    ));
+    overhead.sort_by_key(|entry| (entry.region, entry.kind, entry.requirement, entry.envelope));
+    overhead.into()
+}
+
+const fn logical_region_tag(kind: LogicalRegionKind) -> u8 {
+    match kind {
+        LogicalRegionKind::BootReservation => 1,
+        LogicalRegionKind::Executable => 2,
+        LogicalRegionKind::ImmutableData => 3,
+        LogicalRegionKind::PerCoreMutable => 4,
+        LogicalRegionKind::SharedMutable => 5,
+        LogicalRegionKind::DmaOwned => 6,
+    }
+}
+
+const fn logical_protection_tag(protection: LogicalProtection) -> u8 {
+    match protection {
+        LogicalProtection::Sealed => 1,
+        LogicalProtection::ReadExecute => 2,
+        LogicalProtection::ReadOnlyNoExecute => 3,
+        LogicalProtection::ReadWriteNoExecute => 4,
+        LogicalProtection::DmaVisibleReadWriteNoExecute => 5,
+    }
+}
+
+const fn storage_envelope_tag(kind: StorageEnvelopeKind) -> u8 {
+    match kind {
+        StorageEnvelopeKind::Executable => 1,
+        StorageEnvelopeKind::ImmutableData => 2,
+        StorageEnvelopeKind::PerCoreState => 3,
+        StorageEnvelopeKind::SharedState => 4,
+        StorageEnvelopeKind::DmaState => 5,
+        StorageEnvelopeKind::NormalStack => 6,
+        StorageEnvelopeKind::InterruptStack => 7,
+        StorageEnvelopeKind::AsyncFrame => 8,
+    }
+}
+
+const fn requirement_source_tag(source: RequirementSource) -> u8 {
+    match source {
+        RequirementSource::Domain => 1,
+        RequirementSource::Flow => 2,
+    }
+}
+
+const fn lifetime_tag(lifetime: LogicalLifetime) -> u8 {
+    match lifetime {
+        LogicalLifetime::Image => 1,
+        LogicalLifetime::Activation => 2,
+    }
+}
+
+const fn reservation_observation_tag(kind: LogicalReservationKind) -> u8 {
+    match kind {
+        LogicalReservationKind::Architecture => 1,
+        LogicalReservationKind::NullGuard => 2,
+        LogicalReservationKind::NormalStackBeforeGuard => 3,
+        LogicalReservationKind::NormalStackAfterGuard => 4,
+        LogicalReservationKind::InterruptStackBeforeGuard => 5,
+        LogicalReservationKind::InterruptStackAfterGuard => 6,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::OnceLock;
@@ -13203,6 +15257,66 @@ fn build() -> Image:
             panic!("fixture Requirement Set is feasible");
         };
         assignment
+    }
+
+    fn service_fixture_from_foundation(
+        foundation: VerifiedPlanningFoundation,
+    ) -> VerifiedServicePlan {
+        let assignment = Arc::new(assignment_from_foundation(foundation));
+        let ServicePlanOutcome::Plan(service) = ImagePlanningModule
+            .service_plan(assignment, &Cancellation::new())
+            .expect("Service Plan verifies")
+        else {
+            panic!("fixture service is feasible");
+        };
+        service
+    }
+
+    fn layout_fixture() -> VerifiedLogicalImageLayout {
+        let service = Arc::new(service_fixture_from_foundation(fixture(Root::Image)));
+        let LogicalLayoutOutcome::Layout(layout) = ImagePlanningModule
+            .logical_layout(service, &Cancellation::new())
+            .expect("Logical Image Layout verifies")
+        else {
+            panic!("fixture layout fits");
+        };
+        layout
+    }
+
+    fn layout_outcome_with_ram(maximum_ram_bytes: u64) -> LogicalLayoutOutcome {
+        let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+        let CompilationOutcome::Accepted(accepted) = compiler.compile(
+            CompilationRequest::new(
+                ProjectSnapshot::new(vec![ProjectFile::new(
+                    "src/image.wr",
+                    b"@image\nfn build() -> Image:\n    return Image.new()\n",
+                )]),
+                Root::Image,
+            ),
+            &Cancellation::new(),
+        ) else {
+            panic!("semantic fixture accepts");
+        };
+        let semantic = Arc::new(accepted.completed_semantic_program().clone());
+        let digest = semantic.for_image_planning().distribution_digest();
+        let contract = ArchitecturePlanningModule::new(ContractContext::new(
+            "planning-layout-fit-test",
+            digest,
+        ))
+        .authenticate_private_synthetic_with_ram_bounds(
+            &[250_000, 250_000, 250_000, 250_000],
+            4096,
+            maximum_ram_bytes,
+            &Cancellation::new(),
+        )
+        .expect("private RAM contract authenticates");
+        let foundation = ImagePlanningModule
+            .plan(semantic, Arc::new(contract), &Cancellation::new())
+            .expect("foundation verifies");
+        let service = Arc::new(service_fixture_from_foundation(foundation));
+        ImagePlanningModule
+            .logical_layout(service, &Cancellation::new())
+            .expect("layout fit puzzle is a closed outcome")
     }
 
     fn semantic_capacity_fixture(source: &'static [u8]) -> Arc<CompletedSemanticProgram> {
@@ -16186,5 +18300,292 @@ fn build() -> Image:
         };
         assert_eq!(deadline.requirements, deadline_group.response_requirements);
         verify_service_conflict(&deadline_problem, &deadline, &Cancellation::new()).unwrap();
+    }
+
+    #[test]
+    fn logical_layout_expands_guards_and_rounds_each_closed_region_once() {
+        let layout = layout_fixture();
+        let page = layout
+            .service_plan
+            .assignment
+            .planning_foundation
+            .architecture_contract
+            .for_logical_layout()
+            .page()
+            .quantum_bytes;
+        assert_eq!(layout.regions.len(), 6);
+        assert!(
+            layout
+                .regions
+                .iter()
+                .all(|region| region.start % page == 0 && region.end % page == 0)
+        );
+        assert_eq!(
+            layout
+                .reservations
+                .iter()
+                .filter(|reservation| reservation.is_guard())
+                .count(),
+            17
+        );
+        assert_eq!(
+            layout
+                .reservations
+                .iter()
+                .filter(|reservation| reservation.kind == LogicalReservationKind::NullGuard)
+                .count(),
+            1
+        );
+        for kind in [
+            LogicalReservationKind::NormalStackBeforeGuard,
+            LogicalReservationKind::NormalStackAfterGuard,
+            LogicalReservationKind::InterruptStackBeforeGuard,
+            LogicalReservationKind::InterruptStackAfterGuard,
+        ] {
+            assert_eq!(
+                layout
+                    .reservations
+                    .iter()
+                    .filter(|reservation| reservation.kind == kind)
+                    .count(),
+                4
+            );
+        }
+        for stack in layout.allocations.iter().filter(|allocation| {
+            matches!(
+                allocation.envelope,
+                StorageEnvelopeKind::NormalStack | StorageEnvelopeKind::InterruptStack
+            )
+        }) {
+            let (before_kind, after_kind) = match stack.envelope {
+                StorageEnvelopeKind::NormalStack => (
+                    LogicalReservationKind::NormalStackBeforeGuard,
+                    LogicalReservationKind::NormalStackAfterGuard,
+                ),
+                StorageEnvelopeKind::InterruptStack => (
+                    LogicalReservationKind::InterruptStackBeforeGuard,
+                    LogicalReservationKind::InterruptStackAfterGuard,
+                ),
+                _ => unreachable!(),
+            };
+            let before = layout
+                .reservations
+                .iter()
+                .find(|reservation| {
+                    reservation.kind == before_kind
+                        && reservation.structural_ordinal == stack.local_key.ordinal
+                })
+                .unwrap();
+            let after = layout
+                .reservations
+                .iter()
+                .find(|reservation| {
+                    reservation.kind == after_kind
+                        && reservation.structural_ordinal == stack.local_key.ordinal
+                })
+                .unwrap();
+            assert_eq!(before.end, stack.start);
+            assert_eq!(stack.end, after.start);
+        }
+        for ((source, requirement, envelope), instances) in &layout.allocations.iter().fold(
+            BTreeMap::<_, Vec<u32>>::new(),
+            |mut grouped, allocation| {
+                grouped
+                    .entry((
+                        allocation.requirement_source,
+                        allocation.requirement,
+                        allocation.envelope,
+                    ))
+                    .or_default()
+                    .push(allocation.local_key.ordinal);
+                grouped
+            },
+        ) {
+            let expected = (0..u32::try_from(instances.len()).unwrap()).collect::<Vec<_>>();
+            assert_eq!(
+                *instances, expected,
+                "finite multiplicity for {source:?}/{requirement:032x}/{envelope:?} expands structurally"
+            );
+        }
+    }
+
+    #[test]
+    fn logical_layout_permutation_reproduces_exact_extents_and_fingerprint() {
+        let layout = layout_fixture();
+        let mut demands =
+            produce_layout_demands(&layout.service_plan, &Cancellation::new()).unwrap();
+        let canonical =
+            produce_layout_extents(&layout.service_plan, &demands, &Cancellation::new()).unwrap();
+        demands.reverse();
+        let permuted =
+            produce_layout_extents(&layout.service_plan, &demands, &Cancellation::new()).unwrap();
+        assert_eq!(canonical, permuted);
+        assert_eq!(layout.fingerprint, verifier_layout_fingerprint(&layout));
+    }
+
+    #[test]
+    fn logical_layout_exact_fit_accepts_and_one_short_returns_verified_conflict() {
+        let baseline = layout_fixture();
+        let exact_bytes = 6_750_208;
+        assert_eq!(
+            baseline.reserved_bytes, exact_bytes,
+            "worked current AArch64 fixture extent"
+        );
+        let LogicalLayoutOutcome::Layout(exact) = layout_outcome_with_ram(exact_bytes) else {
+            panic!("the exact reserved extent must fit");
+        };
+        assert_eq!(exact.total_ram_bytes, exact_bytes);
+        let LogicalLayoutOutcome::Conflict(conflict) = layout_outcome_with_ram(exact_bytes - 1)
+        else {
+            panic!("one byte short must return layout conflict");
+        };
+        assert_eq!(conflict.code(), LayoutConflictCode::RamFit);
+        assert_eq!(conflict.required_bytes(), exact_bytes);
+        assert_eq!(conflict.available_bytes(), exact_bytes - 1);
+    }
+
+    #[test]
+    fn logical_layout_cancellation_publishes_no_candidate_or_conflict() {
+        let service = Arc::clone(&layout_fixture().service_plan);
+        let cancellation = Cancellation::new();
+        cancellation.cancel_after_private_polls(5);
+        assert!(matches!(
+            ImagePlanningModule.logical_layout(service, &cancellation),
+            Err(PlanningFailure::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn logical_layout_verifier_contains_malformed_coverage_and_extents() {
+        let baseline = layout_fixture();
+
+        let mut missing = baseline.clone();
+        missing.allocations = missing.allocations[1..].to_vec().into();
+        assert!(matches!(
+            verify_logical_layout(&missing, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut overlap = baseline.clone();
+        let first_start = overlap.allocations[0].start;
+        let bytes = overlap.allocations[1].envelope_bytes();
+        Arc::make_mut(&mut overlap.allocations)[1].start = first_start;
+        Arc::make_mut(&mut overlap.allocations)[1].end = first_start + bytes;
+        overlap.fingerprint = verifier_layout_fingerprint(&overlap);
+        assert!(matches!(
+            verify_logical_layout(&overlap, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut alignment = baseline.clone();
+        Arc::make_mut(&mut alignment.allocations)[0].start += 1;
+        alignment.fingerprint = verifier_layout_fingerprint(&alignment);
+        assert!(matches!(
+            verify_logical_layout(&alignment, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut protection = baseline.clone();
+        Arc::make_mut(&mut protection.regions)[1].protection =
+            LogicalProtection::ReadWriteNoExecute;
+        protection.fingerprint = verifier_layout_fingerprint(&protection);
+        assert!(matches!(
+            verify_logical_layout(&protection, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut dma = baseline.clone();
+        let dma_index = dma
+            .allocations
+            .iter()
+            .position(|allocation| allocation.dma_owned)
+            .unwrap();
+        Arc::make_mut(&mut dma.allocations)[dma_index].dma_owned = false;
+        dma.fingerprint = verifier_layout_fingerprint(&dma);
+        assert!(matches!(
+            verify_logical_layout(&dma, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut fingerprint = baseline;
+        fingerprint.fingerprint ^= 1;
+        assert!(matches!(
+            verify_logical_layout(&fingerprint, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let baseline = layout_fixture();
+        let mut reservation_coverage = baseline.clone();
+        let reservation_index = reservation_coverage
+            .reservations
+            .iter()
+            .position(|reservation| reservation.requirement.is_some())
+            .unwrap();
+        let reservation =
+            &mut Arc::make_mut(&mut reservation_coverage.reservations)[reservation_index];
+        reservation.requirement = reservation.requirement.map(|identity| identity ^ 1);
+        reservation_coverage.fingerprint = verifier_layout_fingerprint(&reservation_coverage);
+        assert!(matches!(
+            verify_logical_layout(&reservation_coverage, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut lifetime = baseline.clone();
+        Arc::make_mut(&mut lifetime.allocations)[0].lifetime = LogicalLifetime::Activation;
+        lifetime.fingerprint = verifier_layout_fingerprint(&lifetime);
+        assert!(matches!(
+            verify_logical_layout(&lifetime, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut rounding = baseline.clone();
+        Arc::make_mut(&mut rounding.regions)[0].end += 1;
+        rounding.fingerprint = verifier_layout_fingerprint(&rounding);
+        assert!(matches!(
+            verify_logical_layout(&rounding, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut bounds = baseline.clone();
+        bounds.total_ram_bytes = bounds
+            .service_plan
+            .assignment
+            .planning_foundation
+            .architecture_contract
+            .for_logical_layout()
+            .capacity()
+            .maximum_ram_bytes
+            + 1;
+        bounds.fingerprint = verifier_layout_fingerprint(&bounds);
+        assert!(matches!(
+            verify_logical_layout(&bounds, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut context = baseline;
+        let service = Arc::make_mut(&mut context.service_plan);
+        service.candidate.context ^= 1;
+        service.fingerprint = service_plan_fingerprint(&service.candidate);
+        context.fingerprint = verifier_layout_fingerprint(&context);
+        assert!(matches!(
+            verify_logical_layout(&context, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+    }
+
+    #[test]
+    fn logical_layout_arithmetic_overflow_is_contained_as_defect() {
+        assert!(matches!(
+            align_up(u64::MAX, 4096),
+            Err(PlanningFailure::Defect(_))
+        ));
+        assert!(matches!(
+            checked_add(u64::MAX, 1),
+            Err(PlanningFailure::Defect(_))
+        ));
+        assert!(matches!(
+            checked_mul(u64::MAX, 2),
+            Err(PlanningFailure::Defect(_))
+        ));
     }
 }

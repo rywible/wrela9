@@ -228,6 +228,23 @@ struct FlowRequirement {
     current_meaning: u128,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FlowRequirementRef {
+    identity: u128,
+    current_meaning: u128,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ImagePlanningFlowView<'a> {
+    flow: &'a VerifiedFlowProgram,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ImagePlanningFlowRequirement<'a>(&'a FlowRequirement);
+
+#[derive(Clone, Copy)]
+pub(crate) struct ImagePlanningActor<'a>(&'a Actor);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Actor {
     identity: u128,
@@ -1376,6 +1393,10 @@ impl VerifiedFlowProgram {
         self.fingerprint
     }
 
+    pub(crate) const fn for_image_planning(&self) -> ImagePlanningFlowView<'_> {
+        ImagePlanningFlowView { flow: self }
+    }
+
     pub(crate) fn observation(
         &self,
         cancellation: &Cancellation,
@@ -1598,6 +1619,90 @@ impl VerifiedFlowProgram {
             model_agrees: self.model.agrees,
             model_evidence_complete: self.model_evidence_complete,
         })
+    }
+}
+
+impl<'a> ImagePlanningFlowView<'a> {
+    pub(crate) const fn context_identity(self) -> u128 {
+        self.flow.context
+    }
+
+    pub(crate) const fn fingerprint(self) -> u128 {
+        self.flow.fingerprint
+    }
+
+    pub(crate) const fn planning_fingerprint(self) -> u128 {
+        self.flow.planning_fingerprint
+    }
+
+    pub(crate) const fn core_fingerprint(self) -> u128 {
+        self.flow.core_fingerprint
+    }
+
+    pub(crate) fn requirements(
+        self,
+    ) -> impl ExactSizeIterator<Item = ImagePlanningFlowRequirement<'a>> {
+        self.flow
+            .requirements
+            .iter()
+            .map(ImagePlanningFlowRequirement)
+    }
+
+    pub(crate) fn actors(self) -> impl ExactSizeIterator<Item = ImagePlanningActor<'a>> {
+        self.flow.actors.iter().map(ImagePlanningActor)
+    }
+}
+
+impl ImagePlanningFlowRequirement<'_> {
+    pub(crate) const fn reference(self) -> FlowRequirementRef {
+        FlowRequirementRef {
+            identity: self.0.identity,
+            current_meaning: self.0.current_meaning,
+        }
+    }
+
+    pub(crate) const fn kind(self) -> FlowRequirementKind {
+        self.0.kind
+    }
+
+    pub(crate) const fn actor(self) -> u128 {
+        self.0.actor
+    }
+
+    pub(crate) const fn handler(self) -> Option<u128> {
+        self.0.handler
+    }
+
+    pub(crate) const fn site(self) -> Option<u128> {
+        self.0.site
+    }
+}
+
+impl FlowRequirementRef {
+    pub(crate) const fn identity(self) -> u128 {
+        self.identity
+    }
+
+    pub(crate) const fn current_meaning(self) -> u128 {
+        self.current_meaning
+    }
+}
+
+impl<'a> ImagePlanningActor<'a> {
+    pub(crate) const fn identity(self) -> u128 {
+        self.0.identity
+    }
+
+    pub(crate) fn handlers(self) -> impl ExactSizeIterator<Item = u128> + 'a {
+        self.0.handlers.iter().copied()
+    }
+
+    pub(crate) const fn mailbox_capacity(self) -> u64 {
+        self.0.mailbox_capacity
+    }
+
+    pub(crate) const fn max_active_turns(self) -> u8 {
+        self.0.max_active_turns
     }
 }
 

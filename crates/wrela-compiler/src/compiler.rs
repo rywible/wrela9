@@ -15,6 +15,7 @@ use crate::core::{CoreFailure, CoreProgramObservation, VerifiedCoreProgram};
 use crate::flow::{FlowFailure, FlowProgramObservation, VerifiedFlowProgram};
 use crate::image_planning::{
     PlanningFailure, PlanningFoundationObservation, VerifiedPlanningFoundation,
+    VerifiedWholeImageAssignment, WholeImageAssignmentObservation,
 };
 use crate::syntax;
 use crate::typed_hir::AuthorityContext;
@@ -1172,6 +1173,7 @@ pub struct Inspection {
     planning_foundation: Option<PlanningFoundationObservation>,
     core_program: Option<CoreProgramObservation>,
     flow_program: Option<FlowProgramObservation>,
+    whole_image_assignment: Option<WholeImageAssignmentObservation>,
 }
 
 impl Inspection {
@@ -1283,6 +1285,11 @@ impl Inspection {
     #[must_use]
     pub const fn flow_program(&self) -> Option<&FlowProgramObservation> {
         self.flow_program.as_ref()
+    }
+
+    #[must_use]
+    pub const fn whole_image_assignment(&self) -> Option<&WholeImageAssignmentObservation> {
+        self.whole_image_assignment.as_ref()
     }
 }
 
@@ -2312,6 +2319,7 @@ pub struct AcceptedCompilation {
     planning_foundation: Option<Arc<VerifiedPlanningFoundation>>,
     core_program: Option<Arc<VerifiedCoreProgram>>,
     flow_program: Option<Arc<VerifiedFlowProgram>>,
+    whole_image_assignment: Option<Arc<VerifiedWholeImageAssignment>>,
 }
 
 impl AcceptedCompilation {
@@ -2345,6 +2353,13 @@ impl AcceptedCompilation {
     #[must_use]
     pub fn flow_program_fingerprint(&self) -> Option<u128> {
         self.flow_program.as_ref().map(|flow| flow.fingerprint())
+    }
+
+    #[must_use]
+    pub fn whole_image_assignment_fingerprint(&self) -> Option<u128> {
+        self.whole_image_assignment
+            .as_ref()
+            .map(|assignment| assignment.fingerprint())
     }
 
     #[allow(dead_code)]
@@ -3011,6 +3026,37 @@ impl Compiler {
             _ => None,
         };
 
+        let whole_image_assignment = match (
+            planning_foundation.as_ref(),
+            core_program.as_ref(),
+            flow_program.as_ref(),
+        ) {
+            (Some(planning), Some(core), Some(flow)) => {
+                match self.distribution.image_planning().solve(
+                    Arc::clone(planning),
+                    Arc::clone(core),
+                    Arc::clone(flow),
+                    cancellation,
+                ) {
+                    Ok(assignment) => Some(Arc::new(assignment)),
+                    Err(PlanningFailure::Cancelled) => return CompilationOutcome::Cancelled,
+                    Err(PlanningFailure::Defect(evidence)) => {
+                        return CompilationOutcome::Defect(Defect::new(
+                            "Whole-Image Assignment",
+                            evidence,
+                        ));
+                    }
+                    Err(_) => {
+                        return CompilationOutcome::Defect(Defect::new(
+                            "Whole-Image Assignment",
+                            "canonical solving returned a pre-Flow planning failure",
+                        ));
+                    }
+                }
+            }
+            _ => None,
+        };
+
         let Some(unreachable_project_syntax) = parse_unreachable_project_syntax(
             &request.project,
             &parsed_sources,
@@ -3136,6 +3182,13 @@ impl Compiler {
             },
             core_program: core_observation,
             flow_program: flow_observation,
+            whole_image_assignment: if request.inspection.planning {
+                whole_image_assignment
+                    .as_ref()
+                    .map(|assignment| assignment.observation())
+            } else {
+                None
+            },
         };
 
         if diagnostics.is_empty() {
@@ -3152,6 +3205,7 @@ impl Compiler {
                 planning_foundation,
                 core_program,
                 flow_program,
+                whole_image_assignment,
             })
         } else {
             CompilationOutcome::Rejected(RejectedCompilation {

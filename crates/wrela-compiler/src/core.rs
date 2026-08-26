@@ -793,6 +793,10 @@ impl VerifiedCoreProgram {
         self.fingerprint
     }
 
+    pub(crate) const fn for_image_planning(&self) -> ImagePlanningCoreView<'_> {
+        ImagePlanningCoreView { core: self }
+    }
+
     pub(crate) fn observation(
         &self,
         cancellation: &Cancellation,
@@ -877,6 +881,25 @@ impl VerifiedCoreProgram {
     #[allow(dead_code)]
     pub(crate) fn for_backend(&self) -> BackendCoreView<'_> {
         BackendCoreView { core: self }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ImagePlanningCoreView<'a> {
+    core: &'a VerifiedCoreProgram,
+}
+
+impl<'a> ImagePlanningCoreView<'a> {
+    pub(crate) const fn context_identity(self) -> u128 {
+        self.core.context
+    }
+
+    pub(crate) const fn fingerprint(self) -> u128 {
+        self.core.fingerprint
+    }
+
+    pub(crate) fn executables(self) -> impl ExactSizeIterator<Item = CoreExecutableIndex<'a>> {
+        self.core.executables.iter().map(CoreExecutableIndex)
     }
 }
 
@@ -2202,6 +2225,10 @@ impl<'a> CoreExecutableIndex<'a> {
 
     pub(crate) fn context(self) -> u128 {
         self.0.reference.context
+    }
+
+    pub(crate) fn current_meaning(self) -> u128 {
+        self.0.reference.current_meaning
     }
 
     pub(crate) fn parameters(self) -> impl ExactSizeIterator<Item = CoreParameterIndex<'a>> {

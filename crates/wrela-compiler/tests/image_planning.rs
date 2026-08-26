@@ -1033,6 +1033,14 @@ fn planning_inspection_is_output_only_and_compiler_use_is_deterministic() {
         first.planning_foundation_fingerprint(),
         repeated.planning_foundation_fingerprint()
     );
+    assert_eq!(
+        without.whole_image_assignment_fingerprint(),
+        first.whole_image_assignment_fingerprint()
+    );
+    assert_eq!(
+        first.whole_image_assignment_fingerprint(),
+        repeated.whole_image_assignment_fingerprint()
+    );
     assert!(without.inspection().planning_foundation().is_none());
     assert_eq!(
         first
@@ -1065,10 +1073,16 @@ fn planning_inspection_is_output_only_and_compiler_use_is_deterministic() {
             accepted.diagnostics().to_vec(),
             accepted.semantic_program_fingerprint(),
             accepted.planning_foundation_fingerprint(),
+            accepted.whole_image_assignment_fingerprint(),
             accepted
                 .inspection()
                 .planning_foundation()
                 .expect("planning selected")
+                .clone(),
+            accepted
+                .inspection()
+                .whole_image_assignment()
+                .expect("planning assignment selected")
                 .clone(),
         )
     };
@@ -1187,6 +1201,7 @@ fn rejected_and_cancelled_compiles_publish_no_planning_foundation() {
         panic!("malformed source rejects");
     };
     assert!(rejected.inspection().planning_foundation().is_none());
+    assert!(rejected.inspection().whole_image_assignment().is_none());
 
     let cancellation = Cancellation::new();
     cancellation.cancel();
@@ -1194,4 +1209,77 @@ fn rejected_and_cancelled_compiles_publish_no_planning_foundation() {
         compiler.compile(deployment_request(InspectSelection::all()), &cancellation),
         CompilationOutcome::Cancelled
     ));
+}
+
+#[test]
+fn whole_image_solver_places_every_executable_and_discharges_every_requirement_once() {
+    let outcome = Compiler::open(CompilerInstallation::layer1())
+        .unwrap()
+        .compile(
+            deployment_request(InspectSelection::all()),
+            &Cancellation::new(),
+        );
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("the minimal deployment Image must be admitted: {outcome:#?}");
+    };
+    let inspection = accepted.inspection();
+    let assignment = inspection
+        .whole_image_assignment()
+        .expect("planning inspection includes the verified canonical assignment");
+    let core = inspection.core_program().expect("Core inspection");
+    let foundation = inspection
+        .planning_foundation()
+        .expect("planning foundation inspection");
+    let flow = inspection.flow_program().expect("Flow inspection");
+
+    assert_eq!(assignment.placements().len(), core.executables().len());
+    assert_eq!(
+        assignment.discharges().len(),
+        foundation.requirements().len() + flow.requirements().len()
+    );
+    assert_eq!(
+        assignment
+            .placements()
+            .iter()
+            .map(|placement| placement.executable())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        assignment.placements().len(),
+        "every executable is placed exactly once"
+    );
+    assert_eq!(
+        assignment
+            .discharges()
+            .iter()
+            .map(|discharge| discharge.requirement())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        assignment.discharges().len(),
+        "every requirement is discharged exactly once"
+    );
+    for role in foundation.generated_roles() {
+        assert_eq!(
+            assignment
+                .placements()
+                .iter()
+                .filter(|placement| placement.executable() == role.executable())
+                .count(),
+            1,
+            "each generated executable has one placement"
+        );
+    }
+    let required_bindings = foundation
+        .requirements()
+        .iter()
+        .filter_map(|requirement| match requirement.bounds() {
+            RequirementBounds::Binding { kind, minimum, .. } if *minimum > 0 => {
+                Some((requirement.reference(), *kind))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(assignment.bindings().len(), required_bindings.len());
+    assert!(assignment.bindings().iter().all(|binding| {
+        required_bindings.get(&binding.requirement()) == Some(&binding.binding())
+    }));
 }

@@ -523,6 +523,16 @@ impl ImagePlanningArchitecture<'_> {
             .any(|slot| slot.kind == binding)
     }
 
+    pub(crate) fn binding_ordinal(self, binding: BindingKind) -> Option<u8> {
+        self.contract
+            .facts
+            .binding_slots
+            .iter()
+            .filter(|slot| slot.kind == binding)
+            .map(|slot| slot.ordinal)
+            .min()
+    }
+
     pub(crate) fn facility_share(
         self,
         role: FacilitySharedRoleKind,

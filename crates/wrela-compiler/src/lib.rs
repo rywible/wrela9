@@ -55,7 +55,8 @@ pub use flow::{
     FlowSuspensionHomeObservation, FlowTraceRecord,
 };
 pub use image_planning::{
-    DomainPlanKind, DomainPlanObservation, ExecutableDemandObservation, FacilityActorRef,
+    BindingAssignmentObservation, DischargeKind, DomainPlanKind, DomainPlanObservation,
+    ExecutableDemandObservation, ExecutablePlacementObservation, FacilityActorRef,
     FacilityBindingAvailability, FacilityContractObservation, FacilityDomainPlanObservation,
     FacilityEndpointOwnership, FacilityFlagshipRule, FacilityKind, FacilityLossPolicy,
     FacilityReplayAuthority, FacilityReplayRule, FacilitySemanticCapacity, FacilitySharedRole,
@@ -63,6 +64,7 @@ pub use image_planning::{
     PlannerObservation, PlanningBinding, PlanningCapability, PlanningFoundationObservation,
     PlanningMultiplicity, PlanningReservation, PoolAdmissionEvidenceObservation,
     PoolModelObservation, PoolObservation, RequirementBounds, RequirementCategory,
-    RequirementObservation, RequirementProvenance, RequirementSubject,
+    RequirementDischargeObservation, RequirementObservation, RequirementProvenance,
+    RequirementSource, RequirementSubject, WholeImageAssignmentObservation,
 };
 pub use typed_hir::PoolOperation;

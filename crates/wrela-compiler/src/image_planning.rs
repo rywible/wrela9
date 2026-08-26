@@ -14,6 +14,8 @@ use crate::completed_semantic::{
     CompletedSemanticProgram, CorePlanningSemanticProgram, CoreSourceExecutableBody,
     CoreSourceExecutableRef, PlanningConstructionValueRef,
 };
+use crate::core::VerifiedCoreProgram;
+use crate::flow::{FlowRequirementKind, FlowRequirementRef, VerifiedFlowProgram};
 use crate::model::{BuildKind, SpecializationId};
 use crate::typed_hir::{
     AccessMode, CallTarget, Expression, ExpressionKind, HirMatchCase, Literal, LocalId,
@@ -22,6 +24,7 @@ use crate::typed_hir::{
 use crate::{Cancellation, Root, SourceRange};
 
 pub(crate) const PHASE_SCHEMA: &str = "wrela.image-planning-foundation.v1";
+pub(crate) const WHOLE_IMAGE_ASSIGNMENT_SCHEMA: &str = "wrela.whole-image-assignment.v1";
 const SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1032,6 +1035,143 @@ pub struct PlanningFoundationObservation {
     facility_domain_plans: Arc<[FacilityDomainPlanObservation]>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RequirementSource {
+    Domain,
+    Flow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DischargeKind {
+    ExecutableRealized,
+    Placed,
+    Bound,
+    CapacityProved,
+    CapabilityPresent,
+    CardinalityProved,
+    LifetimeProved,
+    ContractValidated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutablePlacementObservation {
+    executable: u128,
+    executable_current_meaning: u128,
+    core: u16,
+}
+
+impl ExecutablePlacementObservation {
+    #[must_use]
+    pub const fn executable(&self) -> u128 {
+        self.executable
+    }
+
+    #[must_use]
+    pub const fn executable_current_meaning(&self) -> u128 {
+        self.executable_current_meaning
+    }
+
+    #[must_use]
+    pub const fn core(&self) -> u16 {
+        self.core
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindingAssignmentObservation {
+    requirement: u128,
+    binding: PlanningBinding,
+    slot: u8,
+}
+
+impl BindingAssignmentObservation {
+    #[must_use]
+    pub const fn requirement(&self) -> u128 {
+        self.requirement
+    }
+
+    #[must_use]
+    pub const fn binding(&self) -> PlanningBinding {
+        self.binding
+    }
+
+    #[must_use]
+    pub const fn slot(&self) -> u8 {
+        self.slot
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequirementDischargeObservation {
+    source: RequirementSource,
+    requirement: u128,
+    requirement_current_meaning: u128,
+    kind: DischargeKind,
+}
+
+impl RequirementDischargeObservation {
+    #[must_use]
+    pub const fn source(&self) -> RequirementSource {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn requirement(&self) -> u128 {
+        self.requirement
+    }
+
+    #[must_use]
+    pub const fn requirement_current_meaning(&self) -> u128 {
+        self.requirement_current_meaning
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> DischargeKind {
+        self.kind
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WholeImageAssignmentObservation {
+    fingerprint: u128,
+    requirement_set_fingerprint: u128,
+    placements: Arc<[ExecutablePlacementObservation]>,
+    bindings: Arc<[BindingAssignmentObservation]>,
+    discharges: Arc<[RequirementDischargeObservation]>,
+}
+
+impl WholeImageAssignmentObservation {
+    #[must_use]
+    pub const fn phase_schema(&self) -> &'static str {
+        WHOLE_IMAGE_ASSIGNMENT_SCHEMA
+    }
+
+    #[must_use]
+    pub const fn fingerprint(&self) -> u128 {
+        self.fingerprint
+    }
+
+    #[must_use]
+    pub const fn requirement_set_fingerprint(&self) -> u128 {
+        self.requirement_set_fingerprint
+    }
+
+    #[must_use]
+    pub fn placements(&self) -> &[ExecutablePlacementObservation] {
+        &self.placements
+    }
+
+    #[must_use]
+    pub fn bindings(&self) -> &[BindingAssignmentObservation] {
+        &self.bindings
+    }
+
+    #[must_use]
+    pub fn discharges(&self) -> &[RequirementDischargeObservation] {
+        &self.discharges
+    }
+}
+
 impl PlanningFoundationObservation {
     #[must_use]
     pub const fn phase_schema(&self) -> &'static str {
@@ -1547,6 +1687,83 @@ impl VerifiedPlanningFoundation {
 
     pub(crate) const fn for_flow(&self) -> FlowPlanningInput<'_> {
         FlowPlanningInput { foundation: self }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum WholeRequirementRef {
+    Domain(RequirementRef),
+    Flow(FlowRequirementRef),
+}
+
+impl WholeRequirementRef {
+    const fn source(self) -> RequirementSource {
+        match self {
+            Self::Domain(_) => RequirementSource::Domain,
+            Self::Flow(_) => RequirementSource::Flow,
+        }
+    }
+
+    const fn identity(self) -> u128 {
+        match self {
+            Self::Domain(reference) => reference.identity,
+            Self::Flow(reference) => reference.identity(),
+        }
+    }
+
+    const fn current_meaning(self) -> u128 {
+        match self {
+            Self::Domain(reference) => reference.current_meaning,
+            Self::Flow(reference) => reference.current_meaning(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct VerifiedWholeImageAssignment {
+    planning_foundation: Arc<VerifiedPlanningFoundation>,
+    core_program: Arc<VerifiedCoreProgram>,
+    flow_program: Arc<VerifiedFlowProgram>,
+    requirements: Arc<[WholeRequirementRef]>,
+    requirement_set_fingerprint: u128,
+    placements: Arc<[ExecutablePlacementObservation]>,
+    bindings: Arc<[BindingAssignmentObservation]>,
+    discharges: Arc<[RequirementDischargeObservation]>,
+    fingerprint: u128,
+    _verified: Verified,
+}
+
+impl fmt::Debug for VerifiedWholeImageAssignment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedWholeImageAssignment")
+            .field("fingerprint", &format_args!("{:032x}", self.fingerprint))
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for VerifiedWholeImageAssignment {
+    fn eq(&self, other: &Self) -> bool {
+        self.fingerprint == other.fingerprint
+            && self.requirement_set_fingerprint == other.requirement_set_fingerprint
+    }
+}
+
+impl Eq for VerifiedWholeImageAssignment {}
+
+impl VerifiedWholeImageAssignment {
+    pub(crate) const fn fingerprint(&self) -> u128 {
+        self.fingerprint
+    }
+
+    pub(crate) fn observation(&self) -> WholeImageAssignmentObservation {
+        WholeImageAssignmentObservation {
+            fingerprint: self.fingerprint,
+            requirement_set_fingerprint: self.requirement_set_fingerprint,
+            placements: Arc::clone(&self.placements),
+            bindings: Arc::clone(&self.bindings),
+            discharges: Arc::clone(&self.discharges),
+        }
     }
 }
 
@@ -2416,6 +2633,550 @@ impl ImagePlanningModule {
         verify(&candidate, cancellation)?;
         Ok(candidate)
     }
+}
+
+impl ImagePlanningModule {
+    pub(crate) fn solve(
+        &self,
+        planning_foundation: Arc<VerifiedPlanningFoundation>,
+        core_program: Arc<VerifiedCoreProgram>,
+        flow_program: Arc<VerifiedFlowProgram>,
+        cancellation: &Cancellation,
+    ) -> Result<VerifiedWholeImageAssignment, PlanningFailure> {
+        checkpoint(cancellation)?;
+        let core = core_program.for_image_planning();
+        let flow = flow_program.for_image_planning();
+        if planning_foundation.context != core.context_identity()
+            || planning_foundation.context != flow.context_identity()
+            || planning_foundation.fingerprint != flow.planning_fingerprint()
+            || core.fingerprint() != flow.core_fingerprint()
+        {
+            return defect("whole-Image solver inputs do not share one verified context");
+        }
+        let architecture = planning_foundation
+            .architecture_contract
+            .for_image_planning();
+        if architecture.core_count() == 0 {
+            return defect("whole-Image solver received no symbolic cores");
+        }
+
+        let mut requirements = planning_foundation
+            .requirements
+            .iter()
+            .map(|requirement| WholeRequirementRef::Domain(requirement.reference))
+            .chain(
+                flow.requirements()
+                    .map(|requirement| WholeRequirementRef::Flow(requirement.reference())),
+            )
+            .collect::<Vec<_>>();
+        requirements.sort_by_key(|reference| (reference.identity(), reference.source()));
+        if requirements
+            .windows(2)
+            .any(|pair| pair[0].identity() == pair[1].identity())
+        {
+            return defect("complete Requirement Set contains a duplicate identity");
+        }
+        if requirements.len()
+            > usize::try_from(architecture.capacity().maximum_requirements).unwrap_or(usize::MAX)
+        {
+            return defect("complete Requirement Set exceeds its authenticated finite bound");
+        }
+
+        let executable_meanings = core
+            .executables()
+            .map(|executable| (executable.identity(), executable.current_meaning()))
+            .collect::<BTreeMap<_, _>>();
+        let placement_problem = CanonicalProblem {
+            name: "whole_image",
+            cores: (0..architecture.core_count())
+                .map(|ordinal| {
+                    Ok(CoreResource {
+                        identity: u16::try_from(ordinal).map_err(|_| {
+                            PlanningFailure::Defect(Arc::from(
+                                "symbolic core ordinal exceeds the solver schema",
+                            ))
+                        })?,
+                    })
+                })
+                .collect::<Result<Vec<_>, PlanningFailure>>()?,
+            executables: executable_meanings.keys().copied().collect(),
+            bindings: Vec::new(),
+            capabilities: BTreeSet::new(),
+            requirements: Vec::new(),
+        };
+        let CanonicalSolveOutcome::Assignment {
+            placements: solved_placements,
+            ..
+        } = solve_canonical_problem(&placement_problem, cancellation)?
+        else {
+            return defect("unconstrained whole-Image placement produced a conflict");
+        };
+        let placements = solved_placements
+            .iter()
+            .map(|(executable, core)| ExecutablePlacementObservation {
+                executable: *executable,
+                executable_current_meaning: executable_meanings[executable],
+                core: *core,
+            })
+            .collect::<Vec<_>>();
+        if placements
+            .windows(2)
+            .any(|pair| pair[0].executable == pair[1].executable)
+        {
+            return defect("verified Core contains a duplicate executable identity");
+        }
+
+        let executable_ids = placements
+            .iter()
+            .map(|placement| placement.executable)
+            .collect::<BTreeSet<_>>();
+        let mut domain_kinds = BTreeMap::new();
+        for requirement in planning_foundation.requirements.iter() {
+            checkpoint(cancellation)?;
+            let kind = discharge_domain_requirement(
+                requirement,
+                architecture,
+                &executable_ids,
+                selected_cardinality(&planning_foundation, requirement, architecture),
+            )?;
+            domain_kinds.insert(requirement.reference.identity, kind);
+        }
+        let bindings = expected_binding_assignments(&planning_foundation, architecture)?;
+
+        let actor_placements = flow
+            .actors()
+            .map(|actor| {
+                if actor.max_active_turns() != 1 || actor.mailbox_capacity() == 0 {
+                    return defect("Flow Actor lifetime or Mailbox bound is not realizable");
+                }
+                let mut handler_cores = actor
+                    .handlers()
+                    .map(|handler| {
+                        placements
+                            .iter()
+                            .find(|placement| placement.executable == handler)
+                            .map(|placement| placement.core)
+                            .ok_or_else(|| {
+                                PlanningFailure::Defect(Arc::from(
+                                    "Flow Actor handler is absent from exact executable demand",
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                handler_cores.sort_unstable();
+                handler_cores.dedup();
+                if handler_cores.len() > 1 {
+                    return defect("one Actor's handlers received different permanent cores");
+                }
+                Ok((
+                    actor.identity(),
+                    handler_cores.first().copied().unwrap_or(0),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, PlanningFailure>>()?;
+
+        let mut flow_kinds = BTreeMap::new();
+        for requirement in flow.requirements() {
+            checkpoint(cancellation)?;
+            if !actor_placements.contains_key(&requirement.actor()) {
+                return defect("Flow Planning Requirement names an unknown Actor");
+            }
+            if let Some(handler) = requirement.handler()
+                && !executable_ids.contains(&handler)
+            {
+                return defect("Flow Planning Requirement names an unrealized handler");
+            }
+            if requirement.site().is_some() && requirement.handler().is_none() {
+                return defect("Flow site Requirement is not owned by a handler");
+            }
+            flow_kinds.insert(
+                requirement.reference().identity(),
+                discharge_flow_requirement(requirement.kind()),
+            );
+        }
+
+        let discharges = requirements
+            .iter()
+            .map(|reference| RequirementDischargeObservation {
+                source: reference.source(),
+                requirement: reference.identity(),
+                requirement_current_meaning: reference.current_meaning(),
+                kind: match reference {
+                    WholeRequirementRef::Domain(_) => domain_kinds[&reference.identity()],
+                    WholeRequirementRef::Flow(_) => flow_kinds[&reference.identity()],
+                },
+            })
+            .collect::<Vec<_>>();
+        let requirement_set_fingerprint = whole_requirement_set_fingerprint(
+            planning_foundation.fingerprint,
+            core.fingerprint(),
+            flow.fingerprint(),
+            &requirements,
+        );
+        let fingerprint = whole_assignment_fingerprint(
+            requirement_set_fingerprint,
+            &placements,
+            &bindings,
+            &discharges,
+        );
+        let candidate = VerifiedWholeImageAssignment {
+            planning_foundation,
+            core_program,
+            flow_program,
+            requirements: requirements.into(),
+            requirement_set_fingerprint,
+            placements: placements.into(),
+            bindings: bindings.into(),
+            discharges: discharges.into(),
+            fingerprint,
+            _verified: Verified,
+        };
+        verify_whole_image_assignment(&candidate, cancellation)?;
+        Ok(candidate)
+    }
+}
+
+fn selected_cardinality(
+    planning_foundation: &VerifiedPlanningFoundation,
+    requirement: &Requirement,
+    architecture: crate::architecture_planning::ImagePlanningArchitecture<'_>,
+) -> u32 {
+    match requirement.subject {
+        RequirementOwner::GeneratedRole(reference) => planning_foundation
+            .generated_roles
+            .iter()
+            .find(|role| role.reference == reference)
+            .map_or(1, |role| match role.kind {
+                GeneratedRoleKind::Scheduler => {
+                    u32::try_from(architecture.core_count()).unwrap_or(u32::MAX)
+                }
+                GeneratedRoleKind::TestRuntime => u32::try_from(
+                    planning_foundation
+                        .semantic_program
+                        .for_image_planning()
+                        .test_application_count(),
+                )
+                .unwrap_or(u32::MAX),
+                _ => 1,
+            }),
+        RequirementOwner::Facility(subject) => u32::try_from(
+            planning_foundation
+                .domain_plans
+                .iter()
+                .filter(|plan| {
+                    plan.facility_instance
+                        .as_ref()
+                        .is_some_and(|instance| instance.kind == subject.kind)
+                })
+                .count(),
+        )
+        .unwrap_or(u32::MAX),
+        RequirementOwner::Pool(_) => 1,
+    }
+}
+
+fn expected_binding_assignments(
+    planning_foundation: &VerifiedPlanningFoundation,
+    architecture: crate::architecture_planning::ImagePlanningArchitecture<'_>,
+) -> Result<Vec<BindingAssignmentObservation>, PlanningFailure> {
+    let mut bindings = Vec::new();
+    for requirement in planning_foundation.requirements.iter() {
+        if let RequirementBounds::Binding {
+            kind,
+            minimum,
+            maximum,
+        } = requirement.bounds
+        {
+            if minimum > maximum {
+                return defect("binding requirement has inverted cardinality");
+            }
+            if minimum > 0 {
+                let slot = architecture
+                    .binding_ordinal(kind.contract_kind())
+                    .ok_or_else(|| {
+                        PlanningFailure::Defect(Arc::from(
+                            "admitted binding requirement has no Architecture slot",
+                        ))
+                    })?;
+                bindings.push(BindingAssignmentObservation {
+                    requirement: requirement.reference.identity,
+                    binding: kind,
+                    slot,
+                });
+            }
+        }
+    }
+    bindings.sort_by_key(|binding| (binding.requirement, binding.slot));
+    Ok(bindings)
+}
+
+fn discharge_domain_requirement(
+    requirement: &Requirement,
+    architecture: crate::architecture_planning::ImagePlanningArchitecture<'_>,
+    executable_ids: &BTreeSet<u128>,
+    selected_cardinality: u32,
+) -> Result<DischargeKind, PlanningFailure> {
+    Ok(match &requirement.bounds {
+        RequirementBounds::RealizeExactlyOnce { executable } => {
+            if !executable_ids.contains(executable) {
+                return defect("role-realization Requirement names an absent executable");
+            }
+            DischargeKind::ExecutableRealized
+        }
+        RequirementBounds::ImageLifetime => DischargeKind::LifetimeProved,
+        RequirementBounds::Capability(capability) => {
+            if !architecture.has_capability(capability.contract_kind()) {
+                return defect("admitted capability Requirement is not present");
+            }
+            DischargeKind::CapabilityPresent
+        }
+        RequirementBounds::Cardinality { minimum, maximum } => {
+            if *minimum > *maximum || !(*minimum..=*maximum).contains(&selected_cardinality) {
+                return defect("admitted cardinality Requirement is not realized exactly");
+            }
+            DischargeKind::CardinalityProved
+        }
+        RequirementBounds::Binding {
+            kind,
+            minimum,
+            maximum,
+        } => {
+            if minimum > maximum
+                || (*minimum > 0 && architecture.binding_ordinal(kind.contract_kind()).is_none())
+            {
+                return defect("admitted binding Requirement cannot be realized");
+            }
+            DischargeKind::Bound
+        }
+        RequirementBounds::PoolCapacity {
+            usable,
+            peak_live,
+            peak_reserved,
+            peak_committed,
+            ..
+        } => {
+            if peak_live.saturating_add(*peak_reserved) < *peak_committed || peak_committed > usable
+            {
+                return defect("admitted Pool capacity Requirement is inconsistent");
+            }
+            DischargeKind::CapacityProved
+        }
+        RequirementBounds::MaximumServiceUnits(_)
+        | RequirementBounds::Reservation { .. }
+        | RequirementBounds::FacilityCapacity(_)
+        | RequirementBounds::FacilitySharing(_) => DischargeKind::CapacityProved,
+        RequirementBounds::FacilityEndpoint { .. }
+        | RequirementBounds::FacilityRecovery { .. }
+        | RequirementBounds::FacilityShutdown(_)
+        | RequirementBounds::FacilityReplay { .. }
+        | RequirementBounds::FacilityFlagship(_)
+        | RequirementBounds::FacilityBindingAvailability(_) => DischargeKind::ContractValidated,
+    })
+}
+
+const fn discharge_flow_requirement(kind: FlowRequirementKind) -> DischargeKind {
+    match kind {
+        FlowRequirementKind::PermanentCorePlacement => DischargeKind::Placed,
+        FlowRequirementKind::MailboxCapacity
+        | FlowRequirementKind::ServiceStorage
+        | FlowRequirementKind::ActivationStorage => DischargeKind::CapacityProved,
+        FlowRequirementKind::ActorIdentity
+        | FlowRequirementKind::TurnLease
+        | FlowRequirementKind::SuspensionHome
+        | FlowRequirementKind::ReplyEndpoint
+        | FlowRequirementKind::ReplyReturnPath
+        | FlowRequirementKind::ReplyResponseHome
+        | FlowRequirementKind::ReplyAcyclicWait
+        | FlowRequirementKind::GroupChildActivationBound
+        | FlowRequirementKind::GroupCancellationAuthority
+        | FlowRequirementKind::GroupOutcomePolicy
+        | FlowRequirementKind::GroupResourceReturnHome
+        | FlowRequirementKind::GroupCleanupOrder
+        | FlowRequirementKind::DeadlineClass
+        | FlowRequirementKind::DeadlineAuthority
+        | FlowRequirementKind::DeadlineSlack
+        | FlowRequirementKind::DeadlineFeasibility
+        | FlowRequirementKind::CancellationCheckpoint
+        | FlowRequirementKind::CancellationObservationWorkBound => DischargeKind::LifetimeProved,
+        FlowRequirementKind::LogicalCommitOrder | FlowRequirementKind::ProposalTransport => {
+            DischargeKind::ContractValidated
+        }
+    }
+}
+
+fn whole_requirement_set_fingerprint(
+    planning_fingerprint: u128,
+    core_fingerprint: u128,
+    flow_fingerprint: u128,
+    requirements: &[WholeRequirementRef],
+) -> u128 {
+    let mut hash = Xxh3::new();
+    hash.update(b"wrela.complete-requirement-set\0\x01");
+    hash.update(&planning_fingerprint.to_be_bytes());
+    hash.update(&core_fingerprint.to_be_bytes());
+    hash.update(&flow_fingerprint.to_be_bytes());
+    for requirement in requirements {
+        hash.update(&[match requirement.source() {
+            RequirementSource::Domain => 1,
+            RequirementSource::Flow => 2,
+        }]);
+        hash.update(&requirement.identity().to_be_bytes());
+        hash.update(&requirement.current_meaning().to_be_bytes());
+    }
+    hash.digest128()
+}
+
+fn whole_assignment_fingerprint(
+    requirement_set_fingerprint: u128,
+    placements: &[ExecutablePlacementObservation],
+    bindings: &[BindingAssignmentObservation],
+    discharges: &[RequirementDischargeObservation],
+) -> u128 {
+    let mut hash = Xxh3::new();
+    hash.update(b"wrela.whole-image-assignment\0\x01");
+    hash.update(&requirement_set_fingerprint.to_be_bytes());
+    for placement in placements {
+        hash.update(&placement.executable.to_be_bytes());
+        hash.update(&placement.executable_current_meaning.to_be_bytes());
+        hash.update(&placement.core.to_be_bytes());
+    }
+    for binding in bindings {
+        hash.update(&binding.requirement.to_be_bytes());
+        hash.update(&[binding.binding.tag(), binding.slot]);
+    }
+    for discharge in discharges {
+        hash.update(&[match discharge.source {
+            RequirementSource::Domain => 1,
+            RequirementSource::Flow => 2,
+        }]);
+        hash.update(&discharge.requirement.to_be_bytes());
+        hash.update(&discharge.requirement_current_meaning.to_be_bytes());
+        hash.update(&[match discharge.kind {
+            DischargeKind::ExecutableRealized => 1,
+            DischargeKind::Placed => 2,
+            DischargeKind::Bound => 3,
+            DischargeKind::CapacityProved => 4,
+            DischargeKind::CapabilityPresent => 5,
+            DischargeKind::CardinalityProved => 6,
+            DischargeKind::LifetimeProved => 7,
+            DischargeKind::ContractValidated => 8,
+        }]);
+    }
+    hash.digest128()
+}
+
+fn verify_whole_image_assignment(
+    candidate: &VerifiedWholeImageAssignment,
+    cancellation: &Cancellation,
+) -> Result<(), PlanningFailure> {
+    checkpoint(cancellation)?;
+    let core = candidate.core_program.for_image_planning();
+    let flow = candidate.flow_program.for_image_planning();
+    let architecture = candidate
+        .planning_foundation
+        .architecture_contract
+        .for_image_planning();
+    if candidate.planning_foundation.context != core.context_identity()
+        || candidate.planning_foundation.context != flow.context_identity()
+        || candidate.planning_foundation.fingerprint != flow.planning_fingerprint()
+        || core.fingerprint() != flow.core_fingerprint()
+    {
+        return defect("whole-Image assignment verifier found mixed contexts");
+    }
+    let mut expected_requirements = candidate
+        .planning_foundation
+        .requirements
+        .iter()
+        .map(|requirement| WholeRequirementRef::Domain(requirement.reference))
+        .chain(
+            flow.requirements()
+                .map(|requirement| WholeRequirementRef::Flow(requirement.reference())),
+        )
+        .collect::<Vec<_>>();
+    expected_requirements.sort_by_key(|reference| (reference.identity(), reference.source()));
+    if expected_requirements
+        .windows(2)
+        .any(|pair| pair[0].identity() == pair[1].identity())
+        || expected_requirements.len()
+            > usize::try_from(architecture.capacity().maximum_requirements).unwrap_or(usize::MAX)
+        || candidate.requirements.as_ref() != expected_requirements
+    {
+        return defect("whole-Image assignment does not retain the complete Requirement Set");
+    }
+    let mut expected_executables = core
+        .executables()
+        .map(|executable| (executable.identity(), executable.current_meaning()))
+        .collect::<Vec<_>>();
+    expected_executables.sort_unstable();
+    let actual_executables = candidate
+        .placements
+        .iter()
+        .map(|placement| (placement.executable, placement.executable_current_meaning))
+        .collect::<Vec<_>>();
+    if actual_executables != expected_executables
+        || candidate
+            .placements
+            .iter()
+            .any(|placement| placement.core != 0)
+    {
+        return defect("whole-Image assignment is not the canonical exact executable placement");
+    }
+    let executable_ids = expected_executables
+        .iter()
+        .map(|(identity, _)| *identity)
+        .collect::<BTreeSet<_>>();
+    if candidate.bindings.as_ref()
+        != expected_binding_assignments(&candidate.planning_foundation, architecture)?
+    {
+        return defect("whole-Image assignment does not contain the canonical exact bindings");
+    }
+    let mut expected_discharges = candidate
+        .planning_foundation
+        .requirements
+        .iter()
+        .map(|requirement| {
+            Ok(RequirementDischargeObservation {
+                source: RequirementSource::Domain,
+                requirement: requirement.reference.identity,
+                requirement_current_meaning: requirement.reference.current_meaning,
+                kind: discharge_domain_requirement(
+                    requirement,
+                    architecture,
+                    &executable_ids,
+                    selected_cardinality(&candidate.planning_foundation, requirement, architecture),
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, PlanningFailure>>()?;
+    expected_discharges.extend(flow.requirements().map(|requirement| {
+        RequirementDischargeObservation {
+            source: RequirementSource::Flow,
+            requirement: requirement.reference().identity(),
+            requirement_current_meaning: requirement.reference().current_meaning(),
+            kind: discharge_flow_requirement(requirement.kind()),
+        }
+    }));
+    expected_discharges.sort_by_key(|discharge| (discharge.requirement, discharge.source));
+    if candidate.discharges.as_ref() != expected_discharges {
+        return defect("whole-Image assignment does not discharge every Requirement exactly once");
+    }
+    let expected_set = whole_requirement_set_fingerprint(
+        candidate.planning_foundation.fingerprint,
+        core.fingerprint(),
+        flow.fingerprint(),
+        &expected_requirements,
+    );
+    if expected_set != candidate.requirement_set_fingerprint
+        || whole_assignment_fingerprint(
+            expected_set,
+            &candidate.placements,
+            &candidate.bindings,
+            &candidate.discharges,
+        ) != candidate.fingerprint
+    {
+        return defect("whole-Image assignment fingerprint or Requirement Set disagrees");
+    }
+    Ok(())
 }
 
 fn validate_facility_cardinality(
@@ -7065,12 +7826,1053 @@ fn defect<T>(evidence: &'static str) -> Result<T, PlanningFailure> {
     Err(PlanningFailure::Defect(Arc::from(evidence)))
 }
 
+const MAX_SOLVER_EXPLORATION_STATES: usize = 1_000_000;
+const MAX_CONFLICT_REQUIREMENTS: usize = 24;
+type PlacementPairs = Vec<(u128, u16)>;
+type BindingPairs = Vec<(u128, u8)>;
+type CandidateAssignment = (PlacementPairs, BindingPairs);
+type CandidateSearch = Result<Option<CandidateAssignment>, PlanningFailure>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+struct CanonicalProblem {
+    name: &'static str,
+    cores: Vec<CoreResource>,
+    executables: Vec<u128>,
+    bindings: Vec<BindingResource>,
+    capabilities: BTreeSet<u8>,
+    requirements: Vec<SolverRequirement>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CoreResource {
+    identity: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BindingResource {
+    identity: u8,
+    kind: u8,
+    shareable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SolverRequirement {
+    identity: u128,
+    category: SolverRequirementCategory,
+    constraint: SolverConstraint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(dead_code)]
+enum SolverRequirementCategory {
+    RoleRealization,
+    RequiredCapability,
+    Cardinality,
+    Binding,
+    Capacity,
+    Placement,
+    Affinity,
+    Separation,
+    Exclusivity,
+    ActivationLifetime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum SolverConstraint {
+    Realize {
+        executable: u128,
+    },
+    Capability {
+        capability: u8,
+    },
+    Cardinality {
+        selected: u16,
+        minimum: u16,
+        maximum: u16,
+    },
+    Binding {
+        subject: u128,
+        kind: u8,
+        allow_sharing: bool,
+    },
+    CoreCapacity {
+        core: u16,
+        maximum: u16,
+    },
+    AllowedCores {
+        executable: u128,
+        cores: Arc<[u16]>,
+    },
+    Affinity {
+        left: u128,
+        right: u128,
+    },
+    Separation {
+        left: u128,
+        right: u128,
+    },
+    Exclusive {
+        executable: u128,
+    },
+    Activation {
+        executable: u128,
+        units: u16,
+        start: u16,
+        end: u16,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CanonicalSolveOutcome {
+    Assignment {
+        placements: Arc<[(u128, u16)]>,
+        bindings: Arc<[(u128, u8)]>,
+        discharges: Arc<[u128]>,
+    },
+    Conflict(VerifiedPrivateConflict),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedPrivateConflict {
+    code: ConflictCode,
+    requirements: Arc<[u128]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConflictCode {
+    RoleClosure,
+    MissingCapability,
+    Cardinality,
+    Binding,
+    Capacity,
+    Placement,
+    Affinity,
+    Separation,
+    Exclusivity,
+    ActivationLifetime,
+}
+
+fn solve_canonical_problem(
+    puzzle: &CanonicalProblem,
+    cancellation: &Cancellation,
+) -> Result<CanonicalSolveOutcome, PlanningFailure> {
+    let puzzle = canonicalize_problem(puzzle)?;
+    let all = (0..puzzle.requirements.len()).collect::<Vec<_>>();
+    let mut explored = 0;
+    if let Some((placements, bindings)) =
+        search_canonical_assignment(&puzzle, &all, cancellation, &mut explored)?
+    {
+        return Ok(CanonicalSolveOutcome::Assignment {
+            placements: placements.into(),
+            bindings: bindings.into(),
+            discharges: puzzle
+                .requirements
+                .iter()
+                .map(|requirement| requirement.identity)
+                .collect::<Vec<_>>()
+                .into(),
+        });
+    }
+    if puzzle.requirements.len() > MAX_CONFLICT_REQUIREMENTS {
+        return defect("solver conflict minimization exhausted its authenticated finite bound");
+    }
+    let conflict = minimum_conflict(&puzzle, cancellation, &mut explored)?;
+    verify_private_conflict(&puzzle, &conflict, cancellation)?;
+    Ok(CanonicalSolveOutcome::Conflict(conflict))
+}
+
+fn canonicalize_problem(puzzle: &CanonicalProblem) -> Result<CanonicalProblem, PlanningFailure> {
+    let mut puzzle = puzzle.clone();
+    puzzle.cores.sort_unstable();
+    puzzle.executables.sort_unstable();
+    puzzle.bindings.sort_unstable();
+    puzzle
+        .requirements
+        .sort_by_key(|requirement| (requirement.category, requirement.identity));
+    let binding_identity_count = puzzle
+        .bindings
+        .iter()
+        .map(|binding| binding.identity)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let requirement_identity_count = puzzle
+        .requirements
+        .iter()
+        .map(|requirement| requirement.identity)
+        .collect::<BTreeSet<_>>()
+        .len();
+    if puzzle.cores.is_empty()
+        || puzzle.cores.windows(2).any(|pair| pair[0] == pair[1])
+        || puzzle.executables.windows(2).any(|pair| pair[0] == pair[1])
+        || binding_identity_count != puzzle.bindings.len()
+        || requirement_identity_count != puzzle.requirements.len()
+    {
+        return defect("canonical solver problem is malformed or contains duplicate identities");
+    }
+    Ok(puzzle)
+}
+
+fn search_canonical_assignment(
+    puzzle: &CanonicalProblem,
+    active: &[usize],
+    cancellation: &Cancellation,
+    explored: &mut usize,
+) -> CandidateSearch {
+    if !static_constraints_hold(puzzle, active) {
+        return Ok(None);
+    }
+    let mut placements = Vec::with_capacity(puzzle.executables.len());
+    search_placements(puzzle, active, 0, &mut placements, cancellation, explored)
+}
+
+fn search_placements(
+    puzzle: &CanonicalProblem,
+    active: &[usize],
+    executable_ordinal: usize,
+    placements: &mut Vec<(u128, u16)>,
+    cancellation: &Cancellation,
+    explored: &mut usize,
+) -> CandidateSearch {
+    checkpoint(cancellation)?;
+    *explored = explored.saturating_add(1);
+    if *explored > MAX_SOLVER_EXPLORATION_STATES {
+        return defect("canonical solver exploration exhausted its bounded state budget");
+    }
+    if executable_ordinal == puzzle.executables.len() {
+        if !placement_constraints_hold(puzzle, active, placements) {
+            return Ok(None);
+        }
+        let binding_requirements = active
+            .iter()
+            .filter_map(|ordinal| match &puzzle.requirements[*ordinal].constraint {
+                SolverConstraint::Binding {
+                    subject,
+                    kind,
+                    allow_sharing,
+                } => Some((*subject, *kind, *allow_sharing)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut bindings = Vec::with_capacity(binding_requirements.len());
+        return search_bindings(
+            puzzle,
+            &binding_requirements,
+            0,
+            &mut bindings,
+            placements,
+            cancellation,
+            explored,
+        );
+    }
+    let executable = puzzle.executables[executable_ordinal];
+    for core in &puzzle.cores {
+        placements.push((executable, core.identity));
+        if let Some(solution) = search_placements(
+            puzzle,
+            active,
+            executable_ordinal + 1,
+            placements,
+            cancellation,
+            explored,
+        )? {
+            return Ok(Some(solution));
+        }
+        placements.pop();
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_bindings(
+    puzzle: &CanonicalProblem,
+    requirements: &[(u128, u8, bool)],
+    ordinal: usize,
+    bindings: &mut Vec<(u128, u8)>,
+    placements: &[(u128, u16)],
+    cancellation: &Cancellation,
+    explored: &mut usize,
+) -> CandidateSearch {
+    checkpoint(cancellation)?;
+    *explored = explored.saturating_add(1);
+    if *explored > MAX_SOLVER_EXPLORATION_STATES {
+        return defect("canonical binding exploration exhausted its bounded state budget");
+    }
+    if ordinal == requirements.len() {
+        return Ok(Some((placements.to_vec(), bindings.clone())));
+    }
+    let (subject, kind, allow_sharing) = requirements[ordinal];
+    for slot in puzzle.bindings.iter().filter(|slot| slot.kind == kind) {
+        let compatible = bindings.iter().all(|(other_subject, other_slot)| {
+            *other_slot != slot.identity
+                || (*other_subject == subject)
+                || (allow_sharing
+                    && slot.shareable
+                    && requirements
+                        .iter()
+                        .find(|(candidate, _, _)| candidate == other_subject)
+                        .is_some_and(|(_, _, other_sharing)| *other_sharing))
+        });
+        if compatible {
+            bindings.push((subject, slot.identity));
+            if let Some(solution) = search_bindings(
+                puzzle,
+                requirements,
+                ordinal + 1,
+                bindings,
+                placements,
+                cancellation,
+                explored,
+            )? {
+                return Ok(Some(solution));
+            }
+            bindings.pop();
+        }
+    }
+    Ok(None)
+}
+
+fn static_constraints_hold(puzzle: &CanonicalProblem, active: &[usize]) -> bool {
+    active
+        .iter()
+        .all(|ordinal| match &puzzle.requirements[*ordinal].constraint {
+            SolverConstraint::Realize { executable } => puzzle.executables.contains(executable),
+            SolverConstraint::Capability { capability } => puzzle.capabilities.contains(capability),
+            SolverConstraint::Cardinality {
+                selected,
+                minimum,
+                maximum,
+            } => minimum <= selected && selected <= maximum,
+            SolverConstraint::Activation { start, end, .. } => start < end,
+            SolverConstraint::Binding { .. }
+            | SolverConstraint::CoreCapacity { .. }
+            | SolverConstraint::AllowedCores { .. }
+            | SolverConstraint::Affinity { .. }
+            | SolverConstraint::Separation { .. }
+            | SolverConstraint::Exclusive { .. } => true,
+        })
+}
+
+fn placement_constraints_hold(
+    puzzle: &CanonicalProblem,
+    active: &[usize],
+    placements: &[(u128, u16)],
+) -> bool {
+    let placed = placements.iter().copied().collect::<BTreeMap<_, _>>();
+    for ordinal in active {
+        match &puzzle.requirements[*ordinal].constraint {
+            SolverConstraint::AllowedCores { executable, cores } => {
+                if !placed
+                    .get(executable)
+                    .is_some_and(|core| cores.contains(core))
+                {
+                    return false;
+                }
+            }
+            SolverConstraint::Affinity { left, right } => {
+                if placed.get(left) != placed.get(right) {
+                    return false;
+                }
+            }
+            SolverConstraint::Separation { left, right } => {
+                if placed.get(left) == placed.get(right) {
+                    return false;
+                }
+            }
+            SolverConstraint::CoreCapacity { core, maximum } => {
+                let activations = active_activations(puzzle, active, placements, *core);
+                if maximum_simultaneous_units(&activations) > *maximum {
+                    return false;
+                }
+            }
+            SolverConstraint::Exclusive { executable } => {
+                let Some(core) = placed.get(executable) else {
+                    return false;
+                };
+                let activations = active_activations(puzzle, active, placements, *core);
+                let own = activations
+                    .iter()
+                    .filter(|activation| activation.0 == *executable)
+                    .collect::<Vec<_>>();
+                if own.iter().any(|activation| {
+                    activations.iter().any(|other| {
+                        other.0 != *executable
+                            && intervals_overlap(activation.2, activation.3, other.2, other.3)
+                    })
+                }) {
+                    return false;
+                }
+            }
+            SolverConstraint::Realize { .. }
+            | SolverConstraint::Capability { .. }
+            | SolverConstraint::Cardinality { .. }
+            | SolverConstraint::Binding { .. }
+            | SolverConstraint::Activation { .. } => {}
+        }
+    }
+    true
+}
+
+fn active_activations(
+    puzzle: &CanonicalProblem,
+    active: &[usize],
+    placements: &[(u128, u16)],
+    core: u16,
+) -> Vec<(u128, u16, u16, u16)> {
+    let placed = placements.iter().copied().collect::<BTreeMap<_, _>>();
+    active
+        .iter()
+        .filter_map(|ordinal| match puzzle.requirements[*ordinal].constraint {
+            SolverConstraint::Activation {
+                executable,
+                units,
+                start,
+                end,
+            } if placed.get(&executable) == Some(&core) => Some((executable, units, start, end)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn maximum_simultaneous_units(activations: &[(u128, u16, u16, u16)]) -> u16 {
+    activations
+        .iter()
+        .flat_map(|activation| [activation.2, activation.3.saturating_sub(1)])
+        .map(|point| {
+            activations
+                .iter()
+                .filter(|activation| activation.2 <= point && point < activation.3)
+                .fold(0_u16, |sum, activation| sum.saturating_add(activation.1))
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+const fn intervals_overlap(
+    left_start: u16,
+    left_end: u16,
+    right_start: u16,
+    right_end: u16,
+) -> bool {
+    left_start < right_end && right_start < left_end
+}
+
+fn minimum_conflict(
+    puzzle: &CanonicalProblem,
+    cancellation: &Cancellation,
+    explored: &mut usize,
+) -> Result<VerifiedPrivateConflict, PlanningFailure> {
+    for size in 1..=puzzle.requirements.len() {
+        let mut combination = (0..size).collect::<Vec<_>>();
+        loop {
+            checkpoint(cancellation)?;
+            if search_canonical_assignment(puzzle, &combination, cancellation, explored)?.is_none()
+            {
+                let requirements = combination
+                    .iter()
+                    .map(|ordinal| puzzle.requirements[*ordinal].identity)
+                    .collect::<Vec<_>>();
+                let code = conflict_code(
+                    puzzle.requirements[combination[0]].category,
+                    combination
+                        .iter()
+                        .map(|ordinal| puzzle.requirements[*ordinal].category),
+                );
+                return Ok(VerifiedPrivateConflict {
+                    code,
+                    requirements: requirements.into(),
+                });
+            }
+            if !advance_combination(&mut combination, puzzle.requirements.len()) {
+                break;
+            }
+        }
+    }
+    defect("infeasible solver puzzle has no irreducible conflict")
+}
+
+fn advance_combination(combination: &mut [usize], length: usize) -> bool {
+    for ordinal in (0..combination.len()).rev() {
+        let maximum = length - (combination.len() - ordinal);
+        if combination[ordinal] < maximum {
+            combination[ordinal] += 1;
+            for following in ordinal + 1..combination.len() {
+                combination[following] = combination[following - 1] + 1;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+fn conflict_code(
+    first: SolverRequirementCategory,
+    categories: impl Iterator<Item = SolverRequirementCategory>,
+) -> ConflictCode {
+    let categories = categories.collect::<BTreeSet<_>>();
+    let category = if categories.contains(&SolverRequirementCategory::RequiredCapability) {
+        SolverRequirementCategory::RequiredCapability
+    } else if categories.contains(&SolverRequirementCategory::Cardinality) {
+        SolverRequirementCategory::Cardinality
+    } else if categories.contains(&SolverRequirementCategory::RoleRealization) {
+        SolverRequirementCategory::RoleRealization
+    } else if categories.contains(&SolverRequirementCategory::Binding) {
+        SolverRequirementCategory::Binding
+    } else if categories.contains(&SolverRequirementCategory::Capacity) {
+        SolverRequirementCategory::Capacity
+    } else {
+        first
+    };
+    match category {
+        SolverRequirementCategory::RoleRealization => ConflictCode::RoleClosure,
+        SolverRequirementCategory::RequiredCapability => ConflictCode::MissingCapability,
+        SolverRequirementCategory::Cardinality => ConflictCode::Cardinality,
+        SolverRequirementCategory::Binding => ConflictCode::Binding,
+        SolverRequirementCategory::Capacity => ConflictCode::Capacity,
+        SolverRequirementCategory::Placement => ConflictCode::Placement,
+        SolverRequirementCategory::Affinity => ConflictCode::Affinity,
+        SolverRequirementCategory::Separation => ConflictCode::Separation,
+        SolverRequirementCategory::Exclusivity => ConflictCode::Exclusivity,
+        SolverRequirementCategory::ActivationLifetime => ConflictCode::ActivationLifetime,
+    }
+}
+
+fn verify_private_conflict(
+    puzzle: &CanonicalProblem,
+    conflict: &VerifiedPrivateConflict,
+    cancellation: &Cancellation,
+) -> Result<(), PlanningFailure> {
+    let active = conflict
+        .requirements
+        .iter()
+        .map(|identity| {
+            puzzle
+                .requirements
+                .iter()
+                .position(|requirement| requirement.identity == *identity)
+                .ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from(
+                        "private conflict names a foreign Requirement",
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut explored = 0;
+    if search_canonical_assignment(puzzle, &active, cancellation, &mut explored)?.is_some() {
+        return defect("private conflict is feasible");
+    }
+    for removed in 0..active.len() {
+        let subset = active
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, requirement)| (ordinal != removed).then_some(*requirement))
+            .collect::<Vec<_>>();
+        if search_canonical_assignment(puzzle, &subset, cancellation, &mut explored)?.is_none() {
+            return defect("private conflict is not irreducible");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn independently_enumerate_tiny_puzzle(puzzle: &CanonicalProblem) -> CanonicalSolveOutcome {
+    let puzzle = canonicalize_problem(puzzle).expect("named oracle puzzle is well formed");
+    let all = (0..puzzle.requirements.len()).collect::<Vec<_>>();
+    if let Some((placements, bindings)) = oracle_first_assignment(&puzzle, &all) {
+        return CanonicalSolveOutcome::Assignment {
+            placements: placements.into(),
+            bindings: bindings.into(),
+            discharges: puzzle
+                .requirements
+                .iter()
+                .map(|requirement| requirement.identity)
+                .collect::<Vec<_>>()
+                .into(),
+        };
+    }
+    for size in 1..=puzzle.requirements.len() {
+        let mut combination = (0..size).collect::<Vec<_>>();
+        loop {
+            if oracle_first_assignment(&puzzle, &combination).is_none() {
+                let first = puzzle.requirements[combination[0]].category;
+                return CanonicalSolveOutcome::Conflict(VerifiedPrivateConflict {
+                    code: conflict_code(
+                        first,
+                        combination
+                            .iter()
+                            .map(|ordinal| puzzle.requirements[*ordinal].category),
+                    ),
+                    requirements: combination
+                        .iter()
+                        .map(|ordinal| puzzle.requirements[*ordinal].identity)
+                        .collect::<Vec<_>>()
+                        .into(),
+                });
+            }
+            if !advance_combination(&mut combination, puzzle.requirements.len()) {
+                break;
+            }
+        }
+    }
+    unreachable!("finite infeasible oracle puzzle has a conflict")
+}
+
+#[cfg(test)]
+fn oracle_first_assignment(
+    puzzle: &CanonicalProblem,
+    active: &[usize],
+) -> Option<CandidateAssignment> {
+    let placement_radix = puzzle.cores.len();
+    let placement_count =
+        placement_radix.checked_pow(u32::try_from(puzzle.executables.len()).ok()?)?;
+    let binding_requirements = active
+        .iter()
+        .filter_map(|ordinal| match puzzle.requirements[*ordinal].constraint {
+            SolverConstraint::Binding {
+                subject,
+                kind,
+                allow_sharing,
+            } => Some((subject, kind, allow_sharing)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let binding_radix = puzzle.bindings.len().max(1);
+    let binding_count =
+        binding_radix.checked_pow(u32::try_from(binding_requirements.len()).ok()?)?;
+    for placement_number in 0..placement_count {
+        let placements = puzzle
+            .executables
+            .iter()
+            .enumerate()
+            .map(|(ordinal, executable)| {
+                let divisor = placement_radix
+                    .pow(u32::try_from(puzzle.executables.len() - ordinal - 1).unwrap_or(u32::MAX));
+                let core = puzzle.cores[(placement_number / divisor) % placement_radix].identity;
+                (*executable, core)
+            })
+            .collect::<Vec<_>>();
+        for binding_number in 0..binding_count {
+            let bindings = binding_requirements
+                .iter()
+                .enumerate()
+                .map(|(ordinal, (subject, _, _))| {
+                    let divisor = binding_radix.pow(
+                        u32::try_from(binding_requirements.len() - ordinal - 1).unwrap_or(u32::MAX),
+                    );
+                    let slot = puzzle
+                        .bindings
+                        .get((binding_number / divisor) % binding_radix)
+                        .map(|slot| slot.identity);
+                    (*subject, slot.unwrap_or(u8::MAX))
+                })
+                .collect::<Vec<_>>();
+            if oracle_candidate_feasible(puzzle, active, &placements, &bindings) {
+                return Some((placements, bindings));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn oracle_candidate_feasible(
+    puzzle: &CanonicalProblem,
+    active: &[usize],
+    placements: &[(u128, u16)],
+    bindings: &[(u128, u8)],
+) -> bool {
+    let core_of = |executable: u128| {
+        placements
+            .iter()
+            .find(|(candidate, _)| *candidate == executable)
+            .map(|(_, core)| *core)
+    };
+    for ordinal in active {
+        match &puzzle.requirements[*ordinal].constraint {
+            SolverConstraint::Realize { executable } => {
+                if !puzzle.executables.contains(executable) {
+                    return false;
+                }
+            }
+            SolverConstraint::Capability { capability } => {
+                if !puzzle.capabilities.contains(capability) {
+                    return false;
+                }
+            }
+            SolverConstraint::Cardinality {
+                selected,
+                minimum,
+                maximum,
+            } => {
+                if selected < minimum || selected > maximum {
+                    return false;
+                }
+            }
+            SolverConstraint::Binding {
+                subject,
+                kind,
+                allow_sharing,
+            } => {
+                let Some(slot) = bindings
+                    .iter()
+                    .find(|(candidate, _)| candidate == subject)
+                    .and_then(|(_, slot)| {
+                        puzzle
+                            .bindings
+                            .iter()
+                            .find(|candidate| candidate.identity == *slot)
+                    })
+                else {
+                    return false;
+                };
+                if slot.kind != *kind {
+                    return false;
+                }
+                for (other, other_slot) in bindings.iter().filter(|(other, _)| other != subject) {
+                    if *other_slot == slot.identity {
+                        let other_shared = active.iter().any(|other_ordinal| {
+                            matches!(
+                                puzzle.requirements[*other_ordinal].constraint,
+                                SolverConstraint::Binding {
+                                    subject: candidate,
+                                    allow_sharing: true,
+                                    ..
+                                } if candidate == *other
+                            )
+                        });
+                        if !*allow_sharing || !other_shared || !slot.shareable {
+                            return false;
+                        }
+                    }
+                }
+            }
+            SolverConstraint::CoreCapacity { core, maximum } => {
+                let mut points = Vec::new();
+                for activation_ordinal in active {
+                    if let SolverConstraint::Activation { start, end, .. } =
+                        puzzle.requirements[*activation_ordinal].constraint
+                    {
+                        points.extend([start, end.saturating_sub(1)]);
+                    }
+                }
+                for point in points {
+                    let used = active.iter().fold(0_u16, |sum, activation_ordinal| {
+                        match puzzle.requirements[*activation_ordinal].constraint {
+                            SolverConstraint::Activation {
+                                executable,
+                                units,
+                                start,
+                                end,
+                            } if core_of(executable) == Some(*core)
+                                && start <= point
+                                && point < end =>
+                            {
+                                sum.saturating_add(units)
+                            }
+                            _ => sum,
+                        }
+                    });
+                    if used > *maximum {
+                        return false;
+                    }
+                }
+            }
+            SolverConstraint::AllowedCores { executable, cores } => {
+                if !core_of(*executable).is_some_and(|core| cores.contains(&core)) {
+                    return false;
+                }
+            }
+            SolverConstraint::Affinity { left, right } => {
+                if core_of(*left) != core_of(*right) {
+                    return false;
+                }
+            }
+            SolverConstraint::Separation { left, right } => {
+                if core_of(*left) == core_of(*right) {
+                    return false;
+                }
+            }
+            SolverConstraint::Exclusive { executable } => {
+                let Some(core) = core_of(*executable) else {
+                    return false;
+                };
+                let own = active.iter().filter_map(|activation_ordinal| {
+                    match puzzle.requirements[*activation_ordinal].constraint {
+                        SolverConstraint::Activation {
+                            executable: candidate,
+                            start,
+                            end,
+                            ..
+                        } if candidate == *executable => Some((start, end)),
+                        _ => None,
+                    }
+                });
+                for (start, end) in own {
+                    if active.iter().any(|activation_ordinal| {
+                        matches!(
+                            puzzle.requirements[*activation_ordinal].constraint,
+                            SolverConstraint::Activation {
+                                executable: other,
+                                start: other_start,
+                                end: other_end,
+                                ..
+                            } if other != *executable
+                                && core_of(other) == Some(core)
+                                && intervals_overlap(start, end, other_start, other_end)
+                        )
+                    }) {
+                        return false;
+                    }
+                }
+            }
+            SolverConstraint::Activation { start, end, .. } => {
+                if start >= end {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+fn solver_requirement(
+    identity: u128,
+    category: SolverRequirementCategory,
+    constraint: SolverConstraint,
+) -> SolverRequirement {
+    SolverRequirement {
+        identity,
+        category,
+        constraint,
+    }
+}
+
+#[cfg(test)]
+fn named_tiny_solver_puzzles() -> Vec<CanonicalProblem> {
+    let core = |identity| CoreResource { identity };
+    let activation = |identity, executable, start, end| {
+        solver_requirement(
+            identity,
+            SolverRequirementCategory::ActivationLifetime,
+            SolverConstraint::Activation {
+                executable,
+                units: 1,
+                start,
+                end,
+            },
+        )
+    };
+    let capacity = |identity, core, maximum| {
+        solver_requirement(
+            identity,
+            SolverRequirementCategory::Capacity,
+            SolverConstraint::CoreCapacity { core, maximum },
+        )
+    };
+    let base = |name, cores, executables, requirements| CanonicalProblem {
+        name,
+        cores,
+        executables,
+        bindings: Vec::new(),
+        capabilities: BTreeSet::new(),
+        requirements,
+    };
+    vec![
+        base(
+            "exact_fit",
+            vec![core(0)],
+            vec![10, 20],
+            vec![
+                capacity(1, 0, 2),
+                activation(2, 10, 0, 2),
+                activation(3, 20, 0, 2),
+                solver_requirement(
+                    4,
+                    SolverRequirementCategory::Placement,
+                    SolverConstraint::AllowedCores {
+                        executable: 10,
+                        cores: Arc::from([0]),
+                    },
+                ),
+            ],
+        ),
+        base(
+            "one_short",
+            vec![core(0)],
+            vec![10, 20],
+            vec![
+                capacity(1, 0, 1),
+                activation(2, 10, 0, 2),
+                activation(3, 20, 0, 2),
+            ],
+        ),
+        CanonicalProblem {
+            name: "binding",
+            cores: vec![core(0)],
+            executables: vec![10],
+            bindings: vec![
+                BindingResource {
+                    identity: 0,
+                    kind: 1,
+                    shareable: false,
+                },
+                BindingResource {
+                    identity: 1,
+                    kind: 1,
+                    shareable: false,
+                },
+            ],
+            capabilities: BTreeSet::new(),
+            requirements: vec![
+                solver_requirement(
+                    1,
+                    SolverRequirementCategory::Binding,
+                    SolverConstraint::Binding {
+                        subject: 100,
+                        kind: 1,
+                        allow_sharing: false,
+                    },
+                ),
+                solver_requirement(
+                    2,
+                    SolverRequirementCategory::Binding,
+                    SolverConstraint::Binding {
+                        subject: 200,
+                        kind: 1,
+                        allow_sharing: false,
+                    },
+                ),
+            ],
+        },
+        base(
+            "cardinality",
+            vec![core(0)],
+            vec![10],
+            vec![solver_requirement(
+                1,
+                SolverRequirementCategory::Cardinality,
+                SolverConstraint::Cardinality {
+                    selected: 2,
+                    minimum: 0,
+                    maximum: 1,
+                },
+            )],
+        ),
+        base(
+            "affinity",
+            vec![core(0), core(1)],
+            vec![10, 20],
+            vec![
+                capacity(1, 0, 1),
+                capacity(2, 1, 1),
+                activation(3, 10, 0, 2),
+                activation(4, 20, 0, 2),
+                solver_requirement(
+                    5,
+                    SolverRequirementCategory::Affinity,
+                    SolverConstraint::Affinity {
+                        left: 10,
+                        right: 20,
+                    },
+                ),
+            ],
+        ),
+        base(
+            "separation",
+            vec![core(0)],
+            vec![10, 20],
+            vec![
+                solver_requirement(
+                    1,
+                    SolverRequirementCategory::Separation,
+                    SolverConstraint::Separation {
+                        left: 10,
+                        right: 20,
+                    },
+                ),
+                solver_requirement(
+                    2,
+                    SolverRequirementCategory::Exclusivity,
+                    SolverConstraint::Exclusive { executable: 10 },
+                ),
+                activation(3, 10, 0, 1),
+                activation(4, 20, 0, 1),
+            ],
+        ),
+        CanonicalProblem {
+            name: "sharing",
+            cores: vec![core(0)],
+            executables: vec![10],
+            bindings: vec![BindingResource {
+                identity: 0,
+                kind: 1,
+                shareable: true,
+            }],
+            capabilities: BTreeSet::new(),
+            requirements: vec![
+                solver_requirement(
+                    1,
+                    SolverRequirementCategory::Binding,
+                    SolverConstraint::Binding {
+                        subject: 100,
+                        kind: 1,
+                        allow_sharing: true,
+                    },
+                ),
+                solver_requirement(
+                    2,
+                    SolverRequirementCategory::Binding,
+                    SolverConstraint::Binding {
+                        subject: 200,
+                        kind: 1,
+                        allow_sharing: true,
+                    },
+                ),
+            ],
+        },
+        base(
+            "role_closure",
+            vec![core(0)],
+            vec![10],
+            vec![solver_requirement(
+                1,
+                SolverRequirementCategory::RoleRealization,
+                SolverConstraint::Realize { executable: 99 },
+            )],
+        ),
+        base(
+            "lifetime",
+            vec![core(0)],
+            vec![10, 20],
+            vec![
+                capacity(1, 0, 1),
+                activation(2, 10, 0, 1),
+                activation(3, 20, 1, 2),
+            ],
+        ),
+        base(
+            "required_capability",
+            vec![core(0)],
+            vec![10],
+            vec![solver_requirement(
+                1,
+                SolverRequirementCategory::RequiredCapability,
+                SolverConstraint::Capability { capability: 7 },
+            )],
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::architecture_planning::{
         ArchitecturePlanningModule, ArchitectureProfile, ContractContext,
     };
+    use crate::core::CoreModule;
+    use crate::flow::FlowModule;
     use crate::{
         CompilationOutcome, CompilationRequest, Compiler, CompilerInstallation, ProjectFile,
         ProjectSnapshot,
@@ -7125,6 +8927,23 @@ fn build() -> Image:
             verify(candidate, &Cancellation::new()),
             Err(PlanningFailure::Defect(_))
         ));
+    }
+
+    fn assignment_fixture() -> VerifiedWholeImageAssignment {
+        let foundation = Arc::new(fixture(Root::Image));
+        let core = Arc::new(
+            CoreModule
+                .derive(foundation.for_core(), &Cancellation::new())
+                .expect("Core fixture verifies"),
+        );
+        let flow = Arc::new(
+            FlowModule
+                .derive(foundation.for_flow(), core.for_flow(), &Cancellation::new())
+                .expect("Flow fixture verifies"),
+        );
+        ImagePlanningModule
+            .solve(foundation, core, flow, &Cancellation::new())
+            .expect("whole-Image assignment verifies")
     }
 
     fn pool_fixture() -> VerifiedPlanningFoundation {
@@ -8401,5 +10220,216 @@ fn build() -> Image:
                 .iter()
                 .any(|reference| reference.kind() == CoreSourceExecutableKind::ClosureBody)
         );
+    }
+
+    #[test]
+    fn named_tiny_puzzles_match_the_independent_brute_force_checker() {
+        let puzzles = named_tiny_solver_puzzles();
+        assert_eq!(
+            puzzles
+                .iter()
+                .map(|puzzle| puzzle.name)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "exact_fit",
+                "one_short",
+                "binding",
+                "cardinality",
+                "affinity",
+                "separation",
+                "sharing",
+                "role_closure",
+                "lifetime",
+                "required_capability",
+            ])
+        );
+        for puzzle in puzzles {
+            let production = solve_canonical_problem(&puzzle, &Cancellation::new())
+                .expect("bounded production puzzle search completes");
+            let independent = independently_enumerate_tiny_puzzle(&puzzle);
+            assert_eq!(
+                production, independent,
+                "production and independent checker disagree for {}",
+                puzzle.name
+            );
+
+            let mut permuted = puzzle.clone();
+            permuted.executables.reverse();
+            permuted.cores.reverse();
+            permuted.bindings.reverse();
+            permuted.requirements.reverse();
+            assert_eq!(
+                production,
+                solve_canonical_problem(&permuted, &Cancellation::new())
+                    .expect("permuted bounded production puzzle search completes"),
+                "enumeration order changed the canonical result for {}",
+                puzzle.name
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_verifier_rejects_invariant_disagreement_without_researching() {
+        let mut candidate = assignment_fixture();
+        let mut placements = candidate.placements.to_vec();
+        placements[0].core = 1;
+        candidate.placements = placements.into();
+        candidate.fingerprint = whole_assignment_fingerprint(
+            candidate.requirement_set_fingerprint,
+            &candidate.placements,
+            &candidate.bindings,
+            &candidate.discharges,
+        );
+        assert!(matches!(
+            verify_whole_image_assignment(&candidate, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut candidate = assignment_fixture();
+        let mut requirements = candidate.requirements.to_vec();
+        let mut discharges = candidate.discharges.to_vec();
+        requirements.pop().expect("fixture has a Requirement");
+        discharges.pop().expect("fixture has a discharge");
+        candidate.requirements = requirements.into();
+        candidate.discharges = discharges.into();
+        candidate.requirement_set_fingerprint = whole_requirement_set_fingerprint(
+            candidate.planning_foundation.fingerprint,
+            candidate.core_program.for_image_planning().fingerprint(),
+            candidate.flow_program.for_image_planning().fingerprint(),
+            &candidate.requirements,
+        );
+        candidate.fingerprint = whole_assignment_fingerprint(
+            candidate.requirement_set_fingerprint,
+            &candidate.placements,
+            &candidate.bindings,
+            &candidate.discharges,
+        );
+        assert!(matches!(
+            verify_whole_image_assignment(&candidate, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut candidate = assignment_fixture();
+        let mut discharges = candidate.discharges.to_vec();
+        discharges[0].kind = if discharges[0].kind == DischargeKind::Bound {
+            DischargeKind::Placed
+        } else {
+            DischargeKind::Bound
+        };
+        candidate.discharges = discharges.into();
+        candidate.fingerprint = whole_assignment_fingerprint(
+            candidate.requirement_set_fingerprint,
+            &candidate.placements,
+            &candidate.bindings,
+            &candidate.discharges,
+        );
+        assert!(matches!(
+            verify_whole_image_assignment(&candidate, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut candidate = assignment_fixture();
+        let mut bindings = candidate.bindings.to_vec();
+        bindings[0].slot ^= 1;
+        candidate.bindings = bindings.into();
+        candidate.fingerprint = whole_assignment_fingerprint(
+            candidate.requirement_set_fingerprint,
+            &candidate.placements,
+            &candidate.bindings,
+            &candidate.discharges,
+        );
+        assert!(matches!(
+            verify_whole_image_assignment(&candidate, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+    }
+
+    #[test]
+    fn solver_cancellation_and_exhaustion_publish_no_candidate_or_conflict() {
+        let cancellation = Cancellation::new();
+        cancellation.cancel();
+        let exact_fit = named_tiny_solver_puzzles()
+            .into_iter()
+            .find(|puzzle| puzzle.name == "exact_fit")
+            .unwrap();
+        assert!(matches!(
+            solve_canonical_problem(&exact_fit, &cancellation),
+            Err(PlanningFailure::Cancelled)
+        ));
+
+        let exhausted = CanonicalProblem {
+            name: "bounded_exhaustion",
+            cores: vec![CoreResource { identity: 0 }],
+            executables: vec![1],
+            bindings: Vec::new(),
+            capabilities: BTreeSet::new(),
+            requirements: (0..=MAX_CONFLICT_REQUIREMENTS)
+                .map(|ordinal| {
+                    solver_requirement(
+                        u128::try_from(ordinal + 1).unwrap(),
+                        SolverRequirementCategory::RequiredCapability,
+                        SolverConstraint::Capability {
+                            capability: u8::try_from(ordinal + 1).unwrap(),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        assert!(matches!(
+            solve_canonical_problem(&exhausted, &Cancellation::new()),
+            Err(PlanningFailure::Defect(evidence))
+                if evidence.contains("exhausted")
+        ));
+    }
+
+    #[test]
+    fn canonical_solver_rejects_duplicate_typed_identities() {
+        let duplicate_binding = CanonicalProblem {
+            name: "duplicate_binding",
+            cores: vec![CoreResource { identity: 0 }],
+            executables: vec![1],
+            bindings: vec![
+                BindingResource {
+                    identity: 1,
+                    kind: 1,
+                    shareable: false,
+                },
+                BindingResource {
+                    identity: 1,
+                    kind: 2,
+                    shareable: false,
+                },
+            ],
+            capabilities: BTreeSet::new(),
+            requirements: Vec::new(),
+        };
+        assert!(matches!(
+            solve_canonical_problem(&duplicate_binding, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let duplicate_requirement = CanonicalProblem {
+            name: "duplicate_requirement",
+            cores: vec![CoreResource { identity: 0 }],
+            executables: vec![1],
+            bindings: Vec::new(),
+            capabilities: BTreeSet::from([1]),
+            requirements: vec![
+                solver_requirement(
+                    1,
+                    SolverRequirementCategory::RoleRealization,
+                    SolverConstraint::Realize { executable: 1 },
+                ),
+                solver_requirement(
+                    1,
+                    SolverRequirementCategory::RequiredCapability,
+                    SolverConstraint::Capability { capability: 1 },
+                ),
+            ],
+        };
+        assert!(matches!(
+            solve_canonical_problem(&duplicate_requirement, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
     }
 }

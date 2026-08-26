@@ -13,7 +13,7 @@ use crate::compiler::{
 use crate::evaluator::{Construction, ConstructionOperand, Engine, SemanticEvaluation, Value};
 use crate::identity::IdentityCatalog;
 use crate::image_evaluation::SealedImage;
-use crate::model::{BuildKind, SpecializationId};
+use crate::model::{BuildKind, DefinitionId, SpecializationId};
 use crate::semantic_facts::{FunctionFacts, SolvedSemanticFacts};
 use crate::typed_hir::{AccessMode, VerifiedProgram};
 
@@ -36,6 +36,14 @@ pub(crate) struct CompletionInput {
     pub(crate) evaluations: Vec<SemanticEvaluation>,
     pub(crate) image: SealedImage,
     pub(crate) image_specialization: SpecializationId,
+    pub(crate) actors: Vec<ActorInput>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ActorInput {
+    pub(crate) definition: DefinitionId,
+    pub(crate) source: crate::SourceRange,
+    pub(crate) handlers: Arc<[DefinitionId]>,
 }
 
 pub(crate) enum CompletionFailure {
@@ -264,10 +272,18 @@ pub(crate) struct CompletedSemanticProgram {
     evaluations: Arc<[CompletedEvaluation]>,
     graph: SealedConstructionGraph,
     demand: ExecutableDemand,
+    actors: Arc<[CompletedActor]>,
     receipts: DirectReceipts,
     custody_fingerprint: u128,
     fingerprint: u128,
     _verified: VerifiedMarker,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompletedActor {
+    identity: u128,
+    source: crate::SourceRange,
+    handlers: Arc<[SpecializationId]>,
 }
 
 impl fmt::Debug for CompletedSemanticProgram {
@@ -375,6 +391,47 @@ impl CompletedSemanticProgram {
 
     pub(crate) fn for_core_planning(&self) -> CorePlanningSemanticProgram<'_> {
         CorePlanningSemanticProgram { program: self }
+    }
+
+    pub(crate) fn for_flow_planning(&self) -> FlowPlanningSemanticProgram<'_> {
+        FlowPlanningSemanticProgram { program: self }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FlowPlanningSemanticProgram<'a> {
+    program: &'a CompletedSemanticProgram,
+}
+
+impl<'a> FlowPlanningSemanticProgram<'a> {
+    pub(crate) fn actors(self) -> impl ExactSizeIterator<Item = FlowActorInput<'a>> {
+        self.program
+            .actors
+            .iter()
+            .map(|actor| FlowActorInput { actor })
+    }
+
+    pub(crate) fn context_identity(self) -> u128 {
+        self.program.context.identity
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FlowActorInput<'a> {
+    actor: &'a CompletedActor,
+}
+
+impl<'a> FlowActorInput<'a> {
+    pub(crate) const fn identity(self) -> u128 {
+        self.actor.identity
+    }
+
+    pub(crate) fn source(self) -> &'a crate::SourceRange {
+        &self.actor.source
+    }
+
+    pub(crate) fn handlers(self) -> impl ExactSizeIterator<Item = u128> + 'a {
+        self.actor.handlers.iter().map(|handler| handler.0)
     }
 }
 
@@ -572,13 +629,17 @@ pub(crate) fn complete(
     evaluations.sort_by_key(|evaluation| evaluation.authority.root);
     let evaluations_fingerprint = produce_evaluations_fingerprint(&evaluations, cancellation)?;
     checkpoint(cancellation)?;
+    let actors = complete_actors(&input.actors, &input.program, cancellation)?;
     let demand = produce_demand(
-        context_identity,
-        input.image_specialization,
-        &input.program,
-        &input.facts,
-        &input.image,
-        &input.image.test_applications,
+        DemandInput {
+            context: context_identity,
+            root: input.image_specialization,
+            program: &input.program,
+            facts: &input.facts,
+            image: &input.image,
+            test_applications: &input.image.test_applications,
+            actors: &actors,
+        },
         cancellation,
     )?;
     let graph = produce_graph(
@@ -636,6 +697,7 @@ pub(crate) fn complete(
         evaluations: evaluations.into(),
         graph,
         demand,
+        actors: actors.into(),
         receipts,
         custody_fingerprint,
         fingerprint,
@@ -705,6 +767,7 @@ fn verify(
         return defect("Resource custody receipt disagrees with verified Typed Program");
     }
     verify_fact_coverage(&candidate.program, &candidate.facts, cancellation)?;
+    verify_actors(candidate, cancellation)?;
     verify_evaluation_coverage(
         &candidate.program,
         SpecializationId(candidate.demand.root.raw.identity),
@@ -757,15 +820,67 @@ fn verify_reference(
     Ok(())
 }
 
-fn produce_demand(
+fn complete_actors(
+    inputs: &[ActorInput],
+    program: &VerifiedProgram,
+    cancellation: &Cancellation,
+) -> Result<Vec<CompletedActor>, CompletionFailure> {
+    let mut actors = Vec::with_capacity(inputs.len());
+    let mut identities = BTreeSet::new();
+    for input in inputs {
+        checkpoint(cancellation)?;
+        if !identities.insert(input.definition.0) {
+            return defect("Actor identity is duplicated");
+        }
+        let mut handlers = Vec::with_capacity(input.handlers.len());
+        for definition in input.handlers.iter().copied() {
+            checkpoint(cancellation)?;
+            let Some(specialization) = program.default_specialization(definition) else {
+                return defect("Actor handler has no concrete Specialization");
+            };
+            let Some(function) = program.specialization_function(specialization) else {
+                return defect("Actor handler Specialization is missing");
+            };
+            if function.modifier != crate::syntax::FunctionModifier::Async {
+                return defect("Actor message handler is not async");
+            }
+            handlers.push(specialization);
+        }
+        handlers.sort();
+        handlers.dedup();
+        actors.push(CompletedActor {
+            identity: input.definition.0,
+            source: input.source.clone(),
+            handlers: handlers.into(),
+        });
+    }
+    actors.sort_by_key(|actor| actor.identity);
+    Ok(actors)
+}
+
+struct DemandInput<'a> {
     context: u128,
     root: SpecializationId,
-    program: &VerifiedProgram,
-    facts: &SolvedSemanticFacts,
-    image: &SealedImage,
-    test_applications: &[crate::evaluator::AppliedTest],
+    program: &'a VerifiedProgram,
+    facts: &'a SolvedSemanticFacts,
+    image: &'a SealedImage,
+    test_applications: &'a [crate::evaluator::AppliedTest],
+    actors: &'a [CompletedActor],
+}
+
+fn produce_demand(
+    input: DemandInput<'_>,
     cancellation: &Cancellation,
 ) -> Result<ExecutableDemand, CompletionFailure> {
+    let DemandInput {
+        context,
+        root,
+        program,
+        facts,
+        image,
+        test_applications,
+        actors,
+    } = input;
     if !program.specializations().contains_key(&root) {
         return defect("Image Constructor has no concrete Specialization");
     }
@@ -794,6 +909,10 @@ fn produce_demand(
         }
     }
     roots.insert(root);
+    for actor in actors {
+        checkpoint(cancellation)?;
+        roots.extend(actor.handlers.iter().copied());
+    }
     for application in test_applications {
         if cancellation.is_cancelled() {
             return Err(CompletionFailure::Cancelled);
@@ -1206,6 +1325,10 @@ fn verify_demand(
         }
     }
     roots.insert(root);
+    for actor in candidate.actors.iter() {
+        checkpoint(cancellation)?;
+        roots.extend(actor.handlers.iter().copied());
+    }
     for application in candidate.graph.test_applications.iter() {
         if cancellation.is_cancelled() {
             return Err(CompletionFailure::Cancelled);
@@ -1305,6 +1428,38 @@ fn verify_demand(
     )? != candidate.demand.fingerprint
     {
         return defect("Executable Demand fingerprint is false");
+    }
+    Ok(())
+}
+
+fn verify_actors(
+    candidate: &CompletedSemanticProgram,
+    cancellation: &Cancellation,
+) -> Result<(), CompletionFailure> {
+    let mut previous = None;
+    for actor in candidate.actors.iter() {
+        checkpoint(cancellation)?;
+        if previous.is_some_and(|identity| identity >= actor.identity) {
+            return defect("Actor identities are not unique canonical order");
+        }
+        previous = Some(actor.identity);
+        if actor.source.path().is_empty() {
+            return defect("Actor provenance is missing");
+        }
+        let mut previous_handler = None;
+        for handler in actor.handlers.iter().copied() {
+            checkpoint(cancellation)?;
+            if previous_handler.is_some_and(|identity| identity >= handler) {
+                return defect("Actor handlers are not unique canonical order");
+            }
+            previous_handler = Some(handler);
+            let Some(function) = candidate.program.specialization_function(handler) else {
+                return defect("Actor handler references a missing Specialization");
+            };
+            if function.modifier != crate::syntax::FunctionModifier::Async {
+                return defect("Actor handler references a non-async function");
+            }
+        }
     }
     Ok(())
 }

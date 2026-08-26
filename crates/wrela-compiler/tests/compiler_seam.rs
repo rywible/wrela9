@@ -287,7 +287,6 @@ fn build() -> Image:
         SyntaxNodeKind::WithStatement,
         SyntaxNodeKind::TakeStatement,
         SyntaxNodeKind::SendStatement,
-        SyntaxNodeKind::TrySendStatement,
         SyntaxNodeKind::RangeExpression,
         SyntaxNodeKind::IsExpression,
         SyntaxNodeKind::ClosureExpression,

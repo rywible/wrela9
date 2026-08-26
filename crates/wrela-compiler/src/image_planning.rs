@@ -1077,6 +1077,31 @@ impl VerifiedPlanningFoundation {
     pub(crate) const fn for_core(&self) -> CorePlanningInput<'_> {
         CorePlanningInput { foundation: self }
     }
+
+    pub(crate) const fn for_flow(&self) -> FlowPlanningInput<'_> {
+        FlowPlanningInput { foundation: self }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FlowPlanningInput<'a> {
+    foundation: &'a VerifiedPlanningFoundation,
+}
+
+impl<'a> FlowPlanningInput<'a> {
+    pub(crate) const fn fingerprint(self) -> u128 {
+        self.foundation.fingerprint
+    }
+
+    pub(crate) const fn context_identity(self) -> u128 {
+        self.foundation.context
+    }
+
+    pub(crate) fn semantic_program(
+        self,
+    ) -> crate::completed_semantic::FlowPlanningSemanticProgram<'a> {
+        self.foundation.semantic_program.for_flow_planning()
+    }
 }
 
 #[derive(Clone, Copy)]

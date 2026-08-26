@@ -74,6 +74,7 @@ pub enum CoreOperationKind {
     GeneratedRole,
     RecoverableExit,
     CleanupRun,
+    MessageProposal,
 }
 
 impl CoreOperationKind {
@@ -112,6 +113,7 @@ impl CoreOperationKind {
             Self::GeneratedRole => 31,
             Self::RecoverableExit => 32,
             Self::CleanupRun => 33,
+            Self::MessageProposal => 34,
         }
     }
 }
@@ -1332,6 +1334,14 @@ pub(crate) struct FlowCoreView<'a> {
 
 #[allow(dead_code)]
 impl FlowCoreView<'_> {
+    pub(crate) const fn context_identity(&self) -> u128 {
+        self.core.context
+    }
+
+    pub(crate) const fn fingerprint(&self) -> u128 {
+        self.core.fingerprint
+    }
+
     pub(crate) fn executables(&self) -> impl ExactSizeIterator<Item = CoreExecutableIndex<'_>> {
         self.core.executables.iter().map(CoreExecutableIndex)
     }
@@ -1343,6 +1353,42 @@ impl FlowCoreView<'_> {
             .filter(|executable| executable.facts.suspends)
             .map(|executable| executable.reference.identity)
     }
+
+    pub(crate) fn message_proposals(&self) -> Vec<FlowCoreMessageProposal> {
+        let mut proposals = Vec::new();
+        for executable in self.core.executables.iter() {
+            let mut ordinal = 0_u32;
+            for operation in executable
+                .regions
+                .iter()
+                .flat_map(|region| region.operations.iter())
+                .filter(|operation| operation.kind == CoreOperationKind::MessageProposal)
+            {
+                proposals.push(FlowCoreMessageProposal {
+                    sender_handler: executable.reference.identity,
+                    destination_handler: operation.details.first().copied().unwrap_or(0),
+                    send_ordinal: ordinal,
+                    moved_resource_count: operation
+                        .details
+                        .get(1)
+                        .and_then(|count| usize::try_from(*count).ok())
+                        .unwrap_or(usize::MAX),
+                    source: operation.provenance.clone(),
+                });
+                ordinal = ordinal.saturating_add(1);
+            }
+        }
+        proposals
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FlowCoreMessageProposal {
+    pub(crate) sender_handler: u128,
+    pub(crate) destination_handler: u128,
+    pub(crate) send_ordinal: u32,
+    pub(crate) moved_resource_count: usize,
+    pub(crate) source: SourceRange,
 }
 
 #[allow(dead_code)]
@@ -3452,6 +3498,13 @@ impl<'a> ProducerLowerer<'a> {
                 EffectBoundary::Suspension,
                 FailureLaw::PropagateInOrder,
             ),
+            ExpressionKind::TrySend(value) => (
+                CoreOperationKind::MessageProposal,
+                vec![self.lower_expression(value, operations)?],
+                try_send_details(value),
+                EffectBoundary::Suspension,
+                FailureLaw::CheckBeforeSuccess,
+            ),
             ExpressionKind::Propagate(value) => (
                 CoreOperationKind::Propagate,
                 vec![self.lower_expression(value, operations)?],
@@ -3736,6 +3789,24 @@ fn call_target_details(target: &CallTarget) -> Vec<u128> {
             values
         }
     }
+}
+
+fn try_send_details(expression: &Expression) -> Vec<u128> {
+    let ExpressionKind::Call { target, arguments } = &expression.kind else {
+        return vec![0, 0];
+    };
+    let destination_handler = match target {
+        CallTarget::Function { specialization, .. } => specialization.0,
+        _ => 0,
+    };
+    let moved_resources = arguments
+        .iter()
+        .filter(|argument| argument.access == crate::typed_hir::AccessMode::Move)
+        .count();
+    vec![
+        destination_handler,
+        u128::try_from(moved_resources).unwrap_or(u128::MAX),
+    ]
 }
 
 fn producer_call_binding(target: &CallTarget, argument_count: usize) -> Arc<[u16]> {
@@ -4841,6 +4912,13 @@ impl<'a> VerifierLowerer<'a> {
                 vec![],
                 EffectBoundary::Suspension,
                 FailureLaw::PropagateInOrder,
+            ),
+            ExpressionKind::TrySend(value) => (
+                CoreOperationKind::MessageProposal,
+                vec![self.reconstruct_expression(value, operations)?],
+                try_send_details(value),
+                EffectBoundary::Suspension,
+                FailureLaw::CheckBeforeSuccess,
             ),
             ExpressionKind::Propagate(value) => (
                 CoreOperationKind::Propagate,
@@ -7298,6 +7376,7 @@ fn source_custody_expression(
         | ExpressionKind::BitNot(value)
         | ExpressionKind::Not(value)
         | ExpressionKind::Await(value)
+        | ExpressionKind::TrySend(value)
         | ExpressionKind::Propagate(value)
         | ExpressionKind::Is { value, .. } => {
             source_custody_expression(value, path, program, cancellation, events)?;
@@ -8322,6 +8401,7 @@ fn oracle_supported(
             | CoreOperationKind::CleanupRun
             | CoreOperationKind::PoolScope
             | CoreOperationKind::Suspension
+            | CoreOperationKind::MessageProposal
             | CoreOperationKind::GeneratedRole => false,
         };
         if !supported {

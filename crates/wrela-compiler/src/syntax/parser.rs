@@ -1425,7 +1425,6 @@ pub(super) fn unsupported_statement_node(kind: UnsupportedStatementKind) -> Synt
     match kind {
         UnsupportedStatementKind::Take => SyntaxNodeKind::TakeStatement,
         UnsupportedStatementKind::Send => SyntaxNodeKind::SendStatement,
-        UnsupportedStatementKind::TrySend => SyntaxNodeKind::TrySendStatement,
     }
 }
 
@@ -1689,17 +1688,14 @@ fn parse_statement_block(
                     range: line.range.clone(),
                 }
             }
-            kind @ (TokenKind::Take | TokenKind::Send | TokenKind::TrySend) => {
-                StatementSyntax::Unsupported {
-                    kind: match kind {
-                        TokenKind::Take => UnsupportedStatementKind::Take,
-                        TokenKind::Send => UnsupportedStatementKind::Send,
-                        TokenKind::TrySend => UnsupportedStatementKind::TrySend,
-                        _ => unreachable!("guarded opaque statement"),
-                    },
-                    range: line.range.clone(),
-                }
-            }
+            kind @ (TokenKind::Take | TokenKind::Send) => StatementSyntax::Unsupported {
+                kind: match kind {
+                    TokenKind::Take => UnsupportedStatementKind::Take,
+                    TokenKind::Send => UnsupportedStatementKind::Send,
+                    _ => unreachable!("guarded opaque statement"),
+                },
+                range: line.range.clone(),
+            },
             TokenKind::If => {
                 cursor.advance();
                 let condition = cursor.parse_expression(0)?;
@@ -2442,12 +2438,6 @@ impl<'a, 'tokens> SyntaxCursor<'a, 'tokens> {
         let kind = if self
             .tokens
             .iter()
-            .any(|token| token.kind == TokenKind::TrySend)
-        {
-            UnsupportedExpressionKind::TrySend
-        } else if self
-            .tokens
-            .iter()
             .any(|token| token.kind == TokenKind::Send)
         {
             UnsupportedExpressionKind::Send
@@ -2922,6 +2912,14 @@ impl<'a, 'tokens> SyntaxCursor<'a, 'tokens> {
                 let end = value.range.end();
                 ExpressionSyntax {
                     kind: ExpressionSyntaxKind::Await(Box::new(value)),
+                    range: SourceRange::from_u64_shared(path, start, end),
+                }
+            }
+            TokenKind::TrySend => {
+                let value = self.parse_expression_at(12, depth + 1)?;
+                let end = value.range.end();
+                ExpressionSyntax {
+                    kind: ExpressionSyntaxKind::TrySend(Box::new(value)),
                     range: SourceRange::from_u64_shared(path, start, end),
                 }
             }

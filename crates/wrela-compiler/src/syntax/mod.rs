@@ -449,7 +449,6 @@ pub(crate) struct PatternArgumentSyntax {
 pub(crate) enum UnsupportedStatementKind {
     Take,
     Send,
-    TrySend,
 }
 
 #[derive(Clone, Debug)]
@@ -494,6 +493,7 @@ pub(crate) enum ExpressionSyntaxKind {
     BitNot(Box<ExpressionSyntax>),
     Not(Box<ExpressionSyntax>),
     Await(Box<ExpressionSyntax>),
+    TrySend(Box<ExpressionSyntax>),
     Mut(Box<ExpressionSyntax>),
     Take(Box<ExpressionSyntax>),
     Closure {
@@ -516,7 +516,6 @@ pub(crate) enum ExpressionSyntaxKind {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum UnsupportedExpressionKind {
     Send,
-    TrySend,
 }
 
 #[derive(Clone, Debug)]

@@ -12,6 +12,7 @@ use crate::architecture_planning::{
     VerifiedArchitecturePlanningContract,
 };
 use crate::core::{CoreFailure, CoreProgramObservation, VerifiedCoreProgram};
+use crate::flow::{FlowFailure, FlowProgramObservation, VerifiedFlowProgram};
 use crate::image_planning::{
     PlanningFailure, PlanningFoundationObservation, VerifiedPlanningFoundation,
 };
@@ -1026,6 +1027,7 @@ pub struct Inspection {
     completed_semantic_program: Option<CompletedSemanticProgramObservation>,
     planning_foundation: Option<PlanningFoundationObservation>,
     core_program: Option<CoreProgramObservation>,
+    flow_program: Option<FlowProgramObservation>,
 }
 
 impl Inspection {
@@ -1132,6 +1134,11 @@ impl Inspection {
     #[must_use]
     pub const fn core_program(&self) -> Option<&CoreProgramObservation> {
         self.core_program.as_ref()
+    }
+
+    #[must_use]
+    pub const fn flow_program(&self) -> Option<&FlowProgramObservation> {
+        self.flow_program.as_ref()
     }
 }
 
@@ -2160,6 +2167,7 @@ pub struct AcceptedCompilation {
     completed_semantic_program: Arc<crate::completed_semantic::CompletedSemanticProgram>,
     planning_foundation: Option<Arc<VerifiedPlanningFoundation>>,
     core_program: Option<Arc<VerifiedCoreProgram>>,
+    flow_program: Option<Arc<VerifiedFlowProgram>>,
 }
 
 impl AcceptedCompilation {
@@ -2190,6 +2198,11 @@ impl AcceptedCompilation {
         self.core_program.as_ref().map(|core| core.fingerprint())
     }
 
+    #[must_use]
+    pub fn flow_program_fingerprint(&self) -> Option<u128> {
+        self.flow_program.as_ref().map(|flow| flow.fingerprint())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn completed_semantic_program(
         &self,
@@ -2205,6 +2218,11 @@ impl AcceptedCompilation {
     #[cfg(test)]
     pub(crate) fn verified_core_program(&self) -> Option<&VerifiedCoreProgram> {
         self.core_program.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn verified_flow_program(&self) -> Option<&VerifiedFlowProgram> {
+        self.flow_program.as_deref()
     }
 }
 
@@ -2661,6 +2679,21 @@ impl Compiler {
             },
         };
 
+        let flow_program = match (planning_foundation.as_ref(), core_program.as_ref()) {
+            (Some(planning), Some(core)) => match self.distribution.flow().derive(
+                planning.for_flow(),
+                core.for_flow(),
+                cancellation,
+            ) {
+                Ok(flow) => Some(Arc::new(flow)),
+                Err(FlowFailure::Cancelled) => return CompilationOutcome::Cancelled,
+                Err(FlowFailure::Defect(evidence)) => {
+                    return CompilationOutcome::Defect(Defect::new("Flow", evidence));
+                }
+            },
+            _ => None,
+        };
+
         let Some(unreachable_project_syntax) = parse_unreachable_project_syntax(
             &request.project,
             &parsed_sources,
@@ -2680,6 +2713,22 @@ impl Compiler {
                 Err(CoreFailure::Cancelled) => return CompilationOutcome::Cancelled,
                 Err(CoreFailure::Defect(evidence)) => {
                     return CompilationOutcome::Defect(Defect::new("Core inspection", evidence));
+                }
+            }
+        } else {
+            None
+        };
+
+        let flow_observation = if request.inspection.planning {
+            match flow_program
+                .as_ref()
+                .map(|flow| flow.observation(cancellation))
+                .transpose()
+            {
+                Ok(observation) => observation,
+                Err(FlowFailure::Cancelled) => return CompilationOutcome::Cancelled,
+                Err(FlowFailure::Defect(evidence)) => {
+                    return CompilationOutcome::Defect(Defect::new("Flow inspection", evidence));
                 }
             }
         } else {
@@ -2755,6 +2804,7 @@ impl Compiler {
                 None
             },
             core_program: core_observation,
+            flow_program: flow_observation,
         };
 
         if diagnostics.is_empty() {
@@ -2770,6 +2820,7 @@ impl Compiler {
                 completed_semantic_program,
                 planning_foundation,
                 core_program,
+                flow_program,
             })
         } else {
             CompilationOutcome::Rejected(RejectedCompilation {

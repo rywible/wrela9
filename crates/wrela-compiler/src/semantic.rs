@@ -2602,6 +2602,37 @@ fn analyze_with_probe(
                 Arc::from("Image Constructor has no concrete Specialization"),
             );
         };
+        let actors = definitions
+            .values()
+            .filter(|definition| {
+                definition
+                    .declaration
+                    .attributes
+                    .contains(&AttributeSyntax::Actor)
+            })
+            .filter_map(|definition| {
+                let struct_ = match definition.declaration.syntax.as_ref()? {
+                    DeclarationSyntax::Struct(struct_) => struct_,
+                    _ => return None,
+                };
+                let handlers = struct_
+                    .functions
+                    .iter()
+                    .filter(|member| {
+                        member.public
+                            && member.function.modifier == crate::syntax::FunctionModifier::Async
+                    })
+                    .filter_map(|member| {
+                        identity_catalog.associated_function(definition.id, &member.name)
+                    })
+                    .collect::<Vec<_>>();
+                Some(crate::completed_semantic::ActorInput {
+                    definition: definition.id,
+                    source: definition.declaration.range.clone(),
+                    handlers: handlers.into(),
+                })
+            })
+            .collect::<Vec<_>>();
         match crate::completed_semantic::complete(
             crate::completed_semantic::CompletionInput {
                 context,
@@ -2611,6 +2642,7 @@ fn analyze_with_probe(
                 evaluations: semantic_evaluations,
                 image,
                 image_specialization,
+                actors,
             },
             cancellation,
         ) {

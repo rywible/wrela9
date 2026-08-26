@@ -9,6 +9,7 @@ mod control_flow;
 mod core;
 mod distribution;
 mod evaluator;
+mod flow;
 mod graph;
 mod identity;
 mod image_evaluation;
@@ -43,6 +44,11 @@ pub use core::{
     CoreExecutableKind, CoreExecutableObservation, CoreInitializationEffect, CoreLoanEffect,
     CoreObligationEffect, CoreOperationKind, CoreParameterObservation, CoreProgramObservation,
     CoreRewriteKind,
+};
+pub use flow::{
+    FlowActorObservation, FlowCustodian, FlowEventKind, FlowProgramObservation, FlowProposalKey,
+    FlowProposalObservation, FlowRequirementKind, FlowRequirementObservation, FlowSendOutcome,
+    FlowSuspensionHomeObservation, FlowTraceRecord,
 };
 pub use image_planning::{
     DomainPlanKind, DomainPlanObservation, ExecutableDemandObservation, GeneratedRoleKind,

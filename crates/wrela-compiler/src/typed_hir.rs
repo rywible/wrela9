@@ -1026,6 +1026,7 @@ impl Expression {
             | ExpressionKind::BitNot(value)
             | ExpressionKind::Not(value)
             | ExpressionKind::Await(value)
+            | ExpressionKind::TrySend(value)
             | ExpressionKind::Propagate(value) => visitor(value),
             ExpressionKind::Index { value, index }
             | ExpressionKind::Binary {
@@ -1083,6 +1084,7 @@ pub(crate) enum ExpressionKind {
     BitNot(Box<Expression>),
     Not(Box<Expression>),
     Await(Box<Expression>),
+    TrySend(Box<Expression>),
     Propagate(Box<Expression>),
     Is {
         value: Box<Expression>,
@@ -2518,6 +2520,7 @@ fn collect_expression_demands(
         | ExpressionKind::BitNot(value)
         | ExpressionKind::Not(value)
         | ExpressionKind::Await(value)
+        | ExpressionKind::TrySend(value)
         | ExpressionKind::Propagate(value) => {
             collect_expression_demands(value, constants, functions);
         }
@@ -3619,7 +3622,10 @@ fn verify_loop_control(
 
 fn statements_suspend(statements: &[Statement]) -> bool {
     fn expression_suspends(expression: &Expression) -> bool {
-        if matches!(expression.kind, ExpressionKind::Await(_)) {
+        if matches!(
+            expression.kind,
+            ExpressionKind::Await(_) | ExpressionKind::TrySend(_)
+        ) {
             return true;
         }
         let mut found = false;
@@ -5680,6 +5686,19 @@ fn verify_expression_artifact_with_cleanup(
         ExpressionKind::Await(value) => {
             if call_loan(value).is_some() {
                 return defect("lowered await holds a Resource loan across suspension");
+            }
+            verify_expression_artifact_with_cleanup(
+                value,
+                locals,
+                moved,
+                catalog,
+                &expression.source,
+                cleanup_captures,
+            )?
+        }
+        ExpressionKind::TrySend(value) => {
+            if !matches!(value.kind, ExpressionKind::Call { .. }) {
+                return defect("lowered try_send does not contain a message call");
             }
             verify_expression_artifact_with_cleanup(
                 value,
@@ -7911,6 +7930,14 @@ impl<'a> Lowerer<'a> {
                 let type_ = value.type_.clone();
                 (ExpressionKind::Await(Box::new(value)), type_)
             }
+            ExpressionSyntaxKind::TrySend(value) => {
+                let value = self.expression(value)?;
+                if !matches!(value.kind, ExpressionKind::Call { .. }) {
+                    return creator(CreatorFailureKind::InvalidFunctionValue, &syntax.range);
+                }
+                let type_ = value.type_.clone();
+                (ExpressionKind::TrySend(Box::new(value)), type_)
+            }
             ExpressionSyntaxKind::Mut(value) => {
                 let mut value = self.expression(value)?;
                 let Some(place) = root_place(&value) else {
@@ -8787,6 +8814,9 @@ impl<'a> Lowerer<'a> {
                 self.normalize_cleanup_expression(*value, captures)?,
             )),
             ExpressionKind::Await(value) => ExpressionKind::Await(Box::new(
+                self.normalize_cleanup_expression(*value, captures)?,
+            )),
+            ExpressionKind::TrySend(value) => ExpressionKind::TrySend(Box::new(
                 self.normalize_cleanup_expression(*value, captures)?,
             )),
             ExpressionKind::Propagate(value) => ExpressionKind::Propagate(Box::new(
@@ -12447,6 +12477,10 @@ fn append_expression(bytes: &mut impl ByteSink, expression: &Expression) {
         }
         ExpressionKind::Await(value) => {
             bytes.push(6);
+            append_expression(bytes, value);
+        }
+        ExpressionKind::TrySend(value) => {
+            bytes.push(22);
             append_expression(bytes, value);
         }
         ExpressionKind::Propagate(value) => {

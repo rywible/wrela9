@@ -17,8 +17,8 @@ use crate::typed_hir::{
 };
 use crate::{Cancellation, CanonicalValue, EvaluationOutcome, EvaluationPanicKind, SourceRange};
 
-pub(crate) const PHASE_SCHEMA: &str = "wrela.core.v1";
-const SCHEMA_VERSION: u16 = 1;
+pub(crate) const PHASE_SCHEMA: &str = "wrela.core.v2";
+const SCHEMA_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CoreExecutableKind {
@@ -72,6 +72,7 @@ pub enum CoreOperationKind {
     Pass,
     Suspension,
     GeneratedRole,
+    RecoverableExit,
 }
 
 impl CoreOperationKind {
@@ -108,8 +109,142 @@ impl CoreOperationKind {
             Self::Pass => 29,
             Self::Suspension => 30,
             Self::GeneratedRole => 31,
+            Self::RecoverableExit => 32,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CoreCustodyOperation {
+    Construct,
+    Move,
+    SharedLoan,
+    ExclusiveLoan,
+    Replace,
+    TransferCommit,
+    Discharge,
+    CleanupRegister,
+    CleanupRun,
+    Join,
+    LoopFixpoint,
+    ProofCondition,
+    Panic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreInitializationEffect {
+    None,
+    Initialize,
+    Uninitialize,
+    Replace,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreCustodianEffect {
+    None,
+    Establish,
+    Transfer,
+    Discharge,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreLoanEffect {
+    None,
+    Shared,
+    Exclusive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreObligationEffect {
+    None,
+    Establish,
+    Transfer,
+    Discharge,
+}
+
+impl CoreCustodyOperation {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Construct => 1,
+            Self::Move => 2,
+            Self::SharedLoan => 3,
+            Self::ExclusiveLoan => 4,
+            Self::Replace => 5,
+            Self::TransferCommit => 6,
+            Self::Discharge => 7,
+            Self::CleanupRegister => 8,
+            Self::CleanupRun => 9,
+            Self::Join => 10,
+            Self::LoopFixpoint => 11,
+            Self::ProofCondition => 12,
+            Self::Panic => 13,
+        }
+    }
+}
+
+impl CoreInitializationEffect {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Initialize => 1,
+            Self::Uninitialize => 2,
+            Self::Replace => 3,
+        }
+    }
+}
+
+impl CoreCustodianEffect {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Establish => 1,
+            Self::Transfer => 2,
+            Self::Discharge => 3,
+        }
+    }
+}
+
+impl CoreLoanEffect {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Shared => 1,
+            Self::Exclusive => 2,
+        }
+    }
+}
+
+impl CoreObligationEffect {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Establish => 1,
+            Self::Transfer => 2,
+            Self::Discharge => 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProofCondition {
+    requirement_identity: u128,
+    source_type_identity: u128,
+    retains_fallible_source_type: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CustodyEffect {
+    operation: CoreCustodyOperation,
+    initialization: CoreInitializationEffect,
+    custodian: CoreCustodianEffect,
+    loan: CoreLoanEffect,
+    obligation: CoreObligationEffect,
+    place: Arc<[u128]>,
+    type_identity: Option<u128>,
+    source_home: Option<u128>,
+    destination_home: Option<u128>,
+    cleanup_ordinal: Option<u32>,
+    proof: Option<ProofCondition>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -218,6 +353,7 @@ struct Operation {
     access: CoreAccessLaw,
     failure: FailureLaw,
     provenance: SourceRange,
+    custody: Arc<[CustodyEffect]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -287,6 +423,8 @@ struct CoreExecutable {
 struct OracleSummary {
     cases: usize,
     agrees: bool,
+    custody_cases: usize,
+    custody_agrees: bool,
     fingerprint: u128,
 }
 
@@ -337,6 +475,97 @@ pub struct CoreExecutableObservation {
     operation_type_identities: Arc<[u128]>,
     access_laws: Arc<[CoreAccessLaw]>,
     rewrites: Arc<[CoreRewriteKind]>,
+    custody_effects: Arc<[CoreCustodyEffectObservation]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreCustodyEffectObservation {
+    core_operation_identity: u32,
+    operation: CoreCustodyOperation,
+    initialization: CoreInitializationEffect,
+    custodian: CoreCustodianEffect,
+    loan: CoreLoanEffect,
+    obligation: CoreObligationEffect,
+    place: Arc<[u128]>,
+    type_identity: Option<u128>,
+    source_home: Option<u128>,
+    destination_home: Option<u128>,
+    cleanup_ordinal: Option<u32>,
+    requirement_identity: Option<u128>,
+    source_type_identity: Option<u128>,
+    retains_fallible_source_type: bool,
+}
+
+impl CoreCustodyEffectObservation {
+    #[must_use]
+    pub const fn core_operation_identity(&self) -> u32 {
+        self.core_operation_identity
+    }
+
+    #[must_use]
+    pub const fn operation(&self) -> CoreCustodyOperation {
+        self.operation
+    }
+
+    #[must_use]
+    pub const fn initialization(&self) -> CoreInitializationEffect {
+        self.initialization
+    }
+
+    #[must_use]
+    pub const fn custodian(&self) -> CoreCustodianEffect {
+        self.custodian
+    }
+
+    #[must_use]
+    pub const fn loan(&self) -> CoreLoanEffect {
+        self.loan
+    }
+
+    #[must_use]
+    pub const fn obligation(&self) -> CoreObligationEffect {
+        self.obligation
+    }
+
+    #[must_use]
+    pub fn place(&self) -> &[u128] {
+        &self.place
+    }
+
+    #[must_use]
+    pub const fn type_identity(&self) -> Option<u128> {
+        self.type_identity
+    }
+
+    #[must_use]
+    pub const fn source_home(&self) -> Option<u128> {
+        self.source_home
+    }
+
+    #[must_use]
+    pub const fn destination_home(&self) -> Option<u128> {
+        self.destination_home
+    }
+
+    #[must_use]
+    pub const fn cleanup_ordinal(&self) -> Option<u32> {
+        self.cleanup_ordinal
+    }
+
+    #[must_use]
+    pub const fn requirement_identity(&self) -> Option<u128> {
+        self.requirement_identity
+    }
+
+    #[must_use]
+    pub const fn source_type_identity(&self) -> Option<u128> {
+        self.source_type_identity
+    }
+
+    #[must_use]
+    pub const fn retains_fallible_source_type(&self) -> bool {
+        self.retains_fallible_source_type
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -428,6 +657,11 @@ impl CoreExecutableObservation {
     pub fn rewrites(&self) -> &[CoreRewriteKind] {
         &self.rewrites
     }
+
+    #[must_use]
+    pub fn custody_effects(&self) -> &[CoreCustodyEffectObservation] {
+        &self.custody_effects
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -438,6 +672,8 @@ pub struct CoreProgramObservation {
     executables: Arc<[CoreExecutableObservation]>,
     oracle_case_count: usize,
     oracle_agrees: bool,
+    custody_oracle_case_count: usize,
+    custody_oracle_agrees: bool,
 }
 
 impl CoreProgramObservation {
@@ -474,6 +710,16 @@ impl CoreProgramObservation {
     #[must_use]
     pub const fn oracle_agrees(&self) -> bool {
         self.oracle_agrees
+    }
+
+    #[must_use]
+    pub const fn custody_oracle_case_count(&self) -> usize {
+        self.custody_oracle_case_count
+    }
+
+    #[must_use]
+    pub const fn custody_oracle_agrees(&self) -> bool {
+        self.custody_oracle_agrees
     }
 }
 
@@ -540,11 +786,52 @@ impl VerifiedCoreProgram {
                         .map(|witness| witness.kind)
                         .collect::<Vec<_>>()
                         .into(),
+                    custody_effects: executable
+                        .regions
+                        .iter()
+                        .flat_map(|region| region.operations.iter())
+                        .flat_map(|operation| {
+                            operation
+                                .custody
+                                .iter()
+                                .map(move |effect| (operation.identity, effect))
+                        })
+                        .map(
+                            |(core_operation_identity, effect)| CoreCustodyEffectObservation {
+                                core_operation_identity,
+                                operation: effect.operation,
+                                initialization: effect.initialization,
+                                custodian: effect.custodian,
+                                loan: effect.loan,
+                                obligation: effect.obligation,
+                                place: Arc::clone(&effect.place),
+                                type_identity: effect.type_identity,
+                                source_home: effect.source_home,
+                                destination_home: effect.destination_home,
+                                cleanup_ordinal: effect.cleanup_ordinal,
+                                requirement_identity: effect
+                                    .proof
+                                    .as_ref()
+                                    .map(|proof| proof.requirement_identity),
+                                source_type_identity: effect
+                                    .proof
+                                    .as_ref()
+                                    .map(|proof| proof.source_type_identity),
+                                retains_fallible_source_type: effect
+                                    .proof
+                                    .as_ref()
+                                    .is_some_and(|proof| proof.retains_fallible_source_type),
+                            },
+                        )
+                        .collect::<Vec<_>>()
+                        .into(),
                 })
                 .collect::<Vec<_>>()
                 .into(),
             oracle_case_count: self.oracle.cases,
             oracle_agrees: self.oracle.agrees,
+            custody_oracle_case_count: self.oracle.custody_cases,
+            custody_oracle_agrees: self.oracle.custody_agrees,
         }
     }
 
@@ -584,6 +871,25 @@ impl CustodyCoreView<'_> {
                 .filter(|operation| operation.effect == EffectBoundary::Ownership)
                 .count();
             (executable.reference.identity, count)
+        })
+    }
+
+    pub(crate) fn proof_requirements(&self) -> impl Iterator<Item = (u128, u128, u128)> + '_ {
+        self.core.executables.iter().flat_map(|executable| {
+            executable
+                .regions
+                .iter()
+                .flat_map(|region| region.operations.iter())
+                .flat_map(|operation| operation.custody.iter())
+                .filter_map(|effect| {
+                    effect.proof.as_ref().map(|proof| {
+                        (
+                            executable.reference.identity,
+                            proof.requirement_identity,
+                            proof.source_type_identity,
+                        )
+                    })
+                })
         })
     }
 }
@@ -746,6 +1052,48 @@ impl<'a> CoreOperationIndex<'a> {
     pub(crate) fn provenance(self) -> &'a SourceRange {
         &self.0.provenance
     }
+
+    pub(crate) fn custody(self) -> impl ExactSizeIterator<Item = CoreCustodyIndex<'a>> {
+        self.0.custody.iter().map(CoreCustodyIndex)
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) struct CoreCustodyIndex<'a>(&'a CustodyEffect);
+
+#[allow(dead_code)]
+impl<'a> CoreCustodyIndex<'a> {
+    pub(crate) fn operation(self) -> CoreCustodyOperation {
+        self.0.operation
+    }
+
+    pub(crate) fn dimensions(
+        self,
+    ) -> (
+        CoreInitializationEffect,
+        CoreCustodianEffect,
+        CoreLoanEffect,
+        CoreObligationEffect,
+    ) {
+        (
+            self.0.initialization,
+            self.0.custodian,
+            self.0.loan,
+            self.0.obligation,
+        )
+    }
+
+    pub(crate) fn place(self) -> &'a [u128] {
+        &self.0.place
+    }
+
+    pub(crate) fn proof_requirement(self) -> Option<(u128, u128)> {
+        self.0
+            .proof
+            .as_ref()
+            .map(|proof| (proof.requirement_identity, proof.source_type_identity))
+    }
 }
 
 #[allow(dead_code)]
@@ -814,6 +1162,8 @@ impl CoreModule {
             oracle: OracleSummary {
                 cases: 0,
                 agrees: true,
+                custody_cases: 0,
+                custody_agrees: true,
                 fingerprint: 0,
             },
             fingerprint: 0,
@@ -841,93 +1191,95 @@ fn produce_source_executable(
         identity: input.reference.identity(),
         current_meaning: input.reference.current_meaning(),
     };
-    let (owner, provenance, signature, source_definition, facts, regions, rewrites) = match input
-        .body
-    {
-        CoreSourceExecutableBody::Specialization(function) => {
-            let upstream = semantic
-                .specialization_facts(SpecializationId(reference.identity))
-                .ok_or_else(|| CoreFailure::Defect(Arc::from("Core body has no solved facts")))?;
-            let mut lowerer = ProducerLowerer::new(cancellation);
-            let entry = lowerer.lower_block(&function.body)?;
-            debug_assert_eq!(entry, RegionId(0));
-            let (regions, rewrites) = lowerer.finish();
-            (
-                function.id.0,
-                function.source.clone(),
-                signature(
-                    function
-                        .parameters
-                        .iter()
-                        .zip(function.parameter_type_ids.iter())
-                        .map(|((local, type_, access), type_id)| {
-                            (local.0, type_, *type_id, core_access(*access))
-                        }),
-                    &function.return_type,
-                    function.return_type_id,
-                ),
-                Some(function.id.0),
-                ExecutableFacts {
-                    pure: upstream.pure,
-                    may_panic: upstream.may_panic,
-                    suspends: upstream.suspends,
-                    ownership_transfer: upstream.ownership_transfer,
-                    evaluator_eligible: upstream.evaluator_eligible,
-                },
-                regions,
-                rewrites,
-            )
-        }
-        CoreSourceExecutableBody::Test(test) => {
-            let mut lowerer = ProducerLowerer::new(cancellation);
-            let entry = lowerer.lower_block(&test.body)?;
-            debug_assert_eq!(entry, RegionId(0));
-            let (regions, rewrites) = lowerer.finish();
-            (
-                reference.identity,
-                test.source.clone(),
-                signature(
-                    test.parameters
-                        .iter()
-                        .zip(test.parameter_type_ids.iter())
-                        .map(|((local, type_, access), type_id)| {
-                            (local.0, type_, *type_id, core_access(*access))
-                        }),
-                    &Type::Unit,
-                    test.return_type_id,
-                ),
-                None,
-                facts_from_regions(&regions, semantic),
-                regions,
-                rewrites,
-            )
-        }
-        CoreSourceExecutableBody::Closure(closure) => {
-            let mut lowerer = ProducerLowerer::new(cancellation);
-            let entry = lowerer.lower_expression_body(&closure.body)?;
-            debug_assert_eq!(entry, RegionId(0));
-            let (regions, rewrites) = lowerer.finish();
-            (
-                closure.id.0,
-                closure.source.clone(),
-                signature(
-                    closure
-                        .parameters
-                        .iter()
-                        .zip(closure.parameter_type_ids.iter())
-                        .map(|((local, type_), type_id)| {
-                            (local.0, type_, *type_id, CoreAccessLaw::CopyValue)
-                        }),
-                    &closure.return_type,
-                    closure.return_type_id,
-                ),
-                None,
-                facts_from_regions(&regions, semantic),
-                regions,
-                rewrites,
-            )
-        }
-    };
+    let (owner, provenance, signature, source_definition, facts, mut regions, rewrites) =
+        match input.body {
+            CoreSourceExecutableBody::Specialization(function) => {
+                let upstream = semantic
+                    .specialization_facts(SpecializationId(reference.identity))
+                    .ok_or_else(|| {
+                        CoreFailure::Defect(Arc::from("Core body has no solved facts"))
+                    })?;
+                let mut lowerer = ProducerLowerer::new(cancellation);
+                let entry = lowerer.lower_block(&function.body)?;
+                debug_assert_eq!(entry, RegionId(0));
+                let (regions, rewrites) = lowerer.finish();
+                (
+                    function.id.0,
+                    function.source.clone(),
+                    signature(
+                        function
+                            .parameters
+                            .iter()
+                            .zip(function.parameter_type_ids.iter())
+                            .map(|((local, type_, access), type_id)| {
+                                (local.0, type_, *type_id, core_access(*access))
+                            }),
+                        &function.return_type,
+                        function.return_type_id,
+                    ),
+                    Some(function.id.0),
+                    ExecutableFacts {
+                        pure: upstream.pure,
+                        may_panic: upstream.may_panic,
+                        suspends: upstream.suspends,
+                        ownership_transfer: upstream.ownership_transfer,
+                        evaluator_eligible: upstream.evaluator_eligible,
+                    },
+                    regions,
+                    rewrites,
+                )
+            }
+            CoreSourceExecutableBody::Test(test) => {
+                let mut lowerer = ProducerLowerer::new(cancellation);
+                let entry = lowerer.lower_block(&test.body)?;
+                debug_assert_eq!(entry, RegionId(0));
+                let (regions, rewrites) = lowerer.finish();
+                (
+                    reference.identity,
+                    test.source.clone(),
+                    signature(
+                        test.parameters
+                            .iter()
+                            .zip(test.parameter_type_ids.iter())
+                            .map(|((local, type_, access), type_id)| {
+                                (local.0, type_, *type_id, core_access(*access))
+                            }),
+                        &Type::Unit,
+                        test.return_type_id,
+                    ),
+                    None,
+                    facts_from_regions(&regions, semantic),
+                    regions,
+                    rewrites,
+                )
+            }
+            CoreSourceExecutableBody::Closure(closure) => {
+                let mut lowerer = ProducerLowerer::new(cancellation);
+                let entry = lowerer.lower_expression_body(&closure.body)?;
+                debug_assert_eq!(entry, RegionId(0));
+                let (regions, rewrites) = lowerer.finish();
+                (
+                    closure.id.0,
+                    closure.source.clone(),
+                    signature(
+                        closure
+                            .parameters
+                            .iter()
+                            .zip(closure.parameter_type_ids.iter())
+                            .map(|((local, type_), type_id)| {
+                                (local.0, type_, *type_id, CoreAccessLaw::CopyValue)
+                            }),
+                        &closure.return_type,
+                        closure.return_type_id,
+                    ),
+                    None,
+                    facts_from_regions(&regions, semantic),
+                    regions,
+                    rewrites,
+                )
+            }
+        };
+    producer_attach_custody(&mut regions, &signature, semantic.verified_program());
     let mut executable = CoreExecutable {
         reference,
         semantic_owner: owner,
@@ -977,6 +1329,7 @@ fn produce_generated_executable(
         failure: FailureLaw::None,
         provenance: provenance.clone(),
         access: CoreAccessLaw::None,
+        custody: Arc::from([]),
     };
     let mut core = CoreExecutable {
         reference: ExecutableReference {
@@ -1063,6 +1416,462 @@ fn generated_signature() -> CoreSignature {
     }
 }
 
+fn custody_home(domain: &[u8], identity: u128) -> u128 {
+    let mut bytes = Vec::with_capacity(domain.len() + 16);
+    bytes.extend_from_slice(domain);
+    bytes.extend_from_slice(&identity.to_be_bytes());
+    xxh3_128(&bytes)
+}
+
+fn place_home(place: &[u128]) -> u128 {
+    let mut bytes = Vec::with_capacity(16 + place.len() * 16);
+    bytes.extend_from_slice(b"wrela.core.place-home\0\x01");
+    for part in place {
+        bytes.extend_from_slice(&part.to_be_bytes());
+    }
+    xxh3_128(&bytes)
+}
+
+fn custody_effect(
+    operation: CoreCustodyOperation,
+    dimensions: (
+        CoreInitializationEffect,
+        CoreCustodianEffect,
+        CoreLoanEffect,
+        CoreObligationEffect,
+    ),
+    place: Arc<[u128]>,
+    type_identity: Option<u128>,
+    source_home: Option<u128>,
+    destination_home: Option<u128>,
+) -> CustodyEffect {
+    let (initialization, custodian, loan, obligation) = dimensions;
+    CustodyEffect {
+        operation,
+        initialization,
+        custodian,
+        loan,
+        obligation,
+        place,
+        type_identity,
+        source_home,
+        destination_home,
+        cleanup_ordinal: None,
+        proof: None,
+    }
+}
+
+fn producer_attach_custody(
+    regions: &mut Arc<[Region]>,
+    signature: &CoreSignature,
+    program: &crate::typed_hir::VerifiedProgram,
+) {
+    let mut value_types = BTreeMap::new();
+    let mut value_access = BTreeMap::new();
+    for operation in regions.iter().flat_map(|region| region.operations.iter()) {
+        if let (Some(value), Some(type_identity)) = (operation.result, operation.type_identity) {
+            value_types.insert(value, type_identity);
+            value_access.insert(value, operation.access);
+        }
+    }
+    let inherited_cleanups = custody_inherited_cleanups(regions);
+    let mut next = regions.to_vec();
+    for region in &mut next {
+        let mut cleanups = inherited_cleanups
+            .get(&region.identity)
+            .cloned()
+            .unwrap_or_default();
+        let inherited_count = cleanups.len();
+        let mut initialized_resource_places = BTreeSet::<Arc<[u128]>>::new();
+        let mut operations = region.operations.to_vec();
+        for operation in &mut operations {
+            let mut effects =
+                producer_operation_custody(operation, &value_types, &value_access, program);
+            for effect in &mut effects {
+                if operation.kind == CoreOperationKind::Store
+                    && effect.operation == CoreCustodyOperation::TransferCommit
+                    && !effect.place.is_empty()
+                    && !initialized_resource_places.insert(Arc::clone(&effect.place))
+                {
+                    effect.operation = CoreCustodyOperation::Replace;
+                    effect.initialization = CoreInitializationEffect::Replace;
+                }
+            }
+            if operation.kind == CoreOperationKind::Cleanup {
+                cleanups.push(operation.identity);
+            }
+            let cleanup_slice = match operation.kind {
+                CoreOperationKind::Return | CoreOperationKind::Propagate => cleanups.as_slice(),
+                CoreOperationKind::Break
+                | CoreOperationKind::Continue
+                | CoreOperationKind::RecoverableExit => &cleanups[inherited_count..],
+                _ => &[],
+            };
+            if !cleanup_slice.is_empty() {
+                effects.extend(cleanup_slice.iter().rev().map(|ordinal| {
+                    let mut effect = custody_effect(
+                        CoreCustodyOperation::CleanupRun,
+                        (
+                            CoreInitializationEffect::None,
+                            CoreCustodianEffect::Discharge,
+                            CoreLoanEffect::None,
+                            CoreObligationEffect::Discharge,
+                        ),
+                        Arc::from([]),
+                        None,
+                        Some(custody_home(b"cleanup", u128::from(*ordinal))),
+                        Some(custody_home(b"discharged", u128::from(*ordinal))),
+                    );
+                    effect.cleanup_ordinal = Some(*ordinal);
+                    effect
+                }));
+            }
+            if region.identity == RegionId(0)
+                && operation.kind == CoreOperationKind::RecoverableExit
+            {
+                effects.extend(
+                    signature
+                        .parameters
+                        .iter()
+                        .filter(|parameter| {
+                            parameter.access == CoreAccessLaw::Move
+                                && program.owns_resource_type(TypeId(parameter.type_.identity))
+                        })
+                        .map(|parameter| {
+                            let destination_domain = if program
+                                .requires_explicit_discharge(TypeId(parameter.type_.identity))
+                            {
+                                b"explicit-discharge" as &[u8]
+                            } else {
+                                b"compiler-reclaim"
+                            };
+                            custody_effect(
+                                CoreCustodyOperation::Discharge,
+                                (
+                                    CoreInitializationEffect::Uninitialize,
+                                    CoreCustodianEffect::Discharge,
+                                    CoreLoanEffect::None,
+                                    CoreObligationEffect::Discharge,
+                                ),
+                                Arc::from([u128::from(parameter.local)]),
+                                Some(parameter.type_.identity),
+                                Some(custody_home(b"place", u128::from(parameter.local))),
+                                Some(custody_home(
+                                    destination_domain,
+                                    u128::from(parameter.local),
+                                )),
+                            )
+                        }),
+                );
+            }
+            operation.custody = effects.into();
+        }
+        region.operations = operations.into();
+    }
+    *regions = next.into();
+}
+
+fn custody_inherited_cleanups(regions: &[Region]) -> BTreeMap<RegionId, Vec<u32>> {
+    let mut inherited = BTreeMap::from([(RegionId(0), Vec::new())]);
+    let mut pending = vec![RegionId(0)];
+    while let Some(region_id) = pending.pop() {
+        let Some(region) = regions.get(region_id.0 as usize) else {
+            continue;
+        };
+        let mut active = inherited.get(&region_id).cloned().unwrap_or_default();
+        for operation in region.operations.iter() {
+            if operation.kind == CoreOperationKind::Cleanup {
+                active.push(operation.identity);
+            }
+            for successor in operation.successors.iter().copied() {
+                if operation.kind == CoreOperationKind::LoopBack {
+                    continue;
+                }
+                let successor_cleanups = if operation.kind == CoreOperationKind::Cleanup {
+                    Vec::new()
+                } else {
+                    active.clone()
+                };
+                match inherited.entry(successor) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(successor_cleanups);
+                        pending.push(successor);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry) => {
+                        debug_assert_eq!(entry.get(), &successor_cleanups);
+                    }
+                }
+            }
+        }
+    }
+    inherited
+}
+
+fn producer_operation_custody(
+    operation: &Operation,
+    value_types: &BTreeMap<ValueId, u128>,
+    value_access: &BTreeMap<ValueId, CoreAccessLaw>,
+    program: &crate::typed_hir::VerifiedProgram,
+) -> Vec<CustodyEffect> {
+    let mut effects = Vec::new();
+    let resource_result = operation
+        .type_identity
+        .filter(|identity| program.owns_resource_type(TypeId(*identity)));
+    if let (Some(result), Some(type_identity)) = (operation.result, resource_result) {
+        let destination = custody_home(b"value", u128::from(result.0));
+        match (operation.kind, operation.access) {
+            (CoreOperationKind::Read, CoreAccessLaw::Move | CoreAccessLaw::CleanupCapture) => {
+                effects.push(custody_effect(
+                    CoreCustodyOperation::Move,
+                    (
+                        CoreInitializationEffect::Uninitialize,
+                        CoreCustodianEffect::Transfer,
+                        CoreLoanEffect::None,
+                        CoreObligationEffect::Transfer,
+                    ),
+                    Arc::clone(&operation.details),
+                    Some(type_identity),
+                    Some(place_home(&operation.details)),
+                    Some(destination),
+                ));
+            }
+            (CoreOperationKind::Read, CoreAccessLaw::SharedLoan) => effects.push(custody_effect(
+                CoreCustodyOperation::SharedLoan,
+                (
+                    CoreInitializationEffect::None,
+                    CoreCustodianEffect::None,
+                    CoreLoanEffect::Shared,
+                    CoreObligationEffect::None,
+                ),
+                Arc::clone(&operation.details),
+                Some(type_identity),
+                None,
+                None,
+            )),
+            (CoreOperationKind::Read, CoreAccessLaw::ExclusiveLoan) => {
+                effects.push(custody_effect(
+                    CoreCustodyOperation::ExclusiveLoan,
+                    (
+                        CoreInitializationEffect::None,
+                        CoreCustodianEffect::None,
+                        CoreLoanEffect::Exclusive,
+                        CoreObligationEffect::None,
+                    ),
+                    Arc::clone(&operation.details),
+                    Some(type_identity),
+                    None,
+                    None,
+                ));
+            }
+            (CoreOperationKind::Aggregate | CoreOperationKind::BuildConstruction, _) => {
+                effects.push(custody_effect(
+                    CoreCustodyOperation::Construct,
+                    (
+                        CoreInitializationEffect::Initialize,
+                        CoreCustodianEffect::Establish,
+                        CoreLoanEffect::None,
+                        CoreObligationEffect::Establish,
+                    ),
+                    Arc::from([]),
+                    Some(type_identity),
+                    None,
+                    Some(destination),
+                ));
+            }
+            (CoreOperationKind::Call, _) if operation.details.first() == Some(&8) => {
+                effects.push(custody_effect(
+                    CoreCustodyOperation::Construct,
+                    (
+                        CoreInitializationEffect::Initialize,
+                        CoreCustodianEffect::Establish,
+                        CoreLoanEffect::None,
+                        CoreObligationEffect::Establish,
+                    ),
+                    Arc::from([]),
+                    Some(type_identity),
+                    None,
+                    Some(destination),
+                ));
+            }
+            (CoreOperationKind::Call | CoreOperationKind::Propagate, _) => {
+                effects.push(custody_effect(
+                    CoreCustodyOperation::TransferCommit,
+                    (
+                        CoreInitializationEffect::Initialize,
+                        CoreCustodianEffect::Establish,
+                        CoreLoanEffect::None,
+                        CoreObligationEffect::Establish,
+                    ),
+                    Arc::from([]),
+                    Some(type_identity),
+                    Some(custody_home(b"operation", u128::from(operation.identity))),
+                    Some(destination),
+                ));
+            }
+            _ => {}
+        }
+    }
+    let moved_resources = operation.operands.iter().filter_map(|operand| {
+        let type_identity = *value_types.get(operand)?;
+        (program.owns_resource_type(TypeId(type_identity))
+            && !matches!(
+                value_access.get(operand),
+                Some(CoreAccessLaw::SharedLoan | CoreAccessLaw::ExclusiveLoan)
+            ))
+        .then_some((*operand, type_identity))
+    });
+    for (ordinal, (operand, type_identity)) in moved_resources.enumerate() {
+        let source = custody_home(b"value", u128::from(operand.0));
+        let destination = custody_home(
+            match operation.kind {
+                CoreOperationKind::Return => b"return" as &[u8],
+                CoreOperationKind::Cleanup => b"cleanup",
+                CoreOperationKind::Store => b"place",
+                _ => b"operation",
+            },
+            u128::from(operation.identity) << 32 | ordinal as u128,
+        );
+        if operation.kind == CoreOperationKind::Store {
+            let initialize = operation.details.last().copied() == Some(1);
+            effects.push(custody_effect(
+                if initialize {
+                    CoreCustodyOperation::TransferCommit
+                } else {
+                    CoreCustodyOperation::Replace
+                },
+                (
+                    if initialize {
+                        CoreInitializationEffect::Initialize
+                    } else {
+                        CoreInitializationEffect::Replace
+                    },
+                    CoreCustodianEffect::Transfer,
+                    CoreLoanEffect::None,
+                    CoreObligationEffect::Transfer,
+                ),
+                operation.details[..operation.details.len().saturating_sub(1)].into(),
+                Some(type_identity),
+                Some(source),
+                Some(destination),
+            ));
+        } else if matches!(
+            operation.kind,
+            CoreOperationKind::Call
+                | CoreOperationKind::BuildConstruction
+                | CoreOperationKind::Aggregate
+                | CoreOperationKind::Return
+                | CoreOperationKind::Cleanup
+                | CoreOperationKind::Propagate
+        ) {
+            effects.push(custody_effect(
+                CoreCustodyOperation::TransferCommit,
+                (
+                    CoreInitializationEffect::Uninitialize,
+                    CoreCustodianEffect::Transfer,
+                    CoreLoanEffect::None,
+                    CoreObligationEffect::Transfer,
+                ),
+                Arc::from([]),
+                Some(type_identity),
+                Some(source),
+                Some(destination),
+            ));
+        }
+    }
+    match operation.kind {
+        CoreOperationKind::Cleanup => {
+            let mut effect = custody_effect(
+                CoreCustodyOperation::CleanupRegister,
+                (
+                    CoreInitializationEffect::None,
+                    CoreCustodianEffect::None,
+                    CoreLoanEffect::None,
+                    CoreObligationEffect::Establish,
+                ),
+                Arc::from([]),
+                None,
+                None,
+                Some(custody_home(b"cleanup", u128::from(operation.identity))),
+            );
+            effect.cleanup_ordinal = Some(operation.identity);
+            effects.push(effect);
+        }
+        CoreOperationKind::Branch | CoreOperationKind::Match => effects.push(custody_effect(
+            CoreCustodyOperation::Join,
+            (
+                CoreInitializationEffect::None,
+                CoreCustodianEffect::None,
+                CoreLoanEffect::None,
+                CoreObligationEffect::None,
+            ),
+            Arc::clone(&operation.details),
+            None,
+            None,
+            None,
+        )),
+        CoreOperationKind::Loop | CoreOperationKind::LoopBack => effects.push(custody_effect(
+            CoreCustodyOperation::LoopFixpoint,
+            (
+                CoreInitializationEffect::None,
+                CoreCustodianEffect::None,
+                CoreLoanEffect::None,
+                CoreObligationEffect::None,
+            ),
+            Arc::clone(&operation.details),
+            None,
+            None,
+            None,
+        )),
+        CoreOperationKind::Propagate => {
+            let source_type_identity = operation
+                .operands
+                .first()
+                .and_then(|operand| value_types.get(operand))
+                .copied()
+                .unwrap_or(0);
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"wrela.core.proof-requirement\0\x01");
+            bytes.extend_from_slice(operation.provenance.path().as_bytes());
+            bytes.extend_from_slice(&operation.provenance.start().to_be_bytes());
+            bytes.extend_from_slice(&source_type_identity.to_be_bytes());
+            let mut effect = custody_effect(
+                CoreCustodyOperation::ProofCondition,
+                (
+                    CoreInitializationEffect::None,
+                    CoreCustodianEffect::None,
+                    CoreLoanEffect::None,
+                    CoreObligationEffect::None,
+                ),
+                Arc::from([]),
+                None,
+                None,
+                None,
+            );
+            effect.proof = Some(ProofCondition {
+                requirement_identity: xxh3_128(&bytes),
+                source_type_identity,
+                retains_fallible_source_type: true,
+            });
+            effects.push(effect);
+        }
+        CoreOperationKind::TerminalPanic => effects.push(custody_effect(
+            CoreCustodyOperation::Panic,
+            (
+                CoreInitializationEffect::None,
+                CoreCustodianEffect::None,
+                CoreLoanEffect::None,
+                CoreObligationEffect::None,
+            ),
+            Arc::from([]),
+            None,
+            None,
+            None,
+        )),
+        _ => {}
+    }
+    effects
+}
+
 const fn core_access(access: crate::typed_hir::AccessMode) -> CoreAccessLaw {
     match access {
         crate::typed_hir::AccessMode::Copy => CoreAccessLaw::CopyValue,
@@ -1124,6 +1933,24 @@ impl<'a> ProducerLowerer<'a> {
             checkpoint(self.cancellation)?;
             self.lower_statement(statement, &mut operations)?;
         }
+        let exit_source = statements
+            .last()
+            .map(statement_source)
+            .cloned()
+            .unwrap_or_else(|| SourceRange::new("<core:empty-scope>", 0, 0));
+        self.push_operation(
+            &mut operations,
+            CoreOperationKind::RecoverableExit,
+            None,
+            None,
+            [],
+            [],
+            [],
+            EffectBoundary::Ownership,
+            FailureLaw::None,
+            exit_source,
+            CoreAccessLaw::None,
+        );
         self.install_region(region, operations);
         Ok(region)
     }
@@ -1171,6 +1998,7 @@ impl<'a> ProducerLowerer<'a> {
             access,
             failure,
             provenance,
+            custody: Arc::from([]),
         });
     }
 
@@ -1817,6 +2645,26 @@ fn place_index_values(
     Ok(values)
 }
 
+fn statement_source(statement: &Statement) -> &SourceRange {
+    match statement {
+        Statement::Return { source, .. }
+        | Statement::Panic { source, .. }
+        | Statement::Assert { source, .. }
+        | Statement::Expect { source, .. }
+        | Statement::Initialize { source, .. }
+        | Statement::Assign { source, .. }
+        | Statement::If { source, .. }
+        | Statement::IfPattern { source, .. }
+        | Statement::For { source, .. }
+        | Statement::While { source, .. }
+        | Statement::Match { source, .. }
+        | Statement::Defer { source, .. }
+        | Statement::WithPool { source, .. } => source,
+        Statement::Evaluate(expression) => &expression.source,
+        Statement::Break(source) | Statement::Continue(source) | Statement::Pass(source) => source,
+    }
+}
+
 fn place_details(place: &Place) -> Vec<u128> {
     let mut details = vec![u128::from(place.local.0)];
     for projection in place.projections.iter() {
@@ -2059,7 +2907,7 @@ fn producer_executable_fingerprint(
     cancellation: &Cancellation,
 ) -> Result<u128, CoreFailure> {
     let mut hash = Xxh3::new();
-    hash.update(b"wrela.core.executable\0\x01");
+    hash.update(b"wrela.core.executable\0\x02");
     encode_executable(&mut hash, executable, cancellation)?;
     Ok(hash.digest128())
 }
@@ -2080,6 +2928,8 @@ fn producer_fingerprint(
     }
     hash.update(&(candidate.oracle.cases as u64).to_be_bytes());
     hash.update(&[u8::from(candidate.oracle.agrees)]);
+    hash.update(&(candidate.oracle.custody_cases as u64).to_be_bytes());
+    hash.update(&[u8::from(candidate.oracle.custody_agrees)]);
     hash.update(&candidate.oracle.fingerprint.to_be_bytes());
     Ok(hash.digest128())
 }
@@ -2158,6 +3008,7 @@ fn encode_executable(
                 hash.update(&detail.to_be_bytes());
             }
             encode_source(hash, &operation.provenance);
+            encode_custody(hash, &operation.custody, cancellation)?;
         }
     }
     for rewrite in executable.rewrites.iter() {
@@ -2165,6 +3016,45 @@ fn encode_executable(
         hash.update(&[rewrite.kind.tag()]);
         hash.update(&rewrite.source_order.to_be_bytes());
         encode_source(hash, &rewrite.provenance);
+    }
+    Ok(())
+}
+
+fn encode_custody(
+    hash: &mut Xxh3,
+    effects: &[CustodyEffect],
+    cancellation: &Cancellation,
+) -> Result<(), CoreFailure> {
+    hash.update(&(effects.len() as u64).to_be_bytes());
+    for effect in effects {
+        checkpoint(cancellation)?;
+        hash.update(&[
+            effect.operation.tag(),
+            effect.initialization.tag(),
+            effect.custodian.tag(),
+            effect.loan.tag(),
+            effect.obligation.tag(),
+        ]);
+        hash.update(&(effect.place.len() as u64).to_be_bytes());
+        for part in effect.place.iter() {
+            hash.update(&part.to_be_bytes());
+        }
+        for value in [
+            effect.type_identity,
+            effect.source_home,
+            effect.destination_home,
+        ] {
+            hash.update(&value.unwrap_or(0).to_be_bytes());
+        }
+        hash.update(&effect.cleanup_ordinal.unwrap_or(u32::MAX).to_be_bytes());
+        if let Some(proof) = &effect.proof {
+            hash.update(&[1]);
+            hash.update(&proof.requirement_identity.to_be_bytes());
+            hash.update(&proof.source_type_identity.to_be_bytes());
+            hash.update(&[u8::from(proof.retains_fallible_source_type)]);
+        } else {
+            hash.update(&[0]);
+        }
     }
     Ok(())
 }
@@ -2230,6 +3120,7 @@ fn verify(
         );
     }
     validate_graphs(candidate, cancellation)?;
+    validate_custody(candidate, semantic.verified_program(), cancellation)?;
     let mut references = BTreeSet::new();
     for executable in candidate.executables.iter() {
         checkpoint(cancellation)?;
@@ -2240,7 +3131,10 @@ fn verify(
         }
     }
     let expected_oracle = run_oracle(candidate, input, cancellation)?;
-    if candidate.oracle != expected_oracle || !candidate.oracle.agrees {
+    if candidate.oracle != expected_oracle
+        || !candidate.oracle.agrees
+        || !candidate.oracle.custody_agrees
+    {
         return defect("Core differential semantic oracle disagrees with evaluator meaning");
     }
     let fingerprint = verifier_fingerprint(candidate, cancellation)?;
@@ -2342,6 +3236,7 @@ impl<'a> VerifierLowerer<'a> {
             access,
             failure,
             provenance,
+            custody: Arc::from([]),
         });
     }
 
@@ -2377,6 +3272,24 @@ impl<'a> VerifierLowerer<'a> {
             checkpoint(self.cancellation)?;
             self.reconstruct_statement(statement, &mut operations)?;
         }
+        let exit_source = statements
+            .last()
+            .map(statement_source)
+            .cloned()
+            .unwrap_or_else(|| SourceRange::new("<core:empty-scope>", 0, 0));
+        self.emit(
+            &mut operations,
+            CoreOperationKind::RecoverableExit,
+            None,
+            None,
+            [],
+            [],
+            [],
+            EffectBoundary::Ownership,
+            FailureLaw::None,
+            exit_source,
+            CoreAccessLaw::None,
+        );
         self.install_region(region, operations);
         Ok(region)
     }
@@ -3213,6 +4126,7 @@ fn verify_generated_executable(
         || operation.result.is_some()
         || operation.type_identity.is_some()
         || !operation.operands.is_empty()
+        || !operation.custody.is_empty()
         || !operation.call_binding.is_empty()
         || !operation.successors.is_empty()
         || operation.details.as_ref() != details
@@ -3358,7 +4272,17 @@ impl VerifierLowerer<'_> {
             return defect("Core executable parameter signature is false");
         }
         let reconstruction = VerifierLowerer::reconstruct(input.body, cancellation)?;
-        if supplied.entry != RegionId(0) || supplied.regions != reconstruction.regions {
+        let mut supplied_without_custody = supplied.regions.to_vec();
+        for region in &mut supplied_without_custody {
+            let mut operations = region.operations.to_vec();
+            for operation in &mut operations {
+                operation.custody = Arc::from([]);
+            }
+            region.operations = operations.into();
+        }
+        if supplied.entry != RegionId(0)
+            || supplied_without_custody.as_slice() != reconstruction.regions.as_ref()
+        {
             return defect(
                 "Core operation graph contradicts exact independent Typed HIR reconstruction",
             );
@@ -3447,7 +4371,7 @@ fn verifier_executable_fingerprint(
     cancellation: &Cancellation,
 ) -> Result<u128, CoreFailure> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"wrela.core.executable\0\x01");
+    bytes.extend_from_slice(b"wrela.core.executable\0\x02");
     verifier_encode_executable(&mut bytes, executable, cancellation)?;
     Ok(xxh3_128(&bytes))
 }
@@ -3470,6 +4394,8 @@ fn verifier_fingerprint(
     }
     bytes.extend_from_slice(&(candidate.oracle.cases as u64).to_be_bytes());
     bytes.push(u8::from(candidate.oracle.agrees));
+    bytes.extend_from_slice(&(candidate.oracle.custody_cases as u64).to_be_bytes());
+    bytes.push(u8::from(candidate.oracle.custody_agrees));
     bytes.extend_from_slice(&candidate.oracle.fingerprint.to_be_bytes());
     Ok(xxh3_128(&bytes))
 }
@@ -3549,6 +4475,7 @@ fn verifier_encode_executable(
                 Ok::<_, CoreFailure>(())
             })?;
             verifier_encode_source(bytes, &operation.provenance);
+            verifier_encode_custody(bytes, &operation.custody, cancellation)?;
         }
     }
     for rewrite in executable.rewrites.iter() {
@@ -3556,6 +4483,45 @@ fn verifier_encode_executable(
         bytes.push(rewrite.kind.tag());
         bytes.extend_from_slice(&rewrite.source_order.to_be_bytes());
         verifier_encode_source(bytes, &rewrite.provenance);
+    }
+    Ok(())
+}
+
+fn verifier_encode_custody(
+    bytes: &mut Vec<u8>,
+    effects: &[CustodyEffect],
+    cancellation: &Cancellation,
+) -> Result<(), CoreFailure> {
+    bytes.extend_from_slice(&(effects.len() as u64).to_be_bytes());
+    for effect in effects {
+        checkpoint(cancellation)?;
+        bytes.extend([
+            effect.operation.tag(),
+            effect.initialization.tag(),
+            effect.custodian.tag(),
+            effect.loan.tag(),
+            effect.obligation.tag(),
+        ]);
+        bytes.extend_from_slice(&(effect.place.len() as u64).to_be_bytes());
+        for part in effect.place.iter() {
+            bytes.extend_from_slice(&part.to_be_bytes());
+        }
+        for value in [
+            effect.type_identity,
+            effect.source_home,
+            effect.destination_home,
+        ] {
+            bytes.extend_from_slice(&value.unwrap_or(0).to_be_bytes());
+        }
+        bytes.extend_from_slice(&effect.cleanup_ordinal.unwrap_or(u32::MAX).to_be_bytes());
+        if let Some(proof) = &effect.proof {
+            bytes.push(1);
+            bytes.extend_from_slice(&proof.requirement_identity.to_be_bytes());
+            bytes.extend_from_slice(&proof.source_type_identity.to_be_bytes());
+            bytes.push(u8::from(proof.retains_fallible_source_type));
+        } else {
+            bytes.push(0);
+        }
     }
     Ok(())
 }
@@ -3650,6 +4616,492 @@ fn validate_graphs(
     Ok(())
 }
 
+fn validate_custody(
+    candidate: &VerifiedCoreProgram,
+    program: &crate::typed_hir::VerifiedProgram,
+    cancellation: &Cancellation,
+) -> Result<(), CoreFailure> {
+    for executable in candidate.executables.iter() {
+        let value_types = executable
+            .regions
+            .iter()
+            .flat_map(|region| region.operations.iter())
+            .filter_map(|operation| Some((operation.result?, operation.type_identity?)))
+            .collect::<BTreeMap<_, _>>();
+        let value_access = executable
+            .regions
+            .iter()
+            .flat_map(|region| region.operations.iter())
+            .filter_map(|operation| Some((operation.result?, operation.access)))
+            .collect::<BTreeMap<_, _>>();
+        let context = CustodyVerifierContext {
+            signature: &executable.signature,
+            value_types: &value_types,
+            value_access: &value_access,
+            program,
+        };
+        let expected_cleanup_runs = verifier_expected_cleanup_runs(&executable.regions);
+        for region in executable.regions.iter() {
+            let mut active_loans = Vec::<(CoreLoanEffect, Arc<[u128]>)>::new();
+            let mut initialized_resource_places = BTreeSet::<Arc<[u128]>>::new();
+            for operation in region.operations.iter() {
+                checkpoint(cancellation)?;
+                let moved_resource_count = operation
+                    .operands
+                    .iter()
+                    .filter(|operand| {
+                        value_types
+                            .get(operand)
+                            .is_some_and(|identity| program.owns_resource_type(TypeId(*identity)))
+                            && !matches!(
+                                value_access.get(operand),
+                                Some(CoreAccessLaw::SharedLoan | CoreAccessLaw::ExclusiveLoan)
+                            )
+                    })
+                    .count();
+                let expected_store_operation = (operation.kind == CoreOperationKind::Store
+                    && moved_resource_count > 0)
+                    .then(|| {
+                        let place: Arc<[u128]> =
+                            operation.details[..operation.details.len().saturating_sub(1)].into();
+                        if operation.details.last().copied() == Some(1)
+                            && initialized_resource_places.insert(place)
+                        {
+                            (1, moved_resource_count - 1)
+                        } else {
+                            (0, moved_resource_count)
+                        }
+                    });
+                validate_operation_custody(
+                    operation,
+                    region.identity == RegionId(0),
+                    &context,
+                    expected_cleanup_runs
+                        .get(&operation.identity)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    expected_store_operation,
+                )?;
+                let mut cleanup_runs = Vec::new();
+                let mut commits = BTreeSet::new();
+                for effect in operation.custody.iter() {
+                    if !valid_custody_law(effect) {
+                        return defect("Core custody effect contradicts the closed law catalog");
+                    }
+                    if effect.operation == CoreCustodyOperation::CleanupRun {
+                        let ordinal = effect.cleanup_ordinal.ok_or_else(|| {
+                            CoreFailure::Defect(Arc::from("Core cleanup run has no registration"))
+                        })?;
+                        if cleanup_runs
+                            .last()
+                            .is_some_and(|previous| *previous <= ordinal)
+                        {
+                            return defect(
+                                "Core cleanup order is not deterministic reverse registration",
+                            );
+                        }
+                        cleanup_runs.push(ordinal);
+                    }
+                    if matches!(
+                        effect.operation,
+                        CoreCustodyOperation::Move
+                            | CoreCustodyOperation::Replace
+                            | CoreCustodyOperation::TransferCommit
+                    ) {
+                        let commit = (effect.source_home, effect.destination_home);
+                        if commit.0.is_none()
+                            || commit.1.is_none()
+                            || commit.0 == commit.1
+                            || !commits.insert(commit)
+                        {
+                            return defect(
+                                "Core Transfer Commit duplicates or loses Resource custody",
+                            );
+                        }
+                    }
+                    if matches!(
+                        effect.loan,
+                        CoreLoanEffect::Shared | CoreLoanEffect::Exclusive
+                    ) {
+                        if active_loans.iter().any(|(loan, place)| {
+                            places_overlap(place, &effect.place)
+                                && (*loan == CoreLoanEffect::Exclusive
+                                    || effect.loan == CoreLoanEffect::Exclusive)
+                        }) {
+                            return defect("Core Resource loans alias illegally");
+                        }
+                        active_loans.push((effect.loan, Arc::clone(&effect.place)));
+                    }
+                }
+                if operation.kind == CoreOperationKind::TerminalPanic
+                    && operation
+                        .custody
+                        .iter()
+                        .any(|effect| effect.operation == CoreCustodyOperation::CleanupRun)
+                {
+                    return defect("Core Panic incorrectly runs source cleanup");
+                }
+                if operation.kind == CoreOperationKind::Suspension && !active_loans.is_empty() {
+                    return defect("Core Resource loan crosses a suspension-capable operation");
+                }
+                if matches!(
+                    operation.kind,
+                    CoreOperationKind::Call
+                        | CoreOperationKind::BuildConstruction
+                        | CoreOperationKind::Store
+                        | CoreOperationKind::Return
+                        | CoreOperationKind::RecoverableExit
+                ) {
+                    active_loans.clear();
+                }
+            }
+            if !active_loans.is_empty() {
+                return defect("Core Resource loan escapes its operation scope");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn places_overlap(left: &[u128], right: &[u128]) -> bool {
+    !left.is_empty()
+        && !right.is_empty()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| left == right)
+}
+
+struct CustodyVerifierContext<'a> {
+    signature: &'a CoreSignature,
+    value_types: &'a BTreeMap<ValueId, u128>,
+    value_access: &'a BTreeMap<ValueId, CoreAccessLaw>,
+    program: &'a crate::typed_hir::VerifiedProgram,
+}
+
+fn validate_operation_custody(
+    operation: &Operation,
+    entry_region: bool,
+    context: &CustodyVerifierContext<'_>,
+    expected_cleanup_runs: &[u32],
+    expected_store_operation: Option<(usize, usize)>,
+) -> Result<(), CoreFailure> {
+    let CustodyVerifierContext {
+        signature,
+        value_types,
+        value_access,
+        program,
+    } = context;
+    let mut expected = BTreeMap::<CoreCustodyOperation, usize>::new();
+    let mut expect = |kind, count| {
+        if count > 0 {
+            *expected.entry(kind).or_insert(0) += count;
+        }
+    };
+    let resource_result = operation
+        .type_identity
+        .is_some_and(|identity| program.owns_resource_type(TypeId(identity)));
+    let expected_primary = match (operation.kind, operation.access, resource_result) {
+        (CoreOperationKind::Read, CoreAccessLaw::Move | CoreAccessLaw::CleanupCapture, true) => {
+            Some(CoreCustodyOperation::Move)
+        }
+        (CoreOperationKind::Read, CoreAccessLaw::SharedLoan, true) => {
+            Some(CoreCustodyOperation::SharedLoan)
+        }
+        (CoreOperationKind::Read, CoreAccessLaw::ExclusiveLoan, true) => {
+            Some(CoreCustodyOperation::ExclusiveLoan)
+        }
+        (CoreOperationKind::Aggregate | CoreOperationKind::BuildConstruction, _, true) => {
+            Some(CoreCustodyOperation::Construct)
+        }
+        (CoreOperationKind::Call, _, true) if operation.details.first() == Some(&8) => {
+            Some(CoreCustodyOperation::Construct)
+        }
+        (CoreOperationKind::Call | CoreOperationKind::Propagate, _, true) => {
+            Some(CoreCustodyOperation::TransferCommit)
+        }
+        _ => None,
+    };
+    if let Some(primary) = expected_primary {
+        expect(primary, 1);
+    }
+    let moved_operand_count = operation
+        .operands
+        .iter()
+        .filter(|operand| {
+            value_types
+                .get(operand)
+                .is_some_and(|identity| program.owns_resource_type(TypeId(*identity)))
+                && !matches!(
+                    value_access.get(operand),
+                    Some(CoreAccessLaw::SharedLoan | CoreAccessLaw::ExclusiveLoan)
+                )
+        })
+        .count();
+    if let Some((transfers, replacements)) = expected_store_operation {
+        expect(CoreCustodyOperation::TransferCommit, transfers);
+        expect(CoreCustodyOperation::Replace, replacements);
+    } else if matches!(
+        operation.kind,
+        CoreOperationKind::Call
+            | CoreOperationKind::BuildConstruction
+            | CoreOperationKind::Aggregate
+            | CoreOperationKind::Return
+            | CoreOperationKind::Cleanup
+            | CoreOperationKind::Propagate
+    ) {
+        expect(CoreCustodyOperation::TransferCommit, moved_operand_count);
+    }
+    let structural = match operation.kind {
+        CoreOperationKind::Cleanup => Some(CoreCustodyOperation::CleanupRegister),
+        CoreOperationKind::Branch | CoreOperationKind::Match => Some(CoreCustodyOperation::Join),
+        CoreOperationKind::Loop | CoreOperationKind::LoopBack => {
+            Some(CoreCustodyOperation::LoopFixpoint)
+        }
+        CoreOperationKind::Propagate => Some(CoreCustodyOperation::ProofCondition),
+        CoreOperationKind::TerminalPanic => Some(CoreCustodyOperation::Panic),
+        _ => None,
+    };
+    if let Some(structural) = structural {
+        expect(structural, 1);
+    }
+    expect(
+        CoreCustodyOperation::CleanupRun,
+        expected_cleanup_runs.len(),
+    );
+    if operation.kind == CoreOperationKind::RecoverableExit && entry_region {
+        expect(
+            CoreCustodyOperation::Discharge,
+            signature
+                .parameters
+                .iter()
+                .filter(|parameter| {
+                    parameter.access == CoreAccessLaw::Move
+                        && program.owns_resource_type(TypeId(parameter.type_.identity))
+                })
+                .count(),
+        );
+    }
+    let mut actual = BTreeMap::<CoreCustodyOperation, usize>::new();
+    for effect in operation.custody.iter() {
+        *actual.entry(effect.operation).or_insert(0) += 1;
+    }
+    if actual != expected {
+        return defect("Core operation changes, loses, or duplicates Resource custody");
+    }
+    if operation.kind == CoreOperationKind::Propagate {
+        let source_type = operation
+            .operands
+            .first()
+            .and_then(|operand| value_types.get(operand))
+            .copied();
+        if operation
+            .custody
+            .iter()
+            .find_map(|effect| effect.proof.as_ref())
+            .is_none_or(|proof| Some(proof.source_type_identity) != source_type)
+        {
+            return defect("Core proof-conditioned operation rewrites its fallible source type");
+        }
+    }
+    let actual_cleanup_runs = operation
+        .custody
+        .iter()
+        .filter_map(|effect| {
+            (effect.operation == CoreCustodyOperation::CleanupRun)
+                .then_some(effect.cleanup_ordinal)
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    if actual_cleanup_runs != expected_cleanup_runs {
+        return defect("Core recoverable exit loses, duplicates, or reorders cleanup");
+    }
+    Ok(())
+}
+
+fn verifier_expected_cleanup_runs(regions: &[Region]) -> BTreeMap<u32, Vec<u32>> {
+    let mut inherited = BTreeMap::from([(RegionId(0), Vec::<u32>::new())]);
+    let mut pending = vec![RegionId(0)];
+    let mut result = BTreeMap::new();
+    while let Some(region_id) = pending.pop() {
+        let Some(region) = regions.get(region_id.0 as usize) else {
+            continue;
+        };
+        let mut active = inherited.get(&region_id).cloned().unwrap_or_default();
+        let inherited_count = active.len();
+        for operation in region.operations.iter() {
+            if operation.kind == CoreOperationKind::Cleanup {
+                active.push(operation.identity);
+            }
+            let exiting = match operation.kind {
+                CoreOperationKind::Return | CoreOperationKind::Propagate => active.as_slice(),
+                CoreOperationKind::Break
+                | CoreOperationKind::Continue
+                | CoreOperationKind::RecoverableExit => &active[inherited_count..],
+                _ => &[],
+            };
+            if !exiting.is_empty() {
+                result.insert(operation.identity, exiting.iter().rev().copied().collect());
+            }
+            for successor in operation.successors.iter().copied() {
+                if operation.kind == CoreOperationKind::LoopBack {
+                    continue;
+                }
+                let next = if operation.kind == CoreOperationKind::Cleanup {
+                    Vec::new()
+                } else {
+                    active.clone()
+                };
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    inherited.entry(successor)
+                {
+                    entry.insert(next);
+                    pending.push(successor);
+                }
+            }
+        }
+    }
+    result
+}
+
+fn valid_custody_law(effect: &CustodyEffect) -> bool {
+    let dimensions = (
+        effect.initialization,
+        effect.custodian,
+        effect.loan,
+        effect.obligation,
+    );
+    match effect.operation {
+        CoreCustodyOperation::Construct => {
+            dimensions
+                == (
+                    CoreInitializationEffect::Initialize,
+                    CoreCustodianEffect::Establish,
+                    CoreLoanEffect::None,
+                    CoreObligationEffect::Establish,
+                )
+                && effect.type_identity.is_some()
+                && effect.source_home.is_none()
+                && effect.destination_home.is_some()
+        }
+        CoreCustodyOperation::Move => {
+            dimensions
+                == (
+                    CoreInitializationEffect::Uninitialize,
+                    CoreCustodianEffect::Transfer,
+                    CoreLoanEffect::None,
+                    CoreObligationEffect::Transfer,
+                )
+                && !effect.place.is_empty()
+                && effect.type_identity.is_some()
+        }
+        CoreCustodyOperation::SharedLoan | CoreCustodyOperation::ExclusiveLoan => {
+            dimensions
+                == (
+                    CoreInitializationEffect::None,
+                    CoreCustodianEffect::None,
+                    if effect.operation == CoreCustodyOperation::SharedLoan {
+                        CoreLoanEffect::Shared
+                    } else {
+                        CoreLoanEffect::Exclusive
+                    },
+                    CoreObligationEffect::None,
+                )
+                && !effect.place.is_empty()
+                && effect.type_identity.is_some()
+                && effect.source_home.is_none()
+                && effect.destination_home.is_none()
+        }
+        CoreCustodyOperation::Replace => {
+            dimensions
+                == (
+                    CoreInitializationEffect::Replace,
+                    CoreCustodianEffect::Transfer,
+                    CoreLoanEffect::None,
+                    CoreObligationEffect::Transfer,
+                )
+                && !effect.place.is_empty()
+                && effect.type_identity.is_some()
+        }
+        CoreCustodyOperation::TransferCommit => {
+            matches!(
+                dimensions,
+                (
+                    CoreInitializationEffect::Initialize | CoreInitializationEffect::Uninitialize,
+                    CoreCustodianEffect::Transfer | CoreCustodianEffect::Establish,
+                    CoreLoanEffect::None,
+                    CoreObligationEffect::Transfer | CoreObligationEffect::Establish,
+                )
+            ) && effect.type_identity.is_some()
+        }
+        CoreCustodyOperation::Discharge => {
+            dimensions
+                == (
+                    CoreInitializationEffect::Uninitialize,
+                    CoreCustodianEffect::Discharge,
+                    CoreLoanEffect::None,
+                    CoreObligationEffect::Discharge,
+                )
+                && effect.type_identity.is_some()
+        }
+        CoreCustodyOperation::CleanupRegister => {
+            dimensions
+                == (
+                    CoreInitializationEffect::None,
+                    CoreCustodianEffect::None,
+                    CoreLoanEffect::None,
+                    CoreObligationEffect::Establish,
+                )
+                && effect.cleanup_ordinal.is_some()
+                && effect.destination_home.is_some()
+        }
+        CoreCustodyOperation::CleanupRun => {
+            dimensions
+                == (
+                    CoreInitializationEffect::None,
+                    CoreCustodianEffect::Discharge,
+                    CoreLoanEffect::None,
+                    CoreObligationEffect::Discharge,
+                )
+                && effect.cleanup_ordinal.is_some()
+        }
+        CoreCustodyOperation::Join | CoreCustodyOperation::LoopFixpoint => {
+            dimensions
+                == (
+                    CoreInitializationEffect::None,
+                    CoreCustodianEffect::None,
+                    CoreLoanEffect::None,
+                    CoreObligationEffect::None,
+                )
+                && effect.proof.is_none()
+        }
+        CoreCustodyOperation::ProofCondition => {
+            dimensions
+                == (
+                    CoreInitializationEffect::None,
+                    CoreCustodianEffect::None,
+                    CoreLoanEffect::None,
+                    CoreObligationEffect::None,
+                )
+                && effect.proof.as_ref().is_some_and(|proof| {
+                    proof.requirement_identity != 0
+                        && proof.source_type_identity != 0
+                        && proof.retains_fallible_source_type
+                })
+        }
+        CoreCustodyOperation::Panic => {
+            dimensions
+                == (
+                    CoreInitializationEffect::None,
+                    CoreCustodianEffect::None,
+                    CoreLoanEffect::None,
+                    CoreObligationEffect::None,
+                )
+                && effect.proof.is_none()
+        }
+    }
+}
+
 fn run_oracle(
     candidate: &VerifiedCoreProgram,
     input: CorePlanningInput<'_>,
@@ -3711,11 +5163,257 @@ fn run_oracle(
         hash.update(&[u8::from(same)]);
         encode_oracle_outcome(&mut hash, &core_outcome);
     }
+    let (custody_cases, custody_agrees, custody_fingerprint) =
+        run_custody_oracle(candidate, input, cancellation)?;
+    hash.update(&custody_fingerprint.to_be_bytes());
     Ok(OracleSummary {
         cases,
         agrees,
+        custody_cases,
+        custody_agrees,
         fingerprint: hash.digest128(),
     })
+}
+
+fn run_custody_oracle(
+    candidate: &VerifiedCoreProgram,
+    input: CorePlanningInput<'_>,
+    cancellation: &Cancellation,
+) -> Result<(usize, bool, u128), CoreFailure> {
+    let semantic = input.completed_semantic_program();
+    let program = semantic.verified_program();
+    let observed_kinds = [
+        CoreCustodyOperation::Construct,
+        CoreCustodyOperation::Move,
+        CoreCustodyOperation::SharedLoan,
+        CoreCustodyOperation::ExclusiveLoan,
+        CoreCustodyOperation::Discharge,
+        CoreCustodyOperation::CleanupRegister,
+        CoreCustodyOperation::Join,
+        CoreCustodyOperation::LoopFixpoint,
+        CoreCustodyOperation::ProofCondition,
+        CoreCustodyOperation::Panic,
+    ];
+    let mut cases = 0;
+    let mut agrees = true;
+    let mut hash = Xxh3::new();
+    hash.update(b"wrela.core.custody-oracle\0\x01");
+    for reference in input.exact_source_executables() {
+        checkpoint(cancellation)?;
+        let source = semantic.executable_input(reference).ok_or_else(|| {
+            CoreFailure::Defect(Arc::from("custody oracle source body is missing"))
+        })?;
+        let executable = candidate
+            .executables
+            .iter()
+            .find(|executable| {
+                executable.reference.kind == source_kind(reference.kind())
+                    && executable.reference.identity == reference.identity()
+            })
+            .ok_or_else(|| CoreFailure::Defect(Arc::from("custody oracle Core body is missing")))?;
+        let mut expected = BTreeMap::new();
+        source_custody_counts(source.body, program, &mut expected);
+        let mut actual = BTreeMap::new();
+        for effect in executable
+            .regions
+            .iter()
+            .flat_map(|region| region.operations.iter())
+            .flat_map(|operation| operation.custody.iter())
+            .filter(|effect| observed_kinds.contains(&effect.operation))
+        {
+            *actual.entry(effect.operation).or_insert(0_usize) += 1;
+        }
+        let same = expected == actual;
+        cases += 1;
+        agrees &= same;
+        hash.update(&reference.identity().to_be_bytes());
+        hash.update(&[u8::from(same)]);
+        for kind in observed_kinds {
+            hash.update(&[kind.tag()]);
+            hash.update(&expected.get(&kind).copied().unwrap_or(0).to_be_bytes());
+            hash.update(&actual.get(&kind).copied().unwrap_or(0).to_be_bytes());
+        }
+    }
+    Ok((cases, agrees, hash.digest128()))
+}
+
+fn source_custody_counts(
+    body: CoreSourceExecutableBody<'_>,
+    program: &crate::typed_hir::VerifiedProgram,
+    counts: &mut BTreeMap<CoreCustodyOperation, usize>,
+) {
+    let mut parameter = |type_id: TypeId, access: crate::typed_hir::AccessMode| {
+        if access == crate::typed_hir::AccessMode::Move && program.owns_resource_type(type_id) {
+            *counts.entry(CoreCustodyOperation::Discharge).or_insert(0) += 1;
+        }
+    };
+    match body {
+        CoreSourceExecutableBody::Specialization(function) => {
+            for ((_, _, access), type_id) in function
+                .parameters
+                .iter()
+                .zip(function.parameter_type_ids.iter())
+            {
+                parameter(*type_id, *access);
+            }
+            source_statement_custody(&function.body, program, counts);
+        }
+        CoreSourceExecutableBody::Test(test) => {
+            for ((_, _, access), type_id) in
+                test.parameters.iter().zip(test.parameter_type_ids.iter())
+            {
+                parameter(*type_id, *access);
+            }
+            source_statement_custody(&test.body, program, counts);
+        }
+        CoreSourceExecutableBody::Closure(closure) => {
+            source_expression_custody(&closure.body, program, counts);
+        }
+    }
+}
+
+fn source_statement_custody(
+    statements: &[Statement],
+    program: &crate::typed_hir::VerifiedProgram,
+    counts: &mut BTreeMap<CoreCustodyOperation, usize>,
+) {
+    for statement in statements {
+        match statement {
+            Statement::Return { value, .. } => {
+                if let Some(value) = value {
+                    source_expression_custody(value, program, counts);
+                }
+            }
+            Statement::Panic { value, .. } => {
+                *counts.entry(CoreCustodyOperation::Panic).or_insert(0) += 1;
+                source_expression_custody(value, program, counts);
+            }
+            Statement::Assert { condition, .. } | Statement::Expect { condition, .. } => {
+                source_expression_custody(condition, program, counts);
+            }
+            Statement::Initialize { place, value, .. } | Statement::Assign { place, value, .. } => {
+                for projection in place.projections.iter() {
+                    if let PlaceProjection::Index { index, .. } = projection {
+                        source_expression_custody(index, program, counts);
+                    }
+                }
+                source_expression_custody(value, program, counts);
+            }
+            Statement::Evaluate(expression) => {
+                source_expression_custody(expression, program, counts);
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                *counts.entry(CoreCustodyOperation::Join).or_insert(0) += 1;
+                source_expression_custody(condition, program, counts);
+                source_statement_custody(then_branch, program, counts);
+                source_statement_custody(else_branch, program, counts);
+            }
+            Statement::IfPattern {
+                value,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                *counts.entry(CoreCustodyOperation::Join).or_insert(0) += 1;
+                source_expression_custody(value, program, counts);
+                source_statement_custody(then_branch, program, counts);
+                source_statement_custody(else_branch, program, counts);
+            }
+            Statement::For { iterable, body, .. } => {
+                *counts
+                    .entry(CoreCustodyOperation::LoopFixpoint)
+                    .or_insert(0) += 1;
+                source_expression_custody(iterable, program, counts);
+                source_statement_custody(body, program, counts);
+            }
+            Statement::While {
+                condition, body, ..
+            } => {
+                *counts
+                    .entry(CoreCustodyOperation::LoopFixpoint)
+                    .or_insert(0) += 2;
+                source_expression_custody(condition, program, counts);
+                source_statement_custody(body, program, counts);
+            }
+            Statement::Match { value, cases, .. } => {
+                *counts.entry(CoreCustodyOperation::Join).or_insert(0) += 1;
+                source_expression_custody(value, program, counts);
+                for case in cases.iter() {
+                    if let Some(guard) = &case.guard {
+                        source_expression_custody(guard, program, counts);
+                    }
+                    source_statement_custody(&case.body, program, counts);
+                }
+            }
+            Statement::Defer { action, .. } => {
+                *counts
+                    .entry(CoreCustodyOperation::CleanupRegister)
+                    .or_insert(0) += 1;
+                for capture in action.captures.iter() {
+                    source_expression_custody(&capture.expression, program, counts);
+                }
+                source_expression_custody(&action.expression, program, counts);
+            }
+            Statement::WithPool { scope, body, .. } => {
+                source_expression_custody(scope, program, counts);
+                source_statement_custody(body, program, counts);
+            }
+            Statement::Break(_) | Statement::Continue(_) | Statement::Pass(_) => {}
+        }
+    }
+}
+
+fn source_expression_custody(
+    expression: &Expression,
+    program: &crate::typed_hir::VerifiedProgram,
+    counts: &mut BTreeMap<CoreCustodyOperation, usize>,
+) {
+    let resource = program.owns_resource_type(expression.type_id);
+    if resource {
+        match (&expression.kind, expression.access) {
+            (ExpressionKind::Read(_), crate::typed_hir::AccessMode::Move)
+            | (ExpressionKind::CleanupCapture(_), crate::typed_hir::AccessMode::Move) => {
+                *counts.entry(CoreCustodyOperation::Move).or_insert(0) += 1;
+            }
+            (ExpressionKind::Read(_), crate::typed_hir::AccessMode::Read) => {
+                *counts.entry(CoreCustodyOperation::SharedLoan).or_insert(0) += 1;
+            }
+            (ExpressionKind::Read(_), crate::typed_hir::AccessMode::Mut) => {
+                *counts
+                    .entry(CoreCustodyOperation::ExclusiveLoan)
+                    .or_insert(0) += 1;
+            }
+            (
+                ExpressionKind::Call {
+                    target: CallTarget::Struct { .. },
+                    ..
+                }
+                | ExpressionKind::Array(_)
+                | ExpressionKind::Tuple(_)
+                | ExpressionKind::RepeatedArray { .. },
+                _,
+            ) => {
+                *counts.entry(CoreCustodyOperation::Construct).or_insert(0) += 1;
+            }
+            _ => {}
+        }
+    }
+    if matches!(expression.kind, ExpressionKind::Propagate(_)) {
+        *counts
+            .entry(CoreCustodyOperation::ProofCondition)
+            .or_insert(0) += 1;
+    }
+    if matches!(expression.kind, ExpressionKind::Closure(_)) {
+        return;
+    }
+    expression.visit_children(&mut |child| {
+        source_expression_custody(child, program, counts);
+    });
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3904,7 +5602,8 @@ fn oracle_supported(
             | CoreOperationKind::Branch
             | CoreOperationKind::LoopBack
             | CoreOperationKind::Break
-            | CoreOperationKind::Continue => true,
+            | CoreOperationKind::Continue
+            | CoreOperationKind::RecoverableExit => true,
             CoreOperationKind::FunctionValue => operation.details.len() == 2,
             CoreOperationKind::Call => {
                 let Some(target) = direct_call_target(operation) else {
@@ -4242,6 +5941,7 @@ fn oracle_region(
             CoreOperationKind::LoopBack => return Ok(Signal::LoopBack),
             CoreOperationKind::Break => return Ok(Signal::Break),
             CoreOperationKind::Continue => return Ok(Signal::ContinueLoop),
+            CoreOperationKind::RecoverableExit => {}
             CoreOperationKind::FunctionValue => {
                 let identity = *operation.details.get(1).ok_or_else(|| {
                     CoreFailure::Defect(Arc::from("Core function value is malformed"))
@@ -4861,6 +6561,133 @@ fn build() -> Image:
         )
     }
 
+    fn custody_fixture() -> (
+        VerifiedCoreProgram,
+        Arc<crate::image_planning::VerifiedPlanningFoundation>,
+    ) {
+        let request = CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new(
+                "src/image.wr",
+                br#"enum Failure:
+    Failed
+
+resource struct Ticket:
+    mut id: i64
+
+fn fail() -> Result[i64, Failure]:
+    return Result.Err(Failure.Failed)
+
+fn inspect(read left: Ticket, read right: Ticket) -> i64:
+    return left.id + right.id
+
+fn edit(mut ticket: Ticket):
+    ticket.id = 7
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn oldest():
+    pass
+
+fn newest():
+    pass
+
+fn run() -> Result[i64, Failure]:
+    mut ticket = Ticket(id=1)
+    total = inspect(ticket, ticket)
+    edit(mut ticket)
+    defer oldest()
+    defer newest()
+    consume(take ticket)
+    if total > 0:
+        return fail()?
+    return Result.Ok(total)
+
+fn terminal():
+    defer oldest()
+    panic "terminal"
+
+@image
+fn build() -> Image:
+    if false:
+        terminal()
+    return Image.new(value=run())
+"#,
+            )]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all());
+        let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+        let outcome = compiler.compile(request, &Cancellation::new());
+        let CompilationOutcome::Accepted(accepted) = outcome else {
+            panic!("custody fixture accepts: {outcome:#?}");
+        };
+        (
+            accepted
+                .verified_core_program()
+                .expect("Core derived")
+                .clone(),
+            Arc::new(
+                accepted
+                    .verified_planning_foundation()
+                    .expect("planning derived")
+                    .clone(),
+            ),
+        )
+    }
+
+    fn suspension_fixture() -> (
+        VerifiedCoreProgram,
+        Arc<crate::image_planning::VerifiedPlanningFoundation>,
+    ) {
+        let request = CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new(
+                "src/test.wr",
+                br#"resource struct Ticket:
+    id: i64
+
+async fn answer() -> i64:
+    return 1
+
+fn consume(take ticket: Ticket):
+    pass
+
+pub suite behavior:
+    async test after_resume(take ticket: Ticket):
+        value = await answer()
+        expect ticket.id + value == 2
+        consume(take ticket)
+
+@image
+fn build() -> Image:
+    tests = Test.new(cases=[behavior.after_resume(Ticket(id=1))])
+    return Image.new(tests=tests)
+"#,
+            )]),
+            Root::Test,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all());
+        let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+        let outcome = compiler.compile(request, &Cancellation::new());
+        let CompilationOutcome::Accepted(accepted) = outcome else {
+            panic!("suspension fixture accepts: {outcome:#?}");
+        };
+        (
+            accepted
+                .verified_core_program()
+                .expect("Core derived")
+                .clone(),
+            Arc::new(
+                accepted
+                    .verified_planning_foundation()
+                    .expect("planning derived")
+                    .clone(),
+            ),
+        )
+    }
+
     fn rejected(
         candidate: &VerifiedCoreProgram,
         planning: &crate::image_planning::VerifiedPlanningFoundation,
@@ -4939,6 +6766,61 @@ fn build() -> Image:
         source.regions = regions.into();
         candidate.executables = executables.into();
         resign_fingerprints_only(&mut candidate);
+        candidate
+    }
+
+    fn corrupt_custody_effect(
+        core: &VerifiedCoreProgram,
+        kind: CoreCustodyOperation,
+        mutator: impl FnOnce(&mut CustodyEffect),
+    ) -> VerifiedCoreProgram {
+        let mut candidate = core.clone();
+        let mut executables = candidate.executables.to_vec();
+        let executable = executables
+            .iter_mut()
+            .find(|executable| {
+                executable.regions.iter().any(|region| {
+                    region.operations.iter().any(|operation| {
+                        operation
+                            .custody
+                            .iter()
+                            .any(|effect| effect.operation == kind)
+                    })
+                })
+            })
+            .expect("custody operation executable");
+        let mut regions = executable.regions.to_vec();
+        let region = regions
+            .iter_mut()
+            .find(|region| {
+                region.operations.iter().any(|operation| {
+                    operation
+                        .custody
+                        .iter()
+                        .any(|effect| effect.operation == kind)
+                })
+            })
+            .expect("custody operation region");
+        let mut operations = region.operations.to_vec();
+        let operation = operations
+            .iter_mut()
+            .find(|operation| {
+                operation
+                    .custody
+                    .iter()
+                    .any(|effect| effect.operation == kind)
+            })
+            .expect("custody operation");
+        let mut effects = operation.custody.to_vec();
+        let effect = effects
+            .iter_mut()
+            .find(|effect| effect.operation == kind)
+            .expect("custody effect");
+        mutator(effect);
+        operation.custody = effects.into();
+        region.operations = operations.into();
+        executable.regions = regions.into();
+        candidate.executables = executables.into();
         candidate
     }
 
@@ -5185,6 +7067,325 @@ fn build() -> Image:
         assert!(
             corruptions.iter().all(|(_, rejected)| *rejected),
             "unrejected corruptions: {corruptions:?}"
+        );
+    }
+
+    #[test]
+    fn custody_verifier_rejects_duplicate_lost_and_invalid_transfer_commit() {
+        let (core, planning) = custody_fixture();
+
+        let mut lost = corrupt_custody_effect(&core, CoreCustodyOperation::Move, |effect| {
+            effect.destination_home = None;
+        });
+        resign(&mut lost, &planning);
+        assert!(rejected(&lost, &planning));
+
+        let mut invalid =
+            corrupt_custody_effect(&core, CoreCustodyOperation::TransferCommit, |effect| {
+                effect.destination_home = effect.source_home;
+            });
+        resign(&mut invalid, &planning);
+        assert!(rejected(&invalid, &planning));
+
+        let mut duplicate = core.clone();
+        let mut executables = duplicate.executables.to_vec();
+        let executable = executables
+            .iter_mut()
+            .find(|executable| {
+                executable.regions.iter().any(|region| {
+                    region.operations.iter().any(|operation| {
+                        operation
+                            .custody
+                            .iter()
+                            .any(|effect| effect.operation == CoreCustodyOperation::TransferCommit)
+                    })
+                })
+            })
+            .expect("transfer executable");
+        let mut regions = executable.regions.to_vec();
+        let region = regions
+            .iter_mut()
+            .find(|region| {
+                region.operations.iter().any(|operation| {
+                    operation
+                        .custody
+                        .iter()
+                        .any(|effect| effect.operation == CoreCustodyOperation::TransferCommit)
+                })
+            })
+            .expect("transfer region");
+        let mut operations = region.operations.to_vec();
+        let operation = operations
+            .iter_mut()
+            .find(|operation| {
+                operation
+                    .custody
+                    .iter()
+                    .any(|effect| effect.operation == CoreCustodyOperation::TransferCommit)
+            })
+            .expect("transfer operation");
+        let mut effects = operation.custody.to_vec();
+        let repeated = effects
+            .iter()
+            .find(|effect| effect.operation == CoreCustodyOperation::TransferCommit)
+            .expect("transfer effect")
+            .clone();
+        effects.push(repeated);
+        operation.custody = effects.into();
+        region.operations = operations.into();
+        executable.regions = regions.into();
+        duplicate.executables = executables.into();
+        resign(&mut duplicate, &planning);
+        assert!(rejected(&duplicate, &planning));
+    }
+
+    #[test]
+    fn custody_verifier_rejects_cleanup_reorder_and_custody_changing_rewrite() {
+        let (core, planning) = custody_fixture();
+        let mut reordered = core.clone();
+        let mut executables = reordered.executables.to_vec();
+        let executable = executables
+            .iter_mut()
+            .find(|executable| {
+                executable.regions.iter().any(|region| {
+                    region.operations.iter().any(|operation| {
+                        operation
+                            .custody
+                            .iter()
+                            .filter(|effect| effect.operation == CoreCustodyOperation::CleanupRun)
+                            .count()
+                            >= 2
+                    })
+                })
+            })
+            .expect("cleanup executable");
+        let mut regions = executable.regions.to_vec();
+        let region = regions
+            .iter_mut()
+            .find(|region| {
+                region.operations.iter().any(|operation| {
+                    operation
+                        .custody
+                        .iter()
+                        .filter(|effect| effect.operation == CoreCustodyOperation::CleanupRun)
+                        .count()
+                        >= 2
+                })
+            })
+            .expect("cleanup region");
+        let mut operations = region.operations.to_vec();
+        let operation = operations
+            .iter_mut()
+            .find(|operation| {
+                operation
+                    .custody
+                    .iter()
+                    .filter(|effect| effect.operation == CoreCustodyOperation::CleanupRun)
+                    .count()
+                    >= 2
+            })
+            .expect("cleanup exit");
+        let mut effects = operation.custody.to_vec();
+        let run_indexes = effects
+            .iter()
+            .enumerate()
+            .filter_map(|(index, effect)| {
+                (effect.operation == CoreCustodyOperation::CleanupRun).then_some(index)
+            })
+            .take(2)
+            .collect::<Vec<_>>();
+        effects.swap(run_indexes[0], run_indexes[1]);
+        operation.custody = effects.into();
+        region.operations = operations.into();
+        executable.regions = regions.into();
+        reordered.executables = executables.into();
+        resign(&mut reordered, &planning);
+        assert!(rejected(&reordered, &planning));
+
+        let mut rewritten = core.clone();
+        let mut executables = rewritten.executables.to_vec();
+        let executable = executables
+            .iter_mut()
+            .find(|executable| {
+                executable.regions.iter().any(|region| {
+                    region.operations.iter().any(|operation| {
+                        operation
+                            .custody
+                            .iter()
+                            .any(|effect| effect.operation == CoreCustodyOperation::Move)
+                    })
+                })
+            })
+            .expect("moved custody executable");
+        let move_site = executable
+            .regions
+            .iter()
+            .flat_map(|region| region.operations.iter())
+            .find(|operation| {
+                operation
+                    .custody
+                    .iter()
+                    .any(|effect| effect.operation == CoreCustodyOperation::Move)
+            })
+            .expect("move operation")
+            .provenance
+            .clone();
+        executable.rewrites = Arc::from([RewriteWitness {
+            kind: CoreRewriteKind::EliminatedPass,
+            provenance: move_site,
+            source_order: 0,
+        }]);
+        rewritten.executables = executables.into();
+        resign(&mut rewritten, &planning);
+        assert!(rejected(&rewritten, &planning));
+    }
+
+    #[test]
+    fn custody_verifier_rejects_alias_escape_suspension_and_false_proof_type() {
+        let (core, planning) = custody_fixture();
+
+        let mut alias = corrupt_custody_effect(&core, CoreCustodyOperation::SharedLoan, |effect| {
+            effect.operation = CoreCustodyOperation::ExclusiveLoan;
+            effect.loan = CoreLoanEffect::Exclusive;
+        });
+        resign(&mut alias, &planning);
+        assert!(rejected(&alias, &planning));
+
+        let mut false_proof =
+            corrupt_custody_effect(&core, CoreCustodyOperation::ProofCondition, |effect| {
+                effect
+                    .proof
+                    .as_mut()
+                    .expect("proof condition")
+                    .source_type_identity = 0;
+            });
+        resign(&mut false_proof, &planning);
+        assert!(rejected(&false_proof, &planning));
+
+        let (suspension_core, suspension_planning) = suspension_fixture();
+        let mut suspended = suspension_core.clone();
+        let mut executables = suspended.executables.to_vec();
+        let executable = executables
+            .iter_mut()
+            .find(|executable| {
+                executable.regions.iter().any(|region| {
+                    region
+                        .operations
+                        .iter()
+                        .any(|operation| operation.kind == CoreOperationKind::Suspension)
+                })
+            })
+            .expect("suspending executable");
+        let resource_parameter = executable
+            .signature
+            .parameters
+            .iter()
+            .find(|parameter| parameter.access == CoreAccessLaw::Move)
+            .expect("Resource parameter")
+            .clone();
+        let mut regions = executable.regions.to_vec();
+        let region = regions
+            .iter_mut()
+            .find(|region| {
+                region
+                    .operations
+                    .iter()
+                    .any(|operation| operation.kind == CoreOperationKind::Suspension)
+            })
+            .expect("suspension region");
+        let mut operations = region.operations.to_vec();
+        let operation = operations
+            .iter_mut()
+            .find(|operation| operation.kind == CoreOperationKind::Suspension)
+            .expect("suspension operation");
+        let mut effects = operation.custody.to_vec();
+        effects.push(custody_effect(
+            CoreCustodyOperation::SharedLoan,
+            (
+                CoreInitializationEffect::None,
+                CoreCustodianEffect::None,
+                CoreLoanEffect::Shared,
+                CoreObligationEffect::None,
+            ),
+            Arc::from([u128::from(resource_parameter.local)]),
+            Some(resource_parameter.type_.identity),
+            None,
+            None,
+        ));
+        operation.custody = effects.into();
+        region.operations = operations.into();
+        executable.regions = regions.into();
+        suspended.executables = executables.into();
+        resign(&mut suspended, &suspension_planning);
+        assert!(rejected(&suspended, &suspension_planning));
+    }
+
+    #[test]
+    fn custody_verifier_rejects_cleanup_on_panic_and_cancels_without_publication() {
+        let (core, planning) = custody_fixture();
+        let mut panic_cleanup = core.clone();
+        let mut executables = panic_cleanup.executables.to_vec();
+        let executable = executables
+            .iter_mut()
+            .find(|executable| {
+                executable.regions.iter().any(|region| {
+                    region
+                        .operations
+                        .iter()
+                        .any(|operation| operation.kind == CoreOperationKind::TerminalPanic)
+                })
+            })
+            .expect("Panic executable");
+        let mut regions = executable.regions.to_vec();
+        let region = regions
+            .iter_mut()
+            .find(|region| {
+                region
+                    .operations
+                    .iter()
+                    .any(|operation| operation.kind == CoreOperationKind::TerminalPanic)
+            })
+            .expect("Panic region");
+        let mut operations = region.operations.to_vec();
+        let operation = operations
+            .iter_mut()
+            .find(|operation| operation.kind == CoreOperationKind::TerminalPanic)
+            .expect("Panic operation");
+        let mut effects = operation.custody.to_vec();
+        let mut cleanup = custody_effect(
+            CoreCustodyOperation::CleanupRun,
+            (
+                CoreInitializationEffect::None,
+                CoreCustodianEffect::Discharge,
+                CoreLoanEffect::None,
+                CoreObligationEffect::Discharge,
+            ),
+            Arc::from([]),
+            None,
+            Some(custody_home(b"cleanup", 1)),
+            Some(custody_home(b"discharged", 1)),
+        );
+        cleanup.cleanup_ordinal = Some(1);
+        effects.push(cleanup);
+        operation.custody = effects.into();
+        region.operations = operations.into();
+        executable.regions = regions.into();
+        panic_cleanup.executables = executables.into();
+        resign(&mut panic_cleanup, &planning);
+        assert!(rejected(&panic_cleanup, &planning));
+
+        let cancellation = Cancellation::new();
+        cancellation.cancel_after_private_polls(1);
+        assert_eq!(
+            validate_custody(
+                &core,
+                planning
+                    .for_core()
+                    .completed_semantic_program()
+                    .verified_program(),
+                &cancellation,
+            ),
+            Err(CoreFailure::Cancelled)
         );
     }
 

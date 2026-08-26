@@ -2,8 +2,9 @@ use std::collections::BTreeSet;
 
 use wrela_compiler::{
     Cancellation, CompilationOutcome, CompilationRequest, Compiler, CompilerInstallation,
-    CoreAccessLaw, CoreExecutableKind, CoreOperationKind, CoreRewriteKind, InspectSelection,
-    ProjectFile, ProjectSnapshot, Root,
+    CoreAccessLaw, CoreCustodianEffect, CoreCustodyOperation, CoreExecutableKind,
+    CoreInitializationEffect, CoreLoanEffect, CoreObligationEffect, CoreOperationKind,
+    CoreRewriteKind, InspectSelection, ProjectFile, ProjectSnapshot, Root,
 };
 
 fn compile_core(source: &[u8], root: Root) -> wrela_compiler::CoreProgramObservation {
@@ -74,7 +75,7 @@ fn core_realizes_exact_executable_demand_and_preserves_semantic_operations() {
         .planning_foundation()
         .expect("planning inspection requested");
 
-    assert_eq!(core.phase_schema(), "wrela.core.v1");
+    assert_eq!(core.phase_schema(), "wrela.core.v2");
     assert_eq!(
         accepted.core_program_fingerprint(),
         Some(core.fingerprint())
@@ -667,4 +668,224 @@ fn build() -> Image:
     assert_eq!(rewritten.rewrites(), [CoreRewriteKind::EliminatedPass]);
     assert!(!rewritten.operations().contains(&CoreOperationKind::Pass));
     assert!(core.oracle_agrees());
+}
+
+#[test]
+fn core_preserves_resource_custody_as_four_orthogonal_dimensions() {
+    let core = compile_core(
+        br#"resource struct Ticket:
+    mut id: i64
+
+resource struct Envelope:
+    ticket: Ticket
+
+fn inspect(read ticket: Ticket) -> i64:
+    return ticket.id
+
+fn edit(mut ticket: Ticket):
+    ticket.id = 7
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn run() -> i64:
+    mut ticket = Ticket(id=1)
+    before = inspect(ticket)
+    edit(mut ticket)
+    moved = take ticket
+    ticket = Ticket(id=2)
+    envelope = Envelope(ticket=take moved)
+    consume(take envelope.ticket)
+    consume(take ticket)
+    return before
+
+@image
+fn build() -> Image:
+    return Image.new(value=run())
+"#,
+        Root::Image,
+    );
+
+    let effects = core
+        .executables()
+        .iter()
+        .flat_map(|executable| executable.custody_effects())
+        .collect::<Vec<_>>();
+    let kinds = effects
+        .iter()
+        .map(|effect| effect.operation())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        kinds.is_superset(&BTreeSet::from([
+            CoreCustodyOperation::Construct,
+            CoreCustodyOperation::Move,
+            CoreCustodyOperation::SharedLoan,
+            CoreCustodyOperation::ExclusiveLoan,
+            CoreCustodyOperation::Replace,
+            CoreCustodyOperation::TransferCommit,
+            CoreCustodyOperation::Discharge,
+        ])),
+        "missing custody law: {kinds:?}"
+    );
+    assert!(effects.iter().any(|effect| {
+        effect.operation() == CoreCustodyOperation::Move
+            && effect.place().len() > 1
+            && effect.initialization() == CoreInitializationEffect::Uninitialize
+            && effect.custodian() == CoreCustodianEffect::Transfer
+            && effect.loan() == CoreLoanEffect::None
+            && effect.obligation() == CoreObligationEffect::Transfer
+    }));
+    assert!(effects.iter().any(|effect| {
+        effect.operation() == CoreCustodyOperation::SharedLoan
+            && effect.loan() == CoreLoanEffect::Shared
+            && effect.custodian() == CoreCustodianEffect::None
+    }));
+    assert!(effects.iter().any(|effect| {
+        effect.operation() == CoreCustodyOperation::ExclusiveLoan
+            && effect.loan() == CoreLoanEffect::Exclusive
+            && effect.custodian() == CoreCustodianEffect::None
+    }));
+    assert!(core.custody_oracle_case_count() >= 1);
+    assert!(core.custody_oracle_agrees());
+}
+
+#[test]
+fn recoverable_exits_preserve_cleanup_proof_and_fixpoint_laws_while_panic_does_not_clean_up() {
+    let core = compile_core(
+        br#"enum Failure:
+    Failed
+
+fn fail() -> Result[i64, Failure]:
+    return Result.Err(Failure.Failed)
+
+fn oldest():
+    pass
+
+fn newest():
+    pass
+
+fn run(flag: bool) -> Result[i64, Failure]:
+    defer oldest()
+    defer newest()
+    mut count = 0
+    while count < 1:
+        count += 1
+    if flag:
+        return fail()?
+    return Result.Ok(count)
+
+fn terminal():
+    defer oldest()
+    panic "terminal"
+
+@image
+fn build() -> Image:
+    if false:
+        terminal()
+    return Image.new(value=run(true))
+"#,
+        Root::Image,
+    );
+
+    let effects = core
+        .executables()
+        .iter()
+        .flat_map(|executable| executable.custody_effects())
+        .collect::<Vec<_>>();
+    let registrations = effects
+        .iter()
+        .filter(|effect| effect.operation() == CoreCustodyOperation::CleanupRegister)
+        .filter_map(|effect| effect.cleanup_ordinal())
+        .collect::<Vec<_>>();
+    assert!(registrations.len() >= 3);
+
+    let mut runs_by_exit = std::collections::BTreeMap::<u32, Vec<u32>>::new();
+    for effect in effects
+        .iter()
+        .filter(|effect| effect.operation() == CoreCustodyOperation::CleanupRun)
+    {
+        runs_by_exit
+            .entry(effect.core_operation_identity())
+            .or_default()
+            .push(effect.cleanup_ordinal().expect("cleanup run ordinal"));
+    }
+    assert!(
+        runs_by_exit
+            .values()
+            .any(|runs| { runs.len() == 2 && runs[0] > runs[1] })
+    );
+
+    let proof = effects
+        .iter()
+        .find(|effect| effect.operation() == CoreCustodyOperation::ProofCondition)
+        .expect("propagation keeps a proof-conditioned Core operation");
+    assert_ne!(proof.requirement_identity(), Some(0));
+    assert_ne!(proof.source_type_identity(), Some(0));
+    assert!(proof.retains_fallible_source_type());
+    assert!(
+        effects
+            .iter()
+            .any(|effect| effect.operation() == CoreCustodyOperation::Join)
+    );
+    assert!(
+        effects
+            .iter()
+            .any(|effect| effect.operation() == CoreCustodyOperation::LoopFixpoint)
+    );
+
+    let panic_operation = effects
+        .iter()
+        .find(|effect| effect.operation() == CoreCustodyOperation::Panic)
+        .expect("Panic remains explicit")
+        .core_operation_identity();
+    assert!(!effects.iter().any(|effect| {
+        effect.core_operation_identity() == panic_operation
+            && effect.operation() == CoreCustodyOperation::CleanupRun
+    }));
+}
+
+#[test]
+fn nested_recoverable_exit_runs_inner_then_outer_cleanup_in_reverse_registration_order() {
+    let core = compile_core(
+        br#"fn outer():
+    pass
+
+fn inner_oldest():
+    pass
+
+fn inner_newest():
+    pass
+
+fn run(flag: bool) -> i64:
+    defer outer()
+    if flag:
+        defer inner_oldest()
+        defer inner_newest()
+        return 1
+    return 0
+
+@image
+fn build() -> Image:
+    return Image.new(value=run(true))
+"#,
+        Root::Image,
+    );
+
+    let mut runs_by_exit = std::collections::BTreeMap::<u32, Vec<u32>>::new();
+    for effect in core
+        .executables()
+        .iter()
+        .flat_map(|executable| executable.custody_effects())
+        .filter(|effect| effect.operation() == CoreCustodyOperation::CleanupRun)
+    {
+        runs_by_exit
+            .entry(effect.core_operation_identity())
+            .or_default()
+            .push(effect.cleanup_ordinal().expect("cleanup ordinal"));
+    }
+    assert!(
+        runs_by_exit
+            .values()
+            .any(|runs| { runs.len() == 3 && runs.windows(2).all(|pair| pair[0] > pair[1]) })
+    );
 }

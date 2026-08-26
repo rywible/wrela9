@@ -1561,6 +1561,17 @@ impl VerifiedProgram {
         canonical.digest128()
     }
 
+    pub(crate) fn owns_resource_type(&self, type_id: TypeId) -> bool {
+        self._discharge_laws.laws.contains_key(&type_id)
+    }
+
+    pub(crate) fn requires_explicit_discharge(&self, type_id: TypeId) -> bool {
+        self._discharge_laws
+            .laws
+            .get(&type_id)
+            .is_some_and(DischargeLaw::requires_explicit_discharge)
+    }
+
     pub(crate) fn verify_expression(
         &self,
         syntax: &ExpressionSyntax,

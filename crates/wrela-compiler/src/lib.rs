@@ -39,8 +39,10 @@ pub use compiler::{
     TestBindingObservation, TypeObservation, TypeRole,
 };
 pub use core::{
-    CoreAccessLaw, CoreExecutableKind, CoreExecutableObservation, CoreOperationKind,
-    CoreParameterObservation, CoreProgramObservation, CoreRewriteKind,
+    CoreAccessLaw, CoreCustodianEffect, CoreCustodyEffectObservation, CoreCustodyOperation,
+    CoreExecutableKind, CoreExecutableObservation, CoreInitializationEffect, CoreLoanEffect,
+    CoreObligationEffect, CoreOperationKind, CoreParameterObservation, CoreProgramObservation,
+    CoreRewriteKind,
 };
 pub use image_planning::{
     DomainPlanKind, DomainPlanObservation, ExecutableDemandObservation, GeneratedRoleKind,

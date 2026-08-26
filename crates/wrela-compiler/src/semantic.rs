@@ -2776,7 +2776,9 @@ fn resolve_associated_functions(
                     RecoveryAction::None,
                 )),
                 OwnershipSyntax::Read | OwnershipSyntax::Mut | OwnershipSyntax::Take
-                    if parameter.name != "self" && !resource =>
+                    if parameter.name != "self"
+                        && !resource
+                        && !matches!(parameter.type_, Type::Parameter { .. }) =>
                 {
                     diagnostics.push(Diagnostic::new(
                         "semantic.ownership_mode_requires_resource",
@@ -3025,6 +3027,9 @@ fn validate_parameter_modes(
 ) {
     for (parameter, syntax) in parameters.iter().zip(syntax) {
         let resource = is_resource_type(&parameter.type_, definitions);
+        if matches!(parameter.type_, Type::Parameter { .. }) {
+            continue;
+        }
         let invalid = match parameter.ownership {
             OwnershipSyntax::Value => resource,
             OwnershipSyntax::Read | OwnershipSyntax::Mut | OwnershipSyntax::Take => !resource,

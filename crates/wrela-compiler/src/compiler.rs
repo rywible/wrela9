@@ -75,8 +75,48 @@ pub struct Test:
 fn layer1_pool_module() -> ProjectFile {
     ProjectFile::new(
         "src/core/pool.wr",
-        br#"pub resource struct Scope:
+        br#"pub struct Key[T]:
+    pool_identity: u64
+    slot: u64
+    generation: u64
+    type_identity: u64
+
+pub resource struct Allocation[T]:
+    value: T
+    pub key: Key[T]
+
+pub resource struct PoolFull[T]:
+    pub value: T
+
+pub resource struct Permit[T]:
+    pool_identity: u64
+    slot: u64
+    generation: u64
+    type_identity: u64
+
+pub resource struct Scope:
     capacity: u64
+
+    pub fn try_allocate[T](mut self, take value: T) -> Result[Allocation[T], PoolFull[T]]:
+        panic "sealed Pool try_allocate"
+
+    pub fn allocate[T](mut self, take value: T) -> Allocation[T]:
+        panic "sealed proof-required Pool allocate"
+
+    pub fn reserve[T](mut self) -> Permit[T]:
+        panic "sealed proof-required Pool reserve"
+
+    pub fn consume[T](mut self, take permit: Permit[T], take value: T) -> Allocation[T]:
+        panic "sealed Pool Permit consumption"
+
+    pub pure fn lookup[T](read self, key: Key[T]) -> Option[T]:
+        panic "sealed generation-checked Pool lookup"
+
+    pub fn reclaim[T](mut self, take allocation: Allocation[T]) -> T:
+        panic "sealed Pool reclaim"
+
+    pub fn release[T](mut self, take permit: Permit[T]):
+        pass
 
 pub pure fn scoped(capacity: u64) -> Scope:
     return Scope(capacity=capacity)
@@ -2584,6 +2624,14 @@ impl Compiler {
                     ) {
                         Ok(planning) => Some(Arc::new(planning)),
                         Err(PlanningFailure::Cancelled) => return CompilationOutcome::Cancelled,
+                        Err(PlanningFailure::Admission {
+                            source,
+                            declared,
+                            required,
+                        }) => {
+                            diagnostics.push(pool_capacity_diagnostic(source, declared, required));
+                            None
+                        }
                         Err(PlanningFailure::Defect(evidence)) => {
                             return CompilationOutcome::Defect(Defect::new(
                                 "Image Planning Foundation",
@@ -2749,6 +2797,12 @@ fn unsupported_architecture_diagnostic(root: Root, profile: ArchitectureProfile)
         RecoveryAction::None,
     )
     .with_parameter("profile", profile.canonical_name())
+}
+
+fn pool_capacity_diagnostic(source: SourceRange, declared: u64, required: u64) -> Diagnostic {
+    Diagnostic::new("admission.pool_capacity", source, RecoveryAction::None)
+        .with_parameter("declared", declared.to_string())
+        .with_parameter("required", required.to_string())
 }
 
 fn parse_unreachable_project_syntax(

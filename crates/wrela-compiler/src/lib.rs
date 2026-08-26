@@ -47,6 +47,8 @@ pub use core::{
 pub use image_planning::{
     DomainPlanKind, DomainPlanObservation, ExecutableDemandObservation, GeneratedRoleKind,
     GeneratedRoleObservation, PlannerKind, PlannerObservation, PlanningBinding, PlanningCapability,
-    PlanningFoundationObservation, PlanningMultiplicity, PlanningReservation, RequirementBounds,
+    PlanningFoundationObservation, PlanningMultiplicity, PlanningReservation,
+    PoolAdmissionEvidenceObservation, PoolModelObservation, PoolObservation, RequirementBounds,
     RequirementCategory, RequirementObservation, RequirementProvenance, RequirementSubject,
 };
+pub use typed_hir::PoolOperation;

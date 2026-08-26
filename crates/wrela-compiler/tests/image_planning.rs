@@ -157,7 +157,10 @@ fn deployment_image_derives_exact_mandatory_planning_closure() {
         "every exact requirement has one unique stable Requirement Reference"
     );
     assert!(planning.requirements().iter().all(|requirement| {
-        let wrela_compiler::RequirementSubject::GeneratedRole(role) = requirement.subject();
+        let role = match requirement.subject() {
+            wrela_compiler::RequirementSubject::GeneratedRole(role) => role,
+            wrela_compiler::RequirementSubject::Pool(_) => return true,
+        };
         requirement.reference() != 0
             && requirement.owner() == planning.planners()[0].identity()
             && planning

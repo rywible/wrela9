@@ -437,6 +437,12 @@ impl DischargeLawBuilder {
         self.authenticated_reclaims.insert(type_id);
         Ok(())
     }
+
+    fn has_authenticated_reclaim(&self, type_: &Type) -> bool {
+        self.authenticated_reclaims
+            .iter()
+            .any(|type_id| self.observed.get(type_id) == Some(type_))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -789,6 +795,7 @@ pub(crate) struct HirFunction {
     pub(crate) name: String,
     pub(crate) module_display: String,
     pub(crate) modifier: crate::syntax::FunctionModifier,
+    pub(crate) pool_operation: Option<PoolOperation>,
     pub(crate) parameters: Vec<(LocalId, Type, AccessMode)>,
     pub(crate) parameter_type_ids: Arc<[TypeId]>,
     pub(crate) parameter_definitions: Arc<[DefinitionId]>,
@@ -950,6 +957,10 @@ pub(crate) enum HirMatchPattern {
     Literal(Literal),
     Variant {
         id: VariantId,
+        payload: Arc<[HirMatchPattern]>,
+    },
+    BuiltinVariant {
+        variant: BuiltinVariant,
         payload: Arc<[HirMatchPattern]>,
     },
     Struct {
@@ -1339,9 +1350,35 @@ pub(crate) struct BuildAuthority {
     _sealed: SealedAuthority,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PoolOperation {
+    TryAllocate,
+    Allocate,
+    Reserve,
+    Consume,
+    Lookup,
+    Reclaim,
+    Release,
+}
+
+impl PoolOperation {
+    pub(crate) const fn canonical_tag(self) -> u8 {
+        match self {
+            Self::TryAllocate => 1,
+            Self::Allocate => 2,
+            Self::Reserve => 3,
+            Self::Consume => 4,
+            Self::Lookup => 5,
+            Self::Reclaim => 6,
+            Self::Release => 7,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct PoolAuthority {
     scoped_factory: Option<DefinitionId>,
+    operations: BTreeMap<DefinitionId, PoolOperation>,
     _sealed: SealedPoolAuthority,
 }
 
@@ -1369,21 +1406,47 @@ impl<'a> AuthorityContext<'a> {
 struct SealedPoolAuthority;
 
 impl PoolAuthority {
+    #[cfg(test)]
     pub(crate) const fn from_authenticated_scoped_factory(
         scoped_factory: Option<DefinitionId>,
     ) -> Self {
         Self {
             scoped_factory,
+            operations: BTreeMap::new(),
             _sealed: SealedPoolAuthority,
         }
     }
 
-    pub(crate) const fn is_scoped_factory(self, definition: DefinitionId) -> bool {
+    pub(crate) fn from_authenticated_pool(
+        scoped_factory: Option<DefinitionId>,
+        operations: impl IntoIterator<Item = (DefinitionId, PoolOperation)>,
+    ) -> Self {
+        Self {
+            scoped_factory,
+            operations: operations.into_iter().collect(),
+            _sealed: SealedPoolAuthority,
+        }
+    }
+
+    pub(crate) const fn is_scoped_factory(&self, definition: DefinitionId) -> bool {
         matches!(self.scoped_factory, Some(factory) if factory.0 == definition.0)
     }
 
-    pub(crate) fn canonical_grants(self) -> impl Iterator<Item = DefinitionId> {
-        self.scoped_factory.into_iter()
+    pub(crate) fn operation(&self, definition: DefinitionId) -> Option<PoolOperation> {
+        self.operations.get(&definition).copied()
+    }
+
+    pub(crate) fn canonical_grants(
+        &self,
+    ) -> impl Iterator<Item = (DefinitionId, Option<PoolOperation>)> + '_ {
+        self.scoped_factory
+            .into_iter()
+            .map(|definition| (definition, None))
+            .chain(
+                self.operations
+                    .iter()
+                    .map(|(definition, operation)| (*definition, Some(*operation))),
+            )
     }
 }
 
@@ -1727,6 +1790,7 @@ pub(crate) fn verify(
                 name: function.name.clone(),
                 module_display: function.module_display.clone(),
                 modifier: function.modifier,
+                pool_operation: pool_authority.operation(function.id),
                 parameters,
                 parameter_type_ids: parameter_type_ids.into(),
                 parameter_definitions: function
@@ -2293,6 +2357,7 @@ fn lower_concrete_function(
         name: function.name.clone(),
         module_display: function.module_display.clone(),
         modifier: function.modifier,
+        pool_operation: authorities.pool().operation(function.id),
         parameters,
         parameter_type_ids: parameter_type_ids.into(),
         parameter_definitions: function
@@ -2515,6 +2580,7 @@ pub(crate) fn lower_functions_for_error_inference(
                 name: function.name.clone(),
                 module_display: function.module_display.clone(),
                 modifier: function.modifier,
+                pool_operation: pool_authority.operation(function.id),
                 parameters,
                 parameter_type_ids: parameter_type_ids.into(),
                 parameter_definitions: function
@@ -2638,6 +2704,7 @@ fn materialize_missing_specializations(
                 name: function.name.clone(),
                 module_display: function.module_display.clone(),
                 modifier: function.modifier,
+                pool_operation: authorities.pool().operation(function.id),
                 parameters,
                 parameter_type_ids: parameter_type_ids.into(),
                 parameter_definitions: function
@@ -7875,6 +7942,17 @@ impl<'a> Lowerer<'a> {
         source: SourceRange,
     ) -> Result<Expression, VerificationFailure> {
         let type_id = observe_type_tree(&type_, self.identity_catalog, self.discharge_laws)?;
+        if let ExpressionKind::Call {
+            target: CallTarget::Function { definition, .. },
+            ..
+        } = &kind
+            && matches!(
+                self.pool_authority.operation(*definition),
+                Some(PoolOperation::Allocate | PoolOperation::Reserve | PoolOperation::Consume)
+            )
+        {
+            self.discharge_laws.authenticate_reclaim(type_id)?;
+        }
         Ok(Expression {
             kind,
             type_id,
@@ -8148,6 +8226,9 @@ impl<'a> Lowerer<'a> {
         subject: &str,
         obligations: &mut Vec<LiveDischargeObligation>,
     ) {
+        if self.discharge_laws.has_authenticated_reclaim(type_) {
+            return;
+        }
         let Some(law) = self.discharge_law(type_) else {
             return;
         };
@@ -8862,6 +8943,26 @@ impl<'a> Lowerer<'a> {
                 }
                 Ok(moved)
             }
+            HirMatchPattern::BuiltinVariant { variant, payload } => {
+                let expected_payload =
+                    builtin_pattern_payload(*variant, expected).ok_or_else(|| {
+                        VerificationFailure::Defect {
+                            evidence: Arc::from("typed built-in variant pattern lost its type"),
+                        }
+                    })?;
+                if payload.len() != usize::from(expected_payload.is_some()) {
+                    return defect("typed built-in variant pattern has a false payload");
+                }
+                let mut moved = BTreeSet::new();
+                if let (Some(pattern), Some(type_)) = (payload.first(), expected_payload) {
+                    moved.extend(self.pattern_move_keys(
+                        pattern,
+                        type_,
+                        &project(ProjectionKey::Index(Some(0))),
+                    )?);
+                }
+                Ok(moved)
+            }
             HirMatchPattern::Or(alternatives) => {
                 let mut alternatives = alternatives.iter();
                 let Some(first) = alternatives.next() else {
@@ -8913,14 +9014,60 @@ impl<'a> Lowerer<'a> {
                         })
                     })
             }
+            Type::Result { .. } => [BuiltinVariant::ResultOk, BuiltinVariant::ResultErr]
+                .into_iter()
+                .all(|variant| {
+                    cases.iter().any(|case| {
+                        case.guard.is_none()
+                            && case.pattern.as_ref().is_some_and(|pattern| {
+                                self.pattern_covers_builtin(pattern, type_, variant)
+                            })
+                    })
+                }),
+            Type::Option(_) => [BuiltinVariant::OptionSome, BuiltinVariant::OptionNone]
+                .into_iter()
+                .all(|variant| {
+                    cases.iter().any(|case| {
+                        case.guard.is_none()
+                            && case.pattern.as_ref().is_some_and(|pattern| {
+                                self.pattern_covers_builtin(pattern, type_, variant)
+                            })
+                    })
+                }),
             _ => false,
+        }
+    }
+
+    fn pattern_covers_builtin(
+        &self,
+        pattern: &HirMatchPattern,
+        type_: &Type,
+        expected: BuiltinVariant,
+    ) -> bool {
+        if let HirMatchPattern::Or(alternatives) = pattern {
+            return alternatives
+                .iter()
+                .any(|pattern| self.pattern_covers_builtin(pattern, type_, expected));
+        }
+        let HirMatchPattern::BuiltinVariant { variant, payload } = pattern else {
+            return false;
+        };
+        if *variant != expected {
+            return false;
+        }
+        match builtin_pattern_payload(*variant, type_) {
+            None => false,
+            Some(None) => payload.is_empty(),
+            Some(Some(type_)) => payload.len() == 1 && self.pattern_irrefutable(&payload[0], type_),
         }
     }
 
     fn pattern_irrefutable(&self, pattern: &HirMatchPattern, type_: &Type) -> bool {
         match pattern {
             HirMatchPattern::Wildcard | HirMatchPattern::Binding { .. } => true,
-            HirMatchPattern::Literal(_) | HirMatchPattern::Variant { .. } => false,
+            HirMatchPattern::Literal(_)
+            | HirMatchPattern::Variant { .. }
+            | HirMatchPattern::BuiltinVariant { .. } => false,
             HirMatchPattern::Or(alternatives) => alternatives
                 .iter()
                 .any(|pattern| self.pattern_irrefutable(pattern, type_)),
@@ -9175,6 +9322,48 @@ impl<'a> Lowerer<'a> {
                 Ok(HirMatchPattern::Or(lowered.into()))
             }
             PatternSyntaxKind::Constructor { name, arguments } => {
+                if let Some(variant) = resolve_builtin_variant(name) {
+                    let payload_type = match (variant, expected) {
+                        (BuiltinVariant::ResultOk, Type::Result { success, .. })
+                        | (
+                            BuiltinVariant::ResultErr,
+                            Type::Result {
+                                error: Some(success),
+                                ..
+                            },
+                        )
+                        | (BuiltinVariant::OptionSome, Type::Option(success)) => {
+                            if arguments.len() != 1 || arguments[0].label.is_some() {
+                                return creator(
+                                    CreatorFailureKind::InvalidMatchPattern,
+                                    &pattern.range,
+                                );
+                            }
+                            Some(success.as_ref())
+                        }
+                        (BuiltinVariant::OptionNone, Type::Option(_)) => {
+                            if !arguments.is_empty() {
+                                return creator(
+                                    CreatorFailureKind::InvalidMatchPattern,
+                                    &pattern.range,
+                                );
+                            }
+                            None
+                        }
+                        _ => {
+                            return creator(CreatorFailureKind::BinaryTypeMismatch, &pattern.range);
+                        }
+                    };
+                    let payload = match payload_type {
+                        Some(type_) => Arc::from([self.lower_match_pattern_with_reuse(
+                            &arguments[0].pattern,
+                            type_,
+                            reuse,
+                        )?]),
+                        None => Arc::from([]),
+                    };
+                    return Ok(HirMatchPattern::BuiltinVariant { variant, payload });
+                }
                 let Type::Nominal {
                     definition,
                     arguments: type_arguments,
@@ -9610,6 +9799,24 @@ impl<'a> Lowerer<'a> {
                 argument.access = AccessMode::Read;
                 Ok(())
             }
+            OwnershipSyntax::Mut
+                if argument.access == AccessMode::Copy
+                    && root_place(argument).is_some_and(|place| {
+                        self.locals
+                            .values()
+                            .find(|(local, _, _)| *local == place.local)
+                            .is_some_and(|(_, _, mutable)| {
+                                *mutable
+                                    && place.projections.iter().all(|projection| match projection {
+                                        PlaceProjection::Field { mutable, .. } => *mutable,
+                                        PlaceProjection::Index { .. } => true,
+                                    })
+                            })
+                    }) =>
+            {
+                argument.access = AccessMode::Mut;
+                Ok(())
+            }
             OwnershipSyntax::Mut if argument.access == AccessMode::Mut => Ok(()),
             OwnershipSyntax::Take
                 if argument.access == AccessMode::Move || root_place(argument).is_none() =>
@@ -9957,6 +10164,11 @@ impl<'a> Lowerer<'a> {
             site,
         )?;
         let mut substitutions = BTreeMap::new();
+        if type_has_placeholder(&function.return_type)
+            && let Some(expected) = self.expected_expression_type.as_ref()
+        {
+            bind_type(&function.return_type, expected, &mut substitutions, site)?;
+        }
         for (source_index, parameter_index) in argument_order.iter().enumerate() {
             bind_type(
                 &function.parameters[usize::from(*parameter_index)].type_,
@@ -9966,6 +10178,11 @@ impl<'a> Lowerer<'a> {
             )?;
         }
         let return_type = substitute(&function.return_type, &substitutions);
+        if self.pool_authority.operation(id) == Some(PoolOperation::Lookup)
+            && self.type_owns_resource(&return_type)
+        {
+            return creator(CreatorFailureKind::GenericArgumentConflict, site);
+        }
         if !self.concrete_result_type_is_well_formed(&return_type)
             || function.parameters.iter().any(|parameter| {
                 !self.concrete_result_type_is_well_formed(&substitute(
@@ -10501,6 +10718,7 @@ fn match_pattern_binding_signature(
                 bindings.insert(*local, (type_.clone(), *access));
             }
             HirMatchPattern::Variant { payload, .. }
+            | HirMatchPattern::BuiltinVariant { payload, .. }
             | HirMatchPattern::Struct {
                 fields: payload, ..
             }
@@ -10647,6 +10865,27 @@ fn artifact_pattern_move_keys(
             }
             Ok(moved)
         }
+        HirMatchPattern::BuiltinVariant { variant, payload } => {
+            let expected_payload =
+                builtin_pattern_payload(*variant, expected).ok_or_else(|| {
+                    VerificationFailure::Defect {
+                        evidence: Arc::from("lowered built-in variant pattern lost its type"),
+                    }
+                })?;
+            if payload.len() != usize::from(expected_payload.is_some()) {
+                return defect("lowered built-in variant pattern has a false payload");
+            }
+            let mut moved = BTreeSet::new();
+            if let (Some(pattern), Some(type_)) = (payload.first(), expected_payload) {
+                moved.extend(artifact_pattern_move_keys(
+                    pattern,
+                    type_,
+                    &project(ProjectionKey::Index(Some(0))),
+                    catalog,
+                )?);
+            }
+            Ok(moved)
+        }
         HirMatchPattern::Or(alternatives) => {
             let mut alternatives = alternatives.iter();
             let Some(first) = alternatives.next() else {
@@ -10698,6 +10937,23 @@ fn verify_match_pattern_artifact(
                     .is_some()
             {
                 return defect("lowered match binding repeats a LocalId");
+            }
+            Ok(())
+        }
+        HirMatchPattern::BuiltinVariant { variant, payload } => {
+            let expected_payload =
+                builtin_pattern_payload(*variant, expected).ok_or_else(|| {
+                    VerificationFailure::Defect {
+                        evidence: Arc::from(
+                            "lowered built-in variant pattern targets the wrong type",
+                        ),
+                    }
+                })?;
+            if payload.len() != usize::from(expected_payload.is_some()) {
+                return defect("lowered built-in variant pattern has a false payload");
+            }
+            if let (Some(pattern), Some(type_)) = (payload.first(), expected_payload) {
+                verify_match_pattern_artifact(pattern, type_, locals, catalog)?;
             }
             Ok(())
         }
@@ -10861,7 +11117,53 @@ fn hir_match_exhaustive_for_type(
                     })
                 })
         }
+        Type::Result { .. } => [BuiltinVariant::ResultOk, BuiltinVariant::ResultErr]
+            .into_iter()
+            .all(|variant| {
+                cases.iter().any(|case| {
+                    case.guard.is_none()
+                        && case.pattern.as_ref().is_some_and(|pattern| {
+                            artifact_pattern_covers_builtin(pattern, type_, variant, catalog)
+                        })
+                })
+            }),
+        Type::Option(_) => [BuiltinVariant::OptionSome, BuiltinVariant::OptionNone]
+            .into_iter()
+            .all(|variant| {
+                cases.iter().any(|case| {
+                    case.guard.is_none()
+                        && case.pattern.as_ref().is_some_and(|pattern| {
+                            artifact_pattern_covers_builtin(pattern, type_, variant, catalog)
+                        })
+                })
+            }),
         _ => false,
+    }
+}
+
+fn artifact_pattern_covers_builtin(
+    pattern: &HirMatchPattern,
+    type_: &Type,
+    expected: BuiltinVariant,
+    catalog: &ArtifactCatalog<'_>,
+) -> bool {
+    if let HirMatchPattern::Or(alternatives) = pattern {
+        return alternatives
+            .iter()
+            .any(|pattern| artifact_pattern_covers_builtin(pattern, type_, expected, catalog));
+    }
+    let HirMatchPattern::BuiltinVariant { variant, payload } = pattern else {
+        return false;
+    };
+    if *variant != expected {
+        return false;
+    }
+    match builtin_pattern_payload(*variant, type_) {
+        None => false,
+        Some(None) => payload.is_empty(),
+        Some(Some(type_)) => {
+            payload.len() == 1 && artifact_pattern_irrefutable(&payload[0], type_, catalog)
+        }
     }
 }
 
@@ -10872,7 +11174,9 @@ fn artifact_pattern_irrefutable(
 ) -> bool {
     match pattern {
         HirMatchPattern::Wildcard | HirMatchPattern::Binding { .. } => true,
-        HirMatchPattern::Literal(_) | HirMatchPattern::Variant { .. } => false,
+        HirMatchPattern::Literal(_)
+        | HirMatchPattern::Variant { .. }
+        | HirMatchPattern::BuiltinVariant { .. } => false,
         HirMatchPattern::Or(alternatives) => alternatives
             .iter()
             .any(|pattern| artifact_pattern_irrefutable(pattern, type_, catalog)),
@@ -11146,6 +11450,21 @@ fn builtin_variant_type(
         )),
         BuiltinVariant::OptionNone => Type::Option(Arc::new(Type::Infer)),
     })
+}
+
+fn builtin_pattern_payload(variant: BuiltinVariant, expected: &Type) -> Option<Option<&Type>> {
+    match (variant, expected) {
+        (BuiltinVariant::ResultOk, Type::Result { success, .. }) => Some(Some(success.as_ref())),
+        (
+            BuiltinVariant::ResultErr,
+            Type::Result {
+                error: Some(error), ..
+            },
+        ) => Some(Some(error.as_ref())),
+        (BuiltinVariant::OptionSome, Type::Option(value)) => Some(Some(value.as_ref())),
+        (BuiltinVariant::OptionNone, Type::Option(_)) => Some(None),
+        _ => None,
+    }
 }
 
 fn binary_type(operator: BinaryOperator, left: &Type, right: &Type) -> Option<Type> {
@@ -11946,6 +12265,14 @@ fn append_match_pattern(bytes: &mut impl ByteSink, pattern: &HirMatchPattern) {
             bytes.push(1);
             bytes.extend_from_slice(&id.owner.0.to_be_bytes());
             bytes.extend_from_slice(&id.variant.to_be_bytes());
+            bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            for pattern in payload.iter() {
+                append_match_pattern(bytes, pattern);
+            }
+        }
+        HirMatchPattern::BuiltinVariant { variant, payload } => {
+            bytes.push(7);
+            bytes.push(variant.canonical_tag());
             bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
             for pattern in payload.iter() {
                 append_match_pattern(bytes, pattern);
@@ -12826,6 +13153,7 @@ mod tests {
                                 resource_id
                             },
                             body: Arc::from([]),
+                            pool_operation: None,
                             source: owner.clone(),
                         }),
                     )

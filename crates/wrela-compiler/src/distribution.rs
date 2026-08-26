@@ -13,7 +13,7 @@ use crate::image_planning::ImagePlanningModule;
 use crate::model::BuildKind;
 use crate::semantic;
 use crate::syntax::{DeclarationKind, DeclarationSyntax, FunctionModifier, TypeSyntax};
-use crate::typed_hir::{AuthorityContext, BuildAuthority, PoolAuthority};
+use crate::typed_hir::{AuthorityContext, BuildAuthority, PoolAuthority, PoolOperation};
 use crate::{Cancellation, syntax};
 
 const DISTRIBUTION_VERSION: &str = "wrela9-layer2-architecture-v1";
@@ -159,7 +159,7 @@ impl CompilerDistribution {
             })
             .collect::<Vec<_>>();
         modules.sort_by(|left, right| left.source.path().cmp(right.source.path()));
-        let digest = distribution_digest(&modules, &build_authority, pool_authority);
+        let digest = distribution_digest(&modules, &build_authority, &pool_authority);
         Ok(Self {
             modules: modules.into(),
             build_authority,
@@ -241,7 +241,25 @@ fn authenticated_pool_authority(
         .and_then(|_| {
             identities.definition("src/core/pool.wr", DeclarationKind::Function, "scoped")
         });
-    PoolAuthority::from_authenticated_scoped_factory(scoped_factory)
+    let scope = identities.definition("src/core/pool.wr", DeclarationKind::ResourceStruct, "Scope");
+    let operations = scope.into_iter().flat_map(|scope| {
+        [
+            ("try_allocate", PoolOperation::TryAllocate),
+            ("allocate", PoolOperation::Allocate),
+            ("reserve", PoolOperation::Reserve),
+            ("consume", PoolOperation::Consume),
+            ("lookup", PoolOperation::Lookup),
+            ("reclaim", PoolOperation::Reclaim),
+            ("release", PoolOperation::Release),
+        ]
+        .into_iter()
+        .filter_map(move |(name, operation)| {
+            identities
+                .associated_function(scope, name)
+                .map(|definition| (definition, operation))
+        })
+    });
+    PoolAuthority::from_authenticated_pool(scoped_factory, operations)
 }
 
 fn authenticated_build_authority(
@@ -366,7 +384,7 @@ fn content_digest(source: &ProjectFile) -> u128 {
 fn distribution_digest(
     modules: &[SealedModule],
     authority: &BuildAuthority,
-    pool_authority: PoolAuthority,
+    pool_authority: &PoolAuthority,
 ) -> u128 {
     let mut hasher = Xxh3::new();
     hasher.update(b"wrela.compiler-distribution\0\x01");
@@ -389,9 +407,10 @@ fn distribution_digest(
         }
         hasher.update(&identity.to_be_bytes());
     }
-    for definition in pool_authority.canonical_grants() {
-        hasher.update(b"pool.scoped\0");
+    for (definition, operation) in pool_authority.canonical_grants() {
+        hasher.update(b"pool.authority\0");
         hasher.update(&definition.0.to_be_bytes());
+        hasher.update(&[operation.map_or(0, PoolOperation::canonical_tag)]);
     }
     hasher.digest128()
 }

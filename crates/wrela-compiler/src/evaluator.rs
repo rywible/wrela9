@@ -13,7 +13,7 @@ use crate::model::{
 use crate::typed_hir::{
     AccessMode, BinaryOperator, CallTarget, CleanupAction, ClosureId, Expression, ExpressionKind,
     HirClosure, HirFunction, HirMatchCase, HirMatchPattern, Literal, LocalId, Place,
-    PlaceProjection, Statement, VerifiedProgram, root_place,
+    PlaceProjection, PoolOperation, Statement, VerifiedProgram, root_place,
 };
 use crate::{
     Cancellation, CanonicalValue, EvaluationContributorObservation, EvaluationFrameObservation,
@@ -95,6 +95,26 @@ struct CachedConstant {
     fuel: u64,
     peak_memory: u64,
     dependencies: Arc<[crate::typed_hir::EvaluationRoot]>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimePoolSlot {
+    generation: u64,
+    live: Option<RuntimePoolAllocation>,
+    reserved: Option<u128>,
+    retired: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimePoolAllocation {
+    type_identity: u128,
+    value: Value,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimePoolState {
+    slots: Vec<RuntimePoolSlot>,
+    next_permit: u128,
 }
 
 enum RootWork<'hir> {
@@ -215,6 +235,9 @@ enum Control<'hir> {
     },
     ClearLocals(Vec<LocalId>),
     ReclaimCompilerOwnedLocal(LocalId),
+    FinishOpenPool {
+        site: &'hir SourceRange,
+    },
     ForNext {
         function: &'hir HirFunction,
         pattern: &'hir HirMatchPattern,
@@ -360,6 +383,7 @@ pub(crate) struct Engine<'a> {
     evaluation_provenance: Option<SourceRange>,
     root_dependencies: BTreeSet<crate::typed_hir::EvaluationRoot>,
     fuel_by_site: BTreeMap<SourceRange, u64>,
+    pools: BTreeMap<u128, RuntimePoolState>,
 }
 
 pub(crate) struct Run {
@@ -433,6 +457,7 @@ impl<'a> Engine<'a> {
             evaluation_provenance: None,
             root_dependencies: BTreeSet::new(),
             fuel_by_site: BTreeMap::new(),
+            pools: BTreeMap::new(),
         }
     }
 
@@ -468,6 +493,7 @@ impl<'a> Engine<'a> {
         self.root_dependencies.clear();
         self.evaluation_provenance = None;
         self.fuel_by_site.clear();
+        self.pools.clear();
     }
 
     fn finish(&mut self, result: Result<Value, EvalFailure>) -> Run {
@@ -1245,7 +1271,7 @@ impl<'a> Engine<'a> {
                             binding,
                             scope,
                             body,
-                            ..
+                            source,
                         } => {
                             controls.push(Control::ReclaimCompilerOwnedLocal(binding.local));
                             controls.push(Control::Block {
@@ -1257,6 +1283,7 @@ impl<'a> Engine<'a> {
                                 local: binding.local,
                                 initialize: true,
                             });
+                            controls.push(Control::FinishOpenPool { site: source });
                             controls.push(Control::Expression(scope));
                         }
                         Statement::Pass(_) => {}
@@ -1762,6 +1789,81 @@ impl<'a> Engine<'a> {
                 Control::ReclaimCompilerOwnedLocal(local) => {
                     self.reclaim_compiler_owned_local(&mut frames, local)?
                 }
+                Control::FinishOpenPool { site } => {
+                    let mut scope = self.pop_value(&mut frames)?;
+                    let Value::Struct { fields, .. } = &mut scope else {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "authenticated Pool factory returned a non-struct scope",
+                        )));
+                    };
+                    let capacity = Arc::make_mut(fields)
+                        .iter_mut()
+                        .find(|(name, _)| name.as_ref() == "capacity")
+                        .map(|(_, value)| value)
+                        .ok_or_else(|| {
+                            EvalFailure::Defect(Arc::from(
+                                "authenticated Pool scope omitted capacity",
+                            ))
+                        })?;
+                    let Value::Integer {
+                        kind: IntegerType::U64,
+                        value,
+                    } = capacity
+                    else {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "authenticated Pool capacity is not u64",
+                        )));
+                    };
+                    let declared_capacity = u64::try_from(*value).map_err(|_| {
+                        EvalFailure::Defect(Arc::from("authenticated Pool capacity is outside u64"))
+                    })?;
+                    let mut identity = Vec::new();
+                    identity.extend_from_slice(b"wrela.pool.runtime-identity\0\x01");
+                    identity.extend_from_slice(site.path().as_bytes());
+                    identity.extend_from_slice(&site.start().to_be_bytes());
+                    identity.extend_from_slice(&site.end().to_be_bytes());
+                    identity.extend_from_slice(
+                        &self
+                            .evaluation_root
+                            .expect("Pool opens during an evaluator root")
+                            .identity()
+                            .to_be_bytes(),
+                    );
+                    let identity = xxh3_128(&identity);
+                    if self
+                        .pools
+                        .insert(
+                            identity,
+                            RuntimePoolState {
+                                slots: (0..declared_capacity)
+                                    .map(|_| RuntimePoolSlot {
+                                        generation: 0,
+                                        live: None,
+                                        reserved: None,
+                                        retired: false,
+                                    })
+                                    .collect(),
+                                next_permit: 1,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(EvalFailure::Defect(Arc::from(
+                            "runtime Pool identity was opened twice",
+                        )));
+                    }
+                    *capacity = Value::Tuple(
+                        vec![
+                            Value::Integer {
+                                kind: IntegerType::U64,
+                                value: i128::from(declared_capacity),
+                            },
+                            Value::Bytes(Arc::from(identity.to_be_bytes())),
+                        ]
+                        .into(),
+                    );
+                    self.push_value(&mut frames, scope)?;
+                }
                 Control::FinishArray { count } => {
                     let values = self.pop_values(&mut frames, count)?;
                     self.push_value(&mut frames, Value::Array(values.into()))?;
@@ -2049,11 +2151,19 @@ impl<'a> Engine<'a> {
                             let function = program
                                 .specialization_function(*specialization)
                                 .ok_or(EvalFailure::Creator(RejectKind::UnresolvedCall))?;
+                            let arguments = reorder_values(arguments, argument_order)?;
+                            if let Some(operation) = function.pool_operation {
+                                let value = self.evaluate_pool_operation(
+                                    operation, function, arguments, site,
+                                )?;
+                                self.push_value(&mut frames, value)?;
+                                continue;
+                            }
                             self.push_function_frame(
                                 &mut frames,
                                 function,
                                 *specialization,
-                                reorder_values(arguments, argument_order)?,
+                                arguments,
                                 function_writebacks(
                                     function,
                                     argument_expressions,
@@ -2193,6 +2303,298 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+    }
+
+    fn evaluate_pool_operation(
+        &mut self,
+        operation: PoolOperation,
+        function: &HirFunction,
+        arguments: Vec<Value>,
+        site: &SourceRange,
+    ) -> Result<Value, EvalFailure> {
+        let scope = arguments.first().ok_or_else(|| {
+            EvalFailure::Defect(Arc::from(
+                "authenticated Pool operation omitted its receiver",
+            ))
+        })?;
+        let pool_identity = runtime_pool_identity(scope)?;
+        match operation {
+            PoolOperation::TryAllocate | PoolOperation::Allocate => {
+                let value = arguments.get(1).cloned().ok_or_else(|| {
+                    EvalFailure::Defect(Arc::from("Pool allocation omitted its submitted value"))
+                })?;
+                let value_type = pool_value_type(&function.return_type, operation)?;
+                let type_identity = xxh3_128(&value_type.canonical_key());
+                let required = operation == PoolOperation::Allocate;
+                let slot = {
+                    let pool = self.pools.get_mut(&pool_identity).ok_or_else(|| {
+                        EvalFailure::Defect(Arc::from("Pool allocation names a closed Pool"))
+                    })?;
+                    if let Some(slot) = pool.slots.iter().position(|slot| {
+                        !slot.retired && slot.live.is_none() && slot.reserved.is_none()
+                    }) {
+                        Some(slot)
+                    } else if required {
+                        pool.slots.push(RuntimePoolSlot {
+                            generation: 0,
+                            live: None,
+                            reserved: None,
+                            retired: false,
+                        });
+                        Some(pool.slots.len() - 1)
+                    } else {
+                        None
+                    }
+                };
+                let Some(slot) = slot else {
+                    let error_type = match &function.return_type {
+                        Type::Result {
+                            error: Some(error), ..
+                        } => error.as_ref(),
+                        _ => {
+                            return Err(EvalFailure::Defect(Arc::from(
+                                "try_allocate lost its fallible source interface",
+                            )));
+                        }
+                    };
+                    let full = nominal_value(error_type, vec![("value", value)])?;
+                    return Ok(Value::BuiltinVariant {
+                        variant: BuiltinVariant::ResultErr,
+                        payload: Arc::from([full]),
+                    });
+                };
+                let generation = self.pools[&pool_identity].slots[slot].generation;
+                let allocation = pool_allocation_value(
+                    &function.return_type,
+                    operation,
+                    pool_identity,
+                    slot,
+                    generation,
+                    type_identity,
+                    value.clone(),
+                )?;
+                self.pools
+                    .get_mut(&pool_identity)
+                    .expect("Pool was resolved above")
+                    .slots[slot]
+                    .live = Some(RuntimePoolAllocation {
+                    type_identity,
+                    value,
+                });
+                if required {
+                    Ok(allocation)
+                } else {
+                    Ok(Value::BuiltinVariant {
+                        variant: BuiltinVariant::ResultOk,
+                        payload: Arc::from([allocation]),
+                    })
+                }
+            }
+            PoolOperation::Reserve => {
+                let value_type = pool_value_type(&function.return_type, operation)?;
+                let type_identity = xxh3_128(&value_type.canonical_key());
+                let pool = self.pools.get_mut(&pool_identity).ok_or_else(|| {
+                    EvalFailure::Defect(Arc::from("Pool reserve names a closed Pool"))
+                })?;
+                let slot = pool
+                    .slots
+                    .iter()
+                    .position(|slot| {
+                        !slot.retired && slot.live.is_none() && slot.reserved.is_none()
+                    })
+                    .unwrap_or_else(|| {
+                        pool.slots.push(RuntimePoolSlot {
+                            generation: 0,
+                            live: None,
+                            reserved: None,
+                            retired: false,
+                        });
+                        pool.slots.len() - 1
+                    });
+                let permit = pool.next_permit;
+                pool.next_permit = pool.next_permit.checked_add(1).ok_or_else(|| {
+                    EvalFailure::Defect(Arc::from("Pool Permit identity exhausted"))
+                })?;
+                let generation = pool.slots[slot].generation;
+                pool.slots[slot].reserved = Some(permit);
+                nominal_value(
+                    &function.return_type,
+                    vec![
+                        (
+                            "pool_identity",
+                            Value::Bytes(Arc::from(pool_identity.to_be_bytes())),
+                        ),
+                        ("slot", u64_value(slot)?),
+                        ("generation", u64_value(generation)?),
+                        (
+                            "type_identity",
+                            Value::Bytes(Arc::from(type_identity.to_be_bytes())),
+                        ),
+                        (
+                            "permit_identity",
+                            Value::Bytes(Arc::from(permit.to_be_bytes())),
+                        ),
+                    ],
+                )
+            }
+            PoolOperation::Consume => {
+                let permit = arguments.get(1).ok_or_else(|| {
+                    EvalFailure::Defect(Arc::from("Pool Permit consumption omitted its Permit"))
+                })?;
+                let value = arguments.get(2).cloned().ok_or_else(|| {
+                    EvalFailure::Defect(Arc::from("Pool Permit consumption omitted its value"))
+                })?;
+                let fields = nominal_fields(permit, "Pool Permit")?;
+                let permit_pool = hidden_u128(fields, "pool_identity")?;
+                let slot = hidden_u64(fields, "slot")?;
+                let generation = hidden_u64(fields, "generation")?;
+                let type_identity = hidden_u128(fields, "type_identity")?;
+                let permit_identity = hidden_u128(fields, "permit_identity")?;
+                if permit_pool != pool_identity {
+                    return Err(EvalFailure::Defect(Arc::from(
+                        "Pool Permit belongs to another Pool",
+                    )));
+                }
+                let slot = usize::try_from(slot).map_err(|_| {
+                    EvalFailure::Defect(Arc::from("Pool Permit slot exceeds host bounds"))
+                })?;
+                let pool = self.pools.get_mut(&pool_identity).ok_or_else(|| {
+                    EvalFailure::Defect(Arc::from("Pool Permit names a closed Pool"))
+                })?;
+                let record = pool.slots.get_mut(slot).ok_or_else(|| {
+                    EvalFailure::Defect(Arc::from("Pool Permit names an absent slot"))
+                })?;
+                if record.generation != generation
+                    || record.reserved != Some(permit_identity)
+                    || record.live.is_some()
+                    || record.retired
+                {
+                    return Err(EvalFailure::Defect(Arc::from(
+                        "Pool Permit was stale, reused, or mismatched",
+                    )));
+                }
+                record.reserved = None;
+                record.live = Some(RuntimePoolAllocation {
+                    type_identity,
+                    value: value.clone(),
+                });
+                pool_allocation_value(
+                    &function.return_type,
+                    operation,
+                    pool_identity,
+                    slot,
+                    generation,
+                    type_identity,
+                    value,
+                )
+            }
+            PoolOperation::Lookup => {
+                let key = arguments
+                    .get(1)
+                    .ok_or_else(|| EvalFailure::Defect(Arc::from("Pool lookup omitted its Key")))?;
+                let fields = nominal_fields(key, "Pool Key")?;
+                let key_pool = hidden_u128(fields, "pool_identity")?;
+                let slot = hidden_u64(fields, "slot")?;
+                let generation = hidden_u64(fields, "generation")?;
+                let type_identity = hidden_u128(fields, "type_identity")?;
+                let found = usize::try_from(slot)
+                    .ok()
+                    .filter(|_| key_pool == pool_identity)
+                    .and_then(|slot| self.pools.get(&pool_identity)?.slots.get(slot))
+                    .filter(|slot| !slot.retired && slot.generation == generation)
+                    .and_then(|slot| slot.live.as_ref())
+                    .filter(|live| live.type_identity == type_identity)
+                    .map(|live| live.value.clone());
+                Ok(Value::BuiltinVariant {
+                    variant: if found.is_some() {
+                        BuiltinVariant::OptionSome
+                    } else {
+                        BuiltinVariant::OptionNone
+                    },
+                    payload: found.into_iter().collect::<Vec<_>>().into(),
+                })
+            }
+            PoolOperation::Reclaim => {
+                let allocation = arguments.get(1).ok_or_else(|| {
+                    EvalFailure::Defect(Arc::from("Pool reclaim omitted its Allocation"))
+                })?;
+                let fields = nominal_fields(allocation, "Pool Allocation")?;
+                let allocation_pool = hidden_u128(fields, "pool_identity")?;
+                let slot = hidden_u64(fields, "slot")?;
+                let generation = hidden_u64(fields, "generation")?;
+                let type_identity = hidden_u128(fields, "type_identity")?;
+                let value = fields
+                    .iter()
+                    .find(|(name, _)| name.as_ref() == "value")
+                    .map(|(_, value)| value.clone())
+                    .ok_or_else(|| {
+                        EvalFailure::Defect(Arc::from("Pool Allocation omitted its value"))
+                    })?;
+                if allocation_pool != pool_identity {
+                    return Err(EvalFailure::Defect(Arc::from(
+                        "Pool Allocation belongs to another Pool",
+                    )));
+                }
+                let slot = usize::try_from(slot).map_err(|_| {
+                    EvalFailure::Defect(Arc::from("Pool Allocation slot exceeds host bounds"))
+                })?;
+                let pool = self.pools.get_mut(&pool_identity).ok_or_else(|| {
+                    EvalFailure::Defect(Arc::from("Pool reclaim names a closed Pool"))
+                })?;
+                let record = pool.slots.get_mut(slot).ok_or_else(|| {
+                    EvalFailure::Defect(Arc::from("Pool Allocation names an absent slot"))
+                })?;
+                if record.generation != generation
+                    || record.live.as_ref().map(|live| live.type_identity) != Some(type_identity)
+                    || record.reserved.is_some()
+                    || record.retired
+                {
+                    return Err(EvalFailure::Defect(Arc::from(
+                        "Pool Allocation was stale, reused, or mismatched",
+                    )));
+                }
+                record.live = None;
+                advance_pool_generation(record);
+                Ok(value)
+            }
+            PoolOperation::Release => {
+                let permit = arguments.get(1).ok_or_else(|| {
+                    EvalFailure::Defect(Arc::from("Pool release omitted its Permit"))
+                })?;
+                let fields = nominal_fields(permit, "Pool Permit")?;
+                let permit_pool = hidden_u128(fields, "pool_identity")?;
+                let slot = hidden_u64(fields, "slot")?;
+                let generation = hidden_u64(fields, "generation")?;
+                let permit_identity = hidden_u128(fields, "permit_identity")?;
+                if permit_pool != pool_identity {
+                    return Err(EvalFailure::Defect(Arc::from(
+                        "released Pool Permit belongs to another Pool",
+                    )));
+                }
+                let record = usize::try_from(slot)
+                    .ok()
+                    .and_then(|slot| self.pools.get_mut(&pool_identity)?.slots.get_mut(slot))
+                    .ok_or_else(|| {
+                        EvalFailure::Defect(Arc::from("released Pool Permit names no slot"))
+                    })?;
+                if record.generation != generation || record.reserved != Some(permit_identity) {
+                    return Err(EvalFailure::Defect(Arc::from(
+                        "released Pool Permit was stale or already consumed",
+                    )));
+                }
+                record.reserved = None;
+                Ok(Value::Unit)
+            }
+        }
+        .map_err(|failure| match failure {
+            EvalFailure::Defect(evidence) => EvalFailure::Defect(Arc::from(format!(
+                "{} at {}:{}: {evidence}",
+                function.name,
+                site.path(),
+                site.start()
+            ))),
+            failure => failure,
+        })
     }
 
     fn push_function_frame<'hir>(
@@ -2652,6 +3054,182 @@ fn function_writebacks(
         writebacks.push((local, place.clone()));
     }
     Ok(writebacks)
+}
+
+fn pool_value_type(return_type: &Type, operation: PoolOperation) -> Result<&Type, EvalFailure> {
+    let nominal = match (operation, return_type) {
+        (PoolOperation::TryAllocate, Type::Result { success, .. }) => success.as_ref(),
+        (_, nominal) => nominal,
+    };
+    let Type::Nominal { arguments, .. } = nominal else {
+        return Err(EvalFailure::Defect(Arc::from(
+            "authenticated Pool operation lost its nominal typed result",
+        )));
+    };
+    arguments.first().ok_or_else(|| {
+        EvalFailure::Defect(Arc::from(
+            "authenticated Pool operation lost its exact value type",
+        ))
+    })
+}
+
+fn nominal_value(type_: &Type, fields: Vec<(&str, Value)>) -> Result<Value, EvalFailure> {
+    let Type::Nominal {
+        definition,
+        display,
+        ..
+    } = type_
+    else {
+        return Err(EvalFailure::Defect(Arc::from(
+            "authenticated Pool result is not nominal",
+        )));
+    };
+    Ok(Value::Struct {
+        definition: *definition,
+        type_display: Arc::clone(display),
+        fields: fields
+            .into_iter()
+            .map(|(name, value)| (Arc::from(name), value))
+            .collect::<Vec<_>>()
+            .into(),
+    })
+}
+
+fn nominal_fields<'a>(
+    value: &'a Value,
+    subject: &'static str,
+) -> Result<&'a [(Arc<str>, Value)], EvalFailure> {
+    let Value::Struct { fields, .. } = value else {
+        return Err(EvalFailure::Defect(Arc::from(format!(
+            "{subject} has no nominal runtime representation"
+        ))));
+    };
+    Ok(fields)
+}
+
+fn hidden_u128(fields: &[(Arc<str>, Value)], name: &str) -> Result<u128, EvalFailure> {
+    let bytes = fields
+        .iter()
+        .find(|(field, _)| field.as_ref() == name)
+        .and_then(|(_, value)| match value {
+            Value::Bytes(bytes) => Some(bytes.as_ref()),
+            _ => None,
+        })
+        .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+        .ok_or_else(|| {
+            EvalFailure::Defect(Arc::from(format!(
+                "authenticated Pool value omitted {name}"
+            )))
+        })?;
+    Ok(u128::from_be_bytes(bytes))
+}
+
+fn hidden_u64(fields: &[(Arc<str>, Value)], name: &str) -> Result<u64, EvalFailure> {
+    fields
+        .iter()
+        .find(|(field, _)| field.as_ref() == name)
+        .and_then(|(_, value)| match value {
+            Value::Integer {
+                kind: IntegerType::U64,
+                value,
+            } => u64::try_from(*value).ok(),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            EvalFailure::Defect(Arc::from(format!(
+                "authenticated Pool value omitted {name}"
+            )))
+        })
+}
+
+fn runtime_pool_identity(scope: &Value) -> Result<u128, EvalFailure> {
+    let fields = nominal_fields(scope, "Pool scope")?;
+    let Value::Tuple(parts) = fields
+        .iter()
+        .find(|(name, _)| name.as_ref() == "capacity")
+        .map(|(_, value)| value)
+        .ok_or_else(|| EvalFailure::Defect(Arc::from("Pool scope omitted capacity")))?
+    else {
+        return Err(EvalFailure::Defect(Arc::from(
+            "Pool scope was not authenticated by with",
+        )));
+    };
+    let bytes = parts
+        .get(1)
+        .and_then(|value| match value {
+            Value::Bytes(bytes) => Some(bytes.as_ref()),
+            _ => None,
+        })
+        .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+        .ok_or_else(|| EvalFailure::Defect(Arc::from("Pool scope omitted its identity")))?;
+    Ok(u128::from_be_bytes(bytes))
+}
+
+fn u64_value(value: impl TryInto<u64>) -> Result<Value, EvalFailure> {
+    let value = value
+        .try_into()
+        .map_err(|_| EvalFailure::Defect(Arc::from("Pool slot exceeds u64")))?;
+    Ok(Value::Integer {
+        kind: IntegerType::U64,
+        value: i128::from(value),
+    })
+}
+
+fn pool_allocation_value(
+    return_type: &Type,
+    operation: PoolOperation,
+    pool_identity: u128,
+    slot: usize,
+    generation: u64,
+    type_identity: u128,
+    value: Value,
+) -> Result<Value, EvalFailure> {
+    let allocation_type = match (operation, return_type) {
+        (PoolOperation::TryAllocate, Type::Result { success, .. }) => success.as_ref(),
+        (_, allocation) => allocation,
+    };
+    let key = Value::Struct {
+        definition: DefinitionId(0),
+        type_display: Arc::from("Key"),
+        fields: vec![
+            (
+                Arc::from("pool_identity"),
+                Value::Bytes(Arc::from(pool_identity.to_be_bytes())),
+            ),
+            (Arc::from("slot"), u64_value(slot)?),
+            (Arc::from("generation"), u64_value(generation)?),
+            (
+                Arc::from("type_identity"),
+                Value::Bytes(Arc::from(type_identity.to_be_bytes())),
+            ),
+        ]
+        .into(),
+    };
+    nominal_value(
+        allocation_type,
+        vec![
+            ("value", value),
+            ("key", key),
+            (
+                "pool_identity",
+                Value::Bytes(Arc::from(pool_identity.to_be_bytes())),
+            ),
+            ("slot", u64_value(slot)?),
+            ("generation", u64_value(generation)?),
+            (
+                "type_identity",
+                Value::Bytes(Arc::from(type_identity.to_be_bytes())),
+            ),
+        ],
+    )
+}
+
+fn advance_pool_generation(slot: &mut RuntimePoolSlot) {
+    if let Some(next) = slot.generation.checked_add(1) {
+        slot.generation = next;
+    } else {
+        slot.retired = true;
+    }
 }
 
 fn value_size(value: &Value) -> u64 {
@@ -3234,6 +3812,25 @@ fn pattern_bindings(
                 return None;
             };
             if id != expected || payload.len() != expected_payload.len() {
+                return None;
+            }
+            let mut bindings = Vec::new();
+            for (value, pattern) in Arc::make_mut(payload)
+                .iter_mut()
+                .zip(expected_payload.iter())
+            {
+                bindings.extend(pattern_bindings(value, pattern, transfer)?);
+            }
+            Some(bindings)
+        }
+        HirMatchPattern::BuiltinVariant {
+            variant: expected,
+            payload: expected_payload,
+        } => {
+            let Value::BuiltinVariant { variant, payload } = value else {
+                return None;
+            };
+            if variant != expected || payload.len() != expected_payload.len() {
                 return None;
             }
             let mut bindings = Vec::new();
@@ -4109,5 +4706,20 @@ mod tests {
 
         assert_eq!(take_deferred_actions(&mut controls, 0).len(), 1);
         assert!(take_deferred_actions(&mut controls, 0).is_empty());
+    }
+
+    #[test]
+    fn exhausted_pool_generation_retires_without_wrapping() {
+        let mut slot = RuntimePoolSlot {
+            generation: u64::MAX,
+            live: None,
+            reserved: None,
+            retired: false,
+        };
+
+        advance_pool_generation(&mut slot);
+
+        assert_eq!(slot.generation, u64::MAX);
+        assert!(slot.retired);
     }
 }

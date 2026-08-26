@@ -68,7 +68,7 @@ fn current_aarch64_selection_authenticates_the_planning_contract() {
     assert_eq!(contract.contract_version(), 1);
     assert_eq!(
         contract.distribution_input_receipt(),
-        144_696_432_844_050_407_796_973_414_362_719_389_025
+        78_456_102_208_423_071_297_633_887_758_619_026_825
     );
     assert_eq!(
         contract.identity(),

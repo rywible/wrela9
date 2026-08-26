@@ -13,7 +13,7 @@ use crate::image_planning::{CorePlanningInput, ExecutableRef, GeneratedRole};
 use crate::model::{IntegerType, SpecializationId, Type, TypeId};
 use crate::typed_hir::{
     BinaryOperator, CallTarget, Expression, ExpressionKind, HirMatchPattern, Literal, Place,
-    PlaceProjection, Statement,
+    PlaceProjection, PoolOperation, Statement,
 };
 use crate::{Cancellation, CanonicalValue, EvaluationOutcome, EvaluationPanicKind, SourceRange};
 
@@ -1569,7 +1569,12 @@ impl CoreModule {
             let source = semantic.executable_input(reference).ok_or_else(|| {
                 CoreFailure::Defect(Arc::from("Core demand names a missing typed source body"))
             })?;
-            executables.push(produce_source_executable(source, semantic, cancellation)?);
+            executables.push(produce_source_executable(
+                source,
+                semantic,
+                input,
+                cancellation,
+            )?);
         }
         for addition in input.generated_executable_additions() {
             checkpoint(cancellation)?;
@@ -1617,6 +1622,7 @@ fn planning_input_fingerprint(input: CorePlanningInput<'_>) -> u128 {
 fn produce_source_executable(
     input: CoreSourceExecutableInput<'_>,
     semantic: crate::completed_semantic::CorePlanningSemanticProgram<'_>,
+    planning: CorePlanningInput<'_>,
     cancellation: &Cancellation,
 ) -> Result<CoreExecutable, CoreFailure> {
     let reference = ExecutableReference {
@@ -1720,6 +1726,7 @@ fn produce_source_executable(
         semantic.verified_program(),
         cancellation,
     )?;
+    attach_pool_proof_conditions(&mut regions, semantic, planning, cancellation)?;
     let mut executable = CoreExecutable {
         reference,
         semantic_owner: owner,
@@ -2095,6 +2102,110 @@ fn producer_attach_custody(
         region.operations = operations.into();
     }
     *regions = next.into();
+    Ok(())
+}
+
+fn pool_operation_for_core_call(
+    operation: &Operation,
+    semantic: crate::completed_semantic::CorePlanningSemanticProgram<'_>,
+) -> Option<PoolOperation> {
+    if operation.kind != CoreOperationKind::Call || operation.details.first().copied() != Some(3) {
+        return None;
+    }
+    let specialization = operation.details.get(2).copied()?;
+    semantic
+        .verified_program()
+        .specialization_function(SpecializationId(specialization))?
+        .pool_operation
+}
+
+fn pool_proof_condition(
+    operation: &Operation,
+    semantic: crate::completed_semantic::CorePlanningSemanticProgram<'_>,
+    planning: CorePlanningInput<'_>,
+) -> Option<ProofCondition> {
+    let pool_operation = pool_operation_for_core_call(operation, semantic)?;
+    if !matches!(
+        pool_operation,
+        PoolOperation::Allocate | PoolOperation::Reserve
+    ) {
+        return None;
+    }
+    let (requirement, source_type_identity) =
+        planning.pool_admission_site(pool_operation, &operation.provenance)?;
+    Some(ProofCondition {
+        requirement_identity: requirement.identity(),
+        requirement_current_meaning: requirement.current_meaning(),
+        source_type_identity,
+        retains_fallible_source_type: true,
+    })
+}
+
+fn attach_pool_proof_conditions(
+    regions: &mut Arc<[Region]>,
+    semantic: crate::completed_semantic::CorePlanningSemanticProgram<'_>,
+    planning: CorePlanningInput<'_>,
+    cancellation: &Cancellation,
+) -> Result<(), CoreFailure> {
+    let mut next = regions.to_vec();
+    for region in &mut next {
+        let mut operations = region.operations.to_vec();
+        for operation in &mut operations {
+            checkpoint(cancellation)?;
+            if let Some(proof) = pool_proof_condition(operation, semantic, planning) {
+                let mut effect = custody_effect(
+                    CoreCustodyOperation::ProofCondition,
+                    (
+                        CoreInitializationEffect::None,
+                        CoreCustodianEffect::None,
+                        CoreLoanEffect::None,
+                        CoreObligationEffect::None,
+                    ),
+                    Arc::from([]),
+                    None,
+                    None,
+                    None,
+                );
+                effect.proof = Some(proof);
+                let mut effects = operation.custody.to_vec();
+                effects.push(effect);
+                operation.custody = effects.into();
+            }
+        }
+        region.operations = operations.into();
+    }
+    *regions = next.into();
+    Ok(())
+}
+
+fn verify_pool_proof_conditions(
+    executable: &CoreExecutable,
+    semantic: crate::completed_semantic::CorePlanningSemanticProgram<'_>,
+    planning: CorePlanningInput<'_>,
+    cancellation: &Cancellation,
+) -> Result<(), CoreFailure> {
+    for operation in executable
+        .regions
+        .iter()
+        .flat_map(|region| region.operations.iter())
+    {
+        checkpoint(cancellation)?;
+        let expected = pool_proof_condition(operation, semantic, planning);
+        let supplied = operation
+            .custody
+            .iter()
+            .filter_map(|effect| effect.proof.as_ref())
+            .collect::<Vec<_>>();
+        match expected {
+            Some(expected) if supplied.as_slice() == [&expected] => {}
+            None if supplied.is_empty() => {}
+            _ => {
+                return defect(
+                    "Core Pool proof is missing, extra, stale, wrong-site, or changes the source type",
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3608,6 +3719,16 @@ fn append_pattern(pattern: &HirMatchPattern, output: &mut Vec<u128>) {
                 .iter()
                 .for_each(|pattern| append_pattern(pattern, output));
         }
+        HirMatchPattern::BuiltinVariant { variant, payload } => {
+            output.extend([
+                9,
+                u128::from(variant.canonical_tag()),
+                payload.len() as u128,
+            ]);
+            payload
+                .iter()
+                .for_each(|pattern| append_pattern(pattern, output));
+        }
         HirMatchPattern::Struct { definition, fields } => {
             output.extend([4, definition.0, fields.len() as u128]);
             fields
@@ -3886,7 +4007,7 @@ fn verify(
             .ok_or_else(|| {
                 CoreFailure::Defect(Arc::from("Core verifier found a missing realization"))
             })?;
-        VerifierLowerer::verify_source(source, semantic, supplied, cancellation)?;
+        VerifierLowerer::verify_source(source, semantic, input, supplied, cancellation)?;
         expected_references.push((source_kind(reference.kind()), reference.identity()));
     }
     for addition in input.generated_executable_additions() {
@@ -3911,7 +4032,7 @@ fn verify(
         );
     }
     validate_graphs(candidate, cancellation)?;
-    validate_custody(candidate, semantic.verified_program(), cancellation)?;
+    validate_custody(candidate, semantic, input, cancellation)?;
     let mut references = BTreeSet::new();
     for executable in candidate.executables.iter() {
         checkpoint(cancellation)?;
@@ -4989,6 +5110,14 @@ fn verifier_pattern_details(pattern: &HirMatchPattern) -> Vec<u128> {
                 output.extend([3, id.variant, payload.len() as u128]);
                 payload.iter().for_each(|pattern| encode(pattern, output));
             }
+            HirMatchPattern::BuiltinVariant { variant, payload } => {
+                output.extend([
+                    9,
+                    u128::from(variant.canonical_tag()),
+                    payload.len() as u128,
+                ]);
+                payload.iter().for_each(|pattern| encode(pattern, output));
+            }
             HirMatchPattern::Struct { definition, fields } => {
                 output.extend([4, definition.0, fields.len() as u128]);
                 fields.iter().for_each(|pattern| encode(pattern, output));
@@ -5131,6 +5260,7 @@ impl VerifierLowerer<'_> {
     fn verify_source(
         input: CoreSourceExecutableInput<'_>,
         semantic: crate::completed_semantic::CorePlanningSemanticProgram<'_>,
+        planning: CorePlanningInput<'_>,
         supplied: &CoreExecutable,
         cancellation: &Cancellation,
     ) -> Result<(), CoreFailure> {
@@ -5250,6 +5380,7 @@ impl VerifierLowerer<'_> {
         if supplied.rewrites != reconstruction.rewrites {
             return defect("Core canonical rewrite witness is false, missing, or misassociated");
         }
+        verify_pool_proof_conditions(supplied, semantic, planning, cancellation)?;
         let expected_facts = if let Some(facts) = facts {
             ExecutableFacts {
                 pure: facts.pure,
@@ -5588,9 +5719,11 @@ fn validate_graphs(
 
 fn validate_custody(
     candidate: &VerifiedCoreProgram,
-    program: &crate::typed_hir::VerifiedProgram,
+    semantic: crate::completed_semantic::CorePlanningSemanticProgram<'_>,
+    planning: CorePlanningInput<'_>,
     cancellation: &Cancellation,
 ) -> Result<(), CoreFailure> {
+    let program = semantic.verified_program();
     for executable in candidate.executables.iter() {
         let value_types = executable
             .regions
@@ -5610,7 +5743,8 @@ fn validate_custody(
             value_access: &value_access,
             program,
         };
-        let expected_trace = verifier_expected_custody_trace(executable, program, cancellation)?;
+        let expected_trace =
+            verifier_expected_custody_trace(executable, semantic, planning, cancellation)?;
         let mut expected_trace = expected_trace.iter();
         for region in executable.regions.iter() {
             let mut active_loans = Vec::<(CoreLoanEffect, Arc<[u128]>)>::new();
@@ -5658,6 +5792,10 @@ fn validate_custody(
                     &[],
                     expected_store_operation,
                     &expected_discharges,
+                    exact_expected
+                        .iter()
+                        .filter(|effect| effect.operation == CoreCustodyOperation::ProofCondition)
+                        .count(),
                 )?;
                 let mut cleanup_runs = Vec::new();
                 let mut commits = BTreeSet::new();
@@ -5774,17 +5912,8 @@ fn validate_operation_custody(
     expected_cleanup_runs: &[u32],
     expected_store_operation: Option<(usize, usize)>,
     expected_discharges: &[(Arc<[u128]>, u128)],
+    expected_proofs: usize,
 ) -> Result<(), CoreFailure> {
-    let exact_expected = verifier_operation_custody(
-        operation,
-        entry_region,
-        context,
-        expected_cleanup_runs,
-        expected_discharges,
-    );
-    if operation.custody.as_ref() != exact_expected.as_slice() {
-        return defect("Core custody transition fields do not match their exact source authority");
-    }
     let CustodyVerifierContext {
         signature,
         value_types,
@@ -5871,6 +6000,7 @@ fn validate_operation_custody(
     );
     let _ = (entry_region, signature);
     expect(CoreCustodyOperation::Discharge, expected_discharges.len());
+    expect(CoreCustodyOperation::ProofCondition, expected_proofs);
     let mut actual = BTreeMap::<CoreCustodyOperation, usize>::new();
     for effect in operation.custody.iter() {
         *actual.entry(effect.operation).or_insert(0) += 1;
@@ -7383,7 +7513,9 @@ fn core_custody_contract(
                 checkpoint(cancellation)?;
                 if matches!(
                     effect.operation,
-                    CoreCustodyOperation::Discharge | CoreCustodyOperation::CleanupRun
+                    CoreCustodyOperation::Discharge
+                        | CoreCustodyOperation::CleanupRun
+                        | CoreCustodyOperation::ProofCondition
                 ) {
                     cleanup_runs = cleanup_runs.saturating_add(usize::from(
                         effect.operation == CoreCustodyOperation::CleanupRun,
@@ -7471,9 +7603,11 @@ fn encode_source_custody_contract(
 
 fn verifier_expected_custody_trace(
     executable: &CoreExecutable,
-    program: &crate::typed_hir::VerifiedProgram,
+    semantic: crate::completed_semantic::CorePlanningSemanticProgram<'_>,
+    planning: CorePlanningInput<'_>,
     cancellation: &Cancellation,
 ) -> Result<Vec<Arc<[CustodyEffect]>>, CoreFailure> {
+    let program = semantic.verified_program();
     let components = verifier_resource_components(executable, program, cancellation)?;
     let value_types = executable
         .regions
@@ -7529,10 +7663,28 @@ fn verifier_expected_custody_trace(
         .iter()
         .flat_map(|region| region.operations.iter())
         .map(|operation| {
-            flow.expected
+            let mut effects = flow
+                .expected
                 .remove(&operation.identity)
-                .unwrap_or_default()
-                .into()
+                .unwrap_or_default();
+            if let Some(proof) = pool_proof_condition(operation, semantic, planning) {
+                let mut effect = verifier_effect(
+                    CoreCustodyOperation::ProofCondition,
+                    (
+                        CoreInitializationEffect::None,
+                        CoreCustodianEffect::None,
+                        CoreLoanEffect::None,
+                        CoreObligationEffect::None,
+                    ),
+                    Arc::from([]),
+                    None,
+                    None,
+                    None,
+                );
+                effect.proof = Some(proof);
+                effects.push(effect);
+            }
+            effects.into()
         })
         .collect())
 }
@@ -8891,6 +9043,47 @@ fn build() -> Image:
         )
     }
 
+    fn pool_fixture() -> (
+        VerifiedCoreProgram,
+        Arc<crate::image_planning::VerifiedPlanningFoundation>,
+    ) {
+        let request = CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new(
+                "src/image.wr",
+                br#"from core import pool as pools
+
+@image
+fn build() -> Image:
+    mut value = 0
+    with pools.scoped(capacity=1) as scratch:
+        allocation = scratch.allocate(value=1)
+        value = scratch.reclaim(allocation=take allocation)
+    return Image.new(value=value)
+"#,
+            )]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all());
+        let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+        let outcome = compiler.compile(request, &Cancellation::new());
+        let CompilationOutcome::Accepted(accepted) = outcome else {
+            panic!("Pool Core fixture accepts: {outcome:#?}");
+        };
+        (
+            accepted
+                .verified_core_program()
+                .expect("Core derived")
+                .clone(),
+            Arc::new(
+                accepted
+                    .verified_planning_foundation()
+                    .expect("planning derived")
+                    .clone(),
+            ),
+        )
+    }
+
     fn custody_fixture() -> (
         VerifiedCoreProgram,
         Arc<crate::image_planning::VerifiedPlanningFoundation>,
@@ -9222,6 +9415,21 @@ fn build() -> Image:
         executables[0].reference.context ^= 1;
         mixed.executables = executables.into();
         assert!(rejected(&mixed, &planning));
+    }
+
+    #[test]
+    fn verifier_rejects_resigned_single_fault_pool_proof_corruption() {
+        let (core, planning) = pool_fixture();
+        let mut stale =
+            corrupt_custody_effect(&core, CoreCustodyOperation::ProofCondition, |effect| {
+                effect
+                    .proof
+                    .as_mut()
+                    .expect("Pool proof")
+                    .requirement_current_meaning ^= 1;
+            });
+        resign(&mut stale, &planning);
+        assert!(rejected(&stale, &planning));
     }
 
     #[test]
@@ -9796,10 +10004,8 @@ fn build() -> Image:
         assert_eq!(
             validate_custody(
                 &core,
-                planning
-                    .for_core()
-                    .completed_semantic_program()
-                    .verified_program(),
+                planning.for_core().completed_semantic_program(),
+                planning.for_core(),
                 &cancellation,
             ),
             Err(CoreFailure::Cancelled)

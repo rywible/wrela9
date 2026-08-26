@@ -11,9 +11,14 @@ use crate::architecture_planning::{
     VmAbiCapability,
 };
 use crate::completed_semantic::{
-    CompletedSemanticProgram, CorePlanningSemanticProgram, CoreSourceExecutableRef,
+    CompletedSemanticProgram, CorePlanningSemanticProgram, CoreSourceExecutableBody,
+    CoreSourceExecutableRef,
 };
-use crate::{Cancellation, Root};
+use crate::typed_hir::{
+    CallTarget, Expression, ExpressionKind, HirMatchCase, Literal, LocalId, PoolOperation,
+    Statement, VerifiedProgram,
+};
+use crate::{Cancellation, Root, SourceRange};
 
 pub(crate) const PHASE_SCHEMA: &str = "wrela.image-planning-foundation.v1";
 const SCHEMA_VERSION: u16 = 1;
@@ -60,6 +65,7 @@ pub enum RequirementCategory {
     Service,
     Binding,
     LogicalLayout,
+    CapacityPressure,
 }
 
 impl RequirementCategory {
@@ -72,6 +78,7 @@ impl RequirementCategory {
             Self::Service => 5,
             Self::Binding => 6,
             Self::LogicalLayout => 7,
+            Self::CapacityPressure => 8,
         }
     }
 }
@@ -194,11 +201,19 @@ pub enum RequirementBounds {
         kind: PlanningReservation,
         multiplicity: PlanningMultiplicity,
     },
+    PoolCapacity {
+        declared: u64,
+        usable: u64,
+        peak_live: u64,
+        peak_reserved: u64,
+        peak_committed: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RequirementSubject {
     GeneratedRole(u128),
+    Pool(u128),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -400,6 +415,144 @@ impl RequirementObservation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolObservation {
+    identity: u128,
+    current_meaning: u128,
+    source: SourceRange,
+    declared_capacity: u64,
+    usable_slots: u64,
+    peak_live_allocations: u64,
+    peak_outstanding_permits: u64,
+    peak_commitment: u64,
+}
+
+impl PoolObservation {
+    #[must_use]
+    pub const fn identity(&self) -> u128 {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn current_meaning(&self) -> u128 {
+        self.current_meaning
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &SourceRange {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn declared_capacity(&self) -> u64 {
+        self.declared_capacity
+    }
+
+    #[must_use]
+    pub const fn usable_slots(&self) -> u64 {
+        self.usable_slots
+    }
+
+    #[must_use]
+    pub const fn peak_live_allocations(&self) -> u64 {
+        self.peak_live_allocations
+    }
+
+    #[must_use]
+    pub const fn peak_outstanding_permits(&self) -> u64 {
+        self.peak_outstanding_permits
+    }
+
+    #[must_use]
+    pub const fn peak_commitment(&self) -> u64 {
+        self.peak_commitment
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolAdmissionEvidenceObservation {
+    operation: PoolOperation,
+    source: SourceRange,
+    requirement_identity: u128,
+    requirement_current_meaning: u128,
+}
+
+impl PoolAdmissionEvidenceObservation {
+    #[must_use]
+    pub const fn operation(&self) -> PoolOperation {
+        self.operation
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &SourceRange {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn requirement_identity(&self) -> u128 {
+        self.requirement_identity
+    }
+
+    #[must_use]
+    pub const fn requirement_current_meaning(&self) -> u128 {
+        self.requirement_current_meaning
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolModelObservation {
+    cases: usize,
+    agrees: bool,
+    accepted: bool,
+    full: bool,
+    released: bool,
+    reserved: bool,
+    stale: bool,
+    retired: bool,
+}
+
+impl PoolModelObservation {
+    #[must_use]
+    pub const fn cases(&self) -> usize {
+        self.cases
+    }
+
+    #[must_use]
+    pub const fn agrees(&self) -> bool {
+        self.agrees
+    }
+
+    #[must_use]
+    pub const fn covers_accepted(&self) -> bool {
+        self.accepted
+    }
+
+    #[must_use]
+    pub const fn covers_full(&self) -> bool {
+        self.full
+    }
+
+    #[must_use]
+    pub const fn covers_released(&self) -> bool {
+        self.released
+    }
+
+    #[must_use]
+    pub const fn covers_reserved(&self) -> bool {
+        self.reserved
+    }
+
+    #[must_use]
+    pub const fn covers_stale(&self) -> bool {
+        self.stale
+    }
+
+    #[must_use]
+    pub const fn covers_retired(&self) -> bool {
+        self.retired
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutableDemandObservation {
     source_fingerprint: u128,
     fingerprint: u128,
@@ -449,6 +602,9 @@ pub struct PlanningFoundationObservation {
     domain_plans: Arc<[DomainPlanObservation]>,
     generated_roles: Arc<[GeneratedRoleObservation]>,
     requirements: Arc<[RequirementObservation]>,
+    pools: Arc<[PoolObservation]>,
+    pool_admission_evidence: Arc<[PoolAdmissionEvidenceObservation]>,
+    pool_model: PoolModelObservation,
     executable_demand: ExecutableDemandObservation,
 }
 
@@ -496,6 +652,21 @@ impl PlanningFoundationObservation {
     #[must_use]
     pub fn requirements(&self) -> &[RequirementObservation] {
         &self.requirements
+    }
+
+    #[must_use]
+    pub fn pools(&self) -> &[PoolObservation] {
+        &self.pools
+    }
+
+    #[must_use]
+    pub fn pool_admission_evidence(&self) -> &[PoolAdmissionEvidenceObservation] {
+        &self.pool_admission_evidence
+    }
+
+    #[must_use]
+    pub const fn pool_model(&self) -> &PoolModelObservation {
+        &self.pool_model
     }
 
     #[must_use]
@@ -571,10 +742,53 @@ pub(crate) struct Requirement {
     context: u128,
     reference: RequirementRef,
     owner: PlannerRef,
-    subject: RoleRef,
+    subject: RequirementOwner,
     provenance: RequirementProvenance,
     category: RequirementCategory,
     bounds: RequirementBounds,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequirementOwner {
+    GeneratedRole(RoleRef),
+    Pool(PoolRef),
+}
+
+impl RequirementOwner {
+    const fn context(self) -> u128 {
+        match self {
+            Self::GeneratedRole(reference) => reference.context,
+            Self::Pool(reference) => reference.context,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PoolRef {
+    context: u128,
+    identity: u128,
+    current_meaning: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PoolAdmissionSite {
+    operation: PoolOperation,
+    source: SourceRange,
+    source_type_identity: u128,
+    requirement: RequirementRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PoolPlan {
+    reference: PoolRef,
+    executable: CoreSourceExecutableRef,
+    source: SourceRange,
+    declared_capacity: u64,
+    usable_slots: u64,
+    peak_live: u64,
+    peak_reserved: u64,
+    peak_committed: u64,
+    admission_sites: Arc<[PoolAdmissionSite]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -674,7 +888,7 @@ impl Requirement {
         self.reference
     }
 
-    pub(crate) const fn subject(&self) -> RoleRef {
+    const fn subject(&self) -> RequirementOwner {
         self.subject
     }
 
@@ -704,6 +918,8 @@ pub(crate) struct VerifiedPlanningFoundation {
     domain_plans: Arc<[DomainPlan]>,
     generated_roles: Arc<[GeneratedRole]>,
     requirements: Arc<[Requirement]>,
+    pools: Arc<[PoolPlan]>,
+    pool_model: PoolModelObservation,
     executable_demand: ExactExecutableDemand,
     fingerprint: u128,
     _verified: Verified,
@@ -794,7 +1010,14 @@ impl VerifiedPlanningFoundation {
                 .map(|requirement| RequirementObservation {
                     reference: requirement.reference.identity,
                     owner: requirement.owner.identity,
-                    subject: RequirementSubject::GeneratedRole(requirement.subject.identity),
+                    subject: match requirement.subject {
+                        RequirementOwner::GeneratedRole(reference) => {
+                            RequirementSubject::GeneratedRole(reference.identity)
+                        }
+                        RequirementOwner::Pool(reference) => {
+                            RequirementSubject::Pool(reference.identity)
+                        }
+                    },
                     provenance: requirement.provenance,
                     category: requirement.category,
                     bounds: requirement.bounds.clone(),
@@ -802,6 +1025,34 @@ impl VerifiedPlanningFoundation {
                 })
                 .collect::<Vec<_>>()
                 .into(),
+            pools: self
+                .pools
+                .iter()
+                .map(|pool| PoolObservation {
+                    identity: pool.reference.identity,
+                    current_meaning: pool.reference.current_meaning,
+                    source: pool.source.clone(),
+                    declared_capacity: pool.declared_capacity,
+                    usable_slots: pool.usable_slots,
+                    peak_live_allocations: pool.peak_live,
+                    peak_outstanding_permits: pool.peak_reserved,
+                    peak_commitment: pool.peak_committed,
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            pool_admission_evidence: self
+                .pools
+                .iter()
+                .flat_map(|pool| pool.admission_sites.iter())
+                .map(|site| PoolAdmissionEvidenceObservation {
+                    operation: site.operation,
+                    source: site.source.clone(),
+                    requirement_identity: site.requirement.identity,
+                    requirement_current_meaning: site.requirement.current_meaning,
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            pool_model: self.pool_model.clone(),
             executable_demand: ExecutableDemandObservation {
                 source_fingerprint: self.executable_demand.source.identity,
                 fingerprint: self.executable_demand.fingerprint,
@@ -867,6 +1118,19 @@ impl<'a> CorePlanningInput<'a> {
         &self.foundation.requirements
     }
 
+    pub(crate) fn pool_admission_site(
+        self,
+        operation: PoolOperation,
+        source: &SourceRange,
+    ) -> Option<(RequirementRef, u128)> {
+        self.foundation
+            .pools
+            .iter()
+            .flat_map(|pool| pool.admission_sites.iter())
+            .find(|site| site.operation == operation && site.source == *source)
+            .map(|site| (site.requirement, site.source_type_identity))
+    }
+
     pub(crate) fn generated_executable_additions(&self) -> &[ExecutableRef] {
         &self.foundation.executable_demand.additions
     }
@@ -878,6 +1142,11 @@ pub(crate) struct ImagePlanningModule;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PlanningFailure {
     Cancelled,
+    Admission {
+        source: SourceRange,
+        declared: u64,
+        required: u64,
+    },
     Defect(Arc<str>),
 }
 
@@ -917,7 +1186,7 @@ impl ImagePlanningModule {
             architecture.fingerprint(),
             cancellation,
         )?;
-        let requirements = produce_requirements(
+        let mut requirements = produce_requirements(
             context,
             &generated_roles,
             planner.reference,
@@ -927,6 +1196,36 @@ impl ImagePlanningModule {
             architecture.service().maximum_cycle_units,
             cancellation,
         )?;
+        let (pools, mut pool_requirements) = produce_pool_plans(
+            context,
+            semantic_program.for_core_planning(),
+            planner.reference,
+            plan.reference,
+            cancellation,
+        )?;
+        requirements.append(&mut pool_requirements);
+        requirements.sort_by_key(|requirement| requirement.reference.identity);
+        if let Some(pool) = pools
+            .iter()
+            .find(|pool| pool.peak_committed > pool.usable_slots)
+        {
+            return Err(PlanningFailure::Admission {
+                source: pool.source.clone(),
+                declared: pool.declared_capacity,
+                required: pool.peak_committed,
+            });
+        }
+        let pool_model = run_pool_model();
+        if !pool_model.agrees
+            || !pool_model.accepted
+            || !pool_model.full
+            || !pool_model.released
+            || !pool_model.reserved
+            || !pool_model.stale
+            || !pool_model.retired
+        {
+            return defect("bounded Pool model does not cover the accepted state machine");
+        }
         let source = DemandInputRef {
             context,
             identity: semantic.executable_demand_fingerprint(),
@@ -971,6 +1270,8 @@ impl ImagePlanningModule {
             &domain_plans,
             &generated_roles,
             &requirements,
+            &pools,
+            &pool_model,
             &executable_demand,
         );
         let candidate = VerifiedPlanningFoundation {
@@ -981,6 +1282,8 @@ impl ImagePlanningModule {
             domain_plans,
             generated_roles: generated_roles.into(),
             requirements: requirements.into(),
+            pools: pools.into(),
+            pool_model,
             executable_demand,
             fingerprint,
             _verified: Verified,
@@ -1326,10 +1629,714 @@ fn produce_requirement(
             current_meaning,
         },
         owner,
-        subject,
+        subject: RequirementOwner::GeneratedRole(subject),
         provenance,
         category: spec.category,
         bounds: spec.bounds,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PoolFlowState {
+    live: u64,
+    reserved: u64,
+}
+
+#[derive(Default)]
+struct PoolFlowSummary {
+    peak_live: u64,
+    peak_reserved: u64,
+    peak_committed: u64,
+    admission_sites: Vec<(PoolOperation, SourceRange, u128)>,
+}
+
+fn produce_pool_plans(
+    context: u128,
+    semantic: CorePlanningSemanticProgram<'_>,
+    planner: PlannerRef,
+    plan: DomainPlanRef,
+    cancellation: &Cancellation,
+) -> Result<(Vec<PoolPlan>, Vec<Requirement>), PlanningFailure> {
+    let mut pools = Vec::new();
+    let mut requirements = Vec::new();
+    for reference in semantic.exact_source_executables() {
+        checkpoint(cancellation)?;
+        let input = semantic.executable_input(reference).ok_or_else(|| {
+            PlanningFailure::Defect(Arc::from(
+                "Pool planning demand names a missing source body",
+            ))
+        })?;
+        let statements = match input.body {
+            CoreSourceExecutableBody::Specialization(function) => Some(function.body.as_ref()),
+            CoreSourceExecutableBody::Test(test) => Some(test.body.as_ref()),
+            CoreSourceExecutableBody::Closure(_) => None,
+        };
+        if let Some(statements) = statements {
+            collect_pool_plans(
+                context,
+                reference,
+                statements,
+                semantic.verified_program(),
+                planner,
+                plan,
+                cancellation,
+                &mut pools,
+                &mut requirements,
+            )?;
+        }
+    }
+    pools.sort_by_key(|pool| pool.reference.identity);
+    requirements.sort_by_key(|requirement| requirement.reference.identity);
+    Ok((pools, requirements))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_pool_plans(
+    context: u128,
+    executable: CoreSourceExecutableRef,
+    statements: &[Statement],
+    program: &VerifiedProgram,
+    planner: PlannerRef,
+    plan: DomainPlanRef,
+    cancellation: &Cancellation,
+    pools: &mut Vec<PoolPlan>,
+    requirements: &mut Vec<Requirement>,
+) -> Result<(), PlanningFailure> {
+    for statement in statements {
+        checkpoint(cancellation)?;
+        match statement {
+            Statement::WithPool {
+                binding,
+                scope,
+                body,
+                source,
+            } => {
+                let declared = pool_declared_capacity(scope).ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from(
+                        "authenticated Pool capacity is not an exact u64 value",
+                    ))
+                })?;
+                let mut summary = PoolFlowSummary::default();
+                let states = BTreeSet::from([PoolFlowState {
+                    live: 0,
+                    reserved: 0,
+                }]);
+                let _ = pool_flow_statements(
+                    body,
+                    states,
+                    binding.local,
+                    declared,
+                    program,
+                    &mut summary,
+                    cancellation,
+                )?;
+                let identity =
+                    planning_source_identity(b"wrela.pool-plan.v1", executable.identity(), source);
+                let current_meaning = producer_hash(
+                    b"wrela.pool-plan.meaning.v1",
+                    &[
+                        identity,
+                        executable.current_meaning(),
+                        u128::from(declared),
+                        u128::from(summary.peak_live),
+                        u128::from(summary.peak_reserved),
+                        u128::from(summary.peak_committed),
+                    ],
+                );
+                let pool_ref = PoolRef {
+                    context,
+                    identity,
+                    current_meaning,
+                };
+                let mut admission_sites = Vec::new();
+                for (ordinal, (operation, source, source_type_identity)) in
+                    summary.admission_sites.into_iter().enumerate()
+                {
+                    let local_site = u16::try_from(ordinal + 1).map_err(|_| {
+                        PlanningFailure::Defect(Arc::from("Pool admission site overflow"))
+                    })?;
+                    let bounds = RequirementBounds::PoolCapacity {
+                        declared,
+                        usable: declared,
+                        peak_live: summary.peak_live,
+                        peak_reserved: summary.peak_reserved,
+                        peak_committed: summary.peak_committed,
+                    };
+                    let reference = produce_requirement_identity(
+                        planner.identity,
+                        pool_ref.identity,
+                        RequirementCategory::CapacityPressure,
+                        local_site,
+                    );
+                    let current_meaning = produce_requirement_current_meaning(
+                        reference,
+                        planner.current_meaning,
+                        pool_ref.current_meaning,
+                        plan.current_meaning,
+                        RequirementCategory::CapacityPressure,
+                        &bounds,
+                    );
+                    let requirement_ref = RequirementRef {
+                        context,
+                        identity: reference,
+                        current_meaning,
+                    };
+                    let provenance = RequirementProvenance {
+                        domain_plan: plan.identity,
+                        generated_role: 0,
+                        local_site,
+                    };
+                    requirements.push(Requirement {
+                        context,
+                        reference: requirement_ref,
+                        owner: planner,
+                        subject: RequirementOwner::Pool(pool_ref),
+                        provenance,
+                        category: RequirementCategory::CapacityPressure,
+                        bounds,
+                    });
+                    admission_sites.push(PoolAdmissionSite {
+                        operation,
+                        source,
+                        source_type_identity,
+                        requirement: requirement_ref,
+                    });
+                }
+                pools.push(PoolPlan {
+                    reference: pool_ref,
+                    executable,
+                    source: source.clone(),
+                    declared_capacity: declared,
+                    usable_slots: declared,
+                    peak_live: summary.peak_live,
+                    peak_reserved: summary.peak_reserved,
+                    peak_committed: summary.peak_committed,
+                    admission_sites: admission_sites.into(),
+                });
+                collect_pool_plans(
+                    context,
+                    executable,
+                    body,
+                    program,
+                    planner,
+                    plan,
+                    cancellation,
+                    pools,
+                    requirements,
+                )?;
+            }
+            Statement::If {
+                then_branch,
+                else_branch,
+                ..
+            }
+            | Statement::IfPattern {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_pool_plans(
+                    context,
+                    executable,
+                    then_branch,
+                    program,
+                    planner,
+                    plan,
+                    cancellation,
+                    pools,
+                    requirements,
+                )?;
+                collect_pool_plans(
+                    context,
+                    executable,
+                    else_branch,
+                    program,
+                    planner,
+                    plan,
+                    cancellation,
+                    pools,
+                    requirements,
+                )?;
+            }
+            Statement::For { body, .. } | Statement::While { body, .. } => collect_pool_plans(
+                context,
+                executable,
+                body,
+                program,
+                planner,
+                plan,
+                cancellation,
+                pools,
+                requirements,
+            )?,
+            Statement::Match { cases, .. } => {
+                for case in cases.iter() {
+                    collect_pool_plans(
+                        context,
+                        executable,
+                        &case.body,
+                        program,
+                        planner,
+                        plan,
+                        cancellation,
+                        pools,
+                        requirements,
+                    )?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn pool_declared_capacity(scope: &Expression) -> Option<u64> {
+    let ExpressionKind::Call { arguments, .. } = &scope.kind else {
+        return None;
+    };
+    arguments.iter().find_map(|argument| match argument.kind {
+        ExpressionKind::Literal(Literal::Integer { value, .. }) => u64::try_from(value).ok(),
+        _ => None,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn pool_flow_statements(
+    statements: &[Statement],
+    mut states: BTreeSet<PoolFlowState>,
+    binding: LocalId,
+    capacity: u64,
+    program: &VerifiedProgram,
+    summary: &mut PoolFlowSummary,
+    cancellation: &Cancellation,
+) -> Result<BTreeSet<PoolFlowState>, PlanningFailure> {
+    for statement in statements {
+        checkpoint(cancellation)?;
+        states = match statement {
+            Statement::Return { value, .. } => match value {
+                Some(value) => {
+                    pool_flow_expression(value, states, binding, capacity, program, summary)?
+                }
+                None => states,
+            },
+            Statement::Panic { value, .. }
+            | Statement::Assert {
+                condition: value, ..
+            }
+            | Statement::Expect {
+                condition: value, ..
+            }
+            | Statement::Initialize { value, .. }
+            | Statement::Assign { value, .. }
+            | Statement::Evaluate(value) => {
+                pool_flow_expression(value, states, binding, capacity, program, summary)?
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            }
+            | Statement::IfPattern {
+                value: condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let entered =
+                    pool_flow_expression(condition, states, binding, capacity, program, summary)?;
+                let mut joined = pool_flow_statements(
+                    then_branch,
+                    entered.clone(),
+                    binding,
+                    capacity,
+                    program,
+                    summary,
+                    cancellation,
+                )?;
+                joined.extend(pool_flow_statements(
+                    else_branch,
+                    entered,
+                    binding,
+                    capacity,
+                    program,
+                    summary,
+                    cancellation,
+                )?);
+                joined
+            }
+            Statement::Match { value, cases, .. } => {
+                let entered =
+                    pool_flow_expression(value, states, binding, capacity, program, summary)?;
+                let mut joined = BTreeSet::new();
+                for HirMatchCase { guard, body, .. } in cases.iter() {
+                    let guarded = guard.as_ref().map_or(Ok(entered.clone()), |guard| {
+                        pool_flow_expression(
+                            guard,
+                            entered.clone(),
+                            binding,
+                            capacity,
+                            program,
+                            summary,
+                        )
+                    })?;
+                    joined.extend(pool_flow_statements(
+                        body,
+                        guarded,
+                        binding,
+                        capacity,
+                        program,
+                        summary,
+                        cancellation,
+                    )?);
+                }
+                joined
+            }
+            Statement::While {
+                condition,
+                body,
+                max_iterations,
+                ..
+            } => {
+                let mut joined = states.clone();
+                let mut frontier = states;
+                for _ in 0..*max_iterations {
+                    let entered = pool_flow_expression(
+                        condition, frontier, binding, capacity, program, summary,
+                    )?;
+                    let next = pool_flow_statements(
+                        body,
+                        entered,
+                        binding,
+                        capacity,
+                        program,
+                        summary,
+                        cancellation,
+                    )?;
+                    let before = joined.len();
+                    joined.extend(next.iter().copied());
+                    if joined.len() == before {
+                        break;
+                    }
+                    frontier = next;
+                }
+                joined
+            }
+            Statement::For { iterable, body, .. } => {
+                let entered =
+                    pool_flow_expression(iterable, states, binding, capacity, program, summary)?;
+                let mut joined = entered.clone();
+                joined.extend(pool_flow_statements(
+                    body,
+                    entered,
+                    binding,
+                    capacity,
+                    program,
+                    summary,
+                    cancellation,
+                )?);
+                joined
+            }
+            Statement::WithPool { scope, body, .. } => {
+                let entered =
+                    pool_flow_expression(scope, states, binding, capacity, program, summary)?;
+                pool_flow_statements(
+                    body,
+                    entered,
+                    binding,
+                    capacity,
+                    program,
+                    summary,
+                    cancellation,
+                )?
+            }
+            Statement::Defer { action, .. } => pool_flow_expression(
+                action.expression(),
+                states,
+                binding,
+                capacity,
+                program,
+                summary,
+            )?,
+            Statement::Break(_) | Statement::Continue(_) | Statement::Pass(_) => states,
+        };
+    }
+    Ok(states)
+}
+
+fn pool_flow_expression(
+    expression: &Expression,
+    mut states: BTreeSet<PoolFlowState>,
+    binding: LocalId,
+    capacity: u64,
+    program: &VerifiedProgram,
+    summary: &mut PoolFlowSummary,
+) -> Result<BTreeSet<PoolFlowState>, PlanningFailure> {
+    let mut children = Vec::new();
+    expression.visit_children(&mut |child| children.push(child.clone()));
+    for child in children {
+        states = pool_flow_expression(&child, states, binding, capacity, program, summary)?;
+    }
+    let ExpressionKind::Call { target, arguments } = &expression.kind else {
+        return Ok(states);
+    };
+    let CallTarget::Function { specialization, .. } = target else {
+        return Ok(states);
+    };
+    let Some(operation) = program
+        .specialization_function(*specialization)
+        .and_then(|function| function.pool_operation)
+    else {
+        return Ok(states);
+    };
+    let receiver_matches = arguments.first().is_some_and(
+        |receiver| matches!(&receiver.kind, ExpressionKind::Read(place) if place.local == binding),
+    );
+    if !receiver_matches {
+        return Ok(states);
+    }
+    if matches!(operation, PoolOperation::Allocate | PoolOperation::Reserve) {
+        summary
+            .admission_sites
+            .push((operation, expression.source.clone(), expression.type_id.0));
+    }
+    let limit = capacity.saturating_add(1);
+    let mut next = BTreeSet::new();
+    for state in states {
+        let state = match operation {
+            PoolOperation::TryAllocate if state.live.saturating_add(state.reserved) < capacity => {
+                PoolFlowState {
+                    live: state.live.saturating_add(1).min(limit),
+                    ..state
+                }
+            }
+            PoolOperation::TryAllocate | PoolOperation::Lookup => state,
+            PoolOperation::Allocate => PoolFlowState {
+                live: state.live.saturating_add(1).min(limit),
+                ..state
+            },
+            PoolOperation::Reserve => PoolFlowState {
+                reserved: state.reserved.saturating_add(1).min(limit),
+                ..state
+            },
+            PoolOperation::Consume if state.reserved > 0 => PoolFlowState {
+                live: state.live.saturating_add(1).min(limit),
+                reserved: state.reserved - 1,
+            },
+            PoolOperation::Consume => state,
+            PoolOperation::Reclaim if state.live > 0 => PoolFlowState {
+                live: state.live - 1,
+                ..state
+            },
+            PoolOperation::Reclaim => state,
+            PoolOperation::Release if state.reserved > 0 => PoolFlowState {
+                reserved: state.reserved - 1,
+                ..state
+            },
+            PoolOperation::Release => state,
+        };
+        summary.peak_live = summary.peak_live.max(state.live);
+        summary.peak_reserved = summary.peak_reserved.max(state.reserved);
+        summary.peak_committed = summary
+            .peak_committed
+            .max(state.live.saturating_add(state.reserved));
+        next.insert(state);
+    }
+    Ok(next)
+}
+
+fn planning_source_identity(domain: &[u8], executable: u128, source: &SourceRange) -> u128 {
+    let mut hash = Xxh3::new();
+    hash.update(domain);
+    hash.update(&executable.to_be_bytes());
+    hash.update(&(source.path().len() as u64).to_be_bytes());
+    hash.update(source.path().as_bytes());
+    hash.update(&source.start().to_be_bytes());
+    hash.update(&source.end().to_be_bytes());
+    hash.digest128()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ModelKey {
+    generation: u64,
+    type_identity: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ModelPermit {
+    generation: u64,
+    type_identity: u8,
+    identity: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelSlot {
+    Free {
+        generation: u64,
+    },
+    Live {
+        generation: u64,
+        type_identity: u8,
+        value: u8,
+    },
+    Reserved(ModelPermit),
+    Retired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BoundedPoolModel {
+    slot: ModelSlot,
+    next_permit: u8,
+}
+
+impl BoundedPoolModel {
+    const fn new() -> Self {
+        Self {
+            slot: ModelSlot::Free { generation: 0 },
+            next_permit: 1,
+        }
+    }
+
+    fn try_allocate(&mut self, value: u8, type_identity: u8) -> Result<ModelKey, u8> {
+        let ModelSlot::Free { generation } = self.slot else {
+            return Err(value);
+        };
+        self.slot = ModelSlot::Live {
+            generation,
+            type_identity,
+            value,
+        };
+        Ok(ModelKey {
+            generation,
+            type_identity,
+        })
+    }
+
+    fn lookup(self, key: ModelKey) -> Option<u8> {
+        match self.slot {
+            ModelSlot::Live {
+                generation,
+                type_identity,
+                value,
+            } if generation == key.generation && type_identity == key.type_identity => Some(value),
+            _ => None,
+        }
+    }
+
+    fn reclaim(&mut self, key: ModelKey) -> Option<u8> {
+        let ModelSlot::Live {
+            generation,
+            type_identity,
+            value,
+        } = self.slot
+        else {
+            return None;
+        };
+        if generation != key.generation || type_identity != key.type_identity {
+            return None;
+        }
+        self.slot = generation
+            .checked_add(1)
+            .map_or(ModelSlot::Retired, |generation| ModelSlot::Free {
+                generation,
+            });
+        Some(value)
+    }
+
+    fn reserve(&mut self, type_identity: u8) -> Option<ModelPermit> {
+        let ModelSlot::Free { generation } = self.slot else {
+            return None;
+        };
+        let permit = ModelPermit {
+            generation,
+            type_identity,
+            identity: self.next_permit,
+        };
+        self.next_permit = self.next_permit.checked_add(1)?;
+        self.slot = ModelSlot::Reserved(permit);
+        Some(permit)
+    }
+
+    fn consume(&mut self, permit: ModelPermit, value: u8) -> Option<ModelKey> {
+        if self.slot != ModelSlot::Reserved(permit) {
+            return None;
+        }
+        self.slot = ModelSlot::Live {
+            generation: permit.generation,
+            type_identity: permit.type_identity,
+            value,
+        };
+        Some(ModelKey {
+            generation: permit.generation,
+            type_identity: permit.type_identity,
+        })
+    }
+
+    fn release(&mut self, permit: ModelPermit) -> bool {
+        if self.slot != ModelSlot::Reserved(permit) {
+            return false;
+        }
+        self.slot = ModelSlot::Free {
+            generation: permit.generation,
+        };
+        true
+    }
+
+    const fn commitment(self) -> u8 {
+        match self.slot {
+            ModelSlot::Live { .. } | ModelSlot::Reserved(_) => 1,
+            ModelSlot::Free { .. } | ModelSlot::Retired => 0,
+        }
+    }
+}
+
+fn run_pool_model() -> PoolModelObservation {
+    // This deliberately small reference machine shares no transition code with evaluator or
+    // source-flow planning. Verification recomputes every accepted-state witness from scratch.
+    let mut allocation_model = BoundedPoolModel::new();
+    let key = allocation_model.try_allocate(7, 11).ok();
+    let accepted = key.is_some()
+        && allocation_model.commitment() == 1
+        && key.and_then(|key| allocation_model.lookup(key)) == Some(7);
+    let full = allocation_model.try_allocate(9, 11) == Err(9) && allocation_model.commitment() == 1;
+    let reclaimed = key.and_then(|key| allocation_model.reclaim(key));
+    let stale =
+        reclaimed == Some(7) && key.is_some_and(|key| allocation_model.lookup(key).is_none());
+
+    let mut reservation_model = BoundedPoolModel::new();
+    let permit = reservation_model.reserve(11);
+    let reserved = permit.is_some() && reservation_model.commitment() == 1;
+    let consumed = permit.and_then(|permit| reservation_model.consume(permit, 7));
+    let reserved = reserved && consumed.is_some() && reservation_model.commitment() == 1;
+
+    let mut release_model = BoundedPoolModel::new();
+    let release_permit = release_model.reserve(11);
+    let released = release_permit.is_some_and(|permit| release_model.release(permit))
+        && release_model.commitment() == 0
+        && release_permit.is_some_and(|permit| !release_model.release(permit));
+
+    let mut retirement_model = BoundedPoolModel {
+        slot: ModelSlot::Live {
+            generation: u64::MAX,
+            type_identity: 11,
+            value: 7,
+        },
+        next_permit: 1,
+    };
+    let retired = retirement_model.reclaim(ModelKey {
+        generation: u64::MAX,
+        type_identity: 11,
+    }) == Some(7)
+        && retirement_model.slot == ModelSlot::Retired;
+    PoolModelObservation {
+        cases: 6,
+        agrees: accepted && full && reserved && released && stale && retired,
+        accepted,
+        full,
+        released,
+        reserved,
+        stale,
+        retired,
     }
 }
 
@@ -1383,7 +2390,7 @@ fn verify(
     }
     verify_role_graph(candidate, cancellation)?;
     verify_architecture_evidence(candidate, cancellation)?;
-    let expected_requirements = verify_requirements(
+    let mut expected_requirements = verify_requirements(
         candidate.context,
         &expected_roles,
         expected_planner.reference,
@@ -1393,6 +2400,22 @@ fn verify(
         architecture.service().maximum_cycle_units,
         cancellation,
     )?;
+    let (expected_pools, mut expected_pool_requirements) = produce_pool_plans(
+        candidate.context,
+        candidate.semantic_program.for_core_planning(),
+        expected_planner.reference,
+        expected_plan.reference,
+        cancellation,
+    )?;
+    expected_requirements.append(&mut expected_pool_requirements);
+    expected_requirements.sort_by_key(|requirement| requirement.reference.identity);
+    if candidate.pools.as_ref() != expected_pools.as_slice() {
+        return defect("Pool Plans are missing, extra, stale, or semantically false");
+    }
+    let expected_pool_model = run_pool_model();
+    if candidate.pool_model != expected_pool_model || !candidate.pool_model.agrees {
+        return defect("bounded Pool authority model disagrees");
+    }
     if candidate.requirements.as_ref() != expected_requirements.as_slice() {
         return defect(
             "Requirement Set is missing, extra, duplicate, dangling, wrong-owner, wrong-role, wrong-provenance, or stale",
@@ -1440,6 +2463,8 @@ fn verify(
         &candidate.domain_plans,
         &candidate.generated_roles,
         &candidate.requirements,
+        &candidate.pools,
+        &candidate.pool_model,
         &candidate.executable_demand,
     );
     if candidate.fingerprint != expected_fingerprint {
@@ -1763,7 +2788,7 @@ fn verify_requirement(
             current_meaning,
         },
         owner,
-        subject,
+        subject: RequirementOwner::GeneratedRole(subject),
         provenance: RequirementProvenance {
             domain_plan: plan.identity,
             generated_role: subject.identity,
@@ -1882,12 +2907,16 @@ fn verify_requirement_bounds(
 ) -> Result<(), PlanningFailure> {
     for requirement in candidate.requirements.iter() {
         checkpoint(cancellation)?;
+        let provenance_subject = match requirement.subject {
+            RequirementOwner::GeneratedRole(reference) => reference.identity,
+            RequirementOwner::Pool(_) => 0,
+        };
         if requirement.context != candidate.context
             || requirement.reference.context != candidate.context
             || requirement.owner.context != candidate.context
-            || requirement.subject.context != candidate.context
+            || requirement.subject.context() != candidate.context
             || requirement.provenance.domain_plan != candidate.domain_plans[0].reference.identity
-            || requirement.provenance.generated_role != requirement.subject.identity
+            || requirement.provenance.generated_role != provenance_subject
             || requirement.provenance.local_site == 0
         {
             return defect(
@@ -1899,7 +2928,8 @@ fn verify_requirement_bounds(
                 RequirementCategory::GeneratedRoleRealization,
                 RequirementBounds::RealizeExactlyOnce { executable },
             ) => candidate.generated_roles.iter().any(|role| {
-                role.reference == requirement.subject && role.executable.identity == *executable
+                requirement.subject == RequirementOwner::GeneratedRole(role.reference)
+                    && role.executable.identity == *executable
             }),
             (RequirementCategory::Lifetime, RequirementBounds::ImageLifetime) => true,
             (RequirementCategory::ArchitectureCapability, RequirementBounds::Capability(_)) => true,
@@ -1917,6 +2947,21 @@ fn verify_requirement_bounds(
                 },
             ) => *minimum > 0 && minimum <= maximum,
             (RequirementCategory::LogicalLayout, RequirementBounds::Reservation { .. }) => true,
+            (
+                RequirementCategory::CapacityPressure,
+                RequirementBounds::PoolCapacity {
+                    declared,
+                    usable,
+                    peak_live,
+                    peak_reserved,
+                    peak_committed,
+                },
+            ) => {
+                usable <= declared
+                    && peak_live.saturating_add(*peak_reserved) >= *peak_committed
+                    && *peak_committed <= *usable
+                    && matches!(requirement.subject, RequirementOwner::Pool(_))
+            }
             _ => false,
         };
         if !valid {
@@ -2121,6 +3166,18 @@ fn produce_bounds_encoding(hash: &mut Xxh3, bounds: &RequirementBounds) {
         RequirementBounds::Reservation { kind, multiplicity } => {
             hash.update(&[7, kind.tag(), multiplicity.tag()])
         }
+        RequirementBounds::PoolCapacity {
+            declared,
+            usable,
+            peak_live,
+            peak_reserved,
+            peak_committed,
+        } => {
+            hash.update(&[8]);
+            for value in [declared, usable, peak_live, peak_reserved, peak_committed] {
+                hash.update(&value.to_le_bytes());
+            }
+        }
     }
 }
 
@@ -2152,6 +3209,18 @@ fn verify_bounds_encoding(verifier: &mut Xxh3, bounds: &RequirementBounds) {
         }
         RequirementBounds::Reservation { kind, multiplicity } => {
             verifier.update(&[7, kind.tag(), multiplicity.tag()])
+        }
+        RequirementBounds::PoolCapacity {
+            declared,
+            usable,
+            peak_live,
+            peak_reserved,
+            peak_committed,
+        } => {
+            verifier.update(&[8]);
+            for value in [declared, usable, peak_live, peak_reserved, peak_committed] {
+                verifier.update(&value.to_le_bytes());
+            }
         }
     }
 }
@@ -2213,6 +3282,8 @@ fn produce_foundation_fingerprint(
     plans: &[DomainPlan],
     roles: &[GeneratedRole],
     requirements: &[Requirement],
+    pools: &[PoolPlan],
+    pool_model: &PoolModelObservation,
     demand: &ExactExecutableDemand,
 ) -> u128 {
     let mut hash = Xxh3::new();
@@ -2260,6 +3331,7 @@ fn produce_foundation_fingerprint(
         hash.update(&requirement.reference.identity.to_le_bytes());
         hash.update(&requirement.reference.current_meaning.to_le_bytes());
     }
+    encode_pool_foundation(&mut hash, pools, pool_model);
     hash.update(&demand.fingerprint.to_le_bytes());
     hash.digest128()
 }
@@ -2277,6 +3349,8 @@ fn verify_foundation_fingerprint(
     plans: &[DomainPlan],
     roles: &[GeneratedRole],
     requirements: &[Requirement],
+    pools: &[PoolPlan],
+    pool_model: &PoolModelObservation,
     demand: &ExactExecutableDemand,
 ) -> u128 {
     let mut verifier = Xxh3::new();
@@ -2324,8 +3398,46 @@ fn verify_foundation_fingerprint(
         verifier.update(&requirement.reference.identity.to_le_bytes());
         verifier.update(&requirement.reference.current_meaning.to_le_bytes());
     }
+    encode_pool_foundation(&mut verifier, pools, pool_model);
     verifier.update(&demand.fingerprint.to_le_bytes());
     verifier.digest128()
+}
+
+fn encode_pool_foundation(hash: &mut Xxh3, pools: &[PoolPlan], model: &PoolModelObservation) {
+    hash.update(&(pools.len() as u64).to_le_bytes());
+    for pool in pools {
+        hash.update(&pool.reference.identity.to_le_bytes());
+        hash.update(&pool.reference.current_meaning.to_le_bytes());
+        hash.update(&pool.executable.identity().to_le_bytes());
+        for value in [
+            pool.declared_capacity,
+            pool.usable_slots,
+            pool.peak_live,
+            pool.peak_reserved,
+            pool.peak_committed,
+        ] {
+            hash.update(&value.to_le_bytes());
+        }
+        hash.update(&(pool.admission_sites.len() as u64).to_le_bytes());
+        for site in pool.admission_sites.iter() {
+            hash.update(&[site.operation.canonical_tag()]);
+            hash.update(&site.source.start().to_le_bytes());
+            hash.update(&site.source.end().to_le_bytes());
+            hash.update(&site.source_type_identity.to_le_bytes());
+            hash.update(&site.requirement.identity.to_le_bytes());
+            hash.update(&site.requirement.current_meaning.to_le_bytes());
+        }
+    }
+    hash.update(&(model.cases as u64).to_le_bytes());
+    hash.update(&[
+        u8::from(model.agrees),
+        u8::from(model.accepted),
+        u8::from(model.full),
+        u8::from(model.released),
+        u8::from(model.reserved),
+        u8::from(model.stale),
+        u8::from(model.retired),
+    ]);
 }
 
 fn producer_hash(domain: &[u8], values: &[u128]) -> u128 {
@@ -2431,6 +3543,72 @@ fn build() -> Image:
             verify(candidate, &Cancellation::new()),
             Err(PlanningFailure::Defect(_))
         ));
+    }
+
+    fn pool_fixture() -> VerifiedPlanningFoundation {
+        fixture_from_source(
+            "src/image.wr",
+            br#"from core import pool as pools
+
+@image
+fn build() -> Image:
+    mut value = 0
+    with pools.scoped(capacity=1) as scratch:
+        allocation = scratch.allocate(value=1)
+        value = scratch.reclaim(allocation=take allocation)
+    return Image.new(value=value)
+"#,
+            Root::Image,
+        )
+    }
+
+    fn resign(candidate: &mut VerifiedPlanningFoundation) {
+        let semantic = candidate.semantic_program.for_image_planning();
+        let architecture = candidate.architecture_contract.for_image_planning();
+        candidate.fingerprint = verify_foundation_fingerprint(
+            candidate.context,
+            semantic.fingerprint(),
+            semantic.construction_graph_fingerprint(),
+            semantic.custody_fingerprint(),
+            architecture.identity(),
+            architecture.fingerprint(),
+            architecture.distribution_input_receipt(),
+            &candidate.planner_roster,
+            &candidate.domain_plans,
+            &candidate.generated_roles,
+            &candidate.requirements,
+            &candidate.pools,
+            &candidate.pool_model,
+            &candidate.executable_demand,
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_resigned_single_fault_pool_plan_and_model_corruption() {
+        let original = pool_fixture();
+
+        let mut pressure = original.clone();
+        let mut pools = pressure.pools.to_vec();
+        pools[0].peak_committed = 0;
+        pressure.pools = pools.into();
+        resign(&mut pressure);
+        rejects(&pressure);
+
+        let mut stale_requirement = original.clone();
+        let mut requirements = stale_requirement.requirements.to_vec();
+        let requirement = requirements
+            .iter_mut()
+            .find(|requirement| requirement.category == RequirementCategory::CapacityPressure)
+            .expect("Pool capacity requirement");
+        requirement.reference.current_meaning ^= 1;
+        stale_requirement.requirements = requirements.into();
+        resign(&mut stale_requirement);
+        rejects(&stale_requirement);
+
+        let mut model = original.clone();
+        model.pool_model.retired = false;
+        resign(&mut model);
+        rejects(&model);
     }
 
     #[test]
@@ -2572,7 +3750,9 @@ fn build() -> Image:
 
         let mut dangling = original.clone();
         let mut requirements = dangling.requirements.to_vec();
-        requirements[0].subject.identity ^= 1;
+        if let RequirementOwner::GeneratedRole(reference) = &mut requirements[0].subject {
+            reference.identity ^= 1;
+        }
         dangling.requirements = requirements.into();
         rejects(&dangling);
 

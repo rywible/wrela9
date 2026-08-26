@@ -253,6 +253,8 @@ pub struct DomainPlanObservation {
     planner: u128,
     kind: DomainPlanKind,
     current_meaning: u128,
+    generated_role_count: usize,
+    requirement_count: usize,
 }
 
 impl DomainPlanObservation {
@@ -274,6 +276,16 @@ impl DomainPlanObservation {
     #[must_use]
     pub const fn current_meaning(&self) -> u128 {
         self.current_meaning
+    }
+
+    #[must_use]
+    pub const fn generated_role_count(&self) -> usize {
+        self.generated_role_count
+    }
+
+    #[must_use]
+    pub const fn requirement_count(&self) -> usize {
+        self.requirement_count
     }
 }
 
@@ -491,35 +503,35 @@ impl PlanningFoundationObservation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PlannerRef {
+pub(crate) struct PlannerRef {
     context: u128,
     identity: u128,
     current_meaning: u128,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DomainPlanRef {
+pub(crate) struct DomainPlanRef {
     context: u128,
     identity: u128,
     current_meaning: u128,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct RoleRef {
+pub(crate) struct RoleRef {
     context: u128,
     identity: u128,
     current_meaning: u128,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ExecutableRef {
+pub(crate) struct ExecutableRef {
     context: u128,
     identity: u128,
     current_meaning: u128,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DemandInputRef {
+pub(crate) struct DemandInputRef {
     context: u128,
     identity: u128,
     current_meaning: u128,
@@ -532,14 +544,16 @@ struct Planner {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct DomainPlan {
+pub(crate) struct DomainPlan {
     reference: DomainPlanRef,
     planner: PlannerRef,
     kind: DomainPlanKind,
+    generated_roles: Arc<[RoleRef]>,
+    requirements: Arc<[RequirementRef]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct GeneratedRole {
+pub(crate) struct GeneratedRole {
     reference: RoleRef,
     executable: ExecutableRef,
     owner: PlannerRef,
@@ -551,14 +565,20 @@ struct GeneratedRole {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Requirement {
+pub(crate) struct Requirement {
     context: u128,
-    reference: u128,
+    reference: RequirementRef,
     owner: PlannerRef,
     subject: RoleRef,
     provenance: RequirementProvenance,
     category: RequirementCategory,
     bounds: RequirementBounds,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RequirementRef {
+    context: u128,
+    identity: u128,
     current_meaning: u128,
 }
 
@@ -568,6 +588,73 @@ struct ExactExecutableDemand {
     source_count: usize,
     additions: Arc<[ExecutableRef]>,
     fingerprint: u128,
+}
+
+macro_rules! typed_reference_accessors {
+    ($reference:ty) => {
+        #[allow(dead_code)]
+        impl $reference {
+            pub(crate) const fn context(self) -> u128 {
+                self.context
+            }
+
+            pub(crate) const fn identity(self) -> u128 {
+                self.identity
+            }
+
+            pub(crate) const fn current_meaning(self) -> u128 {
+                self.current_meaning
+            }
+        }
+    };
+}
+
+typed_reference_accessors!(PlannerRef);
+typed_reference_accessors!(DomainPlanRef);
+typed_reference_accessors!(RoleRef);
+typed_reference_accessors!(ExecutableRef);
+typed_reference_accessors!(DemandInputRef);
+typed_reference_accessors!(RequirementRef);
+
+#[allow(dead_code)]
+impl DomainPlan {
+    pub(crate) const fn reference(&self) -> DomainPlanRef {
+        self.reference
+    }
+
+    pub(crate) fn generated_roles(&self) -> &[RoleRef] {
+        &self.generated_roles
+    }
+
+    pub(crate) fn requirements(&self) -> &[RequirementRef] {
+        &self.requirements
+    }
+}
+
+#[allow(dead_code)]
+impl GeneratedRole {
+    pub(crate) const fn reference(&self) -> RoleRef {
+        self.reference
+    }
+
+    pub(crate) const fn executable(&self) -> ExecutableRef {
+        self.executable
+    }
+
+    pub(crate) fn dependencies(&self) -> &[RoleRef] {
+        &self.dependencies
+    }
+}
+
+#[allow(dead_code)]
+impl Requirement {
+    pub(crate) const fn reference(&self) -> RequirementRef {
+        self.reference
+    }
+
+    pub(crate) const fn subject(&self) -> RoleRef {
+        self.subject
+    }
 }
 
 #[derive(Clone)]
@@ -637,6 +724,8 @@ impl VerifiedPlanningFoundation {
                     planner: plan.planner.identity,
                     kind: plan.kind,
                     current_meaning: plan.reference.current_meaning,
+                    generated_role_count: plan.generated_roles.len(),
+                    requirement_count: plan.requirements.len(),
                 })
                 .collect::<Vec<_>>()
                 .into(),
@@ -665,13 +754,13 @@ impl VerifiedPlanningFoundation {
                 .requirements
                 .iter()
                 .map(|requirement| RequirementObservation {
-                    reference: requirement.reference,
+                    reference: requirement.reference.identity,
                     owner: requirement.owner.identity,
                     subject: RequirementSubject::GeneratedRole(requirement.subject.identity),
                     provenance: requirement.provenance,
                     category: requirement.category,
                     bounds: requirement.bounds.clone(),
-                    current_meaning: requirement.current_meaning,
+                    current_meaning: requirement.reference.current_meaning,
                 })
                 .collect::<Vec<_>>()
                 .into(),
@@ -688,6 +777,50 @@ impl VerifiedPlanningFoundation {
                     .into(),
             },
         }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "crate-private handoff reserved for the Core planner"
+    )]
+    pub(crate) const fn for_core(&self) -> CorePlanningInput<'_> {
+        CorePlanningInput { foundation: self }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CorePlanningInput<'a> {
+    foundation: &'a VerifiedPlanningFoundation,
+}
+
+#[allow(dead_code)]
+impl CorePlanningInput<'_> {
+    pub(crate) const fn context_identity(&self) -> u128 {
+        self.foundation.context
+    }
+
+    pub(crate) fn completed_semantic_program(&self) -> &CompletedSemanticProgram {
+        &self.foundation.semantic_program
+    }
+
+    pub(crate) const fn source_executable_demand(&self) -> DemandInputRef {
+        self.foundation.executable_demand.source
+    }
+
+    pub(crate) fn domain_plans(&self) -> &[DomainPlan] {
+        &self.foundation.domain_plans
+    }
+
+    pub(crate) fn generated_roles(&self) -> &[GeneratedRole] {
+        &self.foundation.generated_roles
+    }
+
+    pub(crate) fn requirements(&self) -> &[Requirement] {
+        &self.foundation.requirements
+    }
+
+    pub(crate) fn generated_executable_additions(&self) -> &[ExecutableRef] {
+        &self.foundation.executable_demand.additions
     }
 }
 
@@ -721,7 +854,7 @@ impl ImagePlanningModule {
             architecture.fingerprint(),
         );
         checkpoint(cancellation)?;
-        let plan = produce_domain_plan(
+        let mut plan = produce_domain_plan(
             context,
             planner.reference,
             semantic.fingerprint(),
@@ -751,19 +884,34 @@ impl ImagePlanningModule {
             identity: semantic.executable_demand_fingerprint(),
             current_meaning: semantic.executable_demand_fingerprint(),
         };
-        let additions = generated_roles
+        let mut additions = generated_roles
             .iter()
             .map(|role| role.executable)
             .collect::<Vec<_>>();
+        additions.sort_by_key(|executable| executable.identity);
+        plan.generated_roles = generated_roles
+            .iter()
+            .map(|role| role.reference)
+            .collect::<Vec<_>>()
+            .into();
+        plan.requirements = requirements
+            .iter()
+            .map(|requirement| requirement.reference)
+            .collect::<Vec<_>>()
+            .into();
         let executable_demand = ExactExecutableDemand {
             source,
             source_count: semantic.source_executable_count(),
-            fingerprint: demand_fingerprint(source, semantic.source_executable_count(), &additions),
+            fingerprint: produce_demand_fingerprint(
+                source,
+                semantic.source_executable_count(),
+                &additions,
+            ),
             additions: additions.into(),
         };
         let planner_roster: Arc<[Planner]> = Arc::from([planner]);
         let domain_plans: Arc<[DomainPlan]> = Arc::from([plan]);
-        let fingerprint = foundation_fingerprint(
+        let fingerprint = produce_foundation_fingerprint(
             context,
             semantic.fingerprint(),
             semantic.construction_graph_fingerprint(),
@@ -800,12 +948,12 @@ fn produce_planner(
     semantic_fingerprint: u128,
     architecture_fingerprint: u128,
 ) -> Planner {
-    let identity = identity_hash(b"wrela.planner.image-kind.v1", &[context, 1]);
+    let identity = producer_hash(b"wrela.planner.image-kind.v1", &[root_tag(root).into()]);
     Planner {
         reference: PlannerRef {
             context,
             identity,
-            current_meaning: identity_hash(
+            current_meaning: producer_hash(
                 b"wrela.planner.image-kind.meaning.v1",
                 &[
                     identity,
@@ -825,15 +973,15 @@ fn produce_domain_plan(
     semantic_fingerprint: u128,
     architecture_fingerprint: u128,
 ) -> DomainPlan {
-    let identity = identity_hash(
+    let identity = producer_hash(
         b"wrela.domain-plan.mandatory-image.v1",
-        &[context, planner.identity, 1],
+        &[planner.identity, 1],
     );
     DomainPlan {
         reference: DomainPlanRef {
             context,
             identity,
-            current_meaning: identity_hash(
+            current_meaning: producer_hash(
                 b"wrela.domain-plan.mandatory-image.meaning.v1",
                 &[
                     identity,
@@ -845,6 +993,8 @@ fn produce_domain_plan(
         },
         planner,
         kind: DomainPlanKind::MandatoryImage,
+        generated_roles: Arc::from([]),
+        requirements: Arc::from([]),
     }
 }
 
@@ -919,8 +1069,8 @@ fn produce_roles(
             .collect::<Result<Vec<_>, _>>()?;
         let local_key = u16::try_from(ordinal + 1)
             .map_err(|_| PlanningFailure::Defect(Arc::from("generated role local key overflow")))?;
-        let identity = role_identity(context, planner, spec.kind, local_key);
-        let current_meaning = role_current_meaning(
+        let identity = produce_role_identity(planner, spec.kind, local_key);
+        let current_meaning = produce_role_current_meaning(
             identity,
             plan,
             &dependencies,
@@ -935,7 +1085,7 @@ fn produce_roles(
             },
             executable: ExecutableRef {
                 context,
-                identity: identity_hash(b"wrela.generated-executable.v1", &[context, identity]),
+                identity: producer_hash(b"wrela.generated-executable.v1", &[identity]),
                 current_meaning,
             },
             owner: planner,
@@ -946,6 +1096,7 @@ fn produce_roles(
             provenance: plan,
         });
     }
+    roles.sort_by_key(|role| role.reference.identity);
     Ok(roles)
 }
 
@@ -1080,7 +1231,7 @@ fn produce_requirements(
         .enumerate()
         {
             checkpoint(cancellation)?;
-            requirements.push(make_requirement(
+            requirements.push(produce_requirement(
                 context,
                 planner,
                 plan,
@@ -1091,11 +1242,11 @@ fn produce_requirements(
             ));
         }
     }
-    requirements.sort_by_key(|requirement| requirement.reference);
+    requirements.sort_by_key(|requirement| requirement.reference.identity);
     Ok(requirements)
 }
 
-fn make_requirement(
+fn produce_requirement(
     context: u128,
     owner: PlannerRef,
     plan: DomainPlanRef,
@@ -1103,19 +1254,14 @@ fn make_requirement(
     local_site: u16,
     spec: RequirementSpec,
 ) -> Requirement {
-    let reference = requirement_identity(
-        context,
-        owner.identity,
-        subject.identity,
-        spec.category,
-        local_site,
-    );
+    let reference =
+        produce_requirement_identity(owner.identity, subject.identity, spec.category, local_site);
     let provenance = RequirementProvenance {
         domain_plan: plan.identity,
         generated_role: subject.identity,
         local_site,
     };
-    let current_meaning = requirement_current_meaning(
+    let current_meaning = produce_requirement_current_meaning(
         reference,
         owner.current_meaning,
         subject.current_meaning,
@@ -1125,13 +1271,16 @@ fn make_requirement(
     );
     Requirement {
         context,
-        reference,
+        reference: RequirementRef {
+            context,
+            identity: reference,
+            current_meaning,
+        },
         owner,
         subject,
         provenance,
         category: spec.category,
         bounds: spec.bounds,
-        current_meaning,
     }
 }
 
@@ -1156,13 +1305,17 @@ fn verify(
     if candidate.planner_roster.as_ref() != [expected_planner.clone()] {
         return defect("planner roster is missing, extra, duplicated, or stale");
     }
-    let expected_plan = verify_domain_plan(
+    let mut expected_plan = verify_domain_plan(
         candidate.context,
         expected_planner.reference,
         semantic.fingerprint(),
         architecture.fingerprint(),
     );
-    if candidate.domain_plans.as_ref() != [expected_plan.clone()] {
+    if candidate.domain_plans.len() != 1
+        || candidate.domain_plans[0].reference != expected_plan.reference
+        || candidate.domain_plans[0].planner != expected_plan.planner
+        || candidate.domain_plans[0].kind != expected_plan.kind
+    {
         return defect("Domain Plans are missing, extra, wrong-owner, or stale");
     }
     let expected_roles = verify_roles(
@@ -1196,11 +1349,26 @@ fn verify(
             "Requirement Set is missing, extra, duplicate, dangling, wrong-owner, wrong-role, wrong-provenance, or stale",
         );
     }
+    expected_plan.generated_roles = expected_roles
+        .iter()
+        .map(|role| role.reference)
+        .collect::<Vec<_>>()
+        .into();
+    expected_plan.requirements = expected_requirements
+        .iter()
+        .map(|requirement| requirement.reference)
+        .collect::<Vec<_>>()
+        .into();
+    if candidate.domain_plans.as_ref() != [expected_plan] {
+        return defect(
+            "Domain Plan exports have missing, extra, duplicate, wrong-owner, stale, or mixed-context references",
+        );
+    }
     verify_requirement_bounds(candidate, cancellation)?;
     let mut references = BTreeSet::new();
     for requirement in candidate.requirements.iter() {
         checkpoint(cancellation)?;
-        if !references.insert(requirement.reference) {
+        if !references.insert(requirement.reference.identity) {
             return defect("Requirement Set contains a duplicate Requirement Reference");
         }
     }
@@ -1211,7 +1379,7 @@ fn verify(
         return defect("Generated Role closure exceeds authenticated architecture capacity");
     }
     verify_executable_demand(candidate, &expected_roles)?;
-    let expected_fingerprint = foundation_fingerprint(
+    let expected_fingerprint = verify_foundation_fingerprint(
         candidate.context,
         semantic.fingerprint(),
         semantic.construction_graph_fingerprint(),
@@ -1237,8 +1405,8 @@ fn verify_planner(
     semantic_fingerprint: u128,
     architecture_fingerprint: u128,
 ) -> Planner {
-    let identity = identity_hash(b"wrela.planner.image-kind.v1", &[context, 1]);
-    let current_meaning = identity_hash(
+    let identity = verifier_hash(b"wrela.planner.image-kind.v1", &[root_tag(root).into()]);
+    let current_meaning = verifier_hash(
         b"wrela.planner.image-kind.meaning.v1",
         &[
             identity,
@@ -1263,11 +1431,11 @@ fn verify_domain_plan(
     semantic_fingerprint: u128,
     architecture_fingerprint: u128,
 ) -> DomainPlan {
-    let identity = identity_hash(
+    let identity = verifier_hash(
         b"wrela.domain-plan.mandatory-image.v1",
-        &[context, planner.identity, 1],
+        &[planner.identity, 1],
     );
-    let current_meaning = identity_hash(
+    let current_meaning = verifier_hash(
         b"wrela.domain-plan.mandatory-image.meaning.v1",
         &[
             identity,
@@ -1284,6 +1452,8 @@ fn verify_domain_plan(
         },
         planner,
         kind: DomainPlanKind::MandatoryImage,
+        generated_roles: Arc::from([]),
+        requirements: Arc::from([]),
     }
 }
 
@@ -1339,8 +1509,8 @@ fn verify_roles(
             .collect::<Result<Vec<_>, _>>()?;
         let local_key = u16::try_from(ordinal + 1)
             .map_err(|_| PlanningFailure::Defect(Arc::from("verifier role key overflow")))?;
-        let identity = role_identity(context, planner, kind, local_key);
-        let current_meaning = role_current_meaning(
+        let identity = verify_role_identity(planner, kind, local_key);
+        let current_meaning = verify_role_current_meaning(
             identity,
             plan,
             &dependencies,
@@ -1355,7 +1525,7 @@ fn verify_roles(
             },
             executable: ExecutableRef {
                 context,
-                identity: identity_hash(b"wrela.generated-executable.v1", &[context, identity]),
+                identity: verifier_hash(b"wrela.generated-executable.v1", &[identity]),
                 current_meaning,
             },
             owner: planner,
@@ -1366,6 +1536,7 @@ fn verify_roles(
             provenance: plan,
         });
     }
+    expected.sort_by_key(|role| role.reference.identity);
     Ok(expected)
 }
 
@@ -1498,7 +1669,7 @@ fn verify_requirements(
         .enumerate()
         {
             checkpoint(cancellation)?;
-            expected.push(make_requirement(
+            expected.push(verify_requirement(
                 context,
                 planner,
                 plan,
@@ -1506,18 +1677,64 @@ fn verify_requirements(
                 u16::try_from(offset + 1).map_err(|_| {
                     PlanningFailure::Defect(Arc::from("verifier requirement site overflow"))
                 })?,
-                RequirementSpec { category, bounds },
+                category,
+                bounds,
             ));
         }
     }
-    expected.sort_by_key(|requirement| requirement.reference);
+    expected.sort_by_key(|requirement| requirement.reference.identity);
     Ok(expected)
+}
+
+fn verify_requirement(
+    context: u128,
+    owner: PlannerRef,
+    plan: DomainPlanRef,
+    subject: RoleRef,
+    local_site: u16,
+    category: RequirementCategory,
+    bounds: RequirementBounds,
+) -> Requirement {
+    let identity =
+        verify_requirement_identity(owner.identity, subject.identity, category, local_site);
+    let current_meaning = verify_requirement_current_meaning(
+        identity,
+        owner.current_meaning,
+        subject.current_meaning,
+        plan.current_meaning,
+        category,
+        &bounds,
+    );
+    Requirement {
+        context,
+        reference: RequirementRef {
+            context,
+            identity,
+            current_meaning,
+        },
+        owner,
+        subject,
+        provenance: RequirementProvenance {
+            domain_plan: plan.identity,
+            generated_role: subject.identity,
+            local_site,
+        },
+        category,
+        bounds,
+    }
 }
 
 fn verify_role_graph(
     candidate: &VerifiedPlanningFoundation,
     cancellation: &Cancellation,
 ) -> Result<(), PlanningFailure> {
+    let Some(boot) = candidate
+        .generated_roles
+        .iter()
+        .find(|role| role.kind == GeneratedRoleKind::Boot)
+    else {
+        return defect("Generated Role closure is missing mandatory boot infrastructure");
+    };
     let identities = candidate
         .generated_roles
         .iter()
@@ -1561,7 +1778,7 @@ fn verify_role_graph(
         if role.kind != GeneratedRoleKind::Boot
             && !seen
                 .iter()
-                .any(|identity| candidate.generated_roles[0].reference.identity == *identity)
+                .any(|identity| boot.reference.identity == *identity)
         {
             return defect("Generated Role is unreachable from mandatory boot infrastructure");
         }
@@ -1616,6 +1833,7 @@ fn verify_requirement_bounds(
     for requirement in candidate.requirements.iter() {
         checkpoint(cancellation)?;
         if requirement.context != candidate.context
+            || requirement.reference.context != candidate.context
             || requirement.owner.context != candidate.context
             || requirement.subject.context != candidate.context
             || requirement.provenance.domain_plan != candidate.domain_plans[0].reference.identity
@@ -1668,10 +1886,11 @@ fn verify_executable_demand(
         identity: semantic.executable_demand_fingerprint(),
         current_meaning: semantic.executable_demand_fingerprint(),
     };
-    let expected = expected_roles
+    let mut expected = expected_roles
         .iter()
         .map(|role| role.executable)
         .collect::<Vec<_>>();
+    expected.sort_by_key(|executable| executable.identity);
     if candidate.executable_demand.source != source
         || candidate.executable_demand.source_count != semantic.source_executable_count()
         || candidate.executable_demand.additions.as_ref() != expected.as_slice()
@@ -1689,23 +1908,18 @@ fn verify_executable_demand(
     if unique.len() != candidate.executable_demand.additions.len() {
         return defect("exact Executable Demand contains a duplicate generated executable");
     }
-    let fingerprint = demand_fingerprint(source, semantic.source_executable_count(), &expected);
+    let fingerprint =
+        verify_demand_fingerprint(source, semantic.source_executable_count(), &expected);
     if candidate.executable_demand.fingerprint != fingerprint {
         return defect("exact Executable Demand fingerprint is false");
     }
     Ok(())
 }
 
-fn role_identity(
-    context: u128,
-    planner: PlannerRef,
-    kind: GeneratedRoleKind,
-    local_key: u16,
-) -> u128 {
-    identity_hash(
+fn produce_role_identity(planner: PlannerRef, kind: GeneratedRoleKind, local_key: u16) -> u128 {
+    producer_hash(
         b"wrela.generated-role.identity.v1",
         &[
-            context,
             planner.identity,
             planner.identity,
             kind.tag().into(),
@@ -1714,7 +1928,19 @@ fn role_identity(
     )
 }
 
-fn role_current_meaning(
+fn verify_role_identity(planner: PlannerRef, kind: GeneratedRoleKind, local_key: u16) -> u128 {
+    verifier_hash(
+        b"wrela.generated-role.identity.v1",
+        &[
+            planner.identity,
+            planner.identity,
+            kind.tag().into(),
+            local_key.into(),
+        ],
+    )
+}
+
+fn produce_role_current_meaning(
     identity: u128,
     plan: DomainPlanRef,
     dependencies: &[RoleRef],
@@ -1735,26 +1961,52 @@ fn role_current_meaning(
     hash.digest128()
 }
 
-fn requirement_identity(
-    context: u128,
+fn verify_role_current_meaning(
+    identity: u128,
+    plan: DomainPlanRef,
+    dependencies: &[RoleRef],
+    semantic_fingerprint: u128,
+    architecture_fingerprint: u128,
+) -> u128 {
+    let mut verifier = Xxh3::new();
+    verifier.update(b"wrela.generated-role.meaning.v1");
+    verifier.update(&identity.to_le_bytes());
+    verifier.update(&plan.current_meaning.to_le_bytes());
+    verifier.update(&semantic_fingerprint.to_le_bytes());
+    verifier.update(&architecture_fingerprint.to_le_bytes());
+    verifier.update(&(dependencies.len() as u64).to_le_bytes());
+    for dependency in dependencies {
+        verifier.update(&dependency.identity.to_le_bytes());
+        verifier.update(&dependency.current_meaning.to_le_bytes());
+    }
+    verifier.digest128()
+}
+
+fn produce_requirement_identity(
     owner: u128,
     subject: u128,
     category: RequirementCategory,
     local_site: u16,
 ) -> u128 {
-    identity_hash(
+    producer_hash(
         b"wrela.requirement.identity.v1",
-        &[
-            context,
-            owner,
-            subject,
-            category.tag().into(),
-            local_site.into(),
-        ],
+        &[owner, subject, category.tag().into(), local_site.into()],
     )
 }
 
-fn requirement_current_meaning(
+fn verify_requirement_identity(
+    owner: u128,
+    subject: u128,
+    category: RequirementCategory,
+    local_site: u16,
+) -> u128 {
+    verifier_hash(
+        b"wrela.requirement.identity.v1",
+        &[owner, subject, category.tag().into(), local_site.into()],
+    )
+}
+
+fn produce_requirement_current_meaning(
     reference: u128,
     owner_meaning: u128,
     subject_meaning: u128,
@@ -1768,11 +2020,29 @@ fn requirement_current_meaning(
         hash.update(&value.to_le_bytes());
     }
     hash.update(&[category.tag()]);
-    hash_bounds(&mut hash, bounds);
+    produce_bounds_encoding(&mut hash, bounds);
     hash.digest128()
 }
 
-fn hash_bounds(hash: &mut Xxh3, bounds: &RequirementBounds) {
+fn verify_requirement_current_meaning(
+    reference: u128,
+    owner_meaning: u128,
+    subject_meaning: u128,
+    plan_meaning: u128,
+    category: RequirementCategory,
+    bounds: &RequirementBounds,
+) -> u128 {
+    let mut verifier = Xxh3::new();
+    verifier.update(b"wrela.requirement.meaning.v1");
+    for value in [reference, owner_meaning, subject_meaning, plan_meaning] {
+        verifier.update(&value.to_le_bytes());
+    }
+    verifier.update(&[category.tag()]);
+    verify_bounds_encoding(&mut verifier, bounds);
+    verifier.digest128()
+}
+
+fn produce_bounds_encoding(hash: &mut Xxh3, bounds: &RequirementBounds) {
     match bounds {
         RequirementBounds::RealizeExactlyOnce { executable } => {
             hash.update(&[1]);
@@ -1804,7 +2074,39 @@ fn hash_bounds(hash: &mut Xxh3, bounds: &RequirementBounds) {
     }
 }
 
-fn demand_fingerprint(
+fn verify_bounds_encoding(verifier: &mut Xxh3, bounds: &RequirementBounds) {
+    match bounds {
+        RequirementBounds::RealizeExactlyOnce { executable } => {
+            verifier.update(&[1]);
+            verifier.update(&executable.to_le_bytes());
+        }
+        RequirementBounds::ImageLifetime => verifier.update(&[2]),
+        RequirementBounds::Capability(capability) => verifier.update(&[3, capability.tag()]),
+        RequirementBounds::Cardinality { minimum, maximum } => {
+            verifier.update(&[4]);
+            verifier.update(&minimum.to_le_bytes());
+            verifier.update(&maximum.to_le_bytes());
+        }
+        RequirementBounds::MaximumServiceUnits(units) => {
+            verifier.update(&[5]);
+            verifier.update(&units.to_le_bytes());
+        }
+        RequirementBounds::Binding {
+            kind,
+            minimum,
+            maximum,
+        } => {
+            verifier.update(&[6, kind.tag()]);
+            verifier.update(&minimum.to_le_bytes());
+            verifier.update(&maximum.to_le_bytes());
+        }
+        RequirementBounds::Reservation { kind, multiplicity } => {
+            verifier.update(&[7, kind.tag(), multiplicity.tag()])
+        }
+    }
+}
+
+fn produce_demand_fingerprint(
     source: DemandInputRef,
     source_count: usize,
     additions: &[ExecutableRef],
@@ -1828,8 +2130,28 @@ fn demand_fingerprint(
     hash.digest128()
 }
 
+fn verify_demand_fingerprint(
+    source: DemandInputRef,
+    source_count: usize,
+    additions: &[ExecutableRef],
+) -> u128 {
+    let mut verifier = Xxh3::new();
+    verifier.update(b"wrela.exact-executable-demand.v1");
+    verifier.update(&source.context.to_le_bytes());
+    verifier.update(&source.identity.to_le_bytes());
+    verifier.update(&source.current_meaning.to_le_bytes());
+    verifier.update(&(source_count as u64).to_le_bytes());
+    verifier.update(&(additions.len() as u64).to_le_bytes());
+    for addition in additions {
+        verifier.update(&addition.context.to_le_bytes());
+        verifier.update(&addition.identity.to_le_bytes());
+        verifier.update(&addition.current_meaning.to_le_bytes());
+    }
+    verifier.digest128()
+}
+
 #[allow(clippy::too_many_arguments)]
-fn foundation_fingerprint(
+fn produce_foundation_fingerprint(
     context: u128,
     semantic_fingerprint: u128,
     graph_fingerprint: u128,
@@ -1866,6 +2188,16 @@ fn foundation_fingerprint(
     for plan in plans {
         hash.update(&plan.reference.identity.to_le_bytes());
         hash.update(&plan.reference.current_meaning.to_le_bytes());
+        hash.update(&(plan.generated_roles.len() as u64).to_le_bytes());
+        for role in plan.generated_roles.iter() {
+            hash.update(&role.identity.to_le_bytes());
+            hash.update(&role.current_meaning.to_le_bytes());
+        }
+        hash.update(&(plan.requirements.len() as u64).to_le_bytes());
+        for requirement in plan.requirements.iter() {
+            hash.update(&requirement.identity.to_le_bytes());
+            hash.update(&requirement.current_meaning.to_le_bytes());
+        }
     }
     hash.update(&(roles.len() as u64).to_le_bytes());
     for role in roles {
@@ -1875,20 +2207,93 @@ fn foundation_fingerprint(
     }
     hash.update(&(requirements.len() as u64).to_le_bytes());
     for requirement in requirements {
-        hash.update(&requirement.reference.to_le_bytes());
-        hash.update(&requirement.current_meaning.to_le_bytes());
+        hash.update(&requirement.reference.identity.to_le_bytes());
+        hash.update(&requirement.reference.current_meaning.to_le_bytes());
     }
     hash.update(&demand.fingerprint.to_le_bytes());
     hash.digest128()
 }
 
-fn identity_hash(domain: &[u8], values: &[u128]) -> u128 {
+#[allow(clippy::too_many_arguments)]
+fn verify_foundation_fingerprint(
+    context: u128,
+    semantic_fingerprint: u128,
+    graph_fingerprint: u128,
+    custody_fingerprint: u128,
+    architecture_identity: u128,
+    architecture_fingerprint: u128,
+    architecture_input_receipt: u128,
+    planners: &[Planner],
+    plans: &[DomainPlan],
+    roles: &[GeneratedRole],
+    requirements: &[Requirement],
+    demand: &ExactExecutableDemand,
+) -> u128 {
+    let mut verifier = Xxh3::new();
+    verifier.update(PHASE_SCHEMA.as_bytes());
+    verifier.update(&SCHEMA_VERSION.to_le_bytes());
+    for value in [
+        context,
+        semantic_fingerprint,
+        graph_fingerprint,
+        custody_fingerprint,
+        architecture_identity,
+        architecture_fingerprint,
+        architecture_input_receipt,
+    ] {
+        verifier.update(&value.to_le_bytes());
+    }
+    verifier.update(&(planners.len() as u64).to_le_bytes());
+    for planner in planners {
+        verifier.update(&planner.reference.identity.to_le_bytes());
+        verifier.update(&planner.reference.current_meaning.to_le_bytes());
+    }
+    verifier.update(&(plans.len() as u64).to_le_bytes());
+    for plan in plans {
+        verifier.update(&plan.reference.identity.to_le_bytes());
+        verifier.update(&plan.reference.current_meaning.to_le_bytes());
+        verifier.update(&(plan.generated_roles.len() as u64).to_le_bytes());
+        for role in plan.generated_roles.iter() {
+            verifier.update(&role.identity.to_le_bytes());
+            verifier.update(&role.current_meaning.to_le_bytes());
+        }
+        verifier.update(&(plan.requirements.len() as u64).to_le_bytes());
+        for requirement in plan.requirements.iter() {
+            verifier.update(&requirement.identity.to_le_bytes());
+            verifier.update(&requirement.current_meaning.to_le_bytes());
+        }
+    }
+    verifier.update(&(roles.len() as u64).to_le_bytes());
+    for role in roles {
+        verifier.update(&role.reference.identity.to_le_bytes());
+        verifier.update(&role.reference.current_meaning.to_le_bytes());
+        verifier.update(&role.executable.identity.to_le_bytes());
+    }
+    verifier.update(&(requirements.len() as u64).to_le_bytes());
+    for requirement in requirements {
+        verifier.update(&requirement.reference.identity.to_le_bytes());
+        verifier.update(&requirement.reference.current_meaning.to_le_bytes());
+    }
+    verifier.update(&demand.fingerprint.to_le_bytes());
+    verifier.digest128()
+}
+
+fn producer_hash(domain: &[u8], values: &[u128]) -> u128 {
     let mut hash = Xxh3::new();
     hash.update(domain);
     for value in values {
         hash.update(&value.to_le_bytes());
     }
     hash.digest128()
+}
+
+fn verifier_hash(domain: &[u8], values: &[u128]) -> u128 {
+    let mut verifier = Xxh3::new();
+    verifier.update(domain);
+    for value in values {
+        verifier.update(&value.to_le_bytes());
+    }
+    verifier.digest128()
 }
 
 const fn root_tag(root: Root) -> u8 {
@@ -2000,6 +2405,20 @@ fn build() -> Image:
         planner.reference.context ^= 1;
         mixed_context.planner_roster = Arc::from([planner]);
         rejects(&mixed_context);
+
+        let mut missing_role_export = original.clone();
+        let mut plan = missing_role_export.domain_plans[0].clone();
+        plan.generated_roles = original.domain_plans[0].generated_roles[1..].into();
+        missing_role_export.domain_plans = Arc::from([plan]);
+        rejects(&missing_role_export);
+
+        let mut extra_requirement_export = original.clone();
+        let mut plan = extra_requirement_export.domain_plans[0].clone();
+        let mut requirements = plan.requirements.to_vec();
+        requirements.push(plan.requirements[0]);
+        plan.requirements = requirements.into();
+        extra_requirement_export.domain_plans = Arc::from([plan]);
+        rejects(&extra_requirement_export);
     }
 
     #[test]
@@ -2118,13 +2537,13 @@ fn build() -> Image:
 
         let mut stale = original.clone();
         let mut requirements = stale.requirements.to_vec();
-        requirements[0].current_meaning ^= 1;
+        requirements[0].reference.current_meaning ^= 1;
         stale.requirements = requirements.into();
         rejects(&stale);
 
         let mut mixed_context = original.clone();
         let mut requirements = mixed_context.requirements.to_vec();
-        requirements[0].context ^= 1;
+        requirements[0].reference.context ^= 1;
         mixed_context.requirements = requirements.into();
         rejects(&mixed_context);
     }
@@ -2167,5 +2586,39 @@ fn build() -> Image:
             ),
             Err(PlanningFailure::Cancelled)
         ));
+    }
+
+    #[test]
+    fn core_input_view_is_backed_by_exact_same_context_direct_references() {
+        let foundation = fixture(Root::Test);
+        let core = foundation.for_core();
+
+        assert_eq!(core.context_identity(), foundation.context);
+        assert!(std::ptr::eq(
+            core.completed_semantic_program(),
+            foundation.semantic_program.as_ref()
+        ));
+        assert_eq!(
+            core.source_executable_demand(),
+            foundation.executable_demand.source
+        );
+        assert_eq!(core.domain_plans(), foundation.domain_plans.as_ref());
+        assert_eq!(core.generated_roles(), foundation.generated_roles.as_ref());
+        assert_eq!(core.requirements(), foundation.requirements.as_ref());
+        assert_eq!(
+            core.generated_executable_additions(),
+            foundation.executable_demand.additions.as_ref()
+        );
+        assert!(core.domain_plans().iter().all(|plan| {
+            plan.reference.context == core.context_identity()
+                && plan
+                    .generated_roles
+                    .iter()
+                    .all(|reference| reference.context == core.context_identity())
+                && plan
+                    .requirements
+                    .iter()
+                    .all(|reference| reference.context == core.context_identity())
+        }));
     }
 }

@@ -255,7 +255,8 @@ struct CustodyEffect {
 }
 
 type LivePlaces = BTreeMap<Arc<[u128]>, u128>;
-type RegionLiveInputs = BTreeMap<RegionId, (LivePlaces, LivePlaces)>;
+type ResourceComponents = BTreeMap<u128, Vec<(Arc<[u128]>, u128)>>;
+type SourceRootDischarges = BTreeMap<(Arc<[u128]>, u128), usize>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CoreAccessLaw {
@@ -756,73 +757,75 @@ impl VerifiedCoreProgram {
         self.fingerprint
     }
 
-    pub(crate) fn observation(&self) -> CoreProgramObservation {
-        CoreProgramObservation {
+    pub(crate) fn observation(
+        &self,
+        cancellation: &Cancellation,
+    ) -> Result<CoreProgramObservation, CoreFailure> {
+        let mut executables = Vec::with_capacity(self.executables.len());
+        for executable in self.executables.iter() {
+            checkpoint(cancellation)?;
+            let mut operations = Vec::new();
+            let mut operation_type_identities = Vec::new();
+            let mut access_laws = Vec::new();
+            for region in executable.regions.iter() {
+                checkpoint(cancellation)?;
+                for operation in region.operations.iter() {
+                    checkpoint(cancellation)?;
+                    operations.push(operation.kind);
+                    if let Some(type_identity) = operation.type_identity {
+                        operation_type_identities.push(type_identity);
+                    }
+                    if operation.access != CoreAccessLaw::None {
+                        access_laws.push(operation.access);
+                    }
+                }
+            }
+            executables.push(CoreExecutableObservation {
+                kind: executable.reference.kind,
+                identity: executable.reference.identity,
+                current_meaning: executable.reference.current_meaning,
+                semantic_owner: executable.semantic_owner,
+                operations: operations.into(),
+                region_count: executable.regions.len(),
+                may_panic: executable.facts.may_panic,
+                effectful: !executable.facts.pure,
+                parameters: executable
+                    .signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| CoreParameterObservation {
+                        local_identity: parameter.local,
+                        type_identity: parameter.type_.identity,
+                        access: parameter.access,
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+                return_type_identity: executable.signature.return_type.identity,
+                operation_type_identities: operation_type_identities.into(),
+                access_laws: access_laws.into(),
+                rewrites: executable
+                    .rewrites
+                    .iter()
+                    .map(|witness| witness.kind)
+                    .collect::<Vec<_>>()
+                    .into(),
+                custody_effects: observe_executable_custody(
+                    executable,
+                    &self.executables,
+                    cancellation,
+                )?,
+            });
+        }
+        Ok(CoreProgramObservation {
             fingerprint: self.fingerprint,
             context_identity: self.context,
             planning_foundation_fingerprint: self.planning_fingerprint,
-            executables: self
-                .executables
-                .iter()
-                .map(|executable| CoreExecutableObservation {
-                    kind: executable.reference.kind,
-                    identity: executable.reference.identity,
-                    current_meaning: executable.reference.current_meaning,
-                    semantic_owner: executable.semantic_owner,
-                    operations: executable
-                        .regions
-                        .iter()
-                        .flat_map(|region| region.operations.iter().map(|operation| operation.kind))
-                        .collect::<Vec<_>>()
-                        .into(),
-                    region_count: executable.regions.len(),
-                    may_panic: executable.facts.may_panic,
-                    effectful: !executable.facts.pure,
-                    parameters: executable
-                        .signature
-                        .parameters
-                        .iter()
-                        .map(|parameter| CoreParameterObservation {
-                            local_identity: parameter.local,
-                            type_identity: parameter.type_.identity,
-                            access: parameter.access,
-                        })
-                        .collect::<Vec<_>>()
-                        .into(),
-                    return_type_identity: executable.signature.return_type.identity,
-                    operation_type_identities: executable
-                        .regions
-                        .iter()
-                        .flat_map(|region| region.operations.iter())
-                        .filter_map(|operation| operation.type_identity)
-                        .collect::<Vec<_>>()
-                        .into(),
-                    access_laws: executable
-                        .regions
-                        .iter()
-                        .flat_map(|region| {
-                            region.operations.iter().filter_map(|operation| {
-                                (operation.access != CoreAccessLaw::None)
-                                    .then_some(operation.access)
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                        .into(),
-                    rewrites: executable
-                        .rewrites
-                        .iter()
-                        .map(|witness| witness.kind)
-                        .collect::<Vec<_>>()
-                        .into(),
-                    custody_effects: observe_executable_custody(executable, &self.executables),
-                })
-                .collect::<Vec<_>>()
-                .into(),
+            executables: executables.into(),
             oracle_case_count: self.oracle.cases,
             oracle_agrees: self.oracle.agrees,
             custody_oracle_case_count: self.oracle.custody_cases,
             custody_oracle_agrees: self.oracle.custody_agrees,
-        }
+        })
     }
 
     #[allow(dead_code)]
@@ -841,44 +844,254 @@ impl VerifiedCoreProgram {
     }
 }
 
+fn observation_value_subject(
+    value: ValueId,
+    producers: &BTreeMap<ValueId, &Operation>,
+    memo: &mut BTreeMap<ValueId, u128>,
+    visiting: &mut BTreeSet<ValueId>,
+    cancellation: &Cancellation,
+) -> Result<u128, CoreFailure> {
+    checkpoint(cancellation)?;
+    if let Some(subject) = memo.get(&value) {
+        return Ok(*subject);
+    }
+    if !visiting.insert(value) {
+        return Ok(0);
+    }
+    let mut hash = Xxh3::new();
+    hash.update(b"wrela.core.value-observation-subject\0\x01");
+    if let Some(operation) = producers.get(&value) {
+        hash.update(&[
+            operation.kind.tag(),
+            operation.access.tag(),
+            operation.effect.tag(),
+        ]);
+        hash.update(&operation.type_identity.unwrap_or(0).to_be_bytes());
+        let skip = usize::from(operation.kind == CoreOperationKind::Read);
+        for detail in operation.details.iter().skip(skip) {
+            hash.update(&detail.to_be_bytes());
+        }
+        for operand in operation.operands.iter().copied() {
+            hash.update(
+                &observation_value_subject(operand, producers, memo, visiting, cancellation)?
+                    .to_be_bytes(),
+            );
+        }
+    }
+    visiting.remove(&value);
+    let subject = hash.digest128();
+    memo.insert(value, subject);
+    Ok(subject)
+}
+
+fn observation_control_paths(
+    executable: &CoreExecutable,
+    cancellation: &Cancellation,
+) -> Result<BTreeMap<u32, Arc<[u32]>>, CoreFailure> {
+    fn visit(
+        executable: &CoreExecutable,
+        region: RegionId,
+        path: Vec<u32>,
+        region_paths: &mut BTreeMap<RegionId, Arc<[u32]>>,
+        operation_paths: &mut BTreeMap<u32, Arc<[u32]>>,
+        cancellation: &Cancellation,
+    ) -> Result<(), CoreFailure> {
+        checkpoint(cancellation)?;
+        if region_paths.contains_key(&region) {
+            return Ok(());
+        }
+        region_paths.insert(region, Arc::clone(&Arc::from(path.clone())));
+        let Some(region) = executable.regions.get(region.0 as usize) else {
+            return Ok(());
+        };
+        for operation in region.operations.iter() {
+            operation_paths.insert(operation.identity, Arc::from(path.clone()));
+            for (ordinal, successor) in operation.successors.iter().copied().enumerate() {
+                let mut successor_path = path.clone();
+                successor_path.extend([
+                    u32::from(operation.kind.tag()),
+                    u32::try_from(ordinal).unwrap_or(u32::MAX),
+                ]);
+                visit(
+                    executable,
+                    successor,
+                    successor_path,
+                    region_paths,
+                    operation_paths,
+                    cancellation,
+                )?;
+            }
+        }
+        Ok(())
+    }
+    let mut regions = BTreeMap::new();
+    let mut operations = BTreeMap::new();
+    visit(
+        executable,
+        RegionId(0),
+        Vec::new(),
+        &mut regions,
+        &mut operations,
+        cancellation,
+    )?;
+    for region in executable.regions.iter() {
+        if !regions.contains_key(&region.identity) {
+            visit(
+                executable,
+                region.identity,
+                vec![u32::MAX],
+                &mut regions,
+                &mut operations,
+                cancellation,
+            )?;
+        }
+    }
+    Ok(operations)
+}
+
 fn observe_executable_custody(
     executable: &CoreExecutable,
     executables: &[CoreExecutable],
-) -> Arc<[CoreCustodyEffectObservation]> {
+    cancellation: &Cancellation,
+) -> Result<Arc<[CoreCustodyEffectObservation]>, CoreFailure> {
+    let control_paths = observation_control_paths(executable, cancellation)?;
+    let producers = executable
+        .regions
+        .iter()
+        .flat_map(|region| region.operations.iter())
+        .filter_map(|operation| Some((operation.result?, operation)))
+        .collect::<BTreeMap<_, _>>();
+    let mut value_subjects = BTreeMap::new();
+    for value in producers.keys().copied().collect::<Vec<_>>() {
+        observation_value_subject(
+            value,
+            &producers,
+            &mut value_subjects,
+            &mut BTreeSet::new(),
+            cancellation,
+        )?;
+    }
+    let mut value_uses = BTreeMap::<ValueId, Vec<u128>>::new();
+    for consumer in executable
+        .regions
+        .iter()
+        .flat_map(|region| region.operations.iter())
+    {
+        checkpoint(cancellation)?;
+        for (ordinal, operand) in consumer.operands.iter().copied().enumerate() {
+            let mut hash = Xxh3::new();
+            hash.update(b"wrela.core.value-use-subject\0\x01");
+            hash.update(&[consumer.kind.tag(), consumer.access.tag()]);
+            hash.update(&(ordinal as u64).to_be_bytes());
+            let skip = usize::from(matches!(
+                consumer.kind,
+                CoreOperationKind::Read | CoreOperationKind::Store
+            ));
+            for detail in consumer.details.iter().skip(skip) {
+                hash.update(&detail.to_be_bytes());
+            }
+            value_uses
+                .entry(operand)
+                .or_default()
+                .push(hash.digest128());
+        }
+    }
+    let mut local_subjects = executable
+        .signature
+        .parameters
+        .iter()
+        .enumerate()
+        .map(|(ordinal, parameter)| {
+            let mut hash = Xxh3::new();
+            hash.update(b"wrela.core.parameter-custody-subject\0\x01");
+            hash.update(&executable.reference.identity.to_be_bytes());
+            hash.update(&(ordinal as u64).to_be_bytes());
+            hash.update(&parameter.type_.identity.to_be_bytes());
+            (u128::from(parameter.local), hash.digest128())
+        })
+        .collect::<BTreeMap<_, _>>();
     let cleanup_sources = executable
         .regions
         .iter()
         .flat_map(|region| region.operations.iter())
         .filter(|operation| operation.kind == CoreOperationKind::Cleanup)
-        .enumerate()
-        .map(|(ordinal, operation)| {
+        .map(|operation| {
             let mut hash = Xxh3::new();
-            hash.update(b"wrela.core.cleanup-observation\0\x01");
+            hash.update(b"wrela.core.cleanup-observation\0\x02");
             hash.update(&executable.reference.identity.to_be_bytes());
-            hash.update(&(ordinal as u64).to_be_bytes());
+            hash.update(operation.provenance.path().as_bytes());
+            hash.update(
+                &operation
+                    .provenance
+                    .end()
+                    .saturating_sub(operation.provenance.start())
+                    .to_be_bytes(),
+            );
+            hash.update(&(operation.operands.len() as u64).to_be_bytes());
+            hash.update(&(operation.successors.len() as u64).to_be_bytes());
+            if let Some(action) = operation.successors.first()
+                && let Some(action) = executable.regions.get(action.0 as usize)
+            {
+                for action_operation in action.operations.iter() {
+                    hash.update(&[action_operation.kind.tag(), action_operation.access.tag()]);
+                    hash.update(&action_operation.type_identity.unwrap_or(0).to_be_bytes());
+                    let skip = usize::from(matches!(
+                        action_operation.kind,
+                        CoreOperationKind::Read | CoreOperationKind::Store
+                    ));
+                    for detail in action_operation.details.iter().skip(skip) {
+                        hash.update(&detail.to_be_bytes());
+                    }
+                    for operand in action_operation.operands.iter() {
+                        hash.update(
+                            &value_subjects
+                                .get(operand)
+                                .copied()
+                                .unwrap_or(0)
+                                .to_be_bytes(),
+                        );
+                    }
+                }
+            }
             (operation.identity, hash.digest128())
         })
         .collect::<BTreeMap<_, _>>();
-    let mut known_homes = executable
+    let mut owned_places = executable
         .signature
         .parameters
         .iter()
         .filter(|parameter| parameter.access == CoreAccessLaw::Move)
-        .map(|parameter| place_home(&[u128::from(parameter.local)]))
+        .map(|parameter| Arc::<[u128]>::from([u128::from(parameter.local)]))
+        .collect::<BTreeSet<_>>();
+    let mut moved_components = BTreeSet::<Arc<[u128]>>::new();
+    let mut known_homes = owned_places
+        .iter()
+        .map(|place| place_home(place))
         .collect::<BTreeSet<_>>();
     let mut observations = Vec::new();
-    let mut occurrences = BTreeMap::<(CoreCustodyOperation, Option<u128>), u64>::new();
+    let mut semantic_identities = BTreeSet::new();
     for operation in executable
         .regions
         .iter()
         .flat_map(|region| region.operations.iter())
     {
-        for effect in operation.custody.iter() {
-            let occurrence = occurrences
-                .entry((effect.operation, effect.type_identity))
-                .or_insert(0);
+        checkpoint(cancellation)?;
+        for (effect_role, effect) in operation.custody.iter().enumerate() {
+            checkpoint(cancellation)?;
+            let cleanup_identity = effect
+                .cleanup_ordinal
+                .and_then(|ordinal| cleanup_sources.get(&ordinal).copied());
+            let derived_component = !effect.place.is_empty()
+                && effect.source_home == Some(place_home(&effect.place))
+                && owned_places
+                    .iter()
+                    .any(|root| place_is_prefix(root, &effect.place))
+                && !moved_components
+                    .iter()
+                    .any(|moved| places_overlap(moved, &effect.place));
             let custody_continuous = effect.source_home.is_none_or(|source| {
                 known_homes.contains(&source)
+                    || derived_component
                     || effect.custodian == CoreCustodianEffect::Establish
                     || effect.operation == CoreCustodyOperation::CleanupRun
             });
@@ -890,22 +1103,110 @@ fn observe_executable_custody(
             {
                 known_homes.remove(&source);
             }
+            if matches!(
+                effect.operation,
+                CoreCustodyOperation::Move | CoreCustodyOperation::Discharge
+            ) && !effect.place.is_empty()
+            {
+                if owned_places.remove(&effect.place) {
+                    moved_components.retain(|place| !place_is_prefix(&effect.place, place));
+                } else if owned_places
+                    .iter()
+                    .any(|root| place_is_prefix(root, &effect.place))
+                {
+                    moved_components.insert(Arc::clone(&effect.place));
+                }
+            }
             if let Some(destination) = effect.destination_home
                 && effect.custodian != CoreCustodianEffect::Discharge
             {
                 known_homes.insert(destination);
             }
+            if matches!(
+                effect.operation,
+                CoreCustodyOperation::TransferCommit | CoreCustodyOperation::Reinitialize
+            ) && !effect.place.is_empty()
+            {
+                if !owned_places
+                    .iter()
+                    .any(|root| place_is_prefix(root, &effect.place))
+                {
+                    owned_places.insert(Arc::clone(&effect.place));
+                }
+                moved_components.retain(|moved| !places_overlap(moved, &effect.place));
+            }
             let mut hash = Xxh3::new();
-            hash.update(b"wrela.core.custody-observation\0\x01");
+            hash.update(b"wrela.core.custody-observation\0\x02");
             hash.update(&executable.reference.identity.to_be_bytes());
-            hash.update(&[effect.operation.tag()]);
+            hash.update(&[
+                operation.kind.tag(),
+                operation.access.tag(),
+                effect.operation.tag(),
+                effect.initialization.tag(),
+                effect.custodian.tag(),
+                effect.loan.tag(),
+                effect.obligation.tag(),
+            ]);
             hash.update(&effect.type_identity.unwrap_or(0).to_be_bytes());
-            hash.update(&occurrence.to_be_bytes());
+            hash.update(&(effect_role as u64).to_be_bytes());
+            if let Some(path) = control_paths.get(&operation.identity) {
+                hash.update(&(path.len() as u64).to_be_bytes());
+                for part in path.iter() {
+                    hash.update(&part.to_be_bytes());
+                }
+            }
+            hash.update(operation.provenance.path().as_bytes());
+            hash.update(
+                &operation
+                    .provenance
+                    .end()
+                    .saturating_sub(operation.provenance.start())
+                    .to_be_bytes(),
+            );
             hash.update(&(effect.place.len().saturating_sub(1) as u64).to_be_bytes());
-            *occurrence = occurrence.saturating_add(1);
-            let cleanup_identity = effect
-                .cleanup_ordinal
-                .and_then(|ordinal| cleanup_sources.get(&ordinal).copied());
+            for projection in effect.place.iter().skip(1) {
+                hash.update(&projection.to_be_bytes());
+            }
+            if let Some(local) = effect.place.first()
+                && let Some(subject) = local_subjects.get(local)
+            {
+                hash.update(&subject.to_be_bytes());
+            }
+            for operand in operation.operands.iter() {
+                hash.update(
+                    &value_subjects
+                        .get(operand)
+                        .copied()
+                        .unwrap_or(0)
+                        .to_be_bytes(),
+                );
+            }
+            for successor in operation.successors.iter() {
+                if let Some(successor) = executable.regions.get(successor.0 as usize) {
+                    for successor_operation in successor.operations.iter() {
+                        hash.update(&[
+                            successor_operation.kind.tag(),
+                            successor_operation.access.tag(),
+                        ]);
+                        hash.update(&successor_operation.type_identity.unwrap_or(0).to_be_bytes());
+                        let skip = usize::from(matches!(
+                            successor_operation.kind,
+                            CoreOperationKind::Read | CoreOperationKind::Store
+                        ));
+                        for detail in successor_operation.details.iter().skip(skip) {
+                            hash.update(&detail.to_be_bytes());
+                        }
+                    }
+                }
+            }
+            if let Some(result) = operation.result
+                && let Some(uses) = value_uses.get(&result)
+            {
+                for use_subject in uses {
+                    hash.update(&use_subject.to_be_bytes());
+                }
+            }
+            hash.update(&cleanup_identity.unwrap_or(0).to_be_bytes());
             let action_may_panic = (operation.kind == CoreOperationKind::CleanupRun)
                 .then(|| operation.successors.first())
                 .flatten()
@@ -930,8 +1231,12 @@ fn observe_executable_custody(
                         | FailureLaw::RecordTestFailure => false,
                     })
                 });
+            let semantic_identity = hash.digest128();
+            if !semantic_identities.insert(semantic_identity) {
+                return defect("Core custody observation identity collision");
+            }
             observations.push(CoreCustodyEffectObservation {
-                semantic_identity: hash.digest128(),
+                semantic_identity,
                 provenance: operation.provenance.clone(),
                 operation: effect.operation,
                 initialization: effect.initialization,
@@ -963,8 +1268,17 @@ fn observe_executable_custody(
                     .is_some_and(|proof| proof.retains_fallible_source_type),
             });
         }
+        if operation.kind == CoreOperationKind::Store
+            && let Some(local) = operation.details.first().copied()
+            && let Some(subject) = operation
+                .operands
+                .first()
+                .and_then(|operand| value_subjects.get(operand))
+        {
+            local_subjects.insert(local, *subject);
+        }
     }
-    observations.into()
+    Ok(observations.into())
 }
 
 #[allow(dead_code)]
@@ -1558,6 +1872,10 @@ fn place_home(place: &[u128]) -> u128 {
     xxh3_128(&bytes)
 }
 
+fn cleanup_capture_home(registration: u128, ordinal: u128) -> u128 {
+    custody_home(b"cleanup-capture", registration.rotate_left(37) ^ ordinal)
+}
+
 fn custody_effect(
     operation: CoreCustodyOperation,
     dimensions: (
@@ -1722,6 +2040,7 @@ fn producer_attach_custody(
     program: &crate::typed_hir::VerifiedProgram,
     cancellation: &Cancellation,
 ) -> Result<(), CoreFailure> {
+    let components = producer_resource_components(regions, program, cancellation)?;
     let mut value_types = BTreeMap::new();
     let mut value_access = BTreeMap::new();
     for operation in regions.iter().flat_map(|region| region.operations.iter()) {
@@ -1730,46 +2049,147 @@ fn producer_attach_custody(
             value_access.insert(value, operation.access);
         }
     }
-    let region_live =
-        producer_region_live_inputs(regions, signature, &value_types, program, cancellation)?;
+    let entry = signature
+        .parameters
+        .iter()
+        .filter(|parameter| {
+            parameter.access == CoreAccessLaw::Move
+                && program.owns_resource_type(TypeId(parameter.type_.identity))
+        })
+        .flat_map(|parameter| {
+            let root = u128::from(parameter.local);
+            components
+                .get(&root)
+                .cloned()
+                .unwrap_or_else(|| vec![(Arc::<[u128]>::from([root]), parameter.type_.identity)])
+        })
+        .collect::<LivePlaces>();
+    let mut flow = ProducerCustodyFlow {
+        regions,
+        value_types: &value_types,
+        value_access: &value_access,
+        program,
+        cancellation,
+        components: &components,
+        effects: BTreeMap::new(),
+        completed: BTreeMap::new(),
+        visiting: BTreeSet::new(),
+    };
+    flow.region(RegionId(0), entry, BTreeMap::new())?;
+    for region in regions.iter() {
+        if !flow.completed.contains_key(&region.identity) {
+            flow.region(region.identity, BTreeMap::new(), BTreeMap::new())?;
+        }
+    }
     let mut next = regions.to_vec();
     for region in &mut next {
-        checkpoint(cancellation)?;
-        let (mut live_places, inherited_places) = region_live
-            .get(&region.identity)
-            .cloned()
-            .unwrap_or_default();
         let mut operations = region.operations.to_vec();
         for operation in &mut operations {
             checkpoint(cancellation)?;
+            operation.custody = flow
+                .effects
+                .remove(&operation.identity)
+                .unwrap_or_default()
+                .into();
+        }
+        region.operations = operations.into();
+    }
+    *regions = next.into();
+    Ok(())
+}
+
+struct ProducerCustodyFlow<'a> {
+    regions: &'a [Region],
+    value_types: &'a BTreeMap<ValueId, u128>,
+    value_access: &'a BTreeMap<ValueId, CoreAccessLaw>,
+    program: &'a crate::typed_hir::VerifiedProgram,
+    cancellation: &'a Cancellation,
+    components: &'a ResourceComponents,
+    effects: BTreeMap<u32, Vec<CustodyEffect>>,
+    completed: BTreeMap<RegionId, Option<LivePlaces>>,
+    visiting: BTreeSet<RegionId>,
+}
+
+impl ProducerCustodyFlow<'_> {
+    fn region(
+        &mut self,
+        identity: RegionId,
+        mut live: LivePlaces,
+        inherited: LivePlaces,
+    ) -> Result<Option<LivePlaces>, CoreFailure> {
+        checkpoint(self.cancellation)?;
+        if let Some(output) = self.completed.get(&identity) {
+            return Ok(output.clone());
+        }
+        if !self.visiting.insert(identity) {
+            return Ok(Some(live));
+        }
+        let operations = self
+            .regions
+            .get(identity.0 as usize)
+            .ok_or_else(|| {
+                CoreFailure::Defect(Arc::from("Core custody flow has a dangling region"))
+            })?
+            .operations
+            .to_vec();
+        let mut terminated = false;
+        for operation in &operations {
+            checkpoint(self.cancellation)?;
             let mut effects = producer_operation_custody(
                 operation,
-                &value_types,
-                &value_access,
-                program,
-                cancellation,
+                self.value_types,
+                self.value_access,
+                self.program,
+                self.cancellation,
             )?;
-            if operation.kind == CoreOperationKind::Read
-                && matches!(
-                    operation.access,
-                    CoreAccessLaw::Move | CoreAccessLaw::CleanupCapture
-                )
-                && operation
-                    .type_identity
-                    .is_some_and(|identity| program.owns_resource_type(TypeId(identity)))
+            producer_update_live_places(
+                operation,
+                self.value_types,
+                self.program,
+                self.components,
+                &mut live,
+            );
+            if matches!(
+                operation.kind,
+                CoreOperationKind::Branch | CoreOperationKind::Match
+            ) {
+                let mut outputs = Vec::new();
+                for successor in operation.successors.iter().copied() {
+                    if let Some(output) = self.region(successor, live.clone(), live.clone())? {
+                        outputs.push(output);
+                    }
+                }
+                if let Some(joined) = producer_join_live(outputs)? {
+                    live = joined;
+                } else {
+                    live.clear();
+                    terminated = true;
+                }
+            } else if operation.kind == CoreOperationKind::Loop {
+                let mut outputs = vec![live.clone()];
+                for successor in operation.successors.iter().copied() {
+                    if let Some(output) = self.region(successor, live.clone(), live.clone())? {
+                        outputs.push(output);
+                    }
+                }
+                live = producer_join_live(outputs)?.unwrap_or_default();
+            } else if operation.kind == CoreOperationKind::PoolScope
+                && let Some(successor) = operation.successors.first().copied()
             {
-                live_places.retain(|place, _| !places_overlap(place, &operation.details));
-            }
-            if operation.kind == CoreOperationKind::Store {
-                let place: Arc<[u128]> =
-                    operation.details[..operation.details.len().saturating_sub(1)].into();
+                let mut scoped = live.clone();
                 if let Some(type_identity) = operation
                     .operands
                     .iter()
-                    .filter_map(|operand| value_types.get(operand).copied())
-                    .find(|identity| program.owns_resource_type(TypeId(*identity)))
+                    .filter_map(|operand| self.value_types.get(operand).copied())
+                    .find(|type_identity| self.program.owns_resource_type(TypeId(*type_identity)))
                 {
-                    live_places.insert(place, type_identity);
+                    scoped.insert(Arc::clone(&operation.details), type_identity);
+                }
+                if let Some(output) = self.region(successor, scoped, live.clone())? {
+                    live = output;
+                } else {
+                    live.clear();
+                    terminated = true;
                 }
             }
             let leaving = matches!(
@@ -1785,100 +2205,81 @@ fn producer_attach_custody(
                 let discharge_all = matches!(
                     operation.kind,
                     CoreOperationKind::Return | CoreOperationKind::Propagate
-                ) || region.identity == RegionId(0);
-                effects.extend(
-                    live_places
-                        .iter()
-                        .filter(|(place, type_identity)| {
-                            discharge_all || inherited_places.get(*place) != Some(*type_identity)
-                        })
-                        .map(|(place, type_identity)| {
-                            producer_discharge_effect(place, *type_identity, program)
-                        }),
+                ) || identity == RegionId(0);
+                let discharges = live
+                    .iter()
+                    .filter(|(place, type_identity)| {
+                        discharge_all || inherited.get(*place) != Some(*type_identity)
+                    })
+                    .map(|(place, type_identity)| (Arc::clone(place), *type_identity))
+                    .collect::<Vec<_>>();
+                effects.extend(discharges.iter().map(|(place, type_identity)| {
+                    producer_discharge_effect(place, *type_identity, self.program)
+                }));
+                for (place, _) in discharges {
+                    live.remove(&place);
+                }
+                terminated = matches!(
+                    operation.kind,
+                    CoreOperationKind::Return | CoreOperationKind::Propagate
                 );
-                live_places.clear();
             }
             if operation.kind == CoreOperationKind::TerminalPanic {
-                live_places.clear();
+                live.clear();
+                terminated = true;
             }
-            operation.custody = effects.into();
+            self.effects.insert(operation.identity, effects);
         }
-        region.operations = operations.into();
+        self.visiting.remove(&identity);
+        let output = (!terminated).then_some(live);
+        self.completed.insert(identity, output.clone());
+        Ok(output)
     }
-    *regions = next.into();
-    Ok(())
 }
 
-fn producer_region_live_inputs(
+fn producer_join_live(states: Vec<LivePlaces>) -> Result<Option<LivePlaces>, CoreFailure> {
+    let mut states = states.into_iter();
+    let Some(first) = states.next() else {
+        return Ok(None);
+    };
+    if states.all(|state| state == first) {
+        Ok(Some(first))
+    } else {
+        defect("Core producer found path-dependent custody at a control-flow join")
+    }
+}
+
+fn producer_resource_components(
     regions: &[Region],
-    signature: &CoreSignature,
-    value_types: &BTreeMap<ValueId, u128>,
     program: &crate::typed_hir::VerifiedProgram,
     cancellation: &Cancellation,
-) -> Result<RegionLiveInputs, CoreFailure> {
-    let root = signature
-        .parameters
-        .iter()
-        .filter(|parameter| {
-            parameter.access == CoreAccessLaw::Move
-                && program.owns_resource_type(TypeId(parameter.type_.identity))
-        })
-        .map(|parameter| {
-            (
-                Arc::<[u128]>::from([u128::from(parameter.local)]),
-                parameter.type_.identity,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut inputs = BTreeMap::from([(RegionId(0), (root, BTreeMap::new()))]);
-    let mut work = vec![RegionId(0)];
-    while let Some(region_id) = work.pop() {
+) -> Result<ResourceComponents, CoreFailure> {
+    let mut components = BTreeMap::<u128, BTreeMap<Arc<[u128]>, u128>>::new();
+    for operation in regions.iter().flat_map(|region| region.operations.iter()) {
         checkpoint(cancellation)?;
-        let Some(region) = regions.get(region_id.0 as usize) else {
-            return defect("Core producer custody traversal found a dangling region");
-        };
-        let mut live = inputs
-            .get(&region_id)
-            .map(|(live, _)| live.clone())
-            .unwrap_or_default();
-        for operation in region.operations.iter() {
-            checkpoint(cancellation)?;
-            producer_update_live_places(operation, value_types, program, &mut live);
-            if matches!(
-                operation.kind,
-                CoreOperationKind::Branch
-                    | CoreOperationKind::Match
-                    | CoreOperationKind::Loop
-                    | CoreOperationKind::PoolScope
-            ) {
-                for successor in operation.successors.iter().copied() {
-                    let mut child = live.clone();
-                    if operation.kind == CoreOperationKind::PoolScope
-                        && let Some(type_identity) = operation
-                            .operands
-                            .iter()
-                            .filter_map(|operand| value_types.get(operand).copied())
-                            .find(|identity| program.owns_resource_type(TypeId(*identity)))
-                    {
-                        child.insert(Arc::clone(&operation.details), type_identity);
-                    }
-                    if let std::collections::btree_map::Entry::Vacant(entry) =
-                        inputs.entry(successor)
-                    {
-                        entry.insert((child, live.clone()));
-                        work.push(successor);
-                    }
-                }
-            }
+        if operation.kind == CoreOperationKind::Read
+            && operation.details.len() > 1
+            && operation
+                .type_identity
+                .is_some_and(|identity| program.owns_resource_type(TypeId(identity)))
+        {
+            components.entry(operation.details[0]).or_default().insert(
+                Arc::clone(&operation.details),
+                operation.type_identity.unwrap_or(0),
+            );
         }
     }
-    Ok(inputs)
+    Ok(components
+        .into_iter()
+        .map(|(root, components)| (root, components.into_iter().collect()))
+        .collect())
 }
 
 fn producer_update_live_places(
     operation: &Operation,
     value_types: &BTreeMap<ValueId, u128>,
     program: &crate::typed_hir::VerifiedProgram,
+    components: &ResourceComponents,
     live_places: &mut BTreeMap<Arc<[u128]>, u128>,
 ) {
     if operation.kind == CoreOperationKind::Read
@@ -1901,7 +2302,16 @@ fn producer_update_live_places(
             .filter_map(|operand| value_types.get(operand).copied())
             .find(|identity| program.owns_resource_type(TypeId(*identity)))
         {
-            live_places.insert(place, type_identity);
+            if place.len() == 1 {
+                if let Some(children) = components.get(&place[0]) {
+                    live_places.retain(|candidate, _| !place_is_prefix(&place, candidate));
+                    live_places.extend(children.iter().cloned());
+                } else {
+                    live_places.insert(place, type_identity);
+                }
+            } else {
+                live_places.insert(place, type_identity);
+            }
         }
     }
 }
@@ -1946,6 +2356,14 @@ fn producer_operation_custody(
         let destination = custody_home(b"value", u128::from(result.0));
         match (operation.kind, operation.access) {
             (CoreOperationKind::Read, CoreAccessLaw::Move | CoreAccessLaw::CleanupCapture) => {
+                let source = if operation.access == CoreAccessLaw::CleanupCapture {
+                    cleanup_capture_home(
+                        operation.details.first().copied().unwrap_or(u128::MAX),
+                        operation.details.get(1).copied().unwrap_or(u128::MAX),
+                    )
+                } else {
+                    place_home(&operation.details)
+                };
                 effects.push(custody_effect(
                     CoreCustodyOperation::Move,
                     (
@@ -1956,7 +2374,7 @@ fn producer_operation_custody(
                     ),
                     Arc::clone(&operation.details),
                     Some(type_identity),
-                    Some(place_home(&operation.details)),
+                    Some(source),
                     Some(destination),
                 ));
             }
@@ -2050,11 +2468,12 @@ fn producer_operation_custody(
         let source = custody_home(b"value", u128::from(operand.0));
         let destination = if operation.kind == CoreOperationKind::PoolScope {
             place_home(&operation.details)
+        } else if operation.kind == CoreOperationKind::Cleanup {
+            cleanup_capture_home(u128::from(operation.identity), ordinal as u128)
         } else {
             custody_home(
                 match operation.kind {
                     CoreOperationKind::Return => b"return" as &[u8],
-                    CoreOperationKind::Cleanup => b"cleanup",
                     CoreOperationKind::Store => b"place",
                     _ => b"operation",
                 },
@@ -2649,6 +3068,14 @@ impl<'a> ProducerLowerer<'a> {
                 let action_region = self.reserve_region();
                 let mut action_operations = Vec::new();
                 self.lower_expression(&action.expression, &mut action_operations)?;
+                let cleanup_identity = self.next_operation;
+                for operation in &mut action_operations {
+                    if operation.access == CoreAccessLaw::CleanupCapture {
+                        let ordinal = operation.details.first().copied().unwrap_or(u128::MAX);
+                        operation.details =
+                            Arc::from([u128::from(cleanup_identity), ordinal, u128::MAX]);
+                    }
+                }
                 self.install_region(action_region, action_operations);
                 self.push_operation(
                     operations,
@@ -3029,6 +3456,19 @@ fn place_details(place: &Place) -> Vec<u128> {
             PlaceProjection::Index { index, .. } => {
                 details.push(2);
                 details.push(index.type_id.0);
+                match &index.kind {
+                    ExpressionKind::Literal(literal) => {
+                        details.push(1);
+                        details.extend(literal_details(literal));
+                    }
+                    ExpressionKind::Constant(identity) => details.extend([2, identity.0]),
+                    _ => details.extend([
+                        3,
+                        xxh3_128(index.source.path().as_bytes()),
+                        u128::from(index.source.start()),
+                        u128::from(index.source.end()),
+                    ]),
+                }
             }
         }
     }
@@ -3952,6 +4392,14 @@ impl<'a> VerifierLowerer<'a> {
                 let action_region = self.reserve_region();
                 let mut action_operations = Vec::new();
                 self.reconstruct_expression(&action.expression, &mut action_operations)?;
+                let cleanup_identity = self.next_operation;
+                for operation in &mut action_operations {
+                    if operation.access == CoreAccessLaw::CleanupCapture {
+                        let ordinal = operation.details.first().copied().unwrap_or(u128::MAX);
+                        operation.details =
+                            Arc::from([u128::from(cleanup_identity), ordinal, u128::MAX]);
+                    }
+                }
                 self.install_region(action_region, action_operations);
                 self.emit(
                     operations,
@@ -4398,6 +4846,19 @@ fn verifier_place_details(place: &Place) -> Vec<u128> {
             } => details.extend([1, definition.0, xxh3_128(name.as_bytes())]),
             PlaceProjection::Index { index, .. } => {
                 details.extend([2, index.type_id.0]);
+                match &index.kind {
+                    ExpressionKind::Literal(literal) => {
+                        details.push(1);
+                        details.extend(verifier_literal_details(literal));
+                    }
+                    ExpressionKind::Constant(identity) => details.extend([2, identity.0]),
+                    _ => details.extend([
+                        3,
+                        xxh3_128(index.source.path().as_bytes()),
+                        u128::from(index.source.start()),
+                        u128::from(index.source.end()),
+                    ]),
+                }
             }
         }
     }
@@ -5125,96 +5586,6 @@ fn validate_graphs(
     Ok(())
 }
 
-fn verifier_region_live_inputs(
-    executable: &CoreExecutable,
-    value_types: &BTreeMap<ValueId, u128>,
-    program: &crate::typed_hir::VerifiedProgram,
-    cancellation: &Cancellation,
-) -> Result<RegionLiveInputs, CoreFailure> {
-    let entry_live = executable
-        .signature
-        .parameters
-        .iter()
-        .filter(|parameter| {
-            parameter.access == CoreAccessLaw::Move
-                && program.owns_resource_type(TypeId(parameter.type_.identity))
-        })
-        .map(|parameter| {
-            (
-                Arc::<[u128]>::from([u128::from(parameter.local)]),
-                parameter.type_.identity,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut result = BTreeMap::from([(RegionId(0), (entry_live, BTreeMap::new()))]);
-    let mut pending = vec![RegionId(0)];
-    while let Some(identity) = pending.pop() {
-        checkpoint(cancellation)?;
-        let region = executable.regions.get(identity.0 as usize).ok_or_else(|| {
-            CoreFailure::Defect(Arc::from("Core verifier custody region is missing"))
-        })?;
-        let mut state = result
-            .get(&identity)
-            .map(|(live, _)| live.clone())
-            .unwrap_or_default();
-        for operation in region.operations.iter() {
-            checkpoint(cancellation)?;
-            if operation.kind == CoreOperationKind::Read
-                && matches!(
-                    operation.access,
-                    CoreAccessLaw::Move | CoreAccessLaw::CleanupCapture
-                )
-                && operation
-                    .type_identity
-                    .is_some_and(|type_identity| program.owns_resource_type(TypeId(type_identity)))
-            {
-                state.retain(|place, _| !places_overlap(place, &operation.details));
-            }
-            if operation.kind == CoreOperationKind::Store {
-                let place: Arc<[u128]> =
-                    operation.details[..operation.details.len().saturating_sub(1)].into();
-                if let Some(type_identity) = operation
-                    .operands
-                    .iter()
-                    .filter_map(|operand| value_types.get(operand).copied())
-                    .find(|type_identity| program.owns_resource_type(TypeId(*type_identity)))
-                {
-                    state.insert(place, type_identity);
-                }
-            }
-            if matches!(
-                operation.kind,
-                CoreOperationKind::Branch
-                    | CoreOperationKind::Match
-                    | CoreOperationKind::Loop
-                    | CoreOperationKind::PoolScope
-            ) {
-                for successor in operation.successors.iter().copied() {
-                    let mut successor_live = state.clone();
-                    if operation.kind == CoreOperationKind::PoolScope
-                        && let Some(type_identity) = operation
-                            .operands
-                            .iter()
-                            .filter_map(|operand| value_types.get(operand).copied())
-                            .find(|type_identity| {
-                                program.owns_resource_type(TypeId(*type_identity))
-                            })
-                    {
-                        successor_live.insert(Arc::clone(&operation.details), type_identity);
-                    }
-                    if let std::collections::btree_map::Entry::Vacant(entry) =
-                        result.entry(successor)
-                    {
-                        entry.insert((successor_live, state.clone()));
-                        pending.push(successor);
-                    }
-                }
-            }
-        }
-    }
-    Ok(result)
-}
-
 fn validate_custody(
     candidate: &VerifiedCoreProgram,
     program: &crate::typed_hir::VerifiedProgram,
@@ -5239,16 +5610,20 @@ fn validate_custody(
             value_access: &value_access,
             program,
         };
-        let region_live =
-            verifier_region_live_inputs(executable, &value_types, program, cancellation)?;
+        let expected_trace = verifier_expected_custody_trace(executable, program, cancellation)?;
+        let mut expected_trace = expected_trace.iter();
         for region in executable.regions.iter() {
             let mut active_loans = Vec::<(CoreLoanEffect, Arc<[u128]>)>::new();
-            let (mut live_places, inherited_places) = region_live
-                .get(&region.identity)
-                .cloned()
-                .unwrap_or_default();
             for operation in region.operations.iter() {
                 checkpoint(cancellation)?;
+                let exact_expected = expected_trace.next().ok_or_else(|| {
+                    CoreFailure::Defect(Arc::from("Core custody trace is shorter than its graph"))
+                })?;
+                if operation.custody.as_ref() != exact_expected.as_ref() {
+                    return defect(
+                        "Core custody transition fields do not match their exact source authority",
+                    );
+                }
                 let moved_resource_count = operation
                     .operands
                     .iter()
@@ -5271,53 +5646,11 @@ fn validate_custody(
                             (0, moved_resource_count)
                         }
                     });
-                if operation.kind == CoreOperationKind::Read
-                    && matches!(
-                        operation.access,
-                        CoreAccessLaw::Move | CoreAccessLaw::CleanupCapture
-                    )
-                    && operation
-                        .type_identity
-                        .is_some_and(|identity| program.owns_resource_type(TypeId(identity)))
-                {
-                    live_places.retain(|place, _| !places_overlap(place, &operation.details));
-                }
-                if operation.kind == CoreOperationKind::Store {
-                    let place: Arc<[u128]> =
-                        operation.details[..operation.details.len().saturating_sub(1)].into();
-                    if let Some(type_identity) = operation
-                        .operands
-                        .iter()
-                        .filter_map(|operand| value_types.get(operand).copied())
-                        .find(|identity| program.owns_resource_type(TypeId(*identity)))
-                    {
-                        live_places.insert(place, type_identity);
-                    }
-                }
-                let leaving = matches!(
-                    operation.kind,
-                    CoreOperationKind::Return
-                        | CoreOperationKind::Propagate
-                        | CoreOperationKind::Break
-                        | CoreOperationKind::Continue
-                        | CoreOperationKind::LoopBack
-                        | CoreOperationKind::RecoverableExit
-                );
-                let expected_discharges = if leaving {
-                    let discharge_all = matches!(
-                        operation.kind,
-                        CoreOperationKind::Return | CoreOperationKind::Propagate
-                    ) || region.identity == RegionId(0);
-                    live_places
-                        .iter()
-                        .filter(|(place, type_identity)| {
-                            discharge_all || inherited_places.get(*place) != Some(*type_identity)
-                        })
-                        .map(|(place, type_identity)| (Arc::clone(place), *type_identity))
-                        .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                };
+                let expected_discharges = exact_expected
+                    .iter()
+                    .filter(|effect| effect.operation == CoreCustodyOperation::Discharge)
+                    .filter_map(|effect| Some((Arc::clone(&effect.place), effect.type_identity?)))
+                    .collect::<Vec<_>>();
                 validate_operation_custody(
                     operation,
                     region.identity == RegionId(0),
@@ -5326,12 +5659,6 @@ fn validate_custody(
                     expected_store_operation,
                     &expected_discharges,
                 )?;
-                if leaving {
-                    live_places.clear();
-                }
-                if operation.kind == CoreOperationKind::TerminalPanic {
-                    live_places.clear();
-                }
                 let mut cleanup_runs = Vec::new();
                 let mut commits = BTreeSet::new();
                 for effect in operation.custody.iter() {
@@ -5421,6 +5748,15 @@ fn places_overlap(left: &[u128], right: &[u128]) -> bool {
         && left
             .iter()
             .zip(right.iter())
+            .all(|(left, right)| left == right)
+}
+
+fn place_is_prefix(prefix: &[u128], place: &[u128]) -> bool {
+    !prefix.is_empty()
+        && prefix.len() <= place.len()
+        && prefix
+            .iter()
+            .zip(place.iter())
             .all(|(left, right)| left == right)
 }
 
@@ -5589,6 +5925,14 @@ fn verifier_operation_custody(
         let destination = custody_home(b"value", u128::from(result.0));
         let effect = match (operation.kind, operation.access) {
             (CoreOperationKind::Read, CoreAccessLaw::Move | CoreAccessLaw::CleanupCapture) => {
+                let source = if operation.access == CoreAccessLaw::CleanupCapture {
+                    cleanup_capture_home(
+                        operation.details.first().copied().unwrap_or(u128::MAX),
+                        operation.details.get(1).copied().unwrap_or(u128::MAX),
+                    )
+                } else {
+                    place_home(&operation.details)
+                };
                 Some(verifier_effect(
                     CoreCustodyOperation::Move,
                     (
@@ -5599,7 +5943,7 @@ fn verifier_operation_custody(
                     ),
                     Arc::clone(&operation.details),
                     Some(type_identity),
-                    Some(place_home(&operation.details)),
+                    Some(source),
                     Some(destination),
                 ))
             }
@@ -5741,10 +6085,17 @@ fn verifier_operation_custody(
                 | CoreOperationKind::Cleanup
                 | CoreOperationKind::Propagate
         ) {
-            let domain = match operation.kind {
-                CoreOperationKind::Return => b"return" as &[u8],
-                CoreOperationKind::Cleanup => b"cleanup",
-                _ => b"operation",
+            let destination = if operation.kind == CoreOperationKind::Cleanup {
+                cleanup_capture_home(u128::from(operation.identity), ordinal as u128)
+            } else {
+                custody_home(
+                    if operation.kind == CoreOperationKind::Return {
+                        b"return" as &[u8]
+                    } else {
+                        b"operation"
+                    },
+                    u128::from(operation.identity) << 32 | ordinal as u128,
+                )
             };
             effects.push(verifier_effect(
                 CoreCustodyOperation::TransferCommit,
@@ -5757,10 +6108,7 @@ fn verifier_operation_custody(
                 Arc::from([]),
                 Some(type_identity),
                 Some(source),
-                Some(custody_home(
-                    domain,
-                    u128::from(operation.identity) << 32 | ordinal as u128,
-                )),
+                Some(destination),
             ));
         }
     }
@@ -6124,31 +6472,1001 @@ fn run_custody_oracle(
                     && executable.reference.identity == reference.identity()
             })
             .ok_or_else(|| CoreFailure::Defect(Arc::from("custody oracle Core body is missing")))?;
-        let reconstruction = VerifierLowerer::reconstruct(source.body, cancellation)?;
-        let mut source_executable = executable.clone();
-        source_executable.regions = reconstruction.regions;
-        let expected = verifier_expected_custody_trace(&source_executable, program, cancellation)?;
-        let actual = executable
-            .regions
-            .iter()
-            .flat_map(|region| region.operations.iter())
-            .map(|operation| Arc::clone(&operation.custody))
-            .collect::<Vec<_>>();
+        let expected = source_custody_contract(source.body, program, cancellation)?;
+        let actual = core_custody_contract(executable, cancellation)?;
         let same = expected == actual;
         cases += 1;
         agrees &= same;
         hash.update(&reference.identity().to_be_bytes());
         hash.update(&[u8::from(same)]);
-        hash.update(&(expected.len() as u64).to_be_bytes());
-        for effects in &expected {
-            encode_custody(&mut hash, effects, cancellation)?;
-        }
-        hash.update(&(actual.len() as u64).to_be_bytes());
-        for effects in &actual {
-            encode_custody(&mut hash, effects, cancellation)?;
-        }
+        encode_source_custody_contract(&mut hash, &expected, cancellation)?;
+        encode_source_custody_contract(&mut hash, &actual, cancellation)?;
     }
     Ok((cases, agrees, hash.digest128()))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceCustodyContract {
+    events: Vec<SourceCustodyEvent>,
+    cleanup_runs: usize,
+    root_discharges: SourceRootDischarges,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SourceCustodyEvent {
+    operation: CoreCustodyOperation,
+    type_identity: Option<u128>,
+    place: Arc<[u128]>,
+    source_path: Arc<str>,
+    source_start: u64,
+    source_end: u64,
+    control_path: Arc<[u32]>,
+}
+
+fn source_custody_event(
+    events: &mut Vec<SourceCustodyEvent>,
+    operation: CoreCustodyOperation,
+    type_identity: Option<u128>,
+    place: impl Into<Arc<[u128]>>,
+    source: &SourceRange,
+    control_path: &[u32],
+) {
+    events.push(SourceCustodyEvent {
+        operation,
+        type_identity,
+        place: place.into(),
+        source_path: Arc::from(source.path()),
+        source_start: source.start(),
+        source_end: source.end(),
+        control_path: Arc::from(control_path),
+    });
+}
+
+fn source_custody_contract(
+    body: CoreSourceExecutableBody<'_>,
+    program: &crate::typed_hir::VerifiedProgram,
+    cancellation: &Cancellation,
+) -> Result<SourceCustodyContract, CoreFailure> {
+    let mut events = Vec::new();
+    match body {
+        CoreSourceExecutableBody::Specialization(function) => {
+            source_custody_statements(&function.body, &[], program, cancellation, &mut events)?
+        }
+        CoreSourceExecutableBody::Test(test) => {
+            source_custody_statements(&test.body, &[], program, cancellation, &mut events)?
+        }
+        CoreSourceExecutableBody::Closure(closure) => {
+            source_custody_expression(&closure.body, &[], program, cancellation, &mut events)?
+        }
+    }
+    events.sort();
+    let statements = match body {
+        CoreSourceExecutableBody::Specialization(function) => Some(&*function.body),
+        CoreSourceExecutableBody::Test(test) => Some(&*test.body),
+        CoreSourceExecutableBody::Closure(_) => None,
+    };
+    let cleanup_runs = match statements {
+        Some(statements) => source_cleanup_run_count(statements, 0, cancellation)?,
+        None => 0,
+    };
+    let root_discharges = source_root_discharge_contract(body, program, cancellation)?;
+    Ok(SourceCustodyContract {
+        events,
+        cleanup_runs,
+        root_discharges,
+    })
+}
+
+type SourceLiveRoots = BTreeMap<Arc<[u128]>, u128>;
+
+fn source_root_discharge_contract(
+    body: CoreSourceExecutableBody<'_>,
+    program: &crate::typed_hir::VerifiedProgram,
+    cancellation: &Cancellation,
+) -> Result<SourceRootDischarges, CoreFailure> {
+    let (parameters, type_ids, statements) = match body {
+        CoreSourceExecutableBody::Specialization(function) => (
+            function.parameters.as_slice(),
+            &*function.parameter_type_ids,
+            Some(&*function.body),
+        ),
+        CoreSourceExecutableBody::Test(test) => (
+            test.parameters.as_slice(),
+            &*test.parameter_type_ids,
+            Some(&*test.body),
+        ),
+        CoreSourceExecutableBody::Closure(closure) => {
+            let parameters = closure
+                .parameters
+                .iter()
+                .zip(closure.parameter_type_ids.iter())
+                .filter(|(_, type_id)| program.owns_resource_type(**type_id))
+                .map(|((local, _), type_id)| {
+                    (Arc::<[u128]>::from([u128::from(local.0)]), type_id.0)
+                })
+                .collect::<SourceLiveRoots>();
+            let mut discharges = BTreeMap::new();
+            let mut live = parameters;
+            source_flow_expression(&closure.body, program, &mut live, cancellation)?;
+            for entry in live {
+                *discharges.entry(entry).or_insert(0) += 1;
+            }
+            return Ok(discharges);
+        }
+    };
+    let live = parameters
+        .iter()
+        .zip(type_ids.iter())
+        .filter(|((_, _, access), type_id)| {
+            *access == crate::typed_hir::AccessMode::Move && program.owns_resource_type(**type_id)
+        })
+        .map(|((local, _, _), type_id)| (Arc::<[u128]>::from([u128::from(local.0)]), type_id.0))
+        .collect::<SourceLiveRoots>();
+    let mut discharges = BTreeMap::new();
+    if let Some(statements) = statements {
+        source_flow_statements(
+            statements,
+            live,
+            &BTreeMap::new(),
+            true,
+            program,
+            cancellation,
+            &mut discharges,
+        )?;
+    }
+    Ok(discharges)
+}
+
+fn source_record_root_discharges(
+    live: &SourceLiveRoots,
+    inherited: &SourceLiveRoots,
+    all: bool,
+    discharges: &mut BTreeMap<(Arc<[u128]>, u128), usize>,
+) {
+    for (place, type_identity) in live {
+        if place.len() == 1 && (all || inherited.get(place) != Some(type_identity)) {
+            *discharges
+                .entry((Arc::clone(place), *type_identity))
+                .or_insert(0) += 1;
+        }
+    }
+}
+
+fn source_flow_expression(
+    expression: &Expression,
+    program: &crate::typed_hir::VerifiedProgram,
+    live: &mut SourceLiveRoots,
+    cancellation: &Cancellation,
+) -> Result<(), CoreFailure> {
+    checkpoint(cancellation)?;
+    match &expression.kind {
+        ExpressionKind::Read(place) => {
+            for projection in place.projections.iter() {
+                if let PlaceProjection::Index { index, .. } = projection {
+                    source_flow_expression(index, program, live, cancellation)?;
+                }
+            }
+            if expression.access == crate::typed_hir::AccessMode::Move
+                && program.owns_resource_type(expression.type_id)
+            {
+                let details = place_details(place);
+                live.retain(|candidate, _| !places_overlap(candidate, &details));
+            }
+        }
+        _ => {
+            let mut result = Ok(());
+            expression.visit_children(&mut |child| {
+                if result.is_ok() {
+                    result = source_flow_expression(child, program, live, cancellation);
+                }
+            });
+            result?;
+        }
+    }
+    Ok(())
+}
+
+fn source_flow_statements(
+    statements: &[Statement],
+    mut live: SourceLiveRoots,
+    inherited: &SourceLiveRoots,
+    root: bool,
+    program: &crate::typed_hir::VerifiedProgram,
+    cancellation: &Cancellation,
+    discharges: &mut BTreeMap<(Arc<[u128]>, u128), usize>,
+) -> Result<Option<SourceLiveRoots>, CoreFailure> {
+    for statement in statements {
+        checkpoint(cancellation)?;
+        match statement {
+            Statement::Return { value, .. } => {
+                if let Some(value) = value {
+                    source_flow_expression(value, program, &mut live, cancellation)?;
+                }
+                source_record_root_discharges(&live, inherited, true, discharges);
+                return Ok(None);
+            }
+            Statement::Panic { value, .. } => {
+                source_flow_expression(value, program, &mut live, cancellation)?;
+                return Ok(None);
+            }
+            Statement::Assert { condition, .. } | Statement::Expect { condition, .. } => {
+                source_flow_expression(condition, program, &mut live, cancellation)?;
+            }
+            Statement::Initialize { place, value, .. } | Statement::Assign { place, value, .. } => {
+                source_flow_expression(value, program, &mut live, cancellation)?;
+                if program.owns_resource_type(value.type_id) {
+                    live.insert(Arc::from(place_details(place)), value.type_id.0);
+                }
+            }
+            Statement::Evaluate(expression) => {
+                source_flow_expression(expression, program, &mut live, cancellation)?;
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            }
+            | Statement::IfPattern {
+                value: condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                source_flow_expression(condition, program, &mut live, cancellation)?;
+                let mut outputs = Vec::new();
+                for branch in [then_branch, else_branch] {
+                    if let Some(output) = source_flow_statements(
+                        branch,
+                        live.clone(),
+                        &live,
+                        false,
+                        program,
+                        cancellation,
+                        discharges,
+                    )? {
+                        outputs.push(output);
+                    }
+                }
+                let Some(first) = outputs.first().cloned() else {
+                    return Ok(None);
+                };
+                if outputs.iter().any(|output| output != &first) {
+                    return defect("source custody oracle found a path-dependent branch output");
+                }
+                live = first;
+            }
+            Statement::For { iterable, body, .. } => {
+                source_flow_expression(iterable, program, &mut live, cancellation)?;
+                if let Some(output) = source_flow_statements(
+                    body,
+                    live.clone(),
+                    &live,
+                    false,
+                    program,
+                    cancellation,
+                    discharges,
+                )? && output != live
+                {
+                    return defect("source custody oracle found a non-fixpoint for-loop body");
+                }
+            }
+            Statement::While {
+                condition, body, ..
+            } => {
+                source_flow_expression(condition, program, &mut live, cancellation)?;
+                if let Some(output) = source_flow_statements(
+                    body,
+                    live.clone(),
+                    &live,
+                    false,
+                    program,
+                    cancellation,
+                    discharges,
+                )? && output != live
+                {
+                    return defect("source custody oracle found a non-fixpoint while body");
+                }
+            }
+            Statement::Break(_) | Statement::Continue(_) => {
+                source_record_root_discharges(&live, inherited, false, discharges);
+                return Ok(None);
+            }
+            Statement::Match { value, cases, .. } => {
+                source_flow_expression(value, program, &mut live, cancellation)?;
+                let mut outputs = Vec::new();
+                for case in cases.iter() {
+                    let mut case_live = live.clone();
+                    if let Some(guard) = &case.guard {
+                        source_flow_expression(guard, program, &mut case_live, cancellation)?;
+                    }
+                    if let Some(output) = source_flow_statements(
+                        &case.body,
+                        case_live,
+                        &live,
+                        false,
+                        program,
+                        cancellation,
+                        discharges,
+                    )? {
+                        outputs.push(output);
+                    }
+                }
+                if let Some(first) = outputs.first().cloned() {
+                    if outputs.iter().any(|output| output != &first) {
+                        return defect("source custody oracle found a path-dependent match output");
+                    }
+                    live = first;
+                } else {
+                    return Ok(None);
+                }
+            }
+            Statement::Defer { action, .. } => {
+                for capture in action.captures.iter() {
+                    source_flow_expression(&capture.expression, program, &mut live, cancellation)?;
+                }
+            }
+            Statement::WithPool {
+                binding,
+                scope,
+                body,
+                ..
+            } => {
+                source_flow_expression(scope, program, &mut live, cancellation)?;
+                let outer = live.clone();
+                if program.owns_resource_type(scope.type_id) {
+                    live.insert(Arc::from(place_details(binding)), scope.type_id.0);
+                }
+                if let Some(output) = source_flow_statements(
+                    body,
+                    live,
+                    &outer,
+                    false,
+                    program,
+                    cancellation,
+                    discharges,
+                )? {
+                    live = output;
+                } else {
+                    return Ok(None);
+                }
+            }
+            Statement::Pass(_) => {}
+        }
+    }
+    source_record_root_discharges(&live, inherited, root, discharges);
+    if root {
+        Ok(Some(BTreeMap::new()))
+    } else {
+        live.retain(|place, type_identity| inherited.get(place) == Some(type_identity));
+        Ok(Some(live))
+    }
+}
+
+fn source_expression_propagates(
+    expression: &Expression,
+    cancellation: &Cancellation,
+) -> Result<usize, CoreFailure> {
+    checkpoint(cancellation)?;
+    let mut count = usize::from(matches!(expression.kind, ExpressionKind::Propagate(_)));
+    let mut result = Ok(());
+    expression.visit_children(&mut |child| {
+        if result.is_ok() {
+            match source_expression_propagates(child, cancellation) {
+                Ok(child_count) => count = count.saturating_add(child_count),
+                Err(error) => result = Err(error),
+            }
+        }
+    });
+    result?;
+    Ok(count)
+}
+
+fn source_cleanup_run_count(
+    statements: &[Statement],
+    inherited: usize,
+    cancellation: &Cancellation,
+) -> Result<usize, CoreFailure> {
+    let mut local = 0usize;
+    let mut runs = 0usize;
+    let mut reachable = true;
+    for statement in statements {
+        checkpoint(cancellation)?;
+        if !reachable {
+            break;
+        }
+        let active = inherited.saturating_add(local);
+        let expressions = match statement {
+            Statement::Return { value, .. } => value.iter().collect::<Vec<_>>(),
+            Statement::Panic { value, .. } => vec![value],
+            Statement::Assert { condition, .. } | Statement::Expect { condition, .. } => {
+                vec![condition]
+            }
+            Statement::Initialize { value, .. } | Statement::Assign { value, .. } => vec![value],
+            Statement::Evaluate(expression) => vec![expression],
+            Statement::If { condition, .. } => vec![condition],
+            Statement::IfPattern { value, .. } | Statement::Match { value, .. } => vec![value],
+            Statement::For { iterable, .. } => vec![iterable],
+            Statement::While { condition, .. } => vec![condition],
+            Statement::Defer { action, .. } => action
+                .captures
+                .iter()
+                .map(|capture| &capture.expression)
+                .collect(),
+            Statement::WithPool { scope, .. } => vec![scope],
+            Statement::Break(_) | Statement::Continue(_) | Statement::Pass(_) => Vec::new(),
+        };
+        let propagated = expressions
+            .iter()
+            .map(|expression| source_expression_propagates(expression, cancellation))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .sum::<usize>();
+        runs = runs.saturating_add(active.saturating_mul(propagated));
+        if propagated > 0 {
+            reachable = false;
+            continue;
+        }
+        match statement {
+            Statement::Return { .. } => {
+                runs = runs.saturating_add(active);
+                reachable = false;
+            }
+            Statement::Panic { .. } => reachable = false,
+            Statement::Break(_) | Statement::Continue(_) => {
+                runs = runs.saturating_add(local);
+                reachable = false;
+            }
+            Statement::If {
+                then_branch,
+                else_branch,
+                ..
+            }
+            | Statement::IfPattern {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                runs = runs.saturating_add(source_cleanup_run_count(
+                    then_branch,
+                    active,
+                    cancellation,
+                )?);
+                runs = runs.saturating_add(source_cleanup_run_count(
+                    else_branch,
+                    active,
+                    cancellation,
+                )?);
+            }
+            Statement::For { body, .. } | Statement::While { body, .. } => {
+                runs = runs.saturating_add(source_cleanup_run_count(body, active, cancellation)?);
+            }
+            Statement::Match { cases, .. } => {
+                for case in cases.iter() {
+                    runs = runs.saturating_add(source_cleanup_run_count(
+                        &case.body,
+                        active,
+                        cancellation,
+                    )?);
+                }
+            }
+            Statement::Defer { .. } => local = local.saturating_add(1),
+            Statement::WithPool { body, .. } => {
+                runs = runs.saturating_add(source_cleanup_run_count(body, active, cancellation)?);
+            }
+            Statement::Assert { .. }
+            | Statement::Expect { .. }
+            | Statement::Initialize { .. }
+            | Statement::Assign { .. }
+            | Statement::Evaluate(_)
+            | Statement::Pass(_) => {}
+        }
+    }
+    if reachable {
+        runs = runs.saturating_add(local);
+    }
+    Ok(runs)
+}
+
+fn source_child_transfer(
+    expression: &Expression,
+    source: &SourceRange,
+    path: &[u32],
+    program: &crate::typed_hir::VerifiedProgram,
+    events: &mut Vec<SourceCustodyEvent>,
+) {
+    if program.owns_resource_type(expression.type_id)
+        && !matches!(
+            expression.access,
+            crate::typed_hir::AccessMode::Read | crate::typed_hir::AccessMode::Mut
+        )
+    {
+        source_custody_event(
+            events,
+            CoreCustodyOperation::TransferCommit,
+            Some(expression.type_id.0),
+            Arc::<[u128]>::from([]),
+            source,
+            path,
+        );
+    }
+}
+
+fn source_custody_expression(
+    expression: &Expression,
+    path: &[u32],
+    program: &crate::typed_hir::VerifiedProgram,
+    cancellation: &Cancellation,
+    events: &mut Vec<SourceCustodyEvent>,
+) -> Result<(), CoreFailure> {
+    checkpoint(cancellation)?;
+    match &expression.kind {
+        ExpressionKind::Read(place) => {
+            for projection in place.projections.iter() {
+                if let PlaceProjection::Index { index, .. } = projection {
+                    source_custody_expression(index, path, program, cancellation, events)?;
+                }
+            }
+        }
+        ExpressionKind::Call { target, arguments } => {
+            if let CallTarget::Callable { value } = target {
+                source_custody_expression(value, path, program, cancellation, events)?;
+            }
+            for argument in arguments.iter() {
+                source_custody_expression(argument, path, program, cancellation, events)?;
+            }
+        }
+        ExpressionKind::Array(values) | ExpressionKind::Tuple(values) => {
+            for value in values.iter() {
+                source_custody_expression(value, path, program, cancellation, events)?;
+            }
+        }
+        ExpressionKind::RepeatedArray { value, .. }
+        | ExpressionKind::Positive(value)
+        | ExpressionKind::Negate(value)
+        | ExpressionKind::BitNot(value)
+        | ExpressionKind::Not(value)
+        | ExpressionKind::Await(value)
+        | ExpressionKind::Propagate(value)
+        | ExpressionKind::Is { value, .. } => {
+            source_custody_expression(value, path, program, cancellation, events)?;
+        }
+        ExpressionKind::Index { value, index } => {
+            source_custody_expression(value, path, program, cancellation, events)?;
+            source_custody_expression(index, path, program, cancellation, events)?;
+        }
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            source_custody_expression(left, path, program, cancellation, events)?;
+            let mut right_path = path.to_vec();
+            if binary_kind(*operator) == CoreOperationKind::ShortCircuit {
+                right_path.extend([u32::from(CoreOperationKind::ShortCircuit.tag()), 0]);
+            }
+            source_custody_expression(right, &right_path, program, cancellation, events)?;
+        }
+        ExpressionKind::Closure(closure) => {
+            source_custody_expression(&closure.body, path, program, cancellation, events)?;
+        }
+        ExpressionKind::Literal(_)
+        | ExpressionKind::Constant(_)
+        | ExpressionKind::FunctionValue { .. }
+        | ExpressionKind::CleanupCapture(_) => {}
+    }
+
+    let resource = program.owns_resource_type(expression.type_id);
+    if resource {
+        let operation = match &expression.kind {
+            ExpressionKind::Read(_) | ExpressionKind::CleanupCapture(_)
+                if expression.access == crate::typed_hir::AccessMode::Move
+                    || matches!(expression.kind, ExpressionKind::CleanupCapture(_)) =>
+            {
+                Some(CoreCustodyOperation::Move)
+            }
+            ExpressionKind::Read(_) if expression.access == crate::typed_hir::AccessMode::Read => {
+                Some(CoreCustodyOperation::SharedLoan)
+            }
+            ExpressionKind::Read(_) if expression.access == crate::typed_hir::AccessMode::Mut => {
+                Some(CoreCustodyOperation::ExclusiveLoan)
+            }
+            ExpressionKind::Array(_)
+            | ExpressionKind::Tuple(_)
+            | ExpressionKind::RepeatedArray { .. } => Some(CoreCustodyOperation::Construct),
+            ExpressionKind::Call {
+                target: CallTarget::Build { .. } | CallTarget::Struct { .. },
+                ..
+            } => Some(CoreCustodyOperation::Construct),
+            ExpressionKind::Call { .. } | ExpressionKind::Propagate(_) => {
+                Some(CoreCustodyOperation::TransferCommit)
+            }
+            _ => None,
+        };
+        if let Some(operation) = operation {
+            let place = match &expression.kind {
+                ExpressionKind::Read(place) => Arc::from(place_details(place)),
+                ExpressionKind::CleanupCapture(ordinal) => {
+                    Arc::from([u128::from(ordinal.0), u128::MAX])
+                }
+                _ => Arc::from([]),
+            };
+            source_custody_event(
+                events,
+                operation,
+                Some(expression.type_id.0),
+                place,
+                &expression.source,
+                path,
+            );
+        }
+    }
+
+    let transfers_children = matches!(
+        expression.kind,
+        ExpressionKind::Call { .. }
+            | ExpressionKind::Array(_)
+            | ExpressionKind::Tuple(_)
+            | ExpressionKind::RepeatedArray { .. }
+            | ExpressionKind::Propagate(_)
+    );
+    if transfers_children {
+        match &expression.kind {
+            ExpressionKind::Call { target, arguments } => {
+                if let CallTarget::Callable { value } = target {
+                    source_child_transfer(value, &expression.source, path, program, events);
+                }
+                for child in arguments.iter() {
+                    source_child_transfer(child, &expression.source, path, program, events);
+                }
+            }
+            ExpressionKind::Array(children) | ExpressionKind::Tuple(children) => {
+                for child in children.iter() {
+                    source_child_transfer(child, &expression.source, path, program, events);
+                }
+            }
+            ExpressionKind::RepeatedArray { value, .. } | ExpressionKind::Propagate(value) => {
+                source_child_transfer(value, &expression.source, path, program, events);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn source_custody_statements(
+    statements: &[Statement],
+    path: &[u32],
+    program: &crate::typed_hir::VerifiedProgram,
+    cancellation: &Cancellation,
+    events: &mut Vec<SourceCustodyEvent>,
+) -> Result<(), CoreFailure> {
+    for statement in statements {
+        checkpoint(cancellation)?;
+        match statement {
+            Statement::Return { value, source } => {
+                if let Some(value) = value {
+                    source_custody_expression(value, path, program, cancellation, events)?;
+                    source_child_transfer(value, source, path, program, events);
+                }
+            }
+            Statement::Panic { value, source } => {
+                source_custody_expression(value, path, program, cancellation, events)?;
+                source_custody_event(
+                    events,
+                    CoreCustodyOperation::Panic,
+                    None,
+                    Arc::<[u128]>::from([]),
+                    source,
+                    path,
+                );
+            }
+            Statement::Assert { condition, .. } => {
+                source_custody_expression(condition, path, program, cancellation, events)?;
+            }
+            Statement::Expect { condition, .. } | Statement::Evaluate(condition) => {
+                source_custody_expression(condition, path, program, cancellation, events)?;
+            }
+            Statement::Initialize {
+                place,
+                value,
+                source,
+            }
+            | Statement::Assign {
+                place,
+                value,
+                source,
+            } => {
+                for projection in place.projections.iter() {
+                    if let PlaceProjection::Index { index, .. } = projection {
+                        source_custody_expression(index, path, program, cancellation, events)?;
+                    }
+                }
+                source_custody_expression(value, path, program, cancellation, events)?;
+                if program.owns_resource_type(value.type_id) {
+                    source_custody_event(
+                        events,
+                        if matches!(statement, Statement::Initialize { .. }) {
+                            CoreCustodyOperation::TransferCommit
+                        } else {
+                            CoreCustodyOperation::Reinitialize
+                        },
+                        Some(value.type_id.0),
+                        Arc::from(place_details(place)),
+                        source,
+                        path,
+                    );
+                }
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+                source,
+            }
+            | Statement::IfPattern {
+                value: condition,
+                then_branch,
+                else_branch,
+                source,
+                ..
+            } => {
+                source_custody_expression(condition, path, program, cancellation, events)?;
+                source_custody_event(
+                    events,
+                    CoreCustodyOperation::Join,
+                    None,
+                    Arc::<[u128]>::from([]),
+                    source,
+                    path,
+                );
+                for (ordinal, branch) in [then_branch, else_branch].into_iter().enumerate() {
+                    let mut child = path.to_vec();
+                    child.extend([
+                        u32::from(CoreOperationKind::Branch.tag()),
+                        u32::try_from(ordinal).unwrap_or(u32::MAX),
+                    ]);
+                    source_custody_statements(branch, &child, program, cancellation, events)?;
+                }
+            }
+            Statement::For {
+                pattern,
+                iterable,
+                body,
+                source,
+                ..
+            } => {
+                source_custody_expression(iterable, path, program, cancellation, events)?;
+                source_custody_event(
+                    events,
+                    CoreCustodyOperation::LoopFixpoint,
+                    None,
+                    Arc::from(pattern_details(pattern)),
+                    source,
+                    path,
+                );
+                let mut child = path.to_vec();
+                child.extend([u32::from(CoreOperationKind::Loop.tag()), 0]);
+                source_custody_statements(body, &child, program, cancellation, events)?;
+            }
+            Statement::While {
+                condition,
+                body,
+                max_iterations,
+                source,
+                ..
+            } => {
+                let mut condition_path = path.to_vec();
+                condition_path.extend([u32::from(CoreOperationKind::Loop.tag()), 0]);
+                source_custody_expression(
+                    condition,
+                    &condition_path,
+                    program,
+                    cancellation,
+                    events,
+                )?;
+                source_custody_event(
+                    events,
+                    CoreCustodyOperation::LoopFixpoint,
+                    None,
+                    Arc::from([u128::from(*max_iterations)]),
+                    source,
+                    path,
+                );
+                let mut body_path = path.to_vec();
+                body_path.extend([u32::from(CoreOperationKind::Loop.tag()), 1]);
+                source_custody_statements(body, &body_path, program, cancellation, events)?;
+                source_custody_event(
+                    events,
+                    CoreCustodyOperation::LoopFixpoint,
+                    None,
+                    Arc::<[u128]>::from([]),
+                    source,
+                    &body_path,
+                );
+            }
+            Statement::Match {
+                value,
+                cases,
+                source,
+            } => {
+                source_custody_expression(value, path, program, cancellation, events)?;
+                source_custody_event(
+                    events,
+                    CoreCustodyOperation::Join,
+                    None,
+                    Arc::<[u128]>::from([]),
+                    source,
+                    path,
+                );
+                for (ordinal, case) in cases.iter().enumerate() {
+                    let mut child = path.to_vec();
+                    child.extend([
+                        u32::from(CoreOperationKind::Match.tag()),
+                        u32::try_from(ordinal).unwrap_or(u32::MAX),
+                    ]);
+                    if let Some(guard) = &case.guard {
+                        source_custody_expression(guard, &child, program, cancellation, events)?;
+                    }
+                    source_custody_statements(&case.body, &child, program, cancellation, events)?;
+                }
+            }
+            Statement::Defer { action, source } => {
+                for capture in action.captures.iter() {
+                    source_custody_expression(
+                        &capture.expression,
+                        path,
+                        program,
+                        cancellation,
+                        events,
+                    )?;
+                    source_child_transfer(&capture.expression, source, path, program, events);
+                }
+                source_custody_event(
+                    events,
+                    CoreCustodyOperation::CleanupRegister,
+                    None,
+                    Arc::<[u128]>::from([]),
+                    source,
+                    path,
+                );
+                let mut action_path = path.to_vec();
+                action_path.extend([u32::from(CoreOperationKind::Cleanup.tag()), 0]);
+                source_custody_expression(
+                    &action.expression,
+                    &action_path,
+                    program,
+                    cancellation,
+                    events,
+                )?;
+            }
+            Statement::WithPool {
+                binding,
+                scope,
+                body,
+                source,
+            } => {
+                source_custody_expression(scope, path, program, cancellation, events)?;
+                if program.owns_resource_type(scope.type_id) {
+                    source_custody_event(
+                        events,
+                        CoreCustodyOperation::TransferCommit,
+                        Some(scope.type_id.0),
+                        Arc::from(place_details(binding)),
+                        source,
+                        path,
+                    );
+                }
+                let mut child = path.to_vec();
+                child.extend([u32::from(CoreOperationKind::PoolScope.tag()), 0]);
+                source_custody_statements(body, &child, program, cancellation, events)?;
+            }
+            Statement::Break(_) | Statement::Continue(_) | Statement::Pass(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn core_custody_contract(
+    executable: &CoreExecutable,
+    cancellation: &Cancellation,
+) -> Result<SourceCustodyContract, CoreFailure> {
+    let paths = observation_control_paths(executable, cancellation)?;
+    let mut events = Vec::new();
+    let mut cleanup_runs = 0usize;
+    let mut root_discharges = BTreeMap::new();
+    for region in executable.regions.iter() {
+        checkpoint(cancellation)?;
+        for operation in region.operations.iter() {
+            checkpoint(cancellation)?;
+            for effect in operation.custody.iter() {
+                checkpoint(cancellation)?;
+                if matches!(
+                    effect.operation,
+                    CoreCustodyOperation::Discharge | CoreCustodyOperation::CleanupRun
+                ) {
+                    cleanup_runs = cleanup_runs.saturating_add(usize::from(
+                        effect.operation == CoreCustodyOperation::CleanupRun,
+                    ));
+                    continue;
+                }
+                let place = if effect.operation == CoreCustodyOperation::Join {
+                    Arc::from([])
+                } else if operation.access == CoreAccessLaw::CleanupCapture
+                    && effect.place.len() == 3
+                {
+                    Arc::from(&effect.place[1..])
+                } else {
+                    Arc::clone(&effect.place)
+                };
+                events.push(SourceCustodyEvent {
+                    operation: effect.operation,
+                    type_identity: effect.type_identity,
+                    place,
+                    source_path: Arc::from(operation.provenance.path()),
+                    source_start: operation.provenance.start(),
+                    source_end: operation.provenance.end(),
+                    control_path: paths
+                        .get(&operation.identity)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::from([])),
+                });
+            }
+        }
+    }
+    for effect in executable
+        .regions
+        .iter()
+        .flat_map(|region| region.operations.iter())
+        .flat_map(|operation| operation.custody.iter())
+        .filter(|effect| {
+            effect.operation == CoreCustodyOperation::Discharge && effect.place.len() == 1
+        })
+    {
+        if let Some(type_identity) = effect.type_identity {
+            *root_discharges
+                .entry((Arc::clone(&effect.place), type_identity))
+                .or_insert(0) += 1;
+        }
+    }
+    events.sort();
+    Ok(SourceCustodyContract {
+        events,
+        cleanup_runs,
+        root_discharges,
+    })
+}
+
+fn encode_source_custody_contract(
+    hash: &mut Xxh3,
+    contract: &SourceCustodyContract,
+    cancellation: &Cancellation,
+) -> Result<(), CoreFailure> {
+    hash.update(&(contract.events.len() as u64).to_be_bytes());
+    hash.update(&(contract.cleanup_runs as u64).to_be_bytes());
+    hash.update(&(contract.root_discharges.len() as u64).to_be_bytes());
+    for ((place, type_identity), count) in &contract.root_discharges {
+        for part in place.iter() {
+            hash.update(&part.to_be_bytes());
+        }
+        hash.update(&type_identity.to_be_bytes());
+        hash.update(&(*count as u64).to_be_bytes());
+    }
+    for event in &contract.events {
+        checkpoint(cancellation)?;
+        hash.update(&[event.operation.tag()]);
+        hash.update(&event.type_identity.unwrap_or(0).to_be_bytes());
+        hash.update(event.source_path.as_bytes());
+        hash.update(&event.source_start.to_be_bytes());
+        hash.update(&event.source_end.to_be_bytes());
+        for part in event.place.iter() {
+            hash.update(&part.to_be_bytes());
+        }
+        for part in event.control_path.iter() {
+            hash.update(&part.to_be_bytes());
+        }
+    }
+    Ok(())
 }
 
 fn verifier_expected_custody_trace(
@@ -6156,6 +7474,7 @@ fn verifier_expected_custody_trace(
     program: &crate::typed_hir::VerifiedProgram,
     cancellation: &Cancellation,
 ) -> Result<Vec<Arc<[CustodyEffect]>>, CoreFailure> {
+    let components = verifier_resource_components(executable, program, cancellation)?;
     let value_types = executable
         .regions
         .iter()
@@ -6168,32 +7487,102 @@ fn verifier_expected_custody_trace(
         .flat_map(|region| region.operations.iter())
         .filter_map(|operation| Some((operation.result?, operation.access)))
         .collect::<BTreeMap<_, _>>();
-    let live_inputs = verifier_region_live_inputs(executable, &value_types, program, cancellation)?;
     let context = CustodyVerifierContext {
         signature: &executable.signature,
         value_types: &value_types,
         value_access: &value_access,
         program,
     };
-    let mut trace = Vec::new();
+    let entry = executable
+        .signature
+        .parameters
+        .iter()
+        .filter(|parameter| {
+            parameter.access == CoreAccessLaw::Move
+                && program.owns_resource_type(TypeId(parameter.type_.identity))
+        })
+        .flat_map(|parameter| {
+            let root = u128::from(parameter.local);
+            components
+                .get(&root)
+                .cloned()
+                .unwrap_or_else(|| vec![(Arc::<[u128]>::from([root]), parameter.type_.identity)])
+        })
+        .collect::<LivePlaces>();
+    let mut flow = VerifierCustodyFlow {
+        executable,
+        context: &context,
+        cancellation,
+        components: &components,
+        expected: BTreeMap::new(),
+        outputs: BTreeMap::new(),
+        active: BTreeSet::new(),
+    };
+    flow.inspect_region(RegionId(0), entry, BTreeMap::new())?;
     for region in executable.regions.iter() {
-        checkpoint(cancellation)?;
-        let (mut live, inherited) = live_inputs
-            .get(&region.identity)
-            .cloned()
-            .unwrap_or_default();
-        for operation in region.operations.iter() {
-            checkpoint(cancellation)?;
+        if !flow.outputs.contains_key(&region.identity) {
+            flow.inspect_region(region.identity, BTreeMap::new(), BTreeMap::new())?;
+        }
+    }
+    Ok(executable
+        .regions
+        .iter()
+        .flat_map(|region| region.operations.iter())
+        .map(|operation| {
+            flow.expected
+                .remove(&operation.identity)
+                .unwrap_or_default()
+                .into()
+        })
+        .collect())
+}
+
+struct VerifierCustodyFlow<'a> {
+    executable: &'a CoreExecutable,
+    context: &'a CustodyVerifierContext<'a>,
+    cancellation: &'a Cancellation,
+    components: &'a ResourceComponents,
+    expected: BTreeMap<u32, Vec<CustodyEffect>>,
+    outputs: BTreeMap<RegionId, Option<LivePlaces>>,
+    active: BTreeSet<RegionId>,
+}
+
+impl VerifierCustodyFlow<'_> {
+    fn inspect_region(
+        &mut self,
+        region_id: RegionId,
+        mut state: LivePlaces,
+        inherited: LivePlaces,
+    ) -> Result<Option<LivePlaces>, CoreFailure> {
+        checkpoint(self.cancellation)?;
+        if let Some(output) = self.outputs.get(&region_id) {
+            return Ok(output.clone());
+        }
+        if !self.active.insert(region_id) {
+            return Ok(Some(state));
+        }
+        let operations = self
+            .executable
+            .regions
+            .get(region_id.0 as usize)
+            .ok_or_else(|| {
+                CoreFailure::Defect(Arc::from("Core verifier custody region is absent"))
+            })?
+            .operations
+            .to_vec();
+        let mut terminal = false;
+        for operation in &operations {
+            checkpoint(self.cancellation)?;
             if operation.kind == CoreOperationKind::Read
                 && matches!(
                     operation.access,
                     CoreAccessLaw::Move | CoreAccessLaw::CleanupCapture
                 )
-                && operation
-                    .type_identity
-                    .is_some_and(|identity| program.owns_resource_type(TypeId(identity)))
+                && operation.type_identity.is_some_and(|identity| {
+                    self.context.program.owns_resource_type(TypeId(identity))
+                })
             {
-                live.retain(|place, _| !places_overlap(place, &operation.details));
+                state.retain(|place, _| !places_overlap(place, &operation.details));
             }
             if operation.kind == CoreOperationKind::Store {
                 let place: Arc<[u128]> =
@@ -6201,10 +7590,63 @@ fn verifier_expected_custody_trace(
                 if let Some(type_identity) = operation
                     .operands
                     .iter()
-                    .filter_map(|operand| value_types.get(operand).copied())
-                    .find(|identity| program.owns_resource_type(TypeId(*identity)))
+                    .filter_map(|operand| self.context.value_types.get(operand).copied())
+                    .find(|identity| self.context.program.owns_resource_type(TypeId(*identity)))
                 {
-                    live.insert(place, type_identity);
+                    if place.len() == 1 {
+                        if let Some(children) = self.components.get(&place[0]) {
+                            state.retain(|candidate, _| !place_is_prefix(&place, candidate));
+                            state.extend(children.iter().cloned());
+                        } else {
+                            state.insert(place, type_identity);
+                        }
+                    } else {
+                        state.insert(place, type_identity);
+                    }
+                }
+            }
+            if matches!(
+                operation.kind,
+                CoreOperationKind::Branch | CoreOperationKind::Match
+            ) {
+                let mut continuations = Vec::new();
+                for successor in operation.successors.iter().copied() {
+                    if let Some(output) =
+                        self.inspect_region(successor, state.clone(), state.clone())?
+                    {
+                        continuations.push(output);
+                    }
+                }
+                state = verifier_join_live(continuations)?.unwrap_or_default();
+                terminal = state.is_empty() && !operation.successors.is_empty();
+            } else if operation.kind == CoreOperationKind::Loop {
+                let mut fixpoint = vec![state.clone()];
+                for successor in operation.successors.iter().copied() {
+                    if let Some(output) =
+                        self.inspect_region(successor, state.clone(), state.clone())?
+                    {
+                        fixpoint.push(output);
+                    }
+                }
+                state = verifier_join_live(fixpoint)?.unwrap_or_default();
+            } else if operation.kind == CoreOperationKind::PoolScope
+                && let Some(body) = operation.successors.first().copied()
+            {
+                let mut scoped = state.clone();
+                if let Some(type_identity) = operation
+                    .operands
+                    .iter()
+                    .filter_map(|operand| self.context.value_types.get(operand).copied())
+                    .find(|identity| self.context.program.owns_resource_type(TypeId(*identity)))
+                {
+                    scoped.insert(Arc::clone(&operation.details), type_identity);
+                }
+                match self.inspect_region(body, scoped, state.clone())? {
+                    Some(output) => state = output,
+                    None => {
+                        state.clear();
+                        terminal = true;
+                    }
                 }
             }
             let leaving = matches!(
@@ -6219,9 +7661,10 @@ fn verifier_expected_custody_trace(
             let discharge_all = matches!(
                 operation.kind,
                 CoreOperationKind::Return | CoreOperationKind::Propagate
-            ) || region.identity == RegionId(0);
+            ) || region_id == RegionId(0);
             let discharges = if leaving {
-                live.iter()
+                state
+                    .iter()
                     .filter(|(place, type_identity)| {
                         discharge_all || inherited.get(*place) != Some(*type_identity)
                     })
@@ -6230,22 +7673,76 @@ fn verifier_expected_custody_trace(
             } else {
                 Vec::new()
             };
-            trace.push(
+            self.expected.insert(
+                operation.identity,
                 verifier_operation_custody(
                     operation,
-                    region.identity == RegionId(0),
-                    &context,
+                    region_id == RegionId(0),
+                    self.context,
                     &[],
                     &discharges,
-                )
-                .into(),
+                ),
             );
-            if leaving || operation.kind == CoreOperationKind::TerminalPanic {
-                live.clear();
+            for (place, _) in discharges {
+                state.remove(&place);
+            }
+            if matches!(
+                operation.kind,
+                CoreOperationKind::Return | CoreOperationKind::Propagate
+            ) || operation.kind == CoreOperationKind::TerminalPanic
+            {
+                state.clear();
+                terminal = true;
             }
         }
+        self.active.remove(&region_id);
+        let output = (!terminal).then_some(state);
+        self.outputs.insert(region_id, output.clone());
+        Ok(output)
     }
-    Ok(trace)
+}
+
+fn verifier_resource_components(
+    executable: &CoreExecutable,
+    program: &crate::typed_hir::VerifiedProgram,
+    cancellation: &Cancellation,
+) -> Result<ResourceComponents, CoreFailure> {
+    let mut roots = BTreeMap::<u128, BTreeMap<Arc<[u128]>, u128>>::new();
+    for region in executable.regions.iter() {
+        checkpoint(cancellation)?;
+        for operation in region.operations.iter() {
+            checkpoint(cancellation)?;
+            if operation.kind != CoreOperationKind::Read || operation.details.len() < 2 {
+                continue;
+            }
+            let Some(type_identity) = operation.type_identity else {
+                continue;
+            };
+            if !program.owns_resource_type(TypeId(type_identity)) {
+                continue;
+            }
+            roots
+                .entry(operation.details[0])
+                .or_default()
+                .insert(Arc::clone(&operation.details), type_identity);
+        }
+    }
+    Ok(roots
+        .into_iter()
+        .map(|(root, children)| (root, children.into_iter().collect()))
+        .collect())
+}
+
+fn verifier_join_live(states: Vec<LivePlaces>) -> Result<Option<LivePlaces>, CoreFailure> {
+    let mut paths = states.into_iter();
+    let Some(expected) = paths.next() else {
+        return Ok(None);
+    };
+    if paths.all(|path| path == expected) {
+        Ok(Some(expected))
+    } else {
+        defect("Core verifier found mismatched custody at a join or loop fixpoint")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7470,6 +8967,55 @@ fn build() -> Image:
         )
     }
 
+    fn branch_custody_fixture() -> (
+        VerifiedCoreProgram,
+        Arc<crate::image_planning::VerifiedPlanningFoundation>,
+    ) {
+        let request = CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new(
+                "src/image.wr",
+                br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn finish(flag: bool, take ticket: Ticket):
+    if flag:
+        consume(take ticket)
+    else:
+        consume(take ticket)
+
+@image
+fn build() -> Image:
+    ticket = Ticket(id=1)
+    finish(true, take ticket)
+    return Image.new()
+"#,
+            )]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all());
+        let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+        let outcome = compiler.compile(request, &Cancellation::new());
+        let CompilationOutcome::Accepted(accepted) = outcome else {
+            panic!("branch custody fixture accepts: {outcome:#?}");
+        };
+        (
+            accepted
+                .verified_core_program()
+                .expect("Core derived")
+                .clone(),
+            Arc::new(
+                accepted
+                    .verified_planning_foundation()
+                    .expect("planning derived")
+                    .clone(),
+            ),
+        )
+    }
+
     fn suspension_fixture() -> (
         VerifiedCoreProgram,
         Arc<crate::image_planning::VerifiedPlanningFoundation>,
@@ -8258,6 +9804,64 @@ fn build() -> Image:
             ),
             Err(CoreFailure::Cancelled)
         );
+    }
+
+    #[test]
+    fn source_oracle_and_verifier_reject_stale_join_discharge_after_both_arms_move() {
+        let (core, planning) = branch_custody_fixture();
+        let mut candidate = core.clone();
+        let mut executables = candidate.executables.to_vec();
+        let executable = executables
+            .iter_mut()
+            .find(|executable| {
+                executable
+                    .regions
+                    .iter()
+                    .flat_map(|region| region.operations.iter())
+                    .any(|operation| operation.kind == CoreOperationKind::Branch)
+            })
+            .expect("branching custody executable");
+        let parameter = executable
+            .signature
+            .parameters
+            .iter()
+            .find(|parameter| parameter.access == CoreAccessLaw::Move)
+            .expect("Resource parameter")
+            .clone();
+        let mut regions = executable.regions.to_vec();
+        let operation = regions
+            .iter_mut()
+            .flat_map(|region| Arc::make_mut(&mut region.operations).iter_mut())
+            .find(|operation| operation.kind == CoreOperationKind::RecoverableExit)
+            .expect("function fallthrough exit");
+        let place = Arc::<[u128]>::from([u128::from(parameter.local)]);
+        let mut effects = operation.custody.to_vec();
+        effects.push(producer_discharge_effect(
+            &place,
+            parameter.type_.identity,
+            planning
+                .for_core()
+                .completed_semantic_program()
+                .verified_program(),
+        ));
+        operation.custody = effects.into();
+        executable.regions = regions.into();
+        candidate.executables = executables.into();
+        resign_fingerprints_only(&mut candidate);
+
+        let (_, agrees, _) =
+            run_custody_oracle(&candidate, planning.for_core(), &Cancellation::new())
+                .expect("source oracle remains executable");
+        assert!(!agrees, "direct source dataflow must catch the stale join");
+        assert!(rejected(&candidate, &planning));
+    }
+
+    #[test]
+    fn custody_observation_cancels_during_large_publication_without_partial_artifact() {
+        let (core, _) = custody_fixture();
+        let cancellation = Cancellation::new();
+        cancellation.cancel_after_private_polls(20);
+        assert_eq!(core.observation(&cancellation), Err(CoreFailure::Cancelled));
     }
 
     #[test]

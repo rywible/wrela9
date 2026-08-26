@@ -957,8 +957,7 @@ fn build() -> Image:
 
 #[test]
 fn unrelated_earlier_operation_does_not_renumber_custody_observations() {
-    let without = compile_core(
-        br#"resource struct Ticket:
+    let without_source = br#"resource struct Ticket:
     id: i64
 
 fn consume(take ticket: Ticket):
@@ -972,18 +971,17 @@ fn run():
 fn build() -> Image:
     run()
     return Image.new(value=0)
-"#,
-        Root::Image,
-    );
-    let with = compile_core(
-        br#"resource struct Ticket:
+"#;
+    let without = compile_core(without_source, Root::Image);
+    let with_source = br#"resource struct Ticket:
     id: i64
 
 fn consume(take ticket: Ticket):
     pass
 
 fn run():
-    pass
+    earlier = Ticket(id=0)
+    consume(take earlier)
     ticket = Ticket(id=1)
     consume(take ticket)
 
@@ -991,10 +989,13 @@ fn run():
 fn build() -> Image:
     run()
     return Image.new(value=0)
-"#,
-        Root::Image,
-    );
-    let custody_identities = |core: &wrela_compiler::CoreProgramObservation| {
+"#;
+    let with = compile_core(with_source, Root::Image);
+    let custody_identities = |core: &wrela_compiler::CoreProgramObservation, source: &[u8]| {
+        let target = source
+            .windows(b"    ticket = Ticket(id=1)".len())
+            .position(|window| window == b"    ticket = Ticket(id=1)")
+            .expect("stable target statement") as u64;
         core.executables()
             .iter()
             .find(|executable| {
@@ -1006,10 +1007,14 @@ fn build() -> Image:
             .expect("run executable")
             .custody_effects()
             .iter()
+            .filter(|effect| effect.provenance().start() >= target)
             .map(|effect| effect.semantic_identity())
             .collect::<Vec<_>>()
     };
-    assert_eq!(custody_identities(&without), custody_identities(&with));
+    assert_eq!(
+        custody_identities(&without, without_source),
+        custody_identities(&with, with_source)
+    );
 }
 
 #[test]
@@ -1084,4 +1089,218 @@ fn build() -> Image:
     assert!(custody.iter().any(|effect| {
         effect.operation() == CoreCustodyOperation::Discharge && effect.custody_continuous()
     }));
+}
+
+#[test]
+fn agreeing_branch_moves_do_not_leave_duplicate_fallthrough_custody() {
+    let core = compile_core(
+        br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn finish(flag: bool, take ticket: Ticket):
+    if flag:
+        consume(take ticket)
+    else:
+        consume(take ticket)
+
+@image
+fn build() -> Image:
+    ticket = Ticket(id=1)
+    finish(true, take ticket)
+    return Image.new()
+"#,
+        Root::Image,
+    );
+
+    let finish = core
+        .executables()
+        .iter()
+        .find(|executable| {
+            executable.parameters().len() == 2
+                && executable.operations().contains(&CoreOperationKind::Branch)
+        })
+        .expect("branching Resource consumer");
+    assert_eq!(
+        finish
+            .custody_effects()
+            .iter()
+            .filter(|effect| effect.operation() == CoreCustodyOperation::Discharge)
+            .count(),
+        0,
+        "joined uninitialized custody must not be discharged again"
+    );
+}
+
+#[test]
+fn sibling_resource_fields_have_distinct_continuous_component_custody() {
+    let core = compile_core(
+        br#"resource struct Ticket:
+    id: i64
+
+resource struct Pair:
+    left: Ticket
+    right: Ticket
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn inspect(read ticket: Ticket):
+    pass
+
+fn finish(take pair: Pair):
+    inspect(pair.right)
+    consume(take pair.left)
+
+@image
+fn build() -> Image:
+    pair = Pair(left=Ticket(id=1), right=Ticket(id=2))
+    finish(take pair)
+    return Image.new()
+"#,
+        Root::Image,
+    );
+
+    let finish = core
+        .executables()
+        .iter()
+        .find(|executable| {
+            executable.parameters().len() == 1
+                && executable.operations().contains(&CoreOperationKind::Read)
+        })
+        .expect("two-field Resource consumer");
+    let components = finish
+        .custody_effects()
+        .iter()
+        .filter(|effect| {
+            matches!(
+                effect.operation(),
+                CoreCustodyOperation::Move
+                    | CoreCustodyOperation::SharedLoan
+                    | CoreCustodyOperation::Discharge
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(components.iter().all(|effect| effect.custody_continuous()));
+    assert!(components.iter().any(|effect| {
+        effect.operation() == CoreCustodyOperation::Move && effect.place_projection_count() > 0
+    }));
+    assert!(components.iter().any(|effect| {
+        effect.operation() == CoreCustodyOperation::SharedLoan
+            && effect.place_projection_count() > 0
+    }));
+    assert_eq!(
+        finish
+            .custody_effects()
+            .iter()
+            .filter(|effect| effect.operation() == CoreCustodyOperation::Discharge)
+            .count(),
+        1,
+        "the untouched Resource-bearing sibling remains compiler-reclaimable"
+    );
+}
+
+#[test]
+fn deferred_resource_capture_moves_from_its_registered_cleanup_home() {
+    let core = compile_core(
+        br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn run():
+    ticket = Ticket(id=1)
+    defer consume(take ticket)
+
+@image
+fn build() -> Image:
+    run()
+    return Image.new()
+"#,
+        Root::Image,
+    );
+
+    let run = core
+        .executables()
+        .iter()
+        .find(|executable| {
+            executable
+                .operations()
+                .contains(&CoreOperationKind::Cleanup)
+        })
+        .expect("deferred Resource executable");
+    let transfers = run
+        .custody_effects()
+        .iter()
+        .filter(|effect| {
+            matches!(
+                effect.operation(),
+                CoreCustodyOperation::Move
+                    | CoreCustodyOperation::TransferCommit
+                    | CoreCustodyOperation::CleanupRun
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(transfers.len() >= 4);
+    assert!(transfers.iter().all(|effect| effect.custody_continuous()));
+}
+
+#[test]
+fn fixed_resource_indexes_have_distinct_continuous_custody_subjects() {
+    let core = compile_core(
+        br#"resource struct Ticket:
+    id: i64
+
+fn consume(take ticket: Ticket):
+    pass
+
+fn consume_all(take tickets: [Ticket; 2]):
+    pass
+
+fn finish():
+    mut tickets = [Ticket(id=1), Ticket(id=2)]
+    consume(take tickets[0])
+    tickets[0] = Ticket(id=3)
+    consume(take tickets[1])
+    tickets[1] = Ticket(id=4)
+    consume_all(take tickets)
+
+@image
+fn build() -> Image:
+    finish()
+    return Image.new()
+"#,
+        Root::Image,
+    );
+
+    let finish = core
+        .executables()
+        .iter()
+        .find(|executable| {
+            executable
+                .custody_effects()
+                .iter()
+                .filter(|effect| {
+                    effect.operation() == CoreCustodyOperation::Move
+                        && effect.place_projection_count() > 0
+                })
+                .count()
+                == 2
+        })
+        .expect("fixed-index Resource consumer");
+    let indexed = finish
+        .custody_effects()
+        .iter()
+        .filter(|effect| {
+            effect.operation() == CoreCustodyOperation::Move && effect.place_projection_count() > 0
+        })
+        .collect::<Vec<_>>();
+    assert!(indexed.iter().all(|effect| effect.custody_continuous()));
+    assert_ne!(
+        indexed[0].semantic_identity(),
+        indexed[1].semantic_identity()
+    );
 }

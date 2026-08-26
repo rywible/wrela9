@@ -2622,6 +2622,22 @@ impl Compiler {
             return CompilationOutcome::Cancelled;
         };
 
+        let core_observation = if request.inspection.planning {
+            match core_program
+                .as_ref()
+                .map(|core| core.observation(cancellation))
+                .transpose()
+            {
+                Ok(observation) => observation,
+                Err(CoreFailure::Cancelled) => return CompilationOutcome::Cancelled,
+                Err(CoreFailure::Defect(evidence)) => {
+                    return CompilationOutcome::Defect(Defect::new("Core inspection", evidence));
+                }
+            }
+        } else {
+            None
+        };
+
         let inspection = Inspection {
             distribution_version: Arc::from(self.distribution.version()),
             distribution_digest: self.distribution.digest(),
@@ -2690,11 +2706,7 @@ impl Compiler {
             } else {
                 None
             },
-            core_program: if request.inspection.planning {
-                core_program.as_ref().map(|core| core.observation())
-            } else {
-                None
-            },
+            core_program: core_observation,
         };
 
         if diagnostics.is_empty() {

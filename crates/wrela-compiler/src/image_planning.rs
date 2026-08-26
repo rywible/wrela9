@@ -17,7 +17,8 @@ use crate::completed_semantic::{
 };
 use crate::core::VerifiedCoreProgram;
 use crate::flow::{
-    FlowDeadlineClass, FlowRequirementKind, FlowRequirementRef, VerifiedFlowProgram,
+    FlowDeadlineClass, FlowRequirementKind, FlowRequirementRef, ImagePlanningFlowRequirement,
+    VerifiedFlowProgram,
 };
 use crate::model::{BuildKind, SpecializationId};
 use crate::typed_hir::{
@@ -10629,10 +10630,27 @@ struct ServiceCoreResource {
     maximum_cycle_units: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ServiceRequirementSource {
+    Architecture,
+    Core,
+    Flow,
+    Foundation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ServiceRequirementRef {
+    source: ServiceRequirementSource,
+    context: u128,
+    identity: u128,
+    current_meaning: u128,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ServiceDemand {
     identity: u128,
     requirement: u128,
+    requirements: Arc<[ServiceRequirementRef]>,
     kind: ServiceClassKind,
     core: u16,
     maximum_simultaneous_release: u32,
@@ -10689,14 +10707,19 @@ impl ServiceCoreObservation {
 pub struct ServiceClassObservation {
     identity: u128,
     requirement: u128,
+    requirement_evidence: Arc<[ServiceRequirementRef]>,
     kind: ServiceClassKind,
     core: u16,
     quota: u32,
+    maximum_simultaneous_release: u32,
+    maximum_concurrency: u32,
     activation_units: u64,
+    maximum_non_preemptive_units: u64,
     maximum_response_units: u64,
     maximum_delay_units: u64,
     maximum_cancellation_response_units: u64,
     maximum_cancellation_delay_units: u64,
+    cancellation_work_units: u64,
     fallback_units: u64,
     fallback_order: Arc<[u128]>,
 }
@@ -10863,7 +10886,9 @@ pub(crate) enum ServiceConflictCode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct VerifiedServiceConflict {
     code: ServiceConflictCode,
-    requirements: Arc<[u128]>,
+    context: u128,
+    assignment_fingerprint: u128,
+    requirements: Arc<[ServiceRequirementRef]>,
     required_units: u64,
     available_units: u64,
 }
@@ -10954,6 +10979,20 @@ fn solve_service_problem_with_limit(
         || demands.iter().any(|demand| {
             demand.identity == 0
                 || demand.requirement == 0
+                || demand.requirements.is_empty()
+                || demand
+                    .requirements
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+                || demand.requirements.iter().any(|reference| {
+                    reference.context != problem.context
+                        || reference.identity == 0
+                        || reference.current_meaning == 0
+                })
+                || !demand
+                    .requirements
+                    .iter()
+                    .any(|reference| reference.identity == demand.requirement)
                 || !cores.iter().any(|core| core.ordinal == demand.core)
                 || demand.maximum_simultaneous_release == 0
                 || demand.maximum_concurrency == 0
@@ -10970,7 +11009,7 @@ fn solve_service_problem_with_limit(
 
     let radices = demands
         .iter()
-        .map(|demand| usize::try_from(demand.maximum_simultaneous_release).unwrap_or(usize::MAX))
+        .map(|demand| usize::try_from(demand.maximum_concurrency).unwrap_or(usize::MAX))
         .collect::<Vec<_>>();
     if radices.contains(&usize::MAX) {
         return defect("Service Plan quota search exceeds its finite representation");
@@ -10994,7 +11033,7 @@ fn solve_service_problem_with_limit(
             break;
         }
     }
-    let conflict = service_conflict(&cores, &demands);
+    let conflict = service_conflict(problem, &cores, &demands, cancellation)?;
     Ok(ServiceSolveOutcome::Conflict(conflict))
 }
 
@@ -11057,21 +11096,31 @@ fn service_candidate_if_feasible(
         let fallback_order = demands
             .iter()
             .enumerate()
-            .filter(|(other_index, other)| *other_index != index && other.core == demand.core)
+            .filter(|(other_index, other)| {
+                *other_index != index
+                    && other.core == demand.core
+                    && other.activation_units <= demand.activation_units
+                    && other.maximum_non_preemptive_units <= demand.activation_units
+            })
             .map(|(_, other)| other.identity)
             .collect::<Vec<_>>();
         classes.push(ServiceClassObservation {
             identity: demand.identity,
             requirement: demand.requirement,
+            requirement_evidence: Arc::clone(&demand.requirements),
             kind: demand.kind,
             core: demand.core,
             quota: *quota,
+            maximum_simultaneous_release: demand.maximum_simultaneous_release,
+            maximum_concurrency: demand.maximum_concurrency,
             activation_units: demand.activation_units,
+            maximum_non_preemptive_units: demand.maximum_non_preemptive_units,
             maximum_response_units: response,
             maximum_delay_units: demand.maximum_delay_units,
             maximum_cancellation_response_units: cancellation_response,
             maximum_cancellation_delay_units: demand.maximum_cancellation_delay_units,
-            fallback_units: demand.activation_units.checked_mul(u64::from(*quota))?,
+            cancellation_work_units: demand.cancellation_work_units,
+            fallback_units: demand.activation_units,
             fallback_order: fallback_order.into(),
         });
     }
@@ -11084,10 +11133,70 @@ fn service_candidate_if_feasible(
 }
 
 fn service_conflict(
+    problem: &ServiceProblem,
     cores: &[ServiceCoreResource],
     demands: &[ServiceDemand],
-) -> VerifiedServiceConflict {
+    cancellation: &Cancellation,
+) -> Result<VerifiedServiceConflict, PlanningFailure> {
+    if demands.len() >= usize::BITS as usize {
+        return defect("Service conflict subset search exceeds its finite representation");
+    }
+    let mut best: Option<VerifiedServiceConflict> = None;
+    let mut states = 0_u64;
+    for mask in 1_usize..(1_usize << demands.len()) {
+        checkpoint(cancellation)?;
+        let subset = demands
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| mask & (1_usize << index) != 0)
+            .map(|(_, demand)| demand)
+            .collect::<Vec<_>>();
+        if let Some(candidate) =
+            classify_service_conflict_subset(problem, cores, &subset, cancellation, &mut states)?
+            && best.as_ref().is_none_or(|current| {
+                service_conflict_rank(&candidate) < service_conflict_rank(current)
+            })
+        {
+            best = Some(candidate);
+        }
+    }
+    best.ok_or_else(|| {
+        PlanningFailure::Defect(Arc::from("Service conflict has no contradictory subset"))
+    })
+}
+
+fn service_conflict_rank(
+    conflict: &VerifiedServiceConflict,
+) -> (
+    usize,
+    ServiceConflictCode,
+    &[ServiceRequirementRef],
+    u64,
+    u64,
+) {
+    (
+        conflict.requirements.len(),
+        conflict.code,
+        &conflict.requirements,
+        conflict.required_units,
+        conflict.available_units,
+    )
+}
+
+fn classify_service_conflict_subset(
+    problem: &ServiceProblem,
+    cores: &[ServiceCoreResource],
+    demands: &[&ServiceDemand],
+    cancellation: &Cancellation,
+    states: &mut u64,
+) -> Result<Option<VerifiedServiceConflict>, PlanningFailure> {
+    let requirements = canonical_service_requirements(
+        demands
+            .iter()
+            .flat_map(|demand| demand.requirements.iter().copied()),
+    );
     for core in cores {
+        checkpoint(cancellation)?;
         let required = demands
             .iter()
             .filter(|demand| demand.core == core.ordinal)
@@ -11095,28 +11204,32 @@ fn service_conflict(
                 total.saturating_add(demand.activation_units)
             });
         if required > core.maximum_cycle_units {
-            let requirements = demands
-                .iter()
-                .filter(|demand| demand.core == core.ordinal)
-                .map(|demand| demand.requirement)
-                .collect::<Vec<_>>();
-            return VerifiedServiceConflict {
+            return Ok(Some(VerifiedServiceConflict {
                 code: ServiceConflictCode::CycleCapacity,
-                requirements: requirements.into(),
+                context: problem.context,
+                assignment_fingerprint: problem.assignment_fingerprint,
+                requirements,
                 required_units: required,
                 available_units: core.maximum_cycle_units,
-            };
+            }));
         }
     }
     let mut minimum_delay = vec![u64::MAX; demands.len()];
     let mut minimum_cancellation = vec![u64::MAX; demands.len()];
     let mut minimum_violations = u64::MAX;
-    let mut digits = vec![0_usize; demands.len()];
     let radices = demands
         .iter()
-        .map(|demand| usize::try_from(demand.maximum_simultaneous_release).unwrap_or(1))
+        .map(|demand| usize::try_from(demand.maximum_concurrency).unwrap_or(usize::MAX))
         .collect::<Vec<_>>();
+    let mut digits = vec![0_usize; demands.len()];
     loop {
+        checkpoint(cancellation)?;
+        *states = states.saturating_add(1);
+        if *states > MAX_SERVICE_SEARCH_STATES {
+            return defect(
+                "Service conflict minimization exhausted its authenticated finite bound",
+            );
+        }
         let quotas = digits
             .iter()
             .map(|digit| *digit as u32 + 1)
@@ -11142,25 +11255,29 @@ fn service_conflict(
         {
             let mut violations = 0_u64;
             for (index, (demand, quota)) in demands.iter().zip(&quotas).enumerate() {
-                let blocker = demands
+                let blocking = demands
                     .iter()
                     .filter(|other| other.core == demand.core)
                     .map(|other| other.maximum_non_preemptive_units)
                     .max()
                     .unwrap_or(0);
-                let response = blocker.saturating_add(
+                let response = blocking.saturating_add(
                     u64::from(demand.maximum_simultaneous_release)
                         .div_ceil(u64::from(*quota))
                         .saturating_mul(cycles[&demand.core]),
                 );
+                let cancellation_response = response.saturating_add(demand.cancellation_work_units);
                 minimum_delay[index] = minimum_delay[index].min(response);
-                let cancellation = response.saturating_add(demand.cancellation_work_units);
-                minimum_cancellation[index] = minimum_cancellation[index].min(cancellation);
+                minimum_cancellation[index] =
+                    minimum_cancellation[index].min(cancellation_response);
                 violations = violations
                     .saturating_add(u64::from(response > demand.maximum_delay_units))
                     .saturating_add(u64::from(
-                        cancellation > demand.maximum_cancellation_delay_units,
+                        cancellation_response > demand.maximum_cancellation_delay_units,
                     ));
+            }
+            if violations == 0 {
+                return Ok(None);
             }
             minimum_violations = minimum_violations.min(violations);
         }
@@ -11173,33 +11290,35 @@ fn service_conflict(
         .enumerate()
         .find(|(index, demand)| minimum_delay[*index] > demand.maximum_delay_units)
     {
-        return VerifiedServiceConflict {
+        return Ok(Some(VerifiedServiceConflict {
             code: ServiceConflictCode::MaximumDelay,
-            requirements: Arc::from([demand.requirement]),
+            context: problem.context,
+            assignment_fingerprint: problem.assignment_fingerprint,
+            requirements,
             required_units: minimum_delay[index],
             available_units: demand.maximum_delay_units,
-        };
+        }));
     }
     if let Some((index, demand)) = demands.iter().enumerate().find(|(index, demand)| {
         minimum_cancellation[*index] > demand.maximum_cancellation_delay_units
     }) {
-        return VerifiedServiceConflict {
+        return Ok(Some(VerifiedServiceConflict {
             code: ServiceConflictCode::CancellationDelay,
-            requirements: Arc::from([demand.requirement]),
+            context: problem.context,
+            assignment_fingerprint: problem.assignment_fingerprint,
+            requirements,
             required_units: minimum_cancellation[index],
             available_units: demand.maximum_cancellation_delay_units,
-        };
+        }));
     }
-    VerifiedServiceConflict {
+    Ok(Some(VerifiedServiceConflict {
         code: ServiceConflictCode::SimultaneousMaximums,
-        requirements: demands
-            .iter()
-            .map(|demand| demand.requirement)
-            .collect::<Vec<_>>()
-            .into(),
+        context: problem.context,
+        assignment_fingerprint: problem.assignment_fingerprint,
+        requirements,
         required_units: minimum_violations,
         available_units: 0,
-    }
+    }))
 }
 
 fn verify_service_candidate(
@@ -11244,11 +11363,16 @@ fn verify_service_candidate(
             .any(|(planned, demand)| {
                 planned.identity != demand.identity
                     || planned.requirement != demand.requirement
+                    || planned.requirement_evidence != demand.requirements
                     || planned.kind != demand.kind
                     || planned.core != demand.core
                     || planned.quota == 0
-                    || planned.quota > demand.maximum_simultaneous_release
+                    || planned.quota > demand.maximum_concurrency
+                    || planned.maximum_simultaneous_release != demand.maximum_simultaneous_release
+                    || planned.maximum_concurrency != demand.maximum_concurrency
                     || planned.activation_units != demand.activation_units
+                    || planned.maximum_non_preemptive_units != demand.maximum_non_preemptive_units
+                    || planned.cancellation_work_units != demand.cancellation_work_units
             })
     {
         return defect("Service Plan is missing service or has an invalid placement relationship");
@@ -11273,19 +11397,21 @@ fn verify_service_candidate(
         .zip(&expected_bounds)
         .enumerate()
     {
+        checkpoint(cancellation)?;
         let expected_fallback = demands
             .iter()
             .enumerate()
             .filter(|(other_index, other)| *other_index != index && other.core == demand.core)
+            .filter(|(_, other)| {
+                other.activation_units <= demand.activation_units
+                    && other.maximum_non_preemptive_units <= demand.activation_units
+            })
             .map(|(_, other)| other.identity);
         if planned.maximum_response_units != *response
             || planned.maximum_delay_units != demand.maximum_delay_units
             || planned.maximum_cancellation_response_units != *cancellation_response
             || planned.maximum_cancellation_delay_units != demand.maximum_cancellation_delay_units
-            || planned.fallback_units
-                != demand
-                    .activation_units
-                    .saturating_mul(u64::from(planned.quota))
+            || planned.fallback_units != demand.activation_units
             || planned.fallback_order.iter().copied().ne(expected_fallback)
         {
             return defect("Service Plan bounds or fallback order do not reconstruct");
@@ -11294,9 +11420,10 @@ fn verify_service_candidate(
     let mut digits = vec![0_usize; demands.len()];
     let radices = demands
         .iter()
-        .map(|demand| usize::try_from(demand.maximum_simultaneous_release).unwrap_or(usize::MAX))
+        .map(|demand| usize::try_from(demand.maximum_concurrency).unwrap_or(usize::MAX))
         .collect::<Vec<_>>();
     loop {
+        checkpoint(cancellation)?;
         let prior = digits
             .iter()
             .map(|digit| *digit as u32 + 1)
@@ -11361,7 +11488,7 @@ fn verifier_service_bounds(
     }
     let mut bounds = Vec::with_capacity(demands.len());
     for (demand, quota) in demands.iter().zip(quotas) {
-        if *quota == 0 || *quota > demand.maximum_simultaneous_release {
+        if *quota == 0 || *quota > demand.maximum_concurrency {
             return None;
         }
         let (_, cycle, blocking) = core_bounds
@@ -11392,7 +11519,7 @@ fn verify_service_conflict(
     cores.sort_by_key(|core| core.ordinal);
     let mut demands = problem.demands.clone();
     demands.sort_by_key(|demand| (demand.kind, demand.identity));
-    let expected = verifier_expected_service_conflict(&cores, &demands)?;
+    let expected = verifier_expected_service_conflict(problem, &cores, &demands, cancellation)?;
     if &expected != candidate || candidate.required_units <= candidate.available_units {
         return defect("Service conflict is false, noncanonical, or lacks contradictory bounds");
     }
@@ -11400,130 +11527,195 @@ fn verify_service_conflict(
 }
 
 fn verifier_expected_service_conflict(
+    problem: &ServiceProblem,
     cores: &[ServiceCoreResource],
     demands: &[ServiceDemand],
+    cancellation: &Cancellation,
 ) -> Result<VerifiedServiceConflict, PlanningFailure> {
+    if demands.len() >= usize::BITS as usize {
+        return defect("Service conflict verifier subset space exceeds its finite representation");
+    }
+    let mut best: Option<VerifiedServiceConflict> = None;
+    let mut states = 0_u64;
+    for mask in (1_usize..(1_usize << demands.len())).rev() {
+        checkpoint(cancellation)?;
+        let subset = demands
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| mask & (1_usize << index) != 0)
+            .map(|(_, demand)| demand)
+            .collect::<Vec<_>>();
+        if let Some(candidate) =
+            verifier_classify_service_subset(problem, cores, &subset, cancellation, &mut states)?
+        {
+            let candidate_key = (
+                candidate.requirements.len(),
+                candidate.code,
+                candidate.requirements.as_ref(),
+                candidate.required_units,
+                candidate.available_units,
+            );
+            let replace = best.as_ref().is_none_or(|current| {
+                candidate_key
+                    < (
+                        current.requirements.len(),
+                        current.code,
+                        current.requirements.as_ref(),
+                        current.required_units,
+                        current.available_units,
+                    )
+            });
+            if replace {
+                best = Some(candidate);
+            }
+        }
+    }
+    best.ok_or_else(|| {
+        PlanningFailure::Defect(Arc::from(
+            "Service conflict verifier found no contradictory subset",
+        ))
+    })
+}
+
+fn verifier_classify_service_subset(
+    problem: &ServiceProblem,
+    cores: &[ServiceCoreResource],
+    demands: &[&ServiceDemand],
+    cancellation: &Cancellation,
+    states: &mut u64,
+) -> Result<Option<VerifiedServiceConflict>, PlanningFailure> {
+    let mut requirements = demands
+        .iter()
+        .flat_map(|demand| demand.requirements.iter().copied())
+        .collect::<Vec<_>>();
+    requirements.sort_unstable();
+    requirements.dedup();
     for core in cores {
+        checkpoint(cancellation)?;
         let required = demands
             .iter()
             .filter(|demand| demand.core == core.ordinal)
-            .fold(0_u64, |total, demand| {
-                total.saturating_add(demand.activation_units)
-            });
+            .map(|demand| demand.activation_units)
+            .fold(0_u64, u64::saturating_add);
         if required > core.maximum_cycle_units {
-            return Ok(VerifiedServiceConflict {
+            return Ok(Some(VerifiedServiceConflict {
                 code: ServiceConflictCode::CycleCapacity,
-                requirements: demands
-                    .iter()
-                    .filter(|demand| demand.core == core.ordinal)
-                    .map(|demand| demand.requirement)
-                    .collect::<Vec<_>>()
-                    .into(),
+                context: problem.context,
+                assignment_fingerprint: problem.assignment_fingerprint,
+                requirements: requirements.into(),
                 required_units: required,
                 available_units: core.maximum_cycle_units,
-            });
+            }));
         }
     }
+    let combinations = demands.iter().try_fold(1_u64, |total, demand| {
+        total.checked_mul(u64::from(demand.maximum_concurrency))
+    });
+    let Some(combinations) = combinations else {
+        return defect("Service conflict verifier quota space overflowed");
+    };
     let mut minimum_delay = vec![u64::MAX; demands.len()];
     let mut minimum_cancellation = vec![u64::MAX; demands.len()];
     let mut minimum_violations = u64::MAX;
-    let mut digits = vec![0_usize; demands.len()];
-    let radices = demands
-        .iter()
-        .map(|demand| usize::try_from(demand.maximum_simultaneous_release).unwrap_or(usize::MAX))
-        .collect::<Vec<_>>();
-    loop {
-        let quotas = digits
+    for ordinal in 0..combinations {
+        checkpoint(cancellation)?;
+        *states = states.saturating_add(1);
+        if *states > MAX_SERVICE_SEARCH_STATES {
+            return defect("Service conflict verifier exhausted its finite state bound");
+        }
+        let mut remainder = ordinal;
+        let mut quotas = vec![1_u32; demands.len()];
+        for index in (0..demands.len()).rev() {
+            let radix = u64::from(demands[index].maximum_concurrency);
+            quotas[index] = u32::try_from(remainder % radix + 1).unwrap_or(u32::MAX);
+            remainder /= radix;
+        }
+        let cycles = cores
             .iter()
-            .map(|digit| u32::try_from(digit + 1).unwrap_or(u32::MAX))
-            .collect::<Vec<_>>();
-        let mut cycles = BTreeMap::new();
-        let mut capacity_ok = true;
-        for core in cores {
-            let cycle = demands
-                .iter()
-                .zip(&quotas)
-                .filter(|(demand, _)| demand.core == core.ordinal)
-                .fold(0_u64, |total, (demand, quota)| {
-                    total.saturating_add(demand.activation_units.saturating_mul(u64::from(*quota)))
-                });
-            capacity_ok &= cycle <= core.maximum_cycle_units;
-            cycles.insert(core.ordinal, cycle);
-        }
-        if capacity_ok {
-            let mut violations = 0_u64;
-            for (index, (demand, quota)) in demands.iter().zip(&quotas).enumerate() {
-                let blocking = demands
+            .map(|core| {
+                let cycle = demands
                     .iter()
-                    .filter(|other| other.core == demand.core)
-                    .map(|other| other.maximum_non_preemptive_units)
-                    .max()
-                    .unwrap_or(0);
-                let response = blocking.saturating_add(
-                    u64::from(demand.maximum_simultaneous_release)
-                        .div_ceil(u64::from(*quota))
-                        .saturating_mul(cycles[&demand.core]),
-                );
-                minimum_delay[index] = minimum_delay[index].min(response);
-                minimum_cancellation[index] = minimum_cancellation[index]
-                    .min(response.saturating_add(demand.cancellation_work_units));
-                violations = violations
-                    .saturating_add(u64::from(response > demand.maximum_delay_units))
-                    .saturating_add(u64::from(
-                        response.saturating_add(demand.cancellation_work_units)
-                            > demand.maximum_cancellation_delay_units,
-                    ));
-            }
-            minimum_violations = minimum_violations.min(violations);
+                    .zip(&quotas)
+                    .filter(|(demand, _)| demand.core == core.ordinal)
+                    .map(|(demand, quota)| {
+                        demand.activation_units.saturating_mul(u64::from(*quota))
+                    })
+                    .fold(0_u64, u64::saturating_add);
+                (core.ordinal, cycle)
+            })
+            .collect::<Vec<_>>();
+        if cores.iter().any(|core| {
+            cycles
+                .iter()
+                .find(|(ordinal, _)| *ordinal == core.ordinal)
+                .is_none_or(|(_, cycle)| *cycle > core.maximum_cycle_units)
+        }) {
+            continue;
         }
-        let mut advanced = false;
-        for index in (0..digits.len()).rev() {
-            digits[index] += 1;
-            if digits[index] < radices[index] {
-                advanced = true;
-                break;
-            }
-            digits[index] = 0;
+        let mut violations = 0_u64;
+        for (index, (demand, quota)) in demands.iter().zip(&quotas).enumerate() {
+            let cycle = cycles
+                .iter()
+                .find(|(ordinal, _)| *ordinal == demand.core)
+                .map(|(_, cycle)| *cycle)
+                .unwrap_or(u64::MAX);
+            let blocking = demands
+                .iter()
+                .filter(|other| other.core == demand.core)
+                .map(|other| other.maximum_non_preemptive_units)
+                .max()
+                .unwrap_or(0);
+            let rounds = (u64::from(demand.maximum_simultaneous_release)
+                + u64::from(*quota).saturating_sub(1))
+                / u64::from(*quota);
+            let response = blocking.saturating_add(rounds.saturating_mul(cycle));
+            let cancellation_response = response.saturating_add(demand.cancellation_work_units);
+            minimum_delay[index] = minimum_delay[index].min(response);
+            minimum_cancellation[index] = minimum_cancellation[index].min(cancellation_response);
+            violations = violations
+                .saturating_add(u64::from(response > demand.maximum_delay_units))
+                .saturating_add(u64::from(
+                    cancellation_response > demand.maximum_cancellation_delay_units,
+                ));
         }
-        if !advanced {
-            break;
+        if violations == 0 {
+            return Ok(None);
         }
+        minimum_violations = minimum_violations.min(violations);
     }
-    if let Some((index, demand)) = demands
+    let (code, required_units, available_units) = if let Some((index, demand)) = demands
         .iter()
         .enumerate()
         .find(|(index, demand)| minimum_delay[*index] > demand.maximum_delay_units)
     {
-        return Ok(VerifiedServiceConflict {
-            code: ServiceConflictCode::MaximumDelay,
-            requirements: Arc::from([demand.requirement]),
-            required_units: minimum_delay[index],
-            available_units: demand.maximum_delay_units,
-        });
-    }
-    if let Some((index, demand)) = demands.iter().enumerate().find(|(index, demand)| {
+        (
+            ServiceConflictCode::MaximumDelay,
+            minimum_delay[index],
+            demand.maximum_delay_units,
+        )
+    } else if let Some((index, demand)) = demands.iter().enumerate().find(|(index, demand)| {
         minimum_cancellation[*index] > demand.maximum_cancellation_delay_units
     }) {
-        return Ok(VerifiedServiceConflict {
-            code: ServiceConflictCode::CancellationDelay,
-            requirements: Arc::from([demand.requirement]),
-            required_units: minimum_cancellation[index],
-            available_units: demand.maximum_cancellation_delay_units,
-        });
-    }
-    if minimum_violations == 0 || minimum_violations == u64::MAX {
-        return defect("Service conflict has no independently contradictory bound");
-    }
-    Ok(VerifiedServiceConflict {
-        code: ServiceConflictCode::SimultaneousMaximums,
-        requirements: demands
-            .iter()
-            .map(|demand| demand.requirement)
-            .collect::<Vec<_>>()
-            .into(),
-        required_units: minimum_violations,
-        available_units: 0,
-    })
+        (
+            ServiceConflictCode::CancellationDelay,
+            minimum_cancellation[index],
+            demand.maximum_cancellation_delay_units,
+        )
+    } else {
+        (
+            ServiceConflictCode::SimultaneousMaximums,
+            minimum_violations,
+            0,
+        )
+    };
+    Ok(Some(VerifiedServiceConflict {
+        code,
+        context: problem.context,
+        assignment_fingerprint: problem.assignment_fingerprint,
+        requirements: requirements.into(),
+        required_units,
+        available_units,
+    }))
 }
 
 #[cfg(test)]
@@ -11533,13 +11725,13 @@ fn independently_enumerate_service_puzzle(problem: &ServiceProblem) -> ServiceSo
     let mut demands = problem.demands.clone();
     demands.sort_by_key(|demand| (demand.kind.tag(), demand.identity));
     let combinations = demands.iter().fold(1_u64, |count, demand| {
-        count.saturating_mul(u64::from(demand.maximum_simultaneous_release))
+        count.saturating_mul(u64::from(demand.maximum_concurrency))
     });
     for ordinal in 0..combinations {
         let mut remainder = ordinal;
         let mut quotas = vec![1_u32; demands.len()];
         for index in (0..demands.len()).rev() {
-            let radix = u64::from(demands[index].maximum_simultaneous_release);
+            let radix = u64::from(demands[index].maximum_concurrency);
             quotas[index] = u32::try_from(remainder % radix + 1).unwrap();
             remainder /= radix;
         }
@@ -11576,20 +11768,28 @@ fn independently_enumerate_service_puzzle(problem: &ServiceProblem) -> ServiceSo
             classes.push(ServiceClassObservation {
                 identity: demand.identity,
                 requirement: demand.requirement,
+                requirement_evidence: Arc::clone(&demand.requirements),
                 kind: demand.kind,
                 core: demand.core,
                 quota: *quota,
+                maximum_simultaneous_release: demand.maximum_simultaneous_release,
+                maximum_concurrency: demand.maximum_concurrency,
                 activation_units: demand.activation_units,
+                maximum_non_preemptive_units: demand.maximum_non_preemptive_units,
                 maximum_response_units: response,
                 maximum_delay_units: demand.maximum_delay_units,
                 maximum_cancellation_response_units: cancellation,
                 maximum_cancellation_delay_units: demand.maximum_cancellation_delay_units,
-                fallback_units: demand.activation_units * u64::from(*quota),
+                cancellation_work_units: demand.cancellation_work_units,
+                fallback_units: demand.activation_units,
                 fallback_order: demands
                     .iter()
                     .enumerate()
                     .filter(|(other_index, other)| {
-                        *other_index != index && other.core == demand.core
+                        *other_index != index
+                            && other.core == demand.core
+                            && other.activation_units <= demand.activation_units
+                            && other.maximum_non_preemptive_units <= demand.activation_units
                     })
                     .map(|(_, other)| other.identity)
                     .collect::<Vec<_>>()
@@ -11613,7 +11813,161 @@ fn independently_enumerate_service_puzzle(problem: &ServiceProblem) -> ServiceSo
             });
         }
     }
-    ServiceSolveOutcome::Conflict(service_conflict(&cores, &demands))
+    ServiceSolveOutcome::Conflict(independently_classify_service_conflict(
+        problem, &cores, &demands,
+    ))
+}
+
+#[cfg(test)]
+fn independently_classify_service_conflict(
+    problem: &ServiceProblem,
+    cores: &[ServiceCoreResource],
+    demands: &[ServiceDemand],
+) -> VerifiedServiceConflict {
+    let mut candidates = Vec::new();
+    for mask in 1_usize..(1_usize << demands.len()) {
+        let subset = demands
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| mask & (1_usize << index) != 0)
+            .map(|(_, demand)| demand)
+            .collect::<Vec<_>>();
+        let mut requirements = subset
+            .iter()
+            .flat_map(|demand| demand.requirements.iter().copied())
+            .collect::<Vec<_>>();
+        requirements.sort_unstable();
+        requirements.dedup();
+        if let Some((required, available)) = cores.iter().find_map(|core| {
+            let required = subset
+                .iter()
+                .filter(|demand| demand.core == core.ordinal)
+                .map(|demand| demand.activation_units)
+                .sum::<u64>();
+            (required > core.maximum_cycle_units).then_some((required, core.maximum_cycle_units))
+        }) {
+            candidates.push(VerifiedServiceConflict {
+                code: ServiceConflictCode::CycleCapacity,
+                context: problem.context,
+                assignment_fingerprint: problem.assignment_fingerprint,
+                requirements: requirements.into(),
+                required_units: required,
+                available_units: available,
+            });
+            continue;
+        }
+        let combinations = subset.iter().fold(1_u64, |total, demand| {
+            total * u64::from(demand.maximum_concurrency)
+        });
+        let mut minimum_delay = vec![u64::MAX; subset.len()];
+        let mut minimum_cancellation = vec![u64::MAX; subset.len()];
+        let mut minimum_violations = u64::MAX;
+        let mut feasible = false;
+        for ordinal in 0..combinations {
+            let mut remainder = ordinal;
+            let mut quotas = vec![1_u32; subset.len()];
+            for index in (0..subset.len()).rev() {
+                let radix = u64::from(subset[index].maximum_concurrency);
+                quotas[index] = u32::try_from(remainder % radix + 1).unwrap();
+                remainder /= radix;
+            }
+            let cycles = cores
+                .iter()
+                .map(|core| {
+                    let cycle = subset
+                        .iter()
+                        .zip(&quotas)
+                        .filter(|(demand, _)| demand.core == core.ordinal)
+                        .map(|(demand, quota)| demand.activation_units * u64::from(*quota))
+                        .sum::<u64>();
+                    (core.ordinal, cycle)
+                })
+                .collect::<BTreeMap<_, _>>();
+            if cores
+                .iter()
+                .any(|core| cycles[&core.ordinal] > core.maximum_cycle_units)
+            {
+                continue;
+            }
+            let mut violations = 0_u64;
+            for (index, (demand, quota)) in subset.iter().zip(&quotas).enumerate() {
+                let blocker = subset
+                    .iter()
+                    .filter(|other| other.core == demand.core)
+                    .map(|other| other.maximum_non_preemptive_units)
+                    .max()
+                    .unwrap_or(0);
+                let rounds =
+                    (u64::from(demand.maximum_simultaneous_release) - 1) / u64::from(*quota) + 1;
+                let response = blocker + rounds * cycles[&demand.core];
+                let cancellation = response + demand.cancellation_work_units;
+                minimum_delay[index] = minimum_delay[index].min(response);
+                minimum_cancellation[index] = minimum_cancellation[index].min(cancellation);
+                violations += u64::from(response > demand.maximum_delay_units)
+                    + u64::from(cancellation > demand.maximum_cancellation_delay_units);
+            }
+            if violations == 0 {
+                feasible = true;
+                break;
+            }
+            minimum_violations = minimum_violations.min(violations);
+        }
+        if feasible {
+            continue;
+        }
+        let (code, required_units, available_units) = if let Some((index, demand)) = subset
+            .iter()
+            .enumerate()
+            .find(|(index, demand)| minimum_delay[*index] > demand.maximum_delay_units)
+        {
+            (
+                ServiceConflictCode::MaximumDelay,
+                minimum_delay[index],
+                demand.maximum_delay_units,
+            )
+        } else if let Some((index, demand)) = subset.iter().enumerate().find(|(index, demand)| {
+            minimum_cancellation[*index] > demand.maximum_cancellation_delay_units
+        }) {
+            (
+                ServiceConflictCode::CancellationDelay,
+                minimum_cancellation[index],
+                demand.maximum_cancellation_delay_units,
+            )
+        } else {
+            (
+                ServiceConflictCode::SimultaneousMaximums,
+                minimum_violations,
+                0,
+            )
+        };
+        candidates.push(VerifiedServiceConflict {
+            code,
+            context: problem.context,
+            assignment_fingerprint: problem.assignment_fingerprint,
+            requirements: requirements.into(),
+            required_units,
+            available_units,
+        });
+    }
+    candidates
+        .into_iter()
+        .min_by(|left, right| {
+            (
+                left.requirements.len(),
+                left.code,
+                left.requirements.as_ref(),
+                left.required_units,
+                left.available_units,
+            )
+                .cmp(&(
+                    right.requirements.len(),
+                    right.code,
+                    right.requirements.as_ref(),
+                    right.required_units,
+                    right.available_units,
+                ))
+        })
+        .expect("independent conflict enumeration finds an infeasible subset")
 }
 
 #[cfg(test)]
@@ -11636,6 +11990,7 @@ fn tiny_service_problem(
         demands: vec![ServiceDemand {
             identity: 10 + u128::from(kind.tag()),
             requirement: 20 + u128::from(kind.tag()),
+            requirements: synthetic_service_requirements(1, 20 + u128::from(kind.tag())),
             kind,
             core: 0,
             maximum_simultaneous_release: 1,
@@ -11714,6 +12069,86 @@ fn named_tiny_service_puzzles() -> Vec<ServiceProblem> {
         3,
         8,
     ));
+    let demand = |identity, kind, core, release, concurrency, activation, delay| -> ServiceDemand {
+        ServiceDemand {
+            identity,
+            requirement: identity + 100,
+            requirements: synthetic_service_requirements(1, identity + 100),
+            kind,
+            core,
+            maximum_simultaneous_release: release,
+            maximum_concurrency: concurrency,
+            activation_units: activation,
+            maximum_non_preemptive_units: activation,
+            maximum_delay_units: delay,
+            cancellation_work_units: 0,
+            maximum_cancellation_delay_units: delay,
+        }
+    };
+    let multi_core = ServiceProblem {
+        name: "multi_class_multi_core",
+        context: 1,
+        assignment_fingerprint: 2,
+        cores: vec![
+            ServiceCoreResource {
+                ordinal: 0,
+                maximum_cycle_units: 6,
+            },
+            ServiceCoreResource {
+                ordinal: 1,
+                maximum_cycle_units: 6,
+            },
+        ],
+        demands: vec![
+            demand(31, ServiceClassKind::Ingress, 0, 2, 1, 2, 6),
+            demand(32, ServiceClassKind::Driver, 1, 2, 1, 2, 6),
+        ],
+    };
+    puzzles.push(multi_core.clone());
+    let mut permutation = multi_core;
+    permutation.name = "permuted_multi_class";
+    permutation.cores.reverse();
+    permutation.demands.reverse();
+    puzzles.push(permutation);
+    puzzles.push(ServiceProblem {
+        name: "quota_digit_order_release_exceeds_concurrency",
+        context: 1,
+        assignment_fingerprint: 2,
+        cores: vec![ServiceCoreResource {
+            ordinal: 0,
+            maximum_cycle_units: 12,
+        }],
+        demands: vec![
+            demand(41, ServiceClassKind::Ingress, 0, 4, 2, 1, 34),
+            demand(42, ServiceClassKind::Driver, 0, 1, 1, 10, 34),
+        ],
+    });
+    puzzles.push(ServiceProblem {
+        name: "simultaneous_maxima",
+        context: 1,
+        assignment_fingerprint: 2,
+        cores: vec![ServiceCoreResource {
+            ordinal: 0,
+            maximum_cycle_units: 4,
+        }],
+        demands: vec![
+            demand(51, ServiceClassKind::Ingress, 0, 4, 2, 1, 8),
+            demand(52, ServiceClassKind::ActorTurn, 0, 4, 2, 1, 8),
+        ],
+    });
+    puzzles.push(ServiceProblem {
+        name: "fallback_exact_fit",
+        context: 1,
+        assignment_fingerprint: 2,
+        cores: vec![ServiceCoreResource {
+            ordinal: 0,
+            maximum_cycle_units: 4,
+        }],
+        demands: vec![
+            demand(61, ServiceClassKind::Cleanup, 0, 1, 1, 2, 6),
+            demand(62, ServiceClassKind::Driver, 0, 1, 1, 2, 6),
+        ],
+    });
     puzzles
 }
 
@@ -11731,18 +12166,34 @@ fn service_plan_fingerprint(candidate: &ServicePlanCandidate) -> u128 {
         for value in [
             class.identity,
             class.requirement,
+            u128::try_from(class.requirement_evidence.len()).unwrap_or(u128::MAX),
             u128::from(class.kind.tag()),
             u128::from(class.core),
             u128::from(class.quota),
+            u128::from(class.maximum_simultaneous_release),
+            u128::from(class.maximum_concurrency),
             u128::from(class.activation_units),
+            u128::from(class.maximum_non_preemptive_units),
             u128::from(class.maximum_response_units),
             u128::from(class.maximum_delay_units),
             u128::from(class.maximum_cancellation_response_units),
             u128::from(class.maximum_cancellation_delay_units),
+            u128::from(class.cancellation_work_units),
             u128::from(class.fallback_units),
             u128::try_from(class.fallback_order.len()).unwrap_or(u128::MAX),
         ] {
             hash.update(&value.to_le_bytes());
+        }
+        for reference in class.requirement_evidence.iter() {
+            hash.update(&[match reference.source {
+                ServiceRequirementSource::Architecture => 1,
+                ServiceRequirementSource::Core => 2,
+                ServiceRequirementSource::Flow => 3,
+                ServiceRequirementSource::Foundation => 4,
+            }]);
+            hash.update(&reference.context.to_le_bytes());
+            hash.update(&reference.identity.to_le_bytes());
+            hash.update(&reference.current_meaning.to_le_bytes());
         }
         for fallback in class.fallback_order.iter() {
             hash.update(&fallback.to_le_bytes());
@@ -11765,18 +12216,35 @@ fn verifier_service_plan_fingerprint(candidate: &ServicePlanCandidate) -> u128 {
         for value in [
             class.identity,
             class.requirement,
+            u128::try_from(class.requirement_evidence.len()).unwrap_or(u128::MAX),
             u128::from(class.kind.tag()),
             u128::from(class.core),
             u128::from(class.quota),
+            u128::from(class.maximum_simultaneous_release),
+            u128::from(class.maximum_concurrency),
             u128::from(class.activation_units),
+            u128::from(class.maximum_non_preemptive_units),
             u128::from(class.maximum_response_units),
             u128::from(class.maximum_delay_units),
             u128::from(class.maximum_cancellation_response_units),
             u128::from(class.maximum_cancellation_delay_units),
+            u128::from(class.cancellation_work_units),
             u128::from(class.fallback_units),
             u128::try_from(class.fallback_order.len()).unwrap_or(u128::MAX),
         ] {
             verifier.update(&value.to_le_bytes());
+        }
+        for reference in class.requirement_evidence.iter() {
+            let source = match reference.source {
+                ServiceRequirementSource::Architecture => 1_u8,
+                ServiceRequirementSource::Core => 2,
+                ServiceRequirementSource::Flow => 3,
+                ServiceRequirementSource::Foundation => 4,
+            };
+            verifier.update(&[source]);
+            verifier.update(&reference.context.to_le_bytes());
+            verifier.update(&reference.identity.to_le_bytes());
+            verifier.update(&reference.current_meaning.to_le_bytes());
         }
         for fallback in class.fallback_order.iter() {
             verifier.update(&fallback.to_le_bytes());
@@ -11797,6 +12265,25 @@ fn service_release(bound: u64) -> Result<u32, PlanningFailure> {
         .map_err(|_| PlanningFailure::Defect(Arc::from("service release bound exceeds schema")))
 }
 
+fn canonical_service_requirements(
+    requirements: impl IntoIterator<Item = ServiceRequirementRef>,
+) -> Arc<[ServiceRequirementRef]> {
+    let mut requirements = requirements.into_iter().collect::<Vec<_>>();
+    requirements.sort_unstable();
+    requirements.dedup();
+    requirements.into()
+}
+
+#[cfg(test)]
+fn synthetic_service_requirements(context: u128, identity: u128) -> Arc<[ServiceRequirementRef]> {
+    Arc::from([ServiceRequirementRef {
+        source: ServiceRequirementSource::Flow,
+        context,
+        identity,
+        current_meaning: identity.wrapping_add(1),
+    }])
+}
+
 fn production_service_problem(
     assignment: &VerifiedWholeImageAssignment,
     cancellation: &Cancellation,
@@ -11804,7 +12291,8 @@ fn production_service_problem(
     checkpoint(cancellation)?;
     let foundation = assignment.planning_foundation.as_ref();
     let flow = assignment.flow_program.for_image_planning();
-    let architecture = foundation.architecture_contract.for_image_planning();
+    let architecture = foundation.architecture_contract.for_service_analysis();
+    let core = assignment.core_program.for_service_analysis();
     if foundation.context != flow.context_identity() {
         return defect("Service Plan inputs do not share the verified Assignment context");
     }
@@ -11813,14 +12301,34 @@ fn production_service_problem(
         .iter()
         .map(|placement| (placement.executable, placement.core))
         .collect::<BTreeMap<_, _>>();
+    if core.context_identity() != foundation.context {
+        return defect("Service Plan Core work belongs to a different compilation context");
+    }
     let cores = architecture
         .cores()
+        .iter()
         .map(|core| ServiceCoreResource {
             ordinal: core.ordinal,
             maximum_cycle_units: u64::from(core.maximum_service_units),
         })
         .collect::<Vec<_>>();
-    let service = architecture.service();
+    let service = architecture.costs();
+    let architecture_evidence = ServiceRequirementRef {
+        source: ServiceRequirementSource::Architecture,
+        context: foundation.context,
+        identity: architecture.contract_identity(),
+        current_meaning: architecture.contract_current_meaning(),
+    };
+    let flow_evidence = |requirement: ImagePlanningFlowRequirement<'_>| ServiceRequirementRef {
+        source: ServiceRequirementSource::Flow,
+        context: foundation.context,
+        identity: requirement.reference().identity(),
+        current_meaning: requirement.reference().current_meaning(),
+    };
+    let handler_work = core
+        .handlers()
+        .map(|handler| (handler.identity, handler))
+        .collect::<BTreeMap<_, _>>();
     let default_delay = u64::from(service.maximum_cycle_units);
     let default_cancellation_delay = u64::from(service.maximum_cancellation_delay_units);
     let flow_requirements = flow.requirements().collect::<Vec<_>>();
@@ -11843,6 +12351,24 @@ fn production_service_problem(
         if handler_cores.iter().any(|placed| *placed != core) {
             return defect("Service Plan Actor violates permanent placement");
         }
+        let maximum_handler_work = actor
+            .handlers()
+            .map(|handler| {
+                handler_work
+                    .get(&handler)
+                    .copied()
+                    .filter(|work| work.context == foundation.context)
+                    .map(|work| work.maximum_logical_work_units)
+                    .ok_or_else(|| {
+                        PlanningFailure::Defect(Arc::from(
+                            "Service Plan Actor handler has no verified Core work bound",
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max()
+            .unwrap_or(1);
         let mailbox = flow_requirements
             .iter()
             .copied()
@@ -11867,13 +12393,45 @@ fn production_service_problem(
                     "Service Plan Actor is missing its Turn Requirement",
                 ))
             })?;
+        let placement = flow_requirements
+            .iter()
+            .copied()
+            .find(|requirement| {
+                requirement.actor() == actor.identity()
+                    && requirement.kind() == FlowRequirementKind::PermanentCorePlacement
+            })
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from(
+                    "Service Plan Actor is missing its placement Requirement",
+                ))
+            })?;
+        let handler_evidence = actor
+            .handlers()
+            .filter_map(|handler| handler_work.get(&handler).copied())
+            .map(|handler| ServiceRequirementRef {
+                source: ServiceRequirementSource::Core,
+                context: handler.context,
+                identity: handler.identity,
+                current_meaning: handler.current_meaning,
+            })
+            .collect::<Vec<_>>();
         let release = service_release(actor.mailbox_capacity())?;
         let ingress_units = u64::from(service.ingress_units)
             .checked_add(u64::from(service.cross_core_units))
             .ok_or_else(|| PlanningFailure::Defect(Arc::from("ingress service cost overflow")))?;
+        let turn_units = u64::from(service.actor_turn_units)
+            .checked_add(maximum_handler_work)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("Actor Turn service cost overflow"))
+            })?;
         demands.push(ServiceDemand {
             identity: service_demand_identity(ServiceClassKind::Ingress, actor.identity()),
             requirement: mailbox.reference().identity(),
+            requirements: canonical_service_requirements([
+                architecture_evidence,
+                flow_evidence(mailbox),
+                flow_evidence(placement),
+            ]),
             kind: ServiceClassKind::Ingress,
             core,
             maximum_simultaneous_release: release,
@@ -11887,12 +12445,22 @@ fn production_service_problem(
         demands.push(ServiceDemand {
             identity: service_demand_identity(ServiceClassKind::ActorTurn, actor.identity()),
             requirement: turn.reference().identity(),
+            requirements: canonical_service_requirements(
+                [
+                    architecture_evidence,
+                    flow_evidence(mailbox),
+                    flow_evidence(turn),
+                    flow_evidence(placement),
+                ]
+                .into_iter()
+                .chain(handler_evidence),
+            ),
             kind: ServiceClassKind::ActorTurn,
             core,
             maximum_simultaneous_release: release,
             maximum_concurrency: u32::from(actor.max_active_turns()),
-            activation_units: u64::from(service.actor_turn_units),
-            maximum_non_preemptive_units: u64::from(service.actor_turn_units),
+            activation_units: turn_units,
+            maximum_non_preemptive_units: turn_units,
             maximum_delay_units: default_delay,
             cancellation_work_units: u64::from(service.cancellation_checkpoint_units),
             maximum_cancellation_delay_units: default_cancellation_delay,
@@ -11918,6 +12486,18 @@ fn production_service_problem(
                     "Service Plan Group is missing its child Requirement",
                 ))
             })?;
+        let mut group_evidence = vec![architecture_evidence, flow_evidence(child)];
+        for kind in [
+            FlowRequirementKind::CancellationObservationWorkBound,
+            FlowRequirementKind::DeadlineSlack,
+            FlowRequirementKind::DeadlineFeasibility,
+        ] {
+            if let Some(requirement) = flow_requirements.iter().copied().find(|requirement| {
+                requirement.kind() == kind && requirement.site() == Some(group.identity())
+            }) {
+                group_evidence.push(flow_evidence(requirement));
+            }
+        }
         let release = service_release(group.child_activation_bound())?;
         let work = u64::from(service.group_child_units)
             .checked_add(group.maximum_uninterrupted_work_units())
@@ -11936,6 +12516,7 @@ fn production_service_problem(
         demands.push(ServiceDemand {
             identity: service_demand_identity(ServiceClassKind::GroupChild, group.identity()),
             requirement: child.reference().identity(),
+            requirements: canonical_service_requirements(group_evidence.clone()),
             kind: ServiceClassKind::GroupChild,
             core,
             maximum_simultaneous_release: release,
@@ -11965,6 +12546,12 @@ fn production_service_problem(
             demands.push(ServiceDemand {
                 identity: service_demand_identity(ServiceClassKind::Cleanup, group.identity()),
                 requirement: cleanup.reference().identity(),
+                requirements: canonical_service_requirements(
+                    group_evidence
+                        .iter()
+                        .copied()
+                        .chain([flow_evidence(cleanup)]),
+                ),
                 kind: ServiceClassKind::Cleanup,
                 core,
                 maximum_simultaneous_release: cleanup_release,
@@ -12015,6 +12602,15 @@ fn production_service_problem(
         demands.push(ServiceDemand {
             identity: service_demand_identity(ServiceClassKind::Driver, role.reference.identity),
             requirement: requirement.reference.identity,
+            requirements: canonical_service_requirements([
+                architecture_evidence,
+                ServiceRequirementRef {
+                    source: ServiceRequirementSource::Foundation,
+                    context: requirement.reference.context,
+                    identity: requirement.reference.identity,
+                    current_meaning: requirement.reference.current_meaning,
+                },
+            ]),
             kind: ServiceClassKind::Driver,
             core,
             maximum_simultaneous_release: 1,
@@ -12037,6 +12633,92 @@ fn production_service_problem(
     })
 }
 
+fn verify_actor_turn_demand_work(
+    assignment: &VerifiedWholeImageAssignment,
+    problem: &ServiceProblem,
+    cancellation: &Cancellation,
+) -> Result<(), PlanningFailure> {
+    checkpoint(cancellation)?;
+    let foundation = assignment.planning_foundation.as_ref();
+    let flow = assignment.flow_program.for_image_planning();
+    let core = assignment.core_program.for_service_analysis();
+    let architecture = foundation.architecture_contract.for_service_analysis();
+    if problem.context != foundation.context
+        || problem.assignment_fingerprint != assignment.fingerprint
+        || core.context_identity() != foundation.context
+    {
+        return defect("Service work verifier received mixed Assignment authority");
+    }
+    let baseline = u64::from(architecture.costs().actor_turn_units);
+    let architecture_reference = ServiceRequirementRef {
+        source: ServiceRequirementSource::Architecture,
+        context: foundation.context,
+        identity: architecture.contract_identity(),
+        current_meaning: architecture.contract_current_meaning(),
+    };
+
+    for actor in flow.actors() {
+        checkpoint(cancellation)?;
+        let mut maximum_work = None;
+        let mut core_references = Vec::new();
+        for handler in actor.handlers() {
+            checkpoint(cancellation)?;
+            let work = core
+                .handlers()
+                .find(|work| work.identity == handler && work.context == foundation.context)
+                .ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from(
+                        "Service work verifier cannot reconstruct an Actor handler",
+                    ))
+                })?;
+            maximum_work = Some(
+                maximum_work
+                    .unwrap_or(0_u64)
+                    .max(work.maximum_logical_work_units),
+            );
+            core_references.push(ServiceRequirementRef {
+                source: ServiceRequirementSource::Core,
+                context: work.context,
+                identity: work.identity,
+                current_meaning: work.current_meaning,
+            });
+        }
+        let Some(maximum_work) = maximum_work else {
+            continue;
+        };
+        core_references.sort_unstable();
+        let expected_units = baseline
+            .checked_add(maximum_work)
+            .ok_or_else(|| PlanningFailure::Defect(Arc::from("Actor Turn verifier overflow")))?;
+        let identity = service_demand_identity(ServiceClassKind::ActorTurn, actor.identity());
+        let demand = problem
+            .demands
+            .iter()
+            .find(|demand| {
+                demand.kind == ServiceClassKind::ActorTurn && demand.identity == identity
+            })
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from(
+                    "Service work verifier is missing an Actor Turn demand",
+                ))
+            })?;
+        let actual_core_references = demand
+            .requirements
+            .iter()
+            .copied()
+            .filter(|reference| reference.source == ServiceRequirementSource::Core)
+            .collect::<Vec<_>>();
+        if demand.activation_units != expected_units
+            || demand.maximum_non_preemptive_units != expected_units
+            || !demand.requirements.contains(&architecture_reference)
+            || actual_core_references != core_references
+        {
+            return defect("Actor Turn work or authenticated evidence does not reconstruct");
+        }
+    }
+    Ok(())
+}
+
 impl ImagePlanningModule {
     pub(crate) fn service_plan(
         &self,
@@ -12045,6 +12727,7 @@ impl ImagePlanningModule {
     ) -> Result<ServicePlanOutcome, PlanningFailure> {
         checkpoint(cancellation)?;
         let problem = production_service_problem(&assignment, cancellation)?;
+        verify_actor_turn_demand_work(&assignment, &problem, cancellation)?;
         match solve_service_problem(&problem, cancellation)? {
             ServiceSolveOutcome::Plan(candidate) => {
                 let fingerprint = service_plan_fingerprint(&candidate);
@@ -12075,6 +12758,7 @@ fn verify_service_plan(
         return defect("Service Plan is bound to a different whole-Image Assignment");
     }
     let problem = production_service_problem(&plan.assignment, cancellation)?;
+    verify_actor_turn_demand_work(&plan.assignment, &problem, cancellation)?;
     verify_service_plan_against(&problem, plan, cancellation)
 }
 
@@ -14405,6 +15089,11 @@ fn build() -> Image:
                 "deadline_one_short",
                 "cancellation_exact_fit",
                 "cancellation_one_short",
+                "multi_class_multi_core",
+                "permuted_multi_class",
+                "quota_digit_order_release_exceeds_concurrency",
+                "simultaneous_maxima",
+                "fallback_exact_fit",
             ])
         );
         for puzzle in puzzles {
@@ -14416,6 +15105,22 @@ fn build() -> Image:
                 "production and independent service check disagree for {}",
                 puzzle.name
             );
+            let mut permuted = puzzle.clone();
+            permuted.cores.reverse();
+            permuted.demands.reverse();
+            assert_eq!(
+                production,
+                solve_service_problem(&permuted, &Cancellation::new())
+                    .expect("input permutation search completes"),
+                "production result depends on input order for {}",
+                puzzle.name
+            );
+            assert_eq!(
+                independent,
+                independently_enumerate_service_puzzle(&permuted),
+                "independent result depends on input order for {}",
+                puzzle.name
+            );
         }
     }
 
@@ -14423,10 +15128,11 @@ fn build() -> Image:
         let demand = |identity, kind| ServiceDemand {
             identity,
             requirement: identity + 100,
+            requirements: synthetic_service_requirements(7, identity + 100),
             kind,
             core: 0,
             maximum_simultaneous_release: 2,
-            maximum_concurrency: 1,
+            maximum_concurrency: 2,
             activation_units: 2,
             maximum_non_preemptive_units: 1,
             maximum_delay_units: 20,
@@ -14487,6 +15193,14 @@ fn build() -> Image:
         Arc::make_mut(&mut false_bound.classes)[0].maximum_response_units -= 1;
         assert!(matches!(
             verify_service_candidate(&problem, &false_bound, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut stale_meaning = canonical.clone();
+        Arc::make_mut(&mut Arc::make_mut(&mut stale_meaning.classes)[0].requirement_evidence)[0]
+            .current_meaning ^= 1;
+        assert!(matches!(
+            verify_service_candidate(&problem, &stale_meaning, &Cancellation::new()),
             Err(PlanningFailure::Defect(_))
         ));
 
@@ -14559,9 +15273,200 @@ fn build() -> Image:
             1,
         );
         exhausted.demands[0].maximum_simultaneous_release = 2;
+        exhausted.demands[0].maximum_concurrency = 2;
         assert!(matches!(
             solve_service_problem_with_limit(&exhausted, &Cancellation::new(), 1),
             Err(PlanningFailure::Defect(evidence)) if evidence.contains("exhausted")
         ));
+    }
+
+    #[test]
+    fn service_concurrency_caps_quota_and_fallback_only_borrows_fitting_activations() {
+        let demand = |identity, activation, release, concurrency| ServiceDemand {
+            identity,
+            requirement: identity + 100,
+            requirements: synthetic_service_requirements(1, identity + 100),
+            kind: ServiceClassKind::ActorTurn,
+            core: 0,
+            maximum_simultaneous_release: release,
+            maximum_concurrency: concurrency,
+            activation_units: activation,
+            maximum_non_preemptive_units: activation,
+            maximum_delay_units: 34,
+            cancellation_work_units: 0,
+            maximum_cancellation_delay_units: 34,
+        };
+        let mut problem = ServiceProblem {
+            name: "concurrency_and_fallback",
+            context: 1,
+            assignment_fingerprint: 2,
+            cores: vec![ServiceCoreResource {
+                ordinal: 0,
+                maximum_cycle_units: 12,
+            }],
+            demands: vec![demand(1, 1, 4, 1), demand(2, 10, 1, 1)],
+        };
+        let ServiceSolveOutcome::Conflict(_) =
+            solve_service_problem(&problem, &Cancellation::new()).unwrap()
+        else {
+            panic!("concurrency one cannot select the required quota two");
+        };
+        problem.demands[0].maximum_concurrency = 2;
+        let ServiceSolveOutcome::Plan(plan) =
+            solve_service_problem(&problem, &Cancellation::new()).unwrap()
+        else {
+            panic!("concurrency two admits the canonical second quota");
+        };
+        let small = plan
+            .classes
+            .iter()
+            .find(|class| class.identity == 1)
+            .unwrap();
+        assert_eq!(small.quota, 2);
+        assert!(!small.fallback_order.contains(&2));
+
+        let mut ineligible_fallback = plan.clone();
+        Arc::make_mut(&mut ineligible_fallback.classes)[0].fallback_order = vec![2].into();
+        assert!(matches!(
+            verify_service_candidate(&problem, &ineligible_fallback, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        problem.demands[1].activation_units = 1;
+        problem.demands[1].maximum_non_preemptive_units = 1;
+        let ServiceSolveOutcome::Plan(exact_fit) =
+            solve_service_problem(&problem, &Cancellation::new()).unwrap()
+        else {
+            panic!("equal fallback activation admits");
+        };
+        assert!(exact_fit.classes[0].fallback_order.contains(&2));
+    }
+
+    #[test]
+    fn expensive_handler_service_is_exact_at_capacity_and_conflicts_one_unit_short() {
+        let mut problem = tiny_service_problem(
+            "expensive_handler_exact_fit",
+            ServiceClassKind::ActorTurn,
+            10,
+            20,
+            0,
+            20,
+        );
+        problem.demands[0].activation_units = 10;
+        problem.demands[0].maximum_non_preemptive_units = 10;
+        let ServiceSolveOutcome::Plan(_) =
+            solve_service_problem(&problem, &Cancellation::new()).unwrap()
+        else {
+            panic!("expensive handler must fit its exact authenticated capacity");
+        };
+        problem.cores[0].maximum_cycle_units = 9;
+        let ServiceSolveOutcome::Conflict(conflict) =
+            solve_service_problem(&problem, &Cancellation::new()).unwrap()
+        else {
+            panic!("expensive handler must conflict one authenticated unit short");
+        };
+        assert_eq!(conflict.required_units, 10);
+        assert_eq!(conflict.available_units, 9);
+    }
+
+    #[test]
+    fn service_conflict_minimization_cancels_mid_enumeration_without_publication() {
+        let mut problem = tiny_service_problem(
+            "mid_conflict_cancellation",
+            ServiceClassKind::ActorTurn,
+            8,
+            1,
+            0,
+            1,
+        );
+        problem.demands[0].maximum_simultaneous_release = 8;
+        problem.demands[0].maximum_concurrency = 8;
+        let cancellation = Cancellation::new();
+        cancellation.cancel_after_private_polls(11);
+        assert!(matches!(
+            solve_service_problem(&problem, &cancellation),
+            Err(PlanningFailure::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn service_conflict_is_bound_to_exact_canonical_inclusion_minimal_requirements() {
+        let demand = |identity| ServiceDemand {
+            identity,
+            requirement: identity + 100,
+            requirements: synthetic_service_requirements(7, identity + 100),
+            kind: ServiceClassKind::Driver,
+            core: 0,
+            maximum_simultaneous_release: 1,
+            maximum_concurrency: 1,
+            activation_units: 4,
+            maximum_non_preemptive_units: 4,
+            maximum_delay_units: 100,
+            cancellation_work_units: 0,
+            maximum_cancellation_delay_units: 100,
+        };
+        let problem = ServiceProblem {
+            name: "minimal_cycle_witness",
+            context: 7,
+            assignment_fingerprint: 9,
+            cores: vec![ServiceCoreResource {
+                ordinal: 0,
+                maximum_cycle_units: 7,
+            }],
+            demands: vec![demand(1), demand(2), demand(3)],
+        };
+        let ServiceSolveOutcome::Conflict(conflict) =
+            solve_service_problem(&problem, &Cancellation::new()).unwrap()
+        else {
+            panic!("two of three services exceed capacity");
+        };
+        assert_eq!(conflict.context, 7);
+        assert_eq!(conflict.assignment_fingerprint, 9);
+        assert_eq!(conflict.required_units, 8);
+        assert_eq!(conflict.available_units, 7);
+        assert_eq!(
+            conflict
+                .requirements
+                .iter()
+                .map(|reference| reference.identity)
+                .collect::<Vec<_>>(),
+            vec![101, 102]
+        );
+        verify_service_conflict(&problem, &conflict, &Cancellation::new()).unwrap();
+
+        let rejects_conflict = |candidate: &VerifiedServiceConflict| {
+            assert!(matches!(
+                verify_service_conflict(&problem, candidate, &Cancellation::new()),
+                Err(PlanningFailure::Defect(_))
+            ));
+        };
+        let mut corrupt = conflict.clone();
+        corrupt.context ^= 1;
+        rejects_conflict(&corrupt);
+        let mut corrupt = conflict.clone();
+        corrupt.assignment_fingerprint ^= 1;
+        rejects_conflict(&corrupt);
+        let mut corrupt = conflict.clone();
+        Arc::make_mut(&mut corrupt.requirements)[0].current_meaning ^= 1;
+        rejects_conflict(&corrupt);
+        let mut corrupt = conflict.clone();
+        Arc::make_mut(&mut corrupt.requirements)[0].source = ServiceRequirementSource::Core;
+        rejects_conflict(&corrupt);
+        let mut corrupt = conflict.clone();
+        Arc::make_mut(&mut corrupt.requirements).reverse();
+        rejects_conflict(&corrupt);
+        let mut corrupt = conflict.clone();
+        corrupt.requirements = corrupt.requirements[..1].to_vec().into();
+        rejects_conflict(&corrupt);
+        let mut corrupt = conflict;
+        let mut extra = corrupt.requirements.to_vec();
+        extra.push(ServiceRequirementRef {
+            source: ServiceRequirementSource::Flow,
+            context: 7,
+            identity: 999,
+            current_meaning: 1,
+        });
+        corrupt.requirements = extra.into();
+        rejects_conflict(&corrupt);
     }
 }

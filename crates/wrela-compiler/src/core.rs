@@ -797,6 +797,10 @@ impl VerifiedCoreProgram {
         ImagePlanningCoreView { core: self }
     }
 
+    pub(crate) const fn for_service_analysis(&self) -> ServiceCoreView<'_> {
+        ServiceCoreView { core: self }
+    }
+
     pub(crate) fn observation(
         &self,
         cancellation: &Cancellation,
@@ -881,6 +885,42 @@ impl VerifiedCoreProgram {
     #[allow(dead_code)]
     pub(crate) fn for_backend(&self) -> BackendCoreView<'_> {
         BackendCoreView { core: self }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ServiceCoreView<'a> {
+    core: &'a VerifiedCoreProgram,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ServiceHandlerWork {
+    pub(crate) context: u128,
+    pub(crate) identity: u128,
+    pub(crate) current_meaning: u128,
+    pub(crate) maximum_logical_work_units: u64,
+}
+
+impl<'a> ServiceCoreView<'a> {
+    pub(crate) const fn context_identity(self) -> u128 {
+        self.core.context
+    }
+
+    pub(crate) fn handlers(self) -> impl ExactSizeIterator<Item = ServiceHandlerWork> + 'a {
+        self.core.executables.iter().map(|executable| {
+            let maximum_logical_work_units = executable
+                .regions
+                .iter()
+                .map(|region| u64::try_from(region.operations.len()).unwrap_or(u64::MAX))
+                .fold(0_u64, u64::saturating_add)
+                .max(1);
+            ServiceHandlerWork {
+                context: executable.reference.context,
+                identity: executable.reference.identity,
+                current_meaning: executable.reference.current_meaning,
+                maximum_logical_work_units,
+            }
+        })
     }
 }
 

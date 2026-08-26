@@ -506,7 +506,7 @@ impl VerifiedArchitecturePlanningContract {
     }
 
     pub(crate) const fn for_service_analysis(&self) -> ServiceArchitecture<'_> {
-        ServiceArchitecture { facts: &self.facts }
+        ServiceArchitecture { contract: self }
     }
 
     pub(crate) const fn for_logical_layout(&self) -> LogicalLayoutArchitecture<'_> {
@@ -685,17 +685,25 @@ impl AdmissionArchitecture<'_> {
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ServiceArchitecture<'a> {
-    facts: &'a ContractFacts,
+    contract: &'a VerifiedArchitecturePlanningContract,
 }
 
 #[allow(dead_code)]
 impl ServiceArchitecture<'_> {
     pub(crate) fn cores(&self) -> &[SymbolicCore] {
-        &self.facts.cores
+        &self.contract.facts.cores
     }
 
     pub(crate) const fn costs(&self) -> ServiceCostBaseline {
-        self.facts.service
+        self.contract.facts.service
+    }
+
+    pub(crate) const fn contract_identity(&self) -> u128 {
+        self.contract.identity
+    }
+
+    pub(crate) const fn contract_current_meaning(&self) -> u128 {
+        self.contract.fingerprint
     }
 }
 

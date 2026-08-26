@@ -1432,7 +1432,7 @@ fn build() -> Image:
 
 fn exact_service_deadline_outcome() -> &'static CompilationOutcome {
     static OUTCOME: OnceLock<CompilationOutcome> = OnceLock::new();
-    OUTCOME.get_or_init(|| compile_service_deadline(65))
+    OUTCOME.get_or_init(|| compile_service_deadline(85))
 }
 
 #[test]
@@ -1441,13 +1441,23 @@ fn compiler_rejects_a_positive_but_unmeetable_verified_group_deadline() {
         exact_service_deadline_outcome(),
         CompilationOutcome::Accepted(_)
     ));
-    let outcome = compile_service_deadline(64);
+    let outcome = compile_service_deadline(84);
     let CompilationOutcome::Rejected(rejected) = outcome else {
         panic!("positive slack below verified Flow work must reject: {outcome:#?}");
     };
     assert_eq!(
         rejected.diagnostics()[0].code(),
         "admission.service_conflict"
+    );
+    assert!(
+        rejected.diagnostics()[0]
+            .typed_parameters()
+            .contains(&("required_units".into(), DiagnosticValue::Unsigned(85)))
+    );
+    assert!(
+        rejected.diagnostics()[0]
+            .typed_parameters()
+            .contains(&("available_units".into(), DiagnosticValue::Unsigned(84)))
     );
     assert!(rejected.inspection().flow_program().is_some());
     assert!(rejected.inspection().whole_image_assignment().is_none());
@@ -1488,4 +1498,65 @@ fn compiler_planning_inspection_reports_the_verified_deterministic_service_plan(
             && class.maximum_cancellation_response_units()
                 <= class.maximum_cancellation_delay_units()
     }));
+}
+
+#[test]
+fn actor_turn_service_cost_uses_the_worst_verified_handler_work() {
+    let source = br#"@actor
+struct Light:
+    pub async fn run(self):
+        pass
+
+@actor
+struct Heavy:
+    pub async fn run(self):
+        first = 1 + 2
+        second = first * 3
+        third = second + first
+        _ = third * second
+
+@image
+fn build() -> Image:
+    light = Light()
+    heavy = Heavy()
+    return Image.new(light=light, heavy=heavy)
+"#;
+    let outcome = Compiler::open(CompilerInstallation::layer1())
+        .unwrap()
+        .compile(
+            CompilationRequest::new(
+                ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+                Root::Image,
+            )
+            .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+            .with_inspection(InspectSelection::all()),
+            &Cancellation::new(),
+        );
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("bounded handler work admits: {outcome:#?}");
+    };
+    let flow = accepted.inspection().flow_program().unwrap();
+    let service = accepted.inspection().service_plan().unwrap();
+    let turn_cost = |actor| {
+        let requirement = flow
+            .requirements()
+            .iter()
+            .find(|requirement| {
+                requirement.actor() == actor
+                    && requirement.kind() == wrela_compiler::FlowRequirementKind::TurnLease
+            })
+            .unwrap();
+        service
+            .classes()
+            .iter()
+            .find(|class| class.requirement() == requirement.identity())
+            .unwrap()
+            .activation_units()
+    };
+    let costs = flow
+        .actors()
+        .iter()
+        .map(|actor| turn_cost(actor.identity()))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(costs.len(), 2, "trivial and expensive handlers must differ");
 }

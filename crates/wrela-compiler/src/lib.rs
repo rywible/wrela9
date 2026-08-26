@@ -55,7 +55,7 @@ pub use flow::{
     FlowSuspensionHomeObservation, FlowTraceRecord,
 };
 pub use image_planning::{
-    DomainPlanKind, DomainPlanObservation, ExecutableDemandObservation,
+    DomainPlanKind, DomainPlanObservation, ExecutableDemandObservation, FacilityActorRef,
     FacilityBindingAvailability, FacilityContractObservation, FacilityDomainPlanObservation,
     FacilityEndpointOwnership, FacilityFlagshipRule, FacilityKind, FacilityLossPolicy,
     FacilityReplayAuthority, FacilityReplayRule, FacilitySemanticCapacity, FacilitySharedRole,

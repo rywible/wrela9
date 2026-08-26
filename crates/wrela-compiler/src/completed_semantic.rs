@@ -286,6 +286,7 @@ struct CompletedActor {
     actor_type_identity: u128,
     construction_identity: u128,
     construction_current_meaning: u128,
+    current_meaning: u128,
     source: crate::SourceRange,
     handlers: Arc<[SpecializationId]>,
     wired_actor_constructions: Arc<[u128]>,
@@ -720,7 +721,7 @@ impl<'a> ImagePlanningSemanticProgram<'a> {
         Some(PlanningActorRef {
             context: self.program.context.identity,
             identity: actor.construction_identity,
-            current_meaning: actor.construction_current_meaning,
+            current_meaning: actor.current_meaning,
             _program: std::marker::PhantomData,
         })
     }
@@ -1066,17 +1067,26 @@ fn complete_actors(
                 }
             });
         }
+        let construction_current_meaning =
+            produce_node_local_fingerprint(construction, cancellation)?;
+        let wired_actor_constructions = wiring.into_iter().collect::<Vec<_>>();
+        let current_meaning = produce_actor_current_meaning(
+            program.fingerprint(),
+            definition.0,
+            construction.identity,
+            construction_current_meaning,
+            handlers,
+            &wired_actor_constructions,
+        );
         actors.push(CompletedActor {
             identity: construction.identity,
             actor_type_identity: definition.0,
             construction_identity: construction.identity,
-            construction_current_meaning: produce_node_local_fingerprint(
-                construction,
-                cancellation,
-            )?,
+            construction_current_meaning,
+            current_meaning,
             source: construction.site.clone(),
             handlers: Arc::clone(handlers),
-            wired_actor_constructions: wiring.into_iter().collect::<Vec<_>>().into(),
+            wired_actor_constructions: wired_actor_constructions.into(),
         });
     }
     actors.sort_by_key(|actor| actor.identity);
@@ -1766,18 +1776,25 @@ fn independently_reconstruct_actors(
                     .filter(|identity| actor_constructions.contains(identity)),
             );
         }
+        let actor_handlers = handlers.get(&definition).cloned().unwrap_or_default();
+        let wired_actor_constructions = wiring.into_iter().collect::<Vec<_>>();
+        let current_meaning = verify_actor_current_meaning(
+            program.fingerprint(),
+            definition.0,
+            node.identity,
+            node.local_fingerprint,
+            &actor_handlers,
+            &wired_actor_constructions,
+        );
         expected.push(CompletedActor {
             identity: node.identity,
             actor_type_identity: definition.0,
             construction_identity: node.identity,
             construction_current_meaning: node.local_fingerprint,
+            current_meaning,
             source: node.site.clone(),
-            handlers: handlers
-                .get(&definition)
-                .cloned()
-                .unwrap_or_default()
-                .into(),
-            wired_actor_constructions: wiring.into_iter().collect::<Vec<_>>().into(),
+            handlers: actor_handlers.into(),
+            wired_actor_constructions: wired_actor_constructions.into(),
         });
     }
     expected.sort_by_key(|actor| actor.identity);
@@ -2733,6 +2750,7 @@ fn produce_actor_fingerprint(
         hash.update(&actor.actor_type_identity.to_be_bytes());
         hash.update(&actor.construction_identity.to_be_bytes());
         hash.update(&actor.construction_current_meaning.to_be_bytes());
+        hash.update(&actor.current_meaning.to_be_bytes());
         hash.update(
             &u64::try_from(actor.handlers.len())
                 .unwrap_or(u64::MAX)
@@ -2766,6 +2784,7 @@ fn verify_actor_fingerprint(
         encoding.u128(actor.actor_type_identity);
         encoding.u128(actor.construction_identity);
         encoding.u128(actor.construction_current_meaning);
+        encoding.u128(actor.current_meaning);
         encoding.u64(actor.handlers.len());
         for handler in actor.handlers.iter() {
             encoding.u128(handler.0);
@@ -2776,6 +2795,68 @@ fn verify_actor_fingerprint(
         }
     }
     encoding.finish_cancellable(cancellation)
+}
+
+fn produce_actor_current_meaning(
+    program_fingerprint: u128,
+    actor_type_identity: u128,
+    construction_identity: u128,
+    construction_current_meaning: u128,
+    handlers: &[SpecializationId],
+    wired_actor_constructions: &[u128],
+) -> u128 {
+    let mut hash = Xxh3::new();
+    append_part(&mut hash, b"wrela.completed-actor.meaning\0\x01");
+    for value in [
+        program_fingerprint,
+        actor_type_identity,
+        construction_identity,
+        construction_current_meaning,
+    ] {
+        hash.update(&value.to_be_bytes());
+    }
+    hash.update(
+        &u64::try_from(handlers.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for handler in handlers {
+        hash.update(&handler.0.to_be_bytes());
+    }
+    hash.update(
+        &u64::try_from(wired_actor_constructions.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for construction in wired_actor_constructions {
+        hash.update(&construction.to_be_bytes());
+    }
+    hash.digest128()
+}
+
+fn verify_actor_current_meaning(
+    program_fingerprint: u128,
+    actor_type_identity: u128,
+    construction_identity: u128,
+    construction_current_meaning: u128,
+    handlers: &[SpecializationId],
+    wired_actor_constructions: &[u128],
+) -> u128 {
+    let mut encoding = VerificationEncoding::new();
+    encoding.part(b"wrela.completed-actor.meaning\0\x01");
+    encoding.u128(program_fingerprint);
+    encoding.u128(actor_type_identity);
+    encoding.u128(construction_identity);
+    encoding.u128(construction_current_meaning);
+    encoding.u64(handlers.len());
+    for handler in handlers {
+        encoding.u128(handler.0);
+    }
+    encoding.u64(wired_actor_constructions.len());
+    for construction in wired_actor_constructions {
+        encoding.u128(*construction);
+    }
+    encoding.finish()
 }
 
 fn verify_completed_fingerprint(
@@ -3493,6 +3574,11 @@ fn build() -> Image:
         extra.actors = actors.into();
         resign_actors(&mut extra);
         assert!(evidence(verify(&extra, &Cancellation::new())).contains("Actor roster"));
+
+        let mut stale = original.clone();
+        Arc::make_mut(&mut stale.actors)[0].current_meaning ^= 1;
+        resign_actors(&mut stale);
+        assert!(evidence(verify(&stale, &Cancellation::new())).contains("Actor roster"));
 
         let mut repointed = original;
         Arc::make_mut(&mut repointed.actors)[0].actor_type_identity ^= 1;

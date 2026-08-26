@@ -675,7 +675,8 @@ fn build() -> Image:
             .iter()
             .filter(|requirement| matches!(
                 requirement.bounds(),
-                RequirementBounds::FacilityRecovery { supervisor, .. } if *supervisor != 0
+                RequirementBounds::FacilityRecovery { supervisor, .. }
+                    if supervisor.identity() != 0 && supervisor.current_meaning() != 0
             ))
             .count(),
         6
@@ -701,6 +702,133 @@ fn build() -> Image:
             ))
             .count(),
         6
+    );
+}
+
+fn input_with_actor_meaning(value: u64) -> CompilationRequest {
+    let source = format!(
+        r#"from core import facilities
+
+@actor
+struct Coordinator implements facilities.FacilityActor:
+    pure fn facility_identity(read self) -> u64:
+        return {value}
+    pub async fn run(self):
+        pass
+
+@image
+fn build() -> Image:
+    coordinator = Coordinator()
+    input = facilities.Input.new(owner=coordinator, supervisor=coordinator, loss=facilities.CONTROLLED_SHUTDOWN, replay=facilities.REPLAYABLE_GAMEPLAY)
+    return Image.new(input=input)
+"#
+    );
+    CompilationRequest::new(
+        ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source.into_bytes())]),
+        Root::Image,
+    )
+    .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+    .with_inspection(InspectSelection::planning())
+}
+
+#[test]
+fn actor_meaning_edits_rebind_input_facility_planning_meanings_not_identities() {
+    let before = accepted(input_with_actor_meaning(1));
+    let after = accepted(input_with_actor_meaning(2));
+    let before = before.inspection().planning_foundation().unwrap();
+    let after = after.inspection().planning_foundation().unwrap();
+    let before_plan = &before.facility_domain_plans()[0];
+    let after_plan = &after.facility_domain_plans()[0];
+
+    assert_eq!(before_plan.kind(), FacilityKind::Input);
+    assert_eq!(before_plan.identity(), after_plan.identity());
+    assert_eq!(
+        before_plan.instance_identity(),
+        after_plan.instance_identity()
+    );
+    assert_ne!(before_plan.current_meaning(), after_plan.current_meaning());
+    let before_planner = before
+        .planners()
+        .iter()
+        .find(|planner| planner.kind() == PlannerKind::Facility(FacilityKind::Input))
+        .unwrap();
+    let after_planner = after
+        .planners()
+        .iter()
+        .find(|planner| planner.kind() == PlannerKind::Facility(FacilityKind::Input))
+        .unwrap();
+    assert_eq!(before_planner.identity(), after_planner.identity());
+    assert_ne!(
+        before_planner.current_meaning(),
+        after_planner.current_meaning()
+    );
+
+    let facility_requirements = |planning: &wrela_compiler::PlanningFoundationObservation| {
+        planning
+            .requirements()
+            .iter()
+            .filter(|requirement| {
+                matches!(
+                    requirement.subject(),
+                    wrela_compiler::RequirementSubject::FacilityInstance(_)
+                ) && matches!(
+                    requirement.category(),
+                    RequirementCategory::FacilityOwnership | RequirementCategory::Recovery
+                )
+            })
+            .map(|requirement| (requirement.reference(), requirement.current_meaning()))
+            .collect::<Vec<_>>()
+    };
+    let before_requirements = facility_requirements(before);
+    let after_requirements = facility_requirements(after);
+    assert_eq!(
+        before_requirements
+            .iter()
+            .map(|(identity, _)| identity)
+            .collect::<Vec<_>>(),
+        after_requirements
+            .iter()
+            .map(|(identity, _)| identity)
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(before_requirements, after_requirements);
+
+    let actor_refs = |planning: &wrela_compiler::PlanningFoundationObservation| {
+        planning
+            .requirements()
+            .iter()
+            .filter_map(|requirement| match requirement.bounds() {
+                RequirementBounds::FacilityEndpoint {
+                    input_owner: Some(owner),
+                    ..
+                } => Some(*owner),
+                RequirementBounds::FacilityRecovery { supervisor, .. } => Some(*supervisor),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let before_refs = actor_refs(before);
+    let after_refs = actor_refs(after);
+    assert_eq!(before_refs.len(), 2);
+    assert_eq!(
+        before_refs
+            .iter()
+            .map(|reference| reference.identity())
+            .collect::<Vec<_>>(),
+        after_refs
+            .iter()
+            .map(|reference| reference.identity())
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(
+        before_refs
+            .iter()
+            .map(|reference| reference.current_meaning())
+            .collect::<Vec<_>>(),
+        after_refs
+            .iter()
+            .map(|reference| reference.current_meaning())
+            .collect::<Vec<_>>()
     );
 }
 

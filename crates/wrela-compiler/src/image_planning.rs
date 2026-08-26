@@ -398,10 +398,10 @@ pub enum RequirementBounds {
     FacilityEndpoint {
         maximum: u32,
         ownership: FacilityEndpointOwnership,
-        input_owner: Option<u128>,
+        input_owner: Option<FacilityActorRef>,
     },
     FacilityRecovery {
-        supervisor: u128,
+        supervisor: FacilityActorRef,
         loss_policy: FacilityLossPolicy,
         maximum_attempts: u16,
     },
@@ -618,10 +618,27 @@ struct FacilityContractRef {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct FacilityActorRef {
+pub struct FacilityActorRef {
     context: u128,
     identity: u128,
     current_meaning: u128,
+}
+
+impl FacilityActorRef {
+    #[must_use]
+    pub const fn context(self) -> u128 {
+        self.context
+    }
+
+    #[must_use]
+    pub const fn identity(self) -> u128 {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn current_meaning(self) -> u128 {
+        self.current_meaning
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1953,10 +1970,17 @@ fn discover_facility_instances(
             .ok_or_else(|| {
                 PlanningFailure::Defect(Arc::from("Facility replay fact is malformed"))
             })?;
+        let current_meaning = facility_instance_current_meaning(
+            node,
+            supervisor,
+            input_owner,
+            selected_loss_policy,
+            replay_authority,
+        );
         instances.push(FacilityInstanceRef {
             context: node.context(),
             identity: node.identity(),
-            current_meaning: node.current_meaning(),
+            current_meaning,
             kind,
             source: node.source().clone(),
             supervisor,
@@ -1967,6 +1991,36 @@ fn discover_facility_instances(
     }
     instances.sort_by_key(|instance| instance.identity);
     Ok(instances)
+}
+
+fn facility_instance_current_meaning(
+    node: crate::completed_semantic::PlanningConstructionNodeRef<'_>,
+    supervisor: FacilityActorRef,
+    input_owner: Option<FacilityActorRef>,
+    selected_loss_policy: FacilityLossPolicy,
+    replay_authority: FacilityReplayAuthority,
+) -> u128 {
+    let mut hash = Xxh3::new();
+    hash.update(b"wrela.facility-instance.meaning.v1");
+    for value in [
+        node.context(),
+        node.identity(),
+        node.current_meaning(),
+        supervisor.context,
+        supervisor.identity,
+        supervisor.current_meaning,
+    ] {
+        hash.update(&value.to_le_bytes());
+    }
+    hash.update(&[u8::from(input_owner.is_some())]);
+    if let Some(owner) = input_owner {
+        for value in [owner.context, owner.identity, owner.current_meaning] {
+            hash.update(&value.to_le_bytes());
+        }
+    }
+    hash.update(&facility_loss_tag(selected_loss_policy).to_le_bytes());
+    hash.update(&[facility_replay_authority_tag(replay_authority)]);
+    hash.digest128()
 }
 
 fn facility_actor_operand(
@@ -2755,7 +2809,7 @@ fn produce_facility_requirements(
                 bounds: RequirementBounds::FacilityEndpoint {
                     maximum: contract.observation.maximum_exported_endpoints,
                     ownership: contract.observation.endpoint_ownership,
-                    input_owner: instance.input_owner.map(|owner| owner.identity),
+                    input_owner: instance.input_owner,
                 },
             },
         ),
@@ -2764,7 +2818,7 @@ fn produce_facility_requirements(
             RequirementSpec {
                 category: RequirementCategory::Recovery,
                 bounds: RequirementBounds::FacilityRecovery {
-                    supervisor: instance.supervisor.identity,
+                    supervisor: instance.supervisor,
                     loss_policy: instance.selected_loss_policy,
                     maximum_attempts: contract.observation.maximum_recovery_attempts,
                 },
@@ -5706,14 +5760,14 @@ fn verify_facility_requirements(
             RequirementBounds::FacilityEndpoint {
                 maximum: contract.observation.maximum_exported_endpoints,
                 ownership: contract.observation.endpoint_ownership,
-                input_owner: instance.input_owner.map(|owner| owner.identity),
+                input_owner: instance.input_owner,
             },
         ),
         (
             51,
             RequirementCategory::Recovery,
             RequirementBounds::FacilityRecovery {
-                supervisor: instance.supervisor.identity,
+                supervisor: instance.supervisor,
                 loss_policy: instance.selected_loss_policy,
                 maximum_attempts: contract.observation.maximum_recovery_attempts,
             },
@@ -6283,6 +6337,7 @@ fn verify_requirement_bounds(
                 "Planning Requirement has dangling, wrong-owner, wrong-role, mixed-context, or invalid provenance",
             );
         }
+        let facility_instance = owning_plan.and_then(|plan| plan.facility_instance.as_ref());
         let valid = match (&requirement.category, &requirement.bounds) {
             (
                 RequirementCategory::GeneratedRoleRealization,
@@ -6350,7 +6405,15 @@ fn verify_requirement_bounds(
                     && matches!(requirement.subject, RequirementOwner::Facility(_))
                     && match ownership {
                         FacilityEndpointOwnership::FacilityInstance => input_owner.is_none(),
-                        FacilityEndpointOwnership::BuildWiredActor => input_owner.is_some(),
+                        FacilityEndpointOwnership::BuildWiredActor => {
+                            input_owner.is_some_and(|owner| {
+                                owner.context == candidate.context
+                                    && owner.identity != 0
+                                    && owner.current_meaning != 0
+                                    && facility_instance
+                                        .is_some_and(|instance| instance.input_owner == Some(owner))
+                            })
+                        }
                     }
             }
             (
@@ -6361,7 +6424,10 @@ fn verify_requirement_bounds(
                     ..
                 },
             ) => {
-                *supervisor != 0
+                supervisor.context == candidate.context
+                    && supervisor.identity != 0
+                    && supervisor.current_meaning != 0
+                    && facility_instance.is_some_and(|instance| instance.supervisor == *supervisor)
                     && *maximum_attempts > 0
                     && matches!(requirement.subject, RequirementOwner::Facility(_))
             }
@@ -6603,7 +6669,12 @@ fn produce_bounds_encoding(hash: &mut Xxh3, bounds: &RequirementBounds) {
         } => {
             hash.update(&[11, facility_endpoint_ownership_tag(*ownership)]);
             hash.update(&maximum.to_le_bytes());
-            hash.update(&input_owner.unwrap_or(0).to_le_bytes());
+            hash.update(&[u8::from(input_owner.is_some())]);
+            if let Some(owner) = input_owner {
+                for value in [owner.context, owner.identity, owner.current_meaning] {
+                    hash.update(&value.to_le_bytes());
+                }
+            }
         }
         RequirementBounds::FacilityRecovery {
             supervisor,
@@ -6611,7 +6682,13 @@ fn produce_bounds_encoding(hash: &mut Xxh3, bounds: &RequirementBounds) {
             maximum_attempts,
         } => {
             hash.update(&[12]);
-            hash.update(&supervisor.to_le_bytes());
+            for value in [
+                supervisor.context,
+                supervisor.identity,
+                supervisor.current_meaning,
+            ] {
+                hash.update(&value.to_le_bytes());
+            }
             hash.update(&facility_loss_tag(*loss_policy).to_le_bytes());
             hash.update(&maximum_attempts.to_le_bytes());
         }
@@ -6689,7 +6766,12 @@ fn verify_bounds_encoding(verifier: &mut Xxh3, bounds: &RequirementBounds) {
         } => {
             verifier.update(&[11, facility_endpoint_ownership_tag(*ownership)]);
             verifier.update(&maximum.to_le_bytes());
-            verifier.update(&input_owner.unwrap_or(0).to_le_bytes());
+            verifier.update(&[u8::from(input_owner.is_some())]);
+            if let Some(owner) = input_owner {
+                for value in [owner.context, owner.identity, owner.current_meaning] {
+                    verifier.update(&value.to_le_bytes());
+                }
+            }
         }
         RequirementBounds::FacilityRecovery {
             supervisor,
@@ -6697,7 +6779,13 @@ fn verify_bounds_encoding(verifier: &mut Xxh3, bounds: &RequirementBounds) {
             maximum_attempts,
         } => {
             verifier.update(&[12]);
-            verifier.update(&supervisor.to_le_bytes());
+            for value in [
+                supervisor.context,
+                supervisor.identity,
+                supervisor.current_meaning,
+            ] {
+                verifier.update(&value.to_le_bytes());
+            }
             verifier.update(&facility_loss_tag(*loss_policy).to_le_bytes());
             verifier.update(&maximum_attempts.to_le_bytes());
         }
@@ -7074,6 +7162,28 @@ fn build() -> Image:
     display = facilities.Display.new(supervisor=coordinator, loss=facilities.CONTROLLED_SHUTDOWN, replay=facilities.REPLAYABLE_GAMEPLAY)
     entropy = facilities.Entropy.new(supervisor=coordinator, loss=facilities.SELECTING_IMAGE_POLICY, replay=facilities.NON_REPLAYABLE_FACILITY)
     return Image.new(display=display, entropy=entropy)
+"#,
+            Root::Image,
+        )
+    }
+
+    fn input_facility_fixture() -> VerifiedPlanningFoundation {
+        fixture_from_source(
+            "src/image.wr",
+            br#"from core import facilities
+
+@actor
+struct Coordinator implements facilities.FacilityActor:
+    pure fn facility_identity(read self) -> u64:
+        return 1
+    pub async fn run(self):
+        pass
+
+@image
+fn build() -> Image:
+    coordinator = Coordinator()
+    input = facilities.Input.new(owner=coordinator, supervisor=coordinator, loss=facilities.CONTROLLED_SHUTDOWN, replay=facilities.REPLAYABLE_GAMEPLAY)
+    return Image.new(input=input)
 "#,
             Root::Image,
         )
@@ -7457,6 +7567,70 @@ fn build() -> Image:
         wrong_subject_kind.requirements = requirements.into();
         resign_facility_requirement_set(&mut wrong_subject_kind);
         rejects(&wrong_subject_kind);
+    }
+
+    #[test]
+    fn verifier_rejects_wrong_context_and_stale_facility_actor_references() {
+        let original = input_facility_fixture();
+
+        let mut wrong_owner_context = original.clone();
+        let mut requirements = wrong_owner_context.requirements.to_vec();
+        let requirement = requirements
+            .iter_mut()
+            .find(|requirement| {
+                matches!(
+                    requirement.bounds,
+                    RequirementBounds::FacilityEndpoint {
+                        input_owner: Some(_),
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let RequirementBounds::FacilityEndpoint {
+            input_owner: Some(owner),
+            ..
+        } = &mut requirement.bounds
+        else {
+            unreachable!();
+        };
+        owner.context ^= 1;
+        wrong_owner_context.requirements = requirements.into();
+        resign_facility_requirement_set(&mut wrong_owner_context);
+        rejects(&wrong_owner_context);
+
+        let mut stale_supervisor = original.clone();
+        let mut requirements = stale_supervisor.requirements.to_vec();
+        let requirement = requirements
+            .iter_mut()
+            .find(|requirement| {
+                matches!(
+                    requirement.bounds,
+                    RequirementBounds::FacilityRecovery { .. }
+                )
+            })
+            .unwrap();
+        let RequirementBounds::FacilityRecovery { supervisor, .. } = &mut requirement.bounds else {
+            unreachable!();
+        };
+        supervisor.current_meaning ^= 1;
+        stale_supervisor.requirements = requirements.into();
+        resign_facility_requirement_set(&mut stale_supervisor);
+        rejects(&stale_supervisor);
+
+        let mut stale_instance_actor = original.clone();
+        let mut plans = stale_instance_actor.domain_plans.to_vec();
+        let instance = plans
+            .iter_mut()
+            .find(|plan| plan.kind == DomainPlanKind::Facility(FacilityKind::Input))
+            .unwrap()
+            .facility_instance
+            .as_mut()
+            .unwrap();
+        instance.supervisor.current_meaning ^= 1;
+        stale_instance_actor.domain_plans = plans.into();
+        resign(&mut stale_instance_actor);
+        rejects(&stale_instance_actor);
     }
 
     #[test]

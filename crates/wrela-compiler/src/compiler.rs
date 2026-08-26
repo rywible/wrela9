@@ -51,6 +51,7 @@ impl CompilerInstallation {
         modules.push(layer1_build_module());
         modules.push(layer1_pool_module());
         modules.push(layer1_actor_module());
+        modules.push(layer1_facilities_module());
         Self {
             authenticated_modules: modules.into(),
             cache_layer1: false,
@@ -63,6 +64,36 @@ impl CompilerInstallation {
         installation.cache_layer1 = true;
         installation
     }
+}
+
+fn layer1_facilities_module() -> ProjectFile {
+    ProjectFile::new(
+        "src/core/facilities.wr",
+        br#"pub struct Display:
+    pub pure fn new() -> Display:
+        panic "sealed Display constructor"
+
+pub struct Input:
+    pub pure fn new() -> Input:
+        panic "sealed Input constructor"
+
+pub struct EventStore:
+    pub pure fn new() -> EventStore:
+        panic "sealed Event Store constructor"
+
+pub struct MonotonicClock:
+    pub pure fn new() -> MonotonicClock:
+        panic "sealed Monotonic Clock constructor"
+
+pub struct Entropy:
+    pub pure fn new() -> Entropy:
+        panic "sealed Entropy constructor"
+
+pub struct Telemetry:
+    pub pure fn new() -> Telemetry:
+        panic "sealed Telemetry constructor"
+"#,
+    )
 }
 
 fn layer1_actor_module() -> ProjectFile {
@@ -2751,12 +2782,29 @@ impl Compiler {
                     ) {
                         Ok(planning) => Some(Arc::new(planning)),
                         Err(PlanningFailure::Cancelled) => return CompilationOutcome::Cancelled,
-                        Err(PlanningFailure::Admission {
+                        Err(PlanningFailure::PoolAdmission {
                             source,
                             declared,
                             required,
                         }) => {
                             diagnostics.push(pool_capacity_diagnostic(source, declared, required));
+                            None
+                        }
+                        Err(PlanningFailure::FacilityCardinality {
+                            kind,
+                            selected,
+                            maximum,
+                        }) => {
+                            diagnostics.push(
+                                Diagnostic::new(
+                                    "admission.facility_cardinality",
+                                    SourceRange::new(request.root.path(), 0, 0),
+                                    RecoveryAction::None,
+                                )
+                                .with_parameter("facility", format!("{kind:?}"))
+                                .with_unsigned_parameter("selected", u128::from(selected))
+                                .with_unsigned_parameter("maximum", u128::from(maximum)),
+                            );
                             None
                         }
                         Err(PlanningFailure::Defect(evidence)) => {

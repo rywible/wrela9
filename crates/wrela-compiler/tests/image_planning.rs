@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use wrela_compiler::{
     ArchitectureProfile, Cancellation, CompilationOutcome, CompilationRequest, Compiler,
-    CompilerInstallation, GeneratedRoleKind, InspectSelection, PlannerKind, ProjectFile,
-    ProjectSnapshot, RequirementBounds, RequirementCategory, Root,
+    CompilerInstallation, DiagnosticValue, FacilityEndpointOwnership, FacilityKind,
+    FacilityLossPolicy, FacilitySemanticCapacity, FacilitySharing, FacilityShutdown,
+    GeneratedRoleKind, InspectSelection, PlannerKind, PlanningBinding, PlanningCapability,
+    ProjectFile, ProjectSnapshot, RequirementBounds, RequirementCategory, Root,
 };
 
 fn deployment_request(inspection: InspectSelection) -> CompilationRequest {
@@ -15,6 +17,47 @@ fn deployment_request(inspection: InspectSelection) -> CompilationRequest {
     )
     .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
     .with_inspection(inspection)
+}
+
+#[test]
+fn duplicate_facility_instances_are_rejected_during_admission() {
+    let source = br#"from core import facilities
+
+@image
+fn build() -> Image:
+    first = facilities.Display.new()
+    second = facilities.Display.new()
+    return Image.new(first=first, second=second)
+"#;
+    let compiler = Compiler::open(CompilerInstallation::layer1()).unwrap();
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    );
+    let CompilationOutcome::Rejected(rejected) = outcome else {
+        panic!("duplicate Facility instances reject: {outcome:#?}");
+    };
+    let diagnostic = rejected
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.code() == "admission.facility_cardinality")
+        .expect("typed Facility cardinality diagnostic");
+    assert!(
+        diagnostic
+            .typed_parameters()
+            .contains(&("selected".into(), DiagnosticValue::Unsigned(2),))
+    );
+    assert!(
+        diagnostic
+            .typed_parameters()
+            .contains(&("maximum".into(), DiagnosticValue::Unsigned(1),))
+    );
+    assert!(rejected.inspection().planning_foundation().is_none());
 }
 
 fn valued_deployment_request(value: i64, inspection: InspectSelection) -> CompilationRequest {
@@ -73,6 +116,239 @@ fn accepted(request: CompilationRequest) -> wrela_compiler::AcceptedCompilation 
         panic!("planning fixture must accept: {outcome:#?}");
     };
     accepted
+}
+
+#[test]
+fn selected_current_facilities_publish_complete_verified_domain_plans() {
+    let source = br#"from core import facilities
+
+@image
+fn build() -> Image:
+    display = facilities.Display.new()
+    input = facilities.Input.new()
+    events = facilities.EventStore.new()
+    clock = facilities.MonotonicClock.new()
+    entropy = facilities.Entropy.new()
+    telemetry = facilities.Telemetry.new()
+    return Image.new(display=display, input=input, events=events, clock=clock, entropy=entropy, telemetry=telemetry)
+"#;
+    let accepted = accepted(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::planning()),
+    );
+    let planning = accepted.inspection().planning_foundation().unwrap();
+
+    assert_eq!(planning.facility_contracts().len(), 6);
+    assert_eq!(planning.facility_domain_plans().len(), 6);
+    assert!(
+        planning
+            .facility_contracts()
+            .windows(2)
+            .all(|contracts| contracts[0].kind() < contracts[1].kind())
+    );
+    assert!(
+        planning
+            .facility_domain_plans()
+            .windows(2)
+            .all(|plans| plans[0].identity() < plans[1].identity())
+    );
+    assert_eq!(
+        planning
+            .facility_domain_plans()
+            .iter()
+            .map(|plan| plan.kind())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            FacilityKind::Display,
+            FacilityKind::Input,
+            FacilityKind::EventStore,
+            FacilityKind::MonotonicClock,
+            FacilityKind::Entropy,
+            FacilityKind::Telemetry,
+        ])
+    );
+    assert!(planning.facility_contracts().iter().all(|contract| {
+        contract.allows_deployment()
+            && contract.allows_test()
+            && contract.minimum_instances() == 0
+            && contract.maximum_instances() == 1
+            && contract.maximum_exported_endpoints() > 0
+            && !contract.generated_roles().is_empty()
+            && !contract.semantic_capacities().is_empty()
+            && !contract.required_capabilities().is_empty()
+            && contract.external_binding().is_some()
+            && contract.current_meaning() != 0
+            && contract.fingerprint() != 0
+            && contract.identity() != 0
+            && contract.context_receipt() != 0
+            && contract.maximum_recovery_attempts() > 0
+            && contract.ambient_binding_unavailability_is_boot_failure()
+    }));
+    let contracts = planning
+        .facility_contracts()
+        .iter()
+        .map(|contract| (contract.kind(), contract))
+        .collect::<BTreeMap<_, _>>();
+    let virtio = BTreeSet::from([
+        PlanningCapability::PciVirtioModern,
+        PlanningCapability::SplitVirtqueue,
+        PlanningCapability::SharedIntx,
+        PlanningCapability::DmaOwnership,
+    ]);
+    for kind in [
+        FacilityKind::Display,
+        FacilityKind::Input,
+        FacilityKind::EventStore,
+        FacilityKind::Entropy,
+        FacilityKind::Telemetry,
+    ] {
+        assert_eq!(
+            contracts[&kind]
+                .required_capabilities()
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            virtio
+        );
+    }
+    assert_eq!(
+        contracts[&FacilityKind::MonotonicClock].required_capabilities(),
+        &[PlanningCapability::MonotonicCounter]
+    );
+    assert_eq!(
+        contracts[&FacilityKind::Display].external_binding(),
+        Some(PlanningBinding::Display)
+    );
+    assert_eq!(
+        contracts[&FacilityKind::Input].external_binding(),
+        Some(PlanningBinding::Input)
+    );
+    assert_eq!(
+        contracts[&FacilityKind::EventStore].external_binding(),
+        Some(PlanningBinding::EventStore)
+    );
+    assert_eq!(
+        contracts[&FacilityKind::MonotonicClock].external_binding(),
+        Some(PlanningBinding::MonotonicClock)
+    );
+    assert_eq!(
+        contracts[&FacilityKind::Entropy].external_binding(),
+        Some(PlanningBinding::Entropy)
+    );
+    assert_eq!(
+        contracts[&FacilityKind::Telemetry].external_binding(),
+        Some(PlanningBinding::Telemetry)
+    );
+    assert_eq!(
+        contracts[&FacilityKind::Display].semantic_capacities(),
+        &[FacilitySemanticCapacity::FrameBuffers(3)]
+    );
+    assert_eq!(
+        contracts[&FacilityKind::Input].semantic_capacities(),
+        &[FacilitySemanticCapacity::InputTransitions(256)]
+    );
+    assert_eq!(
+        contracts[&FacilityKind::EventStore].semantic_capacities(),
+        &[FacilitySemanticCapacity::EventSlots(65_536)]
+    );
+    assert_eq!(
+        contracts[&FacilityKind::MonotonicClock].semantic_capacities(),
+        &[FacilitySemanticCapacity::ClockWaiters(1024)]
+    );
+    assert_eq!(
+        contracts[&FacilityKind::Entropy].semantic_capacities(),
+        &[FacilitySemanticCapacity::EntropyRequestBytes(4096)]
+    );
+    assert_eq!(
+        contracts[&FacilityKind::Telemetry].semantic_capacities(),
+        &[FacilitySemanticCapacity::TelemetryRingRecords(4096)]
+    );
+    assert_eq!(
+        contracts[&FacilityKind::Input].endpoint_ownership(),
+        FacilityEndpointOwnership::BuildWiredActor
+    );
+    assert!(
+        contracts
+            .iter()
+            .filter(|(kind, _)| **kind != FacilityKind::Input)
+            .all(|(_, contract)| contract.endpoint_ownership()
+                == FacilityEndpointOwnership::FacilityInstance)
+    );
+    assert_eq!(
+        contracts[&FacilityKind::Display].sharing(),
+        FacilitySharing::Exclusive
+    );
+    assert_eq!(
+        contracts[&FacilityKind::MonotonicClock].sharing(),
+        FacilitySharing::RegisteredDisjoint {
+            role: 1,
+            maximum_units: 1024,
+        }
+    );
+    assert_eq!(
+        contracts[&FacilityKind::Entropy].sharing(),
+        FacilitySharing::RegisteredDisjoint {
+            role: 2,
+            maximum_units: 16,
+        }
+    );
+    let flagship = planning
+        .facility_contracts()
+        .iter()
+        .filter(|contract| contract.required_by_flagship())
+        .map(|contract| contract.kind())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        flagship,
+        BTreeSet::from([
+            FacilityKind::Display,
+            FacilityKind::Input,
+            FacilityKind::EventStore,
+            FacilityKind::MonotonicClock,
+            FacilityKind::Telemetry,
+        ])
+    );
+    let entropy = planning
+        .facility_contracts()
+        .iter()
+        .find(|contract| contract.kind() == FacilityKind::Entropy)
+        .unwrap();
+    assert!(!entropy.allowed_in_replayable_gameplay());
+    assert!(
+        planning
+            .facility_contracts()
+            .iter()
+            .all(|contract| { contract.physical_sharing_is_registered_disjoint_or_exclusive() })
+    );
+    assert_eq!(
+        planning
+            .facility_contracts()
+            .iter()
+            .find(|contract| contract.kind() == FacilityKind::Telemetry)
+            .unwrap()
+            .loss_policy(),
+        FacilityLossPolicy::DisableAndContinue
+    );
+    assert_eq!(
+        planning
+            .facility_contracts()
+            .iter()
+            .find(|contract| contract.kind() == FacilityKind::EventStore)
+            .unwrap()
+            .shutdown(),
+        FacilityShutdown::FlushCommittedAndQuiesce
+    );
+    assert!(planning.facility_domain_plans().iter().all(|plan| {
+        plan.instance_identity() != 0
+            && plan.contract_fingerprint() != 0
+            && plan.generated_role_count() > 0
+            && plan.requirement_count() > 0
+            && plan.current_meaning() != 0
+    }));
 }
 
 #[test]

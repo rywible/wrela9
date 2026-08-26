@@ -568,7 +568,33 @@ pub(crate) struct ImagePlanningSemanticProgram<'a> {
     program: &'a CompletedSemanticProgram,
 }
 
-impl ImagePlanningSemanticProgram<'_> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlanningConstructionNodeRef {
+    context: u128,
+    identity: u128,
+    current_meaning: u128,
+    kind: BuildKind,
+}
+
+impl PlanningConstructionNodeRef {
+    pub(crate) const fn context(self) -> u128 {
+        self.context
+    }
+
+    pub(crate) const fn identity(self) -> u128 {
+        self.identity
+    }
+
+    pub(crate) const fn current_meaning(self) -> u128 {
+        self.current_meaning
+    }
+
+    pub(crate) const fn kind(self) -> BuildKind {
+        self.kind
+    }
+}
+
+impl<'a> ImagePlanningSemanticProgram<'a> {
     pub(crate) fn context_identity(self) -> u128 {
         self.program.context.identity
     }
@@ -603,6 +629,41 @@ impl ImagePlanningSemanticProgram<'_> {
 
     pub(crate) fn test_application_count(self) -> usize {
         self.program.graph.test_applications.len()
+    }
+
+    pub(crate) fn construction_nodes(
+        self,
+    ) -> impl ExactSizeIterator<Item = PlanningConstructionNodeRef> + 'a {
+        self.program
+            .graph
+            .nodes
+            .iter()
+            .map(|node| PlanningConstructionNodeRef {
+                context: self.program.context.identity,
+                identity: node.identity,
+                current_meaning: node.local_fingerprint,
+                kind: node.kind,
+            })
+    }
+
+    pub(crate) fn authenticated_nominal_type(self, path: &str, name: &str) -> Option<u128> {
+        let definition = self
+            .program
+            .context
+            .identity_catalog
+            .definition(path, crate::syntax::DeclarationKind::Struct, name)
+            .or_else(|| {
+                self.program.context.identity_catalog.definition(
+                    path,
+                    crate::syntax::DeclarationKind::ResourceStruct,
+                    name,
+                )
+            })?;
+        self.program
+            .context
+            .identity_catalog
+            .type_for_definition(definition)
+            .map(|identity| identity.0)
     }
 }
 

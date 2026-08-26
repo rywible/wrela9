@@ -429,6 +429,30 @@ impl VerifiedArchitecturePlanningContract {
     pub(crate) const fn for_image_planning(&self) -> ImagePlanningArchitecture<'_> {
         ImagePlanningArchitecture { contract: self }
     }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_remove_capability(&mut self, capability: VmAbiCapability) {
+        self.facts.capabilities = self
+            .facts
+            .capabilities
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != capability)
+            .collect::<Vec<_>>()
+            .into();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_remove_binding(&mut self, binding: BindingKind) {
+        self.facts.binding_slots = self
+            .facts
+            .binding_slots
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.kind != binding)
+            .collect::<Vec<_>>()
+            .into();
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -631,6 +655,7 @@ pub(crate) enum VmAbiCapability {
     SharedIntx,
     DmaOwnership,
     SecondaryCoreStartup,
+    MonotonicCounter,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -923,6 +948,7 @@ fn producer_current_aarch64_facts() -> ContractFacts {
             VmAbiCapability::SharedIntx,
             VmAbiCapability::DmaOwnership,
             VmAbiCapability::SecondaryCoreStartup,
+            VmAbiCapability::MonotonicCounter,
         ]),
         capacity: CapacityRules {
             minimum_ram_bytes: 128 * 1024 * 1024,
@@ -1127,6 +1153,7 @@ fn verifier_current_aarch64_facts() -> ContractFacts {
             VmAbiCapability::SharedIntx,
             VmAbiCapability::DmaOwnership,
             VmAbiCapability::SecondaryCoreStartup,
+            VmAbiCapability::MonotonicCounter,
         ]),
         capacity: CapacityRules {
             minimum_ram_bytes: 134_217_728,
@@ -1963,6 +1990,7 @@ const fn enum_tag(value: VmAbiCapability) -> u8 {
         VmAbiCapability::SharedIntx => 6,
         VmAbiCapability::DmaOwnership => 7,
         VmAbiCapability::SecondaryCoreStartup => 8,
+        VmAbiCapability::MonotonicCounter => 9,
     }
 }
 const fn reservation_tag(value: ReservationKind) -> u8 {
@@ -2041,7 +2069,7 @@ mod tests {
         assert_eq!(verified.schema_version, CONTRACT_SCHEMA_VERSION);
         assert_eq!(verified.distribution_input_receipt, expected_receipt);
         assert_eq!(verified.facts.cores.len(), 4);
-        assert_eq!(verified.facts.capabilities.len(), 8);
+        assert_eq!(verified.facts.capabilities.len(), 9);
         assert_eq!(verified.facts.reservations.len(), 6);
         assert_eq!(verified.facts.envelopes.len(), 8);
         assert_eq!(verified.facts.regions.len(), 6);

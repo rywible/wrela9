@@ -13,7 +13,7 @@ fn sibling_consumers_reach_each_planning_fact_through_purpose_owned_views() {
         .expect("current contract authenticates");
 
     let admission = contract.for_admission();
-    assert_eq!(admission.capabilities().len(), 8);
+    assert_eq!(admission.capabilities().len(), 9);
     assert_eq!(admission.capacity().maximum_requirements(), 65_536);
     assert_eq!(admission.device_slots().len(), 8);
     assert_eq!(admission.binding_slots().len(), 8);

@@ -2659,6 +2659,13 @@ const fn generated_role_tag(kind: crate::image_planning::GeneratedRoleKind) -> u
         crate::image_planning::GeneratedRoleKind::Panic => 4,
         crate::image_planning::GeneratedRoleKind::Shutdown => 5,
         crate::image_planning::GeneratedRoleKind::TestRuntime => 6,
+        crate::image_planning::GeneratedRoleKind::DisplayDriver => 7,
+        crate::image_planning::GeneratedRoleKind::InputDriver => 8,
+        crate::image_planning::GeneratedRoleKind::EventStoreRuntime => 9,
+        crate::image_planning::GeneratedRoleKind::EventStoreDriver => 10,
+        crate::image_planning::GeneratedRoleKind::MonotonicClockDriver => 11,
+        crate::image_planning::GeneratedRoleKind::EntropyDriver => 12,
+        crate::image_planning::GeneratedRoleKind::TelemetryDriver => 13,
     }
 }
 
@@ -6507,6 +6514,13 @@ const fn verifier_generated_role_tag(kind: crate::image_planning::GeneratedRoleK
         crate::image_planning::GeneratedRoleKind::Panic => 4,
         crate::image_planning::GeneratedRoleKind::Shutdown => 5,
         crate::image_planning::GeneratedRoleKind::TestRuntime => 6,
+        crate::image_planning::GeneratedRoleKind::DisplayDriver => 7,
+        crate::image_planning::GeneratedRoleKind::InputDriver => 8,
+        crate::image_planning::GeneratedRoleKind::EventStoreRuntime => 9,
+        crate::image_planning::GeneratedRoleKind::EventStoreDriver => 10,
+        crate::image_planning::GeneratedRoleKind::MonotonicClockDriver => 11,
+        crate::image_planning::GeneratedRoleKind::EntropyDriver => 12,
+        crate::image_planning::GeneratedRoleKind::TelemetryDriver => 13,
     }
 }
 

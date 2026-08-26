@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -16,8 +16,8 @@ use crate::completed_semantic::{
 };
 use crate::model::SpecializationId;
 use crate::typed_hir::{
-    CallTarget, Expression, ExpressionKind, HirMatchCase, Literal, LocalId, PoolOperation,
-    Statement, VerifiedProgram, root_place,
+    AccessMode, CallTarget, Expression, ExpressionKind, HirMatchCase, Literal, LocalId,
+    PoolOperation, Statement, VerifiedProgram, root_place,
 };
 use crate::{Cancellation, Root, SourceRange};
 
@@ -1647,7 +1647,8 @@ fn produce_requirement(
 struct PoolFlowState {
     live: u64,
     reserved: u64,
-    permits: BTreeSet<LocalId>,
+    transient_permits: u64,
+    permits: BTreeMap<LocalId, u64>,
 }
 
 #[derive(Default)]
@@ -1656,7 +1657,7 @@ struct PoolFlowSummary {
     peak_reserved: u64,
     peak_committed: u64,
     admission_sites: Vec<(u128, PoolOperation, SourceRange, u128)>,
-    active_calls: BTreeSet<SpecializationId>,
+    active_calls: BTreeMap<SpecializationId, u64>,
     current_executable: u128,
 }
 
@@ -1734,7 +1735,8 @@ fn collect_pool_plans(
                 let states = BTreeSet::from([PoolFlowState {
                     live: 0,
                     reserved: 0,
-                    permits: BTreeSet::new(),
+                    transient_permits: 0,
+                    permits: BTreeMap::new(),
                 }]);
                 let _ = pool_flow_statements(
                     body,
@@ -1958,8 +1960,6 @@ fn pool_flow_statements(
                 cancellation,
             )?,
             Statement::Initialize { place, value, .. } => {
-                let reserves =
-                    expression_pool_operation(value, program) == Some(PoolOperation::Reserve);
                 let next = pool_flow_expression(
                     value,
                     states,
@@ -1969,16 +1969,16 @@ fn pool_flow_statements(
                     summary,
                     cancellation,
                 )?;
-                if reserves {
-                    next.into_iter()
-                        .map(|mut state| {
-                            state.permits.insert(place.local);
-                            state
-                        })
-                        .collect()
-                } else {
-                    next
-                }
+                next.into_iter()
+                    .map(|mut state| {
+                        if state.transient_permits > 0 {
+                            *state.permits.entry(place.local).or_default() +=
+                                state.transient_permits;
+                            state.transient_permits = 0;
+                        }
+                        state
+                    })
+                    .collect()
             }
             Statement::If {
                 condition,
@@ -2156,28 +2156,14 @@ fn pool_flow_statements(
     Ok(states
         .into_iter()
         .map(|mut state| {
-            let released = state.permits.intersection(&locals).count() as u64;
-            state.permits.retain(|permit| !locals.contains(permit));
+            let released = locals
+                .iter()
+                .filter_map(|local| state.permits.remove(local))
+                .sum::<u64>();
             state.reserved = state.reserved.saturating_sub(released);
             state
         })
         .collect())
-}
-
-fn expression_pool_operation(
-    expression: &Expression,
-    program: &VerifiedProgram,
-) -> Option<PoolOperation> {
-    let ExpressionKind::Call {
-        target: CallTarget::Function { specialization, .. },
-        ..
-    } = &expression.kind
-    else {
-        return None;
-    };
-    program
-        .specialization_function(*specialization)?
-        .pool_operation
 }
 
 fn pool_flow_expression(
@@ -2204,6 +2190,30 @@ fn pool_flow_expression(
         )?;
     }
     let ExpressionKind::Call { target, arguments } = &expression.kind else {
+        if expression.access == AccessMode::Move
+            && let Some(place) = root_place(expression)
+        {
+            states = states
+                .into_iter()
+                .map(|mut state| {
+                    let available = state.permits.get(&place.local).copied().unwrap_or(0);
+                    let moved = if place.projections.is_empty() {
+                        available
+                    } else {
+                        available.min(1)
+                    };
+                    if moved > 0 {
+                        if moved == available {
+                            state.permits.remove(&place.local);
+                        } else {
+                            state.permits.insert(place.local, available - moved);
+                        }
+                        state.transient_permits = state.transient_permits.saturating_add(moved);
+                    }
+                    state
+                })
+                .collect();
+        }
         return Ok(states);
     };
     let CallTarget::Function {
@@ -2239,9 +2249,19 @@ fn pool_flow_expression(
         let Some(receiver_parameter) = receiver_parameter else {
             return Ok(states);
         };
-        if !summary.active_calls.insert(*specialization) {
+        let active_remaining = summary.active_calls.get(specialization).copied();
+        let exact_remaining = arguments.iter().find_map(|argument| match argument.kind {
+            ExpressionKind::Literal(Literal::Integer { value, .. }) => u64::try_from(value).ok(),
+            _ => None,
+        });
+        let remaining = active_remaining
+            .map(|remaining| remaining.saturating_sub(1))
+            .or(exact_remaining)
+            .unwrap_or_else(|| capacity.saturating_add(1));
+        if remaining == 0 {
             return Ok(states);
         }
+        let previous_remaining = summary.active_calls.insert(*specialization, remaining);
         let caller_executable =
             std::mem::replace(&mut summary.current_executable, specialization.0);
         let result = pool_flow_statements(
@@ -2254,7 +2274,11 @@ fn pool_flow_expression(
             cancellation,
         );
         summary.current_executable = caller_executable;
-        summary.active_calls.remove(specialization);
+        if let Some(previous) = previous_remaining {
+            summary.active_calls.insert(*specialization, previous);
+        } else {
+            summary.active_calls.remove(specialization);
+        }
         return result;
     };
     let receiver_matches = arguments.first().is_some_and(
@@ -2264,18 +2288,17 @@ fn pool_flow_expression(
         return Ok(states);
     }
     if matches!(operation, PoolOperation::Allocate | PoolOperation::Reserve) {
-        summary.admission_sites.push((
+        let site = (
             summary.current_executable,
             operation,
             expression.source.clone(),
             expression.type_id.0,
-        ));
+        );
+        if !summary.admission_sites.contains(&site) {
+            summary.admission_sites.push(site);
+        }
     }
     let limit = capacity.saturating_add(1);
-    let discharged_permit = arguments
-        .get(1)
-        .and_then(root_place)
-        .map(|place| place.local);
     let mut next = BTreeSet::new();
     for state in states {
         let state = match operation {
@@ -2292,11 +2315,13 @@ fn pool_flow_expression(
             },
             PoolOperation::Reserve => PoolFlowState {
                 reserved: state.reserved.saturating_add(1).min(limit),
+                transient_permits: state.transient_permits.saturating_add(1).min(limit),
                 ..state
             },
             PoolOperation::Consume if state.reserved > 0 => PoolFlowState {
                 live: state.live.saturating_add(1).min(limit),
                 reserved: state.reserved - 1,
+                transient_permits: state.transient_permits.saturating_sub(1),
                 permits: state.permits,
             },
             PoolOperation::Consume => state,
@@ -2307,16 +2332,11 @@ fn pool_flow_expression(
             PoolOperation::Reclaim => state,
             PoolOperation::Release if state.reserved > 0 => PoolFlowState {
                 reserved: state.reserved - 1,
+                transient_permits: state.transient_permits.saturating_sub(1),
                 ..state
             },
             PoolOperation::Release => state,
         };
-        let mut state = state;
-        if matches!(operation, PoolOperation::Consume | PoolOperation::Release)
-            && let Some(permit) = discharged_permit
-        {
-            state.permits.remove(&permit);
-        }
         summary.peak_live = summary.peak_live.max(state.live);
         summary.peak_reserved = summary.peak_reserved.max(state.reserved);
         summary.peak_committed = summary
@@ -2538,6 +2558,716 @@ fn run_pool_model() -> PoolModelObservation {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum OraclePoolSlot {
+    Free(u64),
+    Live {
+        generation: u64,
+        type_identity: u8,
+        value: u8,
+    },
+    Reserved {
+        generation: u64,
+        type_identity: u8,
+        permit: u8,
+    },
+    Retired,
+}
+
+#[derive(Clone, Copy)]
+enum OraclePoolAction {
+    Allocate { value: u8, type_identity: u8 },
+    Reserve { type_identity: u8, permit: u8 },
+    Lookup(ModelKey),
+    Reclaim(ModelKey),
+    Consume { permit: ModelPermit, value: u8 },
+    Release(ModelPermit),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OraclePoolEffect {
+    Key(ModelKey),
+    Value(Option<u8>),
+    Full(u8),
+    Permit(Option<ModelPermit>),
+    Released(bool),
+}
+
+fn oracle_pool_transition(
+    slot: OraclePoolSlot,
+    action: OraclePoolAction,
+) -> (OraclePoolSlot, OraclePoolEffect) {
+    match (slot, action) {
+        (
+            OraclePoolSlot::Free(generation),
+            OraclePoolAction::Allocate {
+                value,
+                type_identity,
+            },
+        ) => (
+            OraclePoolSlot::Live {
+                generation,
+                type_identity,
+                value,
+            },
+            OraclePoolEffect::Key(ModelKey {
+                generation,
+                type_identity,
+            }),
+        ),
+        (slot, OraclePoolAction::Allocate { value, .. }) => (slot, OraclePoolEffect::Full(value)),
+        (
+            OraclePoolSlot::Free(generation),
+            OraclePoolAction::Reserve {
+                type_identity,
+                permit,
+            },
+        ) => {
+            let permit = ModelPermit {
+                generation,
+                type_identity,
+                identity: permit,
+            };
+            (
+                OraclePoolSlot::Reserved {
+                    generation,
+                    type_identity,
+                    permit: permit.identity,
+                },
+                OraclePoolEffect::Permit(Some(permit)),
+            )
+        }
+        (slot, OraclePoolAction::Reserve { .. }) => (slot, OraclePoolEffect::Permit(None)),
+        (
+            slot @ OraclePoolSlot::Live {
+                generation,
+                type_identity,
+                value,
+            },
+            OraclePoolAction::Lookup(key),
+        ) if key.generation == generation && key.type_identity == type_identity => {
+            (slot, OraclePoolEffect::Value(Some(value)))
+        }
+        (slot, OraclePoolAction::Lookup(_)) => (slot, OraclePoolEffect::Value(None)),
+        (
+            OraclePoolSlot::Live {
+                generation,
+                type_identity,
+                value,
+            },
+            OraclePoolAction::Reclaim(key),
+        ) if key.generation == generation && key.type_identity == type_identity => (
+            generation
+                .checked_add(1)
+                .map_or(OraclePoolSlot::Retired, OraclePoolSlot::Free),
+            OraclePoolEffect::Value(Some(value)),
+        ),
+        (slot, OraclePoolAction::Reclaim(_)) => (slot, OraclePoolEffect::Value(None)),
+        (
+            OraclePoolSlot::Reserved {
+                generation,
+                type_identity,
+                permit,
+            },
+            OraclePoolAction::Consume {
+                permit: supplied,
+                value,
+            },
+        ) if supplied.generation == generation
+            && supplied.type_identity == type_identity
+            && supplied.identity == permit =>
+        {
+            (
+                OraclePoolSlot::Live {
+                    generation,
+                    type_identity,
+                    value,
+                },
+                OraclePoolEffect::Key(ModelKey {
+                    generation,
+                    type_identity,
+                }),
+            )
+        }
+        (slot, OraclePoolAction::Consume { .. }) => (slot, OraclePoolEffect::Value(None)),
+        (
+            OraclePoolSlot::Reserved {
+                generation,
+                type_identity,
+                permit,
+            },
+            OraclePoolAction::Release(supplied),
+        ) if supplied.generation == generation
+            && supplied.type_identity == type_identity
+            && supplied.identity == permit =>
+        {
+            (
+                OraclePoolSlot::Free(generation),
+                OraclePoolEffect::Released(true),
+            )
+        }
+        (slot, OraclePoolAction::Release(_)) => (slot, OraclePoolEffect::Released(false)),
+    }
+}
+
+fn independently_verify_pool_model() -> PoolModelObservation {
+    let key = ModelKey {
+        generation: 0,
+        type_identity: 11,
+    };
+    let permit = ModelPermit {
+        generation: 0,
+        type_identity: 11,
+        identity: 1,
+    };
+    let actions = [
+        OraclePoolAction::Allocate {
+            value: 7,
+            type_identity: 11,
+        },
+        OraclePoolAction::Allocate {
+            value: 9,
+            type_identity: 11,
+        },
+        OraclePoolAction::Reserve {
+            type_identity: 11,
+            permit: 1,
+        },
+        OraclePoolAction::Lookup(key),
+        OraclePoolAction::Lookup(ModelKey {
+            generation: 0,
+            type_identity: 99,
+        }),
+        OraclePoolAction::Reclaim(key),
+        OraclePoolAction::Consume { permit, value: 7 },
+        OraclePoolAction::Release(permit),
+    ];
+    let mut reachable = BTreeSet::from([OraclePoolSlot::Free(0)]);
+    for _ in 0..4 {
+        let frontier = reachable.iter().copied().collect::<Vec<_>>();
+        for state in frontier {
+            for action in actions {
+                reachable.insert(oracle_pool_transition(state, action).0);
+            }
+        }
+    }
+    let accepted = reachable.iter().any(|state| {
+        matches!(
+            state,
+            OraclePoolSlot::Live {
+                generation: 0,
+                type_identity: 11,
+                value: 7
+            }
+        )
+    });
+    let live = OraclePoolSlot::Live {
+        generation: 0,
+        type_identity: 11,
+        value: 7,
+    };
+    let (unchanged, full_effect) = oracle_pool_transition(
+        live,
+        OraclePoolAction::Allocate {
+            value: 9,
+            type_identity: 11,
+        },
+    );
+    let full = unchanged == live && full_effect == OraclePoolEffect::Full(9);
+    let (reserved_slot, reserved_effect) = oracle_pool_transition(
+        OraclePoolSlot::Free(0),
+        OraclePoolAction::Reserve {
+            type_identity: 11,
+            permit: 1,
+        },
+    );
+    let (consumed_slot, consumed_effect) = oracle_pool_transition(
+        reserved_slot,
+        OraclePoolAction::Consume { permit, value: 7 },
+    );
+    let reserved = reserved_effect == OraclePoolEffect::Permit(Some(permit))
+        && consumed_slot == live
+        && consumed_effect == OraclePoolEffect::Key(key);
+    let (released_slot, released_effect) =
+        oracle_pool_transition(reserved_slot, OraclePoolAction::Release(permit));
+    let (_, reused_release) =
+        oracle_pool_transition(released_slot, OraclePoolAction::Release(permit));
+    let released = released_slot == OraclePoolSlot::Free(0)
+        && released_effect == OraclePoolEffect::Released(true)
+        && reused_release == OraclePoolEffect::Released(false);
+    let (reclaimed_slot, reclaimed) = oracle_pool_transition(live, OraclePoolAction::Reclaim(key));
+    let (_, stale_lookup) = oracle_pool_transition(reclaimed_slot, OraclePoolAction::Lookup(key));
+    let stale = reclaimed == OraclePoolEffect::Value(Some(7))
+        && stale_lookup == OraclePoolEffect::Value(None);
+    let retiring = OraclePoolSlot::Live {
+        generation: u64::MAX,
+        type_identity: 11,
+        value: 7,
+    };
+    let (retired_slot, retired_value) = oracle_pool_transition(
+        retiring,
+        OraclePoolAction::Reclaim(ModelKey {
+            generation: u64::MAX,
+            type_identity: 11,
+        }),
+    );
+    let (retired_after_allocate, retired_full) = oracle_pool_transition(
+        retired_slot,
+        OraclePoolAction::Allocate {
+            value: 8,
+            type_identity: 11,
+        },
+    );
+    let retired = retired_slot == OraclePoolSlot::Retired
+        && retired_value == OraclePoolEffect::Value(Some(7))
+        && retired_after_allocate == OraclePoolSlot::Retired
+        && retired_full == OraclePoolEffect::Full(8);
+    let agrees = accepted && full && released && reserved && stale && retired;
+    PoolModelObservation {
+        cases: 10,
+        agrees,
+        accepted,
+        full,
+        released,
+        reserved,
+        stale,
+        retired,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AuditedPoolState {
+    allocations: u64,
+    reservations: u64,
+    moving_reservations: u64,
+    owners: BTreeMap<LocalId, u64>,
+}
+
+#[derive(Default)]
+struct AuditedPoolFlow {
+    maximum_allocations: u64,
+    maximum_reservations: u64,
+    maximum_commitment: u64,
+    sites: Vec<(u128, PoolOperation, SourceRange, u128)>,
+    activations: BTreeMap<SpecializationId, u64>,
+    executable: u128,
+}
+
+struct AuditedPoolDeclaration {
+    identity: u128,
+    executable: CoreSourceExecutableRef,
+    source: SourceRange,
+    declared: u64,
+    peak_live: u64,
+    peak_reserved: u64,
+    peak_committed: u64,
+    sites: Vec<(u128, PoolOperation, SourceRange, u128)>,
+}
+
+fn audit_pool_expression(
+    expression: &Expression,
+    mut paths: BTreeSet<AuditedPoolState>,
+    scope: LocalId,
+    capacity: u64,
+    program: &VerifiedProgram,
+    flow: &mut AuditedPoolFlow,
+    cancellation: &Cancellation,
+) -> Result<BTreeSet<AuditedPoolState>, PlanningFailure> {
+    checkpoint(cancellation)?;
+    let mut operands = Vec::new();
+    expression.visit_children(&mut |child| operands.push(child.clone()));
+    for operand in operands {
+        paths = audit_pool_expression(
+            &operand,
+            paths,
+            scope,
+            capacity,
+            program,
+            flow,
+            cancellation,
+        )?;
+    }
+    let ExpressionKind::Call { target, arguments } = &expression.kind else {
+        if expression.access == AccessMode::Move
+            && let Some(place) = root_place(expression)
+        {
+            paths = paths
+                .into_iter()
+                .map(|mut path| {
+                    let owned = path.owners.get(&place.local).copied().unwrap_or(0);
+                    let moved = if place.projections.is_empty() {
+                        owned
+                    } else {
+                        owned.min(1)
+                    };
+                    if moved == owned {
+                        path.owners.remove(&place.local);
+                    } else if moved > 0 {
+                        path.owners.insert(place.local, owned - moved);
+                    }
+                    path.moving_reservations = path.moving_reservations.saturating_add(moved);
+                    path
+                })
+                .collect();
+        }
+        return Ok(paths);
+    };
+    let CallTarget::Function {
+        specialization,
+        argument_order,
+        ..
+    } = target
+    else {
+        return Ok(paths);
+    };
+    let function = program
+        .specialization_function(*specialization)
+        .ok_or_else(|| {
+            PlanningFailure::Defect(Arc::from(
+                "Pool audit call names a missing exact Specialization",
+            ))
+        })?;
+    let Some(operation) = function.pool_operation else {
+        let scope_parameter = arguments
+            .iter()
+            .enumerate()
+            .find_map(|(source_index, argument)| {
+                matches!(&argument.kind, ExpressionKind::Read(place) if place.local == scope)
+                    .then(|| {
+                        argument_order
+                            .get(source_index)
+                            .and_then(|parameter| function.parameters.get(usize::from(*parameter)))
+                            .map(|(local, _, _)| *local)
+                    })
+                    .flatten()
+            });
+        let Some(scope_parameter) = scope_parameter else {
+            return Ok(paths);
+        };
+        let active = flow.activations.get(specialization).copied();
+        let authored = arguments.iter().find_map(|argument| match argument.kind {
+            ExpressionKind::Literal(Literal::Integer { value, .. }) => u64::try_from(value).ok(),
+            _ => None,
+        });
+        let remaining = active
+            .map(|remaining| remaining.saturating_sub(1))
+            .or(authored)
+            .unwrap_or_else(|| capacity.saturating_add(1));
+        if remaining == 0 {
+            return Ok(paths);
+        }
+        let prior = flow.activations.insert(*specialization, remaining);
+        let caller = std::mem::replace(&mut flow.executable, specialization.0);
+        let result = audit_pool_statements(
+            &function.body,
+            paths,
+            scope_parameter,
+            capacity,
+            program,
+            flow,
+            cancellation,
+        );
+        flow.executable = caller;
+        if let Some(prior) = prior {
+            flow.activations.insert(*specialization, prior);
+        } else {
+            flow.activations.remove(specialization);
+        }
+        return result;
+    };
+    if !arguments.first().is_some_and(
+        |receiver| matches!(&receiver.kind, ExpressionKind::Read(place) if place.local == scope),
+    ) {
+        return Ok(paths);
+    }
+    if matches!(operation, PoolOperation::Allocate | PoolOperation::Reserve) {
+        let site = (
+            flow.executable,
+            operation,
+            expression.source.clone(),
+            expression.type_id.0,
+        );
+        if !flow.sites.contains(&site) {
+            flow.sites.push(site);
+        }
+    }
+    let ceiling = capacity.saturating_add(1);
+    paths = paths
+        .into_iter()
+        .flat_map(|path| {
+            let can_try = path.allocations.saturating_add(path.reservations) < capacity;
+            let mut alternatives = Vec::new();
+            if operation == PoolOperation::TryAllocate {
+                alternatives.push(path.clone());
+                if can_try {
+                    let mut accepted = path;
+                    accepted.allocations = accepted.allocations.saturating_add(1).min(ceiling);
+                    alternatives.push(accepted);
+                }
+            } else {
+                let mut next = path;
+                match operation {
+                    PoolOperation::Allocate => {
+                        next.allocations = next.allocations.saturating_add(1).min(ceiling);
+                    }
+                    PoolOperation::Reserve => {
+                        next.reservations = next.reservations.saturating_add(1).min(ceiling);
+                        next.moving_reservations =
+                            next.moving_reservations.saturating_add(1).min(ceiling);
+                    }
+                    PoolOperation::Consume if next.reservations > 0 => {
+                        next.reservations -= 1;
+                        next.allocations = next.allocations.saturating_add(1).min(ceiling);
+                        next.moving_reservations = next.moving_reservations.saturating_sub(1);
+                    }
+                    PoolOperation::Reclaim if next.allocations > 0 => next.allocations -= 1,
+                    PoolOperation::Release if next.reservations > 0 => {
+                        next.reservations -= 1;
+                        next.moving_reservations = next.moving_reservations.saturating_sub(1);
+                    }
+                    PoolOperation::TryAllocate
+                    | PoolOperation::Lookup
+                    | PoolOperation::Consume
+                    | PoolOperation::Reclaim
+                    | PoolOperation::Release => {}
+                }
+                alternatives.push(next);
+            }
+            alternatives
+        })
+        .collect();
+    for path in &paths {
+        flow.maximum_allocations = flow.maximum_allocations.max(path.allocations);
+        flow.maximum_reservations = flow.maximum_reservations.max(path.reservations);
+        flow.maximum_commitment = flow
+            .maximum_commitment
+            .max(path.allocations.saturating_add(path.reservations));
+    }
+    Ok(paths)
+}
+
+#[allow(clippy::too_many_lines)]
+fn audit_pool_statements(
+    statements: &[Statement],
+    mut paths: BTreeSet<AuditedPoolState>,
+    scope: LocalId,
+    capacity: u64,
+    program: &VerifiedProgram,
+    flow: &mut AuditedPoolFlow,
+    cancellation: &Cancellation,
+) -> Result<BTreeSet<AuditedPoolState>, PlanningFailure> {
+    for statement in statements {
+        checkpoint(cancellation)?;
+        paths = match statement {
+            Statement::Return {
+                value: Some(value), ..
+            }
+            | Statement::Panic { value, .. }
+            | Statement::Assert {
+                condition: value, ..
+            }
+            | Statement::Expect {
+                condition: value, ..
+            }
+            | Statement::Assign { value, .. }
+            | Statement::Evaluate(value) => {
+                audit_pool_expression(value, paths, scope, capacity, program, flow, cancellation)?
+            }
+            Statement::Return { value: None, .. }
+            | Statement::Break(_)
+            | Statement::Continue(_)
+            | Statement::Pass(_) => paths,
+            Statement::Initialize { place, value, .. } => {
+                audit_pool_expression(value, paths, scope, capacity, program, flow, cancellation)?
+                    .into_iter()
+                    .map(|mut path| {
+                        if path.moving_reservations > 0 {
+                            *path.owners.entry(place.local).or_default() +=
+                                path.moving_reservations;
+                            path.moving_reservations = 0;
+                        }
+                        path
+                    })
+                    .collect()
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            }
+            | Statement::IfPattern {
+                value: condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let entered = audit_pool_expression(
+                    condition,
+                    paths,
+                    scope,
+                    capacity,
+                    program,
+                    flow,
+                    cancellation,
+                )?;
+                let mut exits = audit_pool_statements(
+                    then_branch,
+                    entered.clone(),
+                    scope,
+                    capacity,
+                    program,
+                    flow,
+                    cancellation,
+                )?;
+                exits.extend(audit_pool_statements(
+                    else_branch,
+                    entered,
+                    scope,
+                    capacity,
+                    program,
+                    flow,
+                    cancellation,
+                )?);
+                exits
+            }
+            Statement::Match { value, cases, .. } => {
+                let entered = audit_pool_expression(
+                    value,
+                    paths,
+                    scope,
+                    capacity,
+                    program,
+                    flow,
+                    cancellation,
+                )?;
+                let mut exits = BTreeSet::new();
+                for case in cases.iter() {
+                    let guarded = if let Some(guard) = &case.guard {
+                        audit_pool_expression(
+                            guard,
+                            entered.clone(),
+                            scope,
+                            capacity,
+                            program,
+                            flow,
+                            cancellation,
+                        )?
+                    } else {
+                        entered.clone()
+                    };
+                    exits.extend(audit_pool_statements(
+                        &case.body,
+                        guarded,
+                        scope,
+                        capacity,
+                        program,
+                        flow,
+                        cancellation,
+                    )?);
+                }
+                exits
+            }
+            Statement::While {
+                condition,
+                body,
+                max_iterations,
+                ..
+            } => {
+                let mut exits = paths.clone();
+                let mut frontier = paths;
+                for _ in 0..*max_iterations {
+                    let entered = audit_pool_expression(
+                        condition,
+                        frontier,
+                        scope,
+                        capacity,
+                        program,
+                        flow,
+                        cancellation,
+                    )?;
+                    frontier = audit_pool_statements(
+                        body,
+                        entered,
+                        scope,
+                        capacity,
+                        program,
+                        flow,
+                        cancellation,
+                    )?;
+                    exits.extend(frontier.iter().cloned());
+                }
+                exits
+            }
+            Statement::For { iterable, body, .. } => {
+                let entered = audit_pool_expression(
+                    iterable,
+                    paths,
+                    scope,
+                    capacity,
+                    program,
+                    flow,
+                    cancellation,
+                )?;
+                let mut exits = entered.clone();
+                exits.extend(audit_pool_statements(
+                    body,
+                    entered,
+                    scope,
+                    capacity,
+                    program,
+                    flow,
+                    cancellation,
+                )?);
+                exits
+            }
+            Statement::WithPool {
+                scope: nested,
+                body,
+                ..
+            } => {
+                let entered = audit_pool_expression(
+                    nested,
+                    paths,
+                    scope,
+                    capacity,
+                    program,
+                    flow,
+                    cancellation,
+                )?;
+                audit_pool_statements(body, entered, scope, capacity, program, flow, cancellation)?
+            }
+            Statement::Defer { action, .. } => audit_pool_expression(
+                action.expression(),
+                paths,
+                scope,
+                capacity,
+                program,
+                flow,
+                cancellation,
+            )?,
+        };
+    }
+    let locals = statements
+        .iter()
+        .filter_map(|statement| match statement {
+            Statement::Initialize { place, .. } => Some(place.local),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    Ok(paths
+        .into_iter()
+        .map(|mut path| {
+            let released = locals
+                .iter()
+                .filter_map(|local| path.owners.remove(local))
+                .sum::<u64>();
+            path.reservations = path.reservations.saturating_sub(released);
+            path
+        })
+        .collect())
+}
+
 fn audit_pool_foundation(
     candidate: &VerifiedPlanningFoundation,
     planner: PlannerRef,
@@ -2546,6 +3276,7 @@ fn audit_pool_foundation(
 ) -> Result<Vec<Requirement>, PlanningFailure> {
     let semantic = candidate.semantic_program.for_core_planning();
     let mut declarations = Vec::new();
+    let program = semantic.verified_program();
     for executable in semantic.exact_source_executables() {
         checkpoint(cancellation)?;
         let input = semantic.executable_input(executable).ok_or_else(|| {
@@ -2556,25 +3287,36 @@ fn audit_pool_foundation(
             CoreSourceExecutableBody::Test(test) => test.body.as_ref(),
             CoreSourceExecutableBody::Closure(_) => continue,
         };
-        audit_pool_declarations(executable, statements, cancellation, &mut declarations)?;
+        audit_pool_declarations(
+            executable,
+            statements,
+            program,
+            cancellation,
+            &mut declarations,
+        )?;
     }
-    declarations.sort_by_key(|declaration| declaration.0);
+    declarations.sort_by_key(|declaration| declaration.identity);
     let mut pools = candidate.pools.iter().collect::<Vec<_>>();
     pools.sort_by_key(|pool| pool.reference.identity);
     if pools.len() != declarations.len() {
         return defect("Pool Plans do not match the independently audited scoped Pool roster");
     }
     let mut requirements = Vec::new();
-    for (pool, (identity, executable, source, declared)) in pools.into_iter().zip(declarations) {
+    for (pool, declaration) in pools.into_iter().zip(declarations) {
         checkpoint(cancellation)?;
+        let identity = declaration.identity;
+        let executable = declaration.executable;
+        let source = declaration.source;
+        let declared = declaration.declared;
         if pool.reference.context != candidate.context
             || pool.reference.identity != identity
             || pool.executable != executable
             || pool.source != source
             || pool.declared_capacity != declared
             || pool.usable_slots != declared
-            || pool.peak_live > pool.peak_committed
-            || pool.peak_reserved > pool.peak_committed
+            || pool.peak_live != declaration.peak_live
+            || pool.peak_reserved != declaration.peak_reserved
+            || pool.peak_committed != declaration.peak_committed
             || pool.peak_committed > pool.usable_slots
         {
             return defect(
@@ -2594,6 +3336,23 @@ fn audit_pool_foundation(
         );
         if pool.reference.current_meaning != expected_meaning {
             return defect("Pool Plan current meaning is stale or fabricated");
+        }
+        let observed_sites = pool
+            .admission_sites
+            .iter()
+            .map(|site| {
+                (
+                    site.executable_identity,
+                    site.operation,
+                    site.source.clone(),
+                    site.source_type_identity,
+                )
+            })
+            .collect::<Vec<_>>();
+        if observed_sites != declaration.sites {
+            return defect(
+                "Pool admission sites disagree with independently audited Specializations",
+            );
         }
         for (ordinal, site) in pool.admission_sites.iter().enumerate() {
             let local_site = u16::try_from(ordinal + 1).map_err(|_| {
@@ -2650,14 +3409,16 @@ fn audit_pool_foundation(
 fn audit_pool_declarations(
     executable: CoreSourceExecutableRef,
     statements: &[Statement],
+    program: &VerifiedProgram,
     cancellation: &Cancellation,
-    output: &mut Vec<(u128, CoreSourceExecutableRef, SourceRange, u64)>,
+    output: &mut Vec<AuditedPoolDeclaration>,
 ) -> Result<(), PlanningFailure> {
     for statement in statements {
         checkpoint(cancellation)?;
         match statement {
             Statement::WithPool {
                 pool,
+                binding,
                 scope,
                 body,
                 source,
@@ -2666,8 +3427,36 @@ fn audit_pool_declarations(
                 let declared = pool_declared_capacity(scope).ok_or_else(|| {
                     PlanningFailure::Defect(Arc::from("Pool audit found an inexact capacity"))
                 })?;
-                output.push((pool.0, executable, source.clone(), declared));
-                audit_pool_declarations(executable, body, cancellation, output)?;
+                let mut flow = AuditedPoolFlow {
+                    executable: executable.identity(),
+                    ..AuditedPoolFlow::default()
+                };
+                let initial = BTreeSet::from([AuditedPoolState {
+                    allocations: 0,
+                    reservations: 0,
+                    moving_reservations: 0,
+                    owners: BTreeMap::new(),
+                }]);
+                let _ = audit_pool_statements(
+                    body,
+                    initial,
+                    binding.local,
+                    declared,
+                    program,
+                    &mut flow,
+                    cancellation,
+                )?;
+                output.push(AuditedPoolDeclaration {
+                    identity: pool.0,
+                    executable,
+                    source: source.clone(),
+                    declared,
+                    peak_live: flow.maximum_allocations,
+                    peak_reserved: flow.maximum_reservations,
+                    peak_committed: flow.maximum_commitment,
+                    sites: flow.sites,
+                });
+                audit_pool_declarations(executable, body, program, cancellation, output)?;
             }
             Statement::If {
                 then_branch,
@@ -2679,15 +3468,15 @@ fn audit_pool_declarations(
                 else_branch,
                 ..
             } => {
-                audit_pool_declarations(executable, then_branch, cancellation, output)?;
-                audit_pool_declarations(executable, else_branch, cancellation, output)?;
+                audit_pool_declarations(executable, then_branch, program, cancellation, output)?;
+                audit_pool_declarations(executable, else_branch, program, cancellation, output)?;
             }
             Statement::For { body, .. } | Statement::While { body, .. } => {
-                audit_pool_declarations(executable, body, cancellation, output)?;
+                audit_pool_declarations(executable, body, program, cancellation, output)?;
             }
             Statement::Match { cases, .. } => {
                 for case in cases.iter() {
-                    audit_pool_declarations(executable, &case.body, cancellation, output)?;
+                    audit_pool_declarations(executable, &case.body, program, cancellation, output)?;
                 }
             }
             _ => {}
@@ -2764,7 +3553,7 @@ fn verify(
     )?;
     expected_requirements.append(&mut expected_pool_requirements);
     expected_requirements.sort_by_key(|requirement| requirement.reference.identity);
-    let expected_pool_model = run_pool_model();
+    let expected_pool_model = independently_verify_pool_model();
     if candidate.pool_model != expected_pool_model || !candidate.pool_model.agrees {
         return defect("bounded Pool authority model disagrees");
     }
@@ -3961,6 +4750,92 @@ fn build() -> Image:
         model.pool_model.retired = false;
         resign(&mut model);
         rejects(&model);
+    }
+
+    #[test]
+    fn verifier_independently_rejects_consistently_low_pool_pressure() {
+        let mut candidate = pool_fixture();
+        let mut pools = candidate.pools.to_vec();
+        let pool = &mut pools[0];
+        pool.peak_live = 0;
+        pool.peak_reserved = 0;
+        pool.peak_committed = 0;
+        pool.reference.current_meaning = producer_hash(
+            b"wrela.pool-plan.meaning.v1",
+            &[
+                pool.reference.identity,
+                pool.executable.current_meaning(),
+                u128::from(pool.declared_capacity),
+                0,
+                0,
+                0,
+            ],
+        );
+        let mut requirements = candidate.requirements.to_vec();
+        let requirement = requirements
+            .iter_mut()
+            .find(|requirement| requirement.category == RequirementCategory::CapacityPressure)
+            .expect("Pool pressure requirement");
+        requirement.subject = RequirementOwner::Pool(pool.reference);
+        requirement.bounds = RequirementBounds::PoolCapacity {
+            declared: pool.declared_capacity,
+            usable: pool.usable_slots,
+            peak_live: 0,
+            peak_reserved: 0,
+            peak_committed: 0,
+        };
+        requirement.reference.current_meaning = produce_requirement_current_meaning(
+            requirement.reference.identity,
+            requirement.owner.current_meaning,
+            pool.reference.current_meaning,
+            candidate.domain_plans[0].reference.current_meaning,
+            requirement.category,
+            &requirement.bounds,
+        );
+        pool.admission_sites = Arc::from([PoolAdmissionSite {
+            requirement: requirement.reference,
+            ..pool.admission_sites[0].clone()
+        }]);
+        candidate.pools = pools.into();
+        candidate.requirements = requirements.into();
+        let mut plan = candidate.domain_plans[0].clone();
+        plan.requirements = candidate
+            .requirements
+            .iter()
+            .map(|requirement| requirement.reference)
+            .collect::<Vec<_>>()
+            .into();
+        candidate.domain_plans = Arc::from([plan]);
+        resign(&mut candidate);
+        rejects(&candidate);
+    }
+
+    #[test]
+    fn verifier_oracle_rejects_every_exported_transition_fault() {
+        let original = pool_fixture();
+        let mut mutations = Vec::new();
+        for field in 0..8 {
+            let mut candidate = original.clone();
+            match field {
+                0 => candidate.pool_model.cases -= 1,
+                1 => candidate.pool_model.agrees = false,
+                2 => candidate.pool_model.accepted = false,
+                3 => candidate.pool_model.full = false,
+                4 => candidate.pool_model.released = false,
+                5 => candidate.pool_model.reserved = false,
+                6 => candidate.pool_model.stale = false,
+                7 => candidate.pool_model.retired = false,
+                _ => unreachable!(),
+            }
+            resign(&mut candidate);
+            mutations.push(candidate);
+        }
+        for mutation in mutations {
+            rejects(&mutation);
+        }
+        let oracle = independently_verify_pool_model();
+        assert_eq!(oracle.cases, 10);
+        assert!(oracle.agrees);
     }
 
     #[test]

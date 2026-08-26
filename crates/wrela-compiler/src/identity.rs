@@ -37,7 +37,7 @@ pub(crate) struct IdentityCatalog {
     tests: BTreeMap<(String, String, String), TestId>,
     types: BTreeMap<DefinitionId, TypeId>,
     pools: BTreeMap<DefinitionId, PoolId>,
-    scoped_pools: BTreeMap<(DefinitionId, String), PoolId>,
+    scoped_pools: BTreeMap<(DefinitionId, u32), PoolId>,
     interned_types: BTreeMap<Arc<[u8]>, TypeId>,
     variants: BTreeMap<(DefinitionId, String), VariantId>,
     full_keys: BTreeMap<u128, Arc<[u8]>>,
@@ -301,21 +301,21 @@ impl IdentityCatalog {
     pub(crate) fn scoped_pool(
         &mut self,
         owner: DefinitionId,
-        binding: &str,
+        source_site: u32,
     ) -> Result<PoolId, IdentityCollision> {
-        let map_key = (owner, binding.to_owned());
+        let map_key = (owner, source_site);
         if let Some(pool) = self.scoped_pools.get(&map_key).copied() {
             return Ok(pool);
         }
         let canonical_key = key(
             IdentityDomain::Pool,
             IdentityOrigin::Generated,
-            &[&owner.0.to_be_bytes(), binding.as_bytes()],
+            &[&owner.0.to_be_bytes(), &source_site.to_be_bytes()],
         );
         let observation = intern(
             IdentityDomain::Pool,
             IdentityOrigin::Generated,
-            format!("{:032x}.{binding}", owner.0),
+            format!("{:032x}.site-{source_site}", owner.0),
             Arc::clone(&canonical_key),
             fingerprint(&canonical_key),
             &xxh3_128,

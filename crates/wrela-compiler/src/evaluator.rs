@@ -2782,7 +2782,7 @@ impl<'a> Engine<'a> {
                 .get_mut(local.0 as usize)
                 .and_then(Option::take);
             if let Some(value) = value {
-                self.release_compiler_owned_permit(&value)?;
+                self.release_compiler_owned_permits(&value)?;
                 self.release(value_size(&value))?;
             }
         }
@@ -2809,17 +2809,59 @@ impl<'a> Engine<'a> {
         self.release(value_size(&value))
     }
 
-    fn release_compiler_owned_permit(&mut self, value: &Value) -> Result<(), EvalFailure> {
-        let Value::Struct { fields, .. } = value else {
-            return Ok(());
-        };
-        if fields.iter().all(|(_, value)| *value == Value::Unavailable) {
-            return Ok(());
+    fn release_compiler_owned_permits(&mut self, value: &Value) -> Result<(), EvalFailure> {
+        match value {
+            Value::Struct {
+                definition, fields, ..
+            } if self.program.is_authenticated_pool_permit(*definition) => {
+                self.release_exact_compiler_owned_permit(fields)
+            }
+            Value::Struct { fields, .. } => {
+                for (_, field) in fields.iter().rev() {
+                    self.release_compiler_owned_permits(field)?;
+                }
+                Ok(())
+            }
+            Value::Array(values)
+            | Value::Tuple(values)
+            | Value::BuiltinVariant {
+                payload: values, ..
+            }
+            | Value::UserVariant {
+                payload: values, ..
+            }
+            | Value::TestApplication {
+                payload: values, ..
+            } => {
+                for value in values.iter().rev() {
+                    self.release_compiler_owned_permits(value)?;
+                }
+                Ok(())
+            }
+            Value::Closure { captures, .. } => {
+                for (_, value) in captures.iter().rev() {
+                    self.release_compiler_owned_permits(value)?;
+                }
+                Ok(())
+            }
+            Value::Unavailable
+            | Value::Unit
+            | Value::Bool(_)
+            | Value::Integer { .. }
+            | Value::Float { .. }
+            | Value::Text(_)
+            | Value::Scalar(_)
+            | Value::Bytes(_)
+            | Value::Function(_)
+            | Value::SymbolicHandle { .. } => Ok(()),
         }
-        if !fields
-            .iter()
-            .any(|(name, _)| name.as_ref() == "permit_identity")
-        {
+    }
+
+    fn release_exact_compiler_owned_permit(
+        &mut self,
+        fields: &[(Arc<str>, Value)],
+    ) -> Result<(), EvalFailure> {
+        if fields.iter().all(|(_, value)| *value == Value::Unavailable) {
             return Ok(());
         }
         let pool_identity = hidden_u128(fields, "pool_identity")?;
@@ -4859,11 +4901,14 @@ mod tests {
                 ),
             ]),
         };
+        let Value::Struct { fields, .. } = &permit else {
+            unreachable!("test Permit")
+        };
         engine
-            .release_compiler_owned_permit(&permit)
+            .release_exact_compiler_owned_permit(fields)
             .expect("first cleanup releases the reservation");
         assert!(matches!(
-            engine.release_compiler_owned_permit(&permit),
+            engine.release_exact_compiler_owned_permit(fields),
             Err(EvalFailure::Defect(_))
         ));
 

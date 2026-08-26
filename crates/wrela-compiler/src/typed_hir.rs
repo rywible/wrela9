@@ -1655,6 +1655,19 @@ impl VerifiedProgram {
             .is_some_and(DischargeLaw::requires_explicit_discharge)
     }
 
+    pub(crate) fn is_authenticated_pool_permit(&self, definition: DefinitionId) -> bool {
+        self.functions
+            .values()
+            .chain(self.specialized_functions.values())
+            .any(|function| {
+                function.pool_operation == Some(PoolOperation::Reserve)
+                    && matches!(
+                        function.return_type,
+                        Type::Nominal { definition: permit, .. } if permit == definition
+                    )
+            })
+    }
+
     pub(crate) fn verify_expression(
         &self,
         syntax: &ExpressionSyntax,
@@ -5240,6 +5253,17 @@ fn verify_expression_artifact_with_cleanup(
                                     ),
                                 })?;
                         }
+                        bind_type(
+                            &function.return_type,
+                            &expression.type_,
+                            &mut substitutions,
+                            &expression.source,
+                        )
+                        .map_err(|_| VerificationFailure::Defect {
+                            evidence: Arc::from(
+                                "template call result does not bind its generic return type",
+                            ),
+                        })?;
                         Ok(substitute(&function.return_type, &substitutions))
                     })
                     .transpose()?
@@ -5732,16 +5756,21 @@ fn verify_expression_artifact_with_cleanup(
     }
     let valid_existential_coercion = expression.coerced_from.as_ref() == Some(&actual)
         && matches!(
-            (&actual, &expression.type_),
-            (
-                Type::Nominal { definition, .. },
-                Type::Any { interface, .. }
-            ) if catalog.interfaces.get(interface).is_some_and(|interface| {
-                interface.implementations.contains_key(definition)
-            })
+                (&actual, &expression.type_),
+                (
+                    Type::Nominal { definition, .. },
+                    Type::Any { interface, .. }
+                ) if catalog.interfaces.get(interface).is_some_and(|interface| {
+                    interface.implementations.contains_key(definition)
+                })
         );
     if actual != expression.type_ && !valid_existential_coercion {
-        return defect("lowered expression type annotation is inconsistent");
+        return Err(VerificationFailure::Defect {
+            evidence: Arc::from(format!(
+                "lowered expression type annotation is inconsistent: {actual:?} != {:?}",
+                expression.type_
+            )),
+        });
     }
     Ok(expression.type_.clone())
 }
@@ -5906,8 +5935,10 @@ struct Lowerer<'a> {
     test_application_context: u16,
     expected_expression_type: Option<Type>,
     pending_scoped_pool: Option<PoolId>,
+    next_scoped_pool_site: u32,
     scoped_pool_types: BTreeMap<String, PoolId>,
     owner_identity: Option<DefinitionId>,
+    generic_types: BTreeMap<String, Type>,
     generic_interface_bounds: BTreeMap<TypeParameterId, DefinitionId>,
     generic_pool_bounds: BTreeSet<TypeParameterId>,
     generic_const_values: BTreeMap<String, (IntegerType, u64)>,
@@ -5962,8 +5993,10 @@ impl<'a> Lowerer<'a> {
             test_application_context: 0,
             expected_expression_type: None,
             pending_scoped_pool: None,
+            next_scoped_pool_site: 0,
             scoped_pool_types: BTreeMap::new(),
             owner_identity: None,
+            generic_types: BTreeMap::new(),
             generic_interface_bounds: BTreeMap::new(),
             generic_pool_bounds: BTreeSet::new(),
             generic_const_values: BTreeMap::new(),
@@ -5976,6 +6009,22 @@ impl<'a> Lowerer<'a> {
         substitutions: Option<&BTreeMap<TypeParameterId, Type>>,
     ) {
         self.owner_identity = Some(function.id);
+        self.generic_types = function
+            .generic_parameter_names
+            .iter()
+            .zip(function.type_parameters.iter())
+            .map(|(name, parameter)| {
+                let type_ = substitutions
+                    .and_then(|substitutions| substitutions.get(parameter))
+                    .cloned()
+                    .unwrap_or_else(|| Type::Parameter {
+                        owner: function.id,
+                        id: *parameter,
+                        display: Arc::from(name.as_str()),
+                    });
+                (name.clone(), type_)
+            })
+            .collect();
         self.generic_interface_bounds = function
             .type_parameters
             .iter()
@@ -7161,15 +7210,17 @@ impl<'a> Lowerer<'a> {
                         .ok_or_else(|| VerificationFailure::Defect {
                             evidence: Arc::from("authenticated scoped Pool has no semantic owner"),
                         })?;
-                    let pool =
-                        self.identity_catalog
-                            .scoped_pool(owner, binding)
-                            .map_err(|collision| VerificationFailure::Defect {
-                                evidence: Arc::from(format!(
-                                    "scoped Pool identity collision {:032x}",
-                                    collision.digest
-                                )),
-                            })?;
+                    let source_site = self.next_scoped_pool_site;
+                    self.next_scoped_pool_site = self.next_scoped_pool_site.saturating_add(1);
+                    let pool = self
+                        .identity_catalog
+                        .scoped_pool(owner, source_site)
+                        .map_err(|collision| VerificationFailure::Defect {
+                            evidence: Arc::from(format!(
+                                "scoped Pool identity collision {:032x}",
+                                collision.digest
+                            )),
+                        })?;
                     let previous_pool = self.pending_scoped_pool.replace(pool);
                     let scope_result = self.expression(scope);
                     self.pending_scoped_pool = previous_pool;
@@ -7445,6 +7496,40 @@ impl<'a> Lowerer<'a> {
                         }
                         _ => false,
                     };
+                let contextual_result_type = self.expected_expression_type.clone();
+                let contextual_argument_types = match (
+                    self.namespace.resolve(self.module, &callee.segments),
+                    contextual_result_type.as_ref(),
+                ) {
+                    (
+                        Some(ResolvedName::Nominal(definition)),
+                        Some(Type::Nominal {
+                            definition: expected_definition,
+                            arguments,
+                            ..
+                        }),
+                    ) if definition == *expected_definition => {
+                        let struct_ = self.structs.get(&definition).ok_or_else(|| {
+                            creator_value(CreatorFailureKind::UnresolvedNominalType, &syntax.range)
+                        })?;
+                        let substitutions = struct_
+                            .type_parameters
+                            .iter()
+                            .copied()
+                            .zip(arguments.iter().cloned())
+                            .collect::<BTreeMap<_, _>>();
+                        Some(
+                            struct_
+                                .fields
+                                .iter()
+                                .map(|field| {
+                                    (field.name.clone(), substitute(&field.type_, &substitutions))
+                                })
+                                .collect::<BTreeMap<_, _>>(),
+                        )
+                    }
+                    _ => None,
+                };
                 for argument in arguments {
                     let establishes_context =
                         inside_test_cases && argument.label.as_deref() == Some("cases");
@@ -7452,7 +7537,13 @@ impl<'a> Lowerer<'a> {
                         self.test_application_context =
                             self.test_application_context.saturating_add(1);
                     }
-                    let value = if scoped_pool_factory {
+                    let value = if let Some(expected) = argument
+                        .label
+                        .as_ref()
+                        .and_then(|label| contextual_argument_types.as_ref()?.get(label))
+                    {
+                        self.expression_expected(&argument.value, expected)
+                    } else if scoped_pool_factory {
                         self.expression_expected(&argument.value, &Type::Integer(IntegerType::U64))
                     } else {
                         self.expression(&argument.value)
@@ -8062,6 +8153,17 @@ impl<'a> Lowerer<'a> {
                 self.pool_authority.operation(*definition),
                 Some(PoolOperation::Allocate | PoolOperation::Reserve | PoolOperation::Consume)
             )
+        {
+            self.discharge_laws.authenticate_reclaim(type_id)?;
+        }
+        if let ExpressionKind::Call {
+            target: CallTarget::Struct { .. },
+            arguments,
+        } = &kind
+            && arguments.iter().any(|argument| {
+                self.discharge_laws
+                    .has_authenticated_reclaim(&argument.type_)
+            })
         {
             self.discharge_laws.authenticate_reclaim(type_id)?;
         }
@@ -8831,6 +8933,11 @@ impl<'a> Lowerer<'a> {
             TypeSyntax::Named(name) => {
                 if let Some(type_) = resolve_builtin_type(name) {
                     return Some(type_);
+                }
+                if let [name] = name.segments.as_slice()
+                    && let Some(type_) = self.generic_types.get(name)
+                {
+                    return Some(type_.clone());
                 }
                 if let [name] = name.segments.as_slice()
                     && let Some(pool) = self.scoped_pool_types.get(name)

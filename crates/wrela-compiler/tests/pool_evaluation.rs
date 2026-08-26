@@ -77,6 +77,28 @@ fn build() -> Image:
 }
 
 #[test]
+fn ordinary_permit_identity_fields_never_gain_cleanup_authority() {
+    let source = br#"struct OrdinaryReceipt:
+    pool_identity: u64
+    slot: u64
+    generation: u64
+    permit_identity: u64
+
+@image
+fn build() -> Image:
+    if true:
+        receipt = OrdinaryReceipt(pool_identity=1u64, slot=0u64, generation=0u64, permit_identity=2u64)
+    return Image.new()
+"#;
+
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "field spelling cannot fabricate compiler cleanup authority: {outcome:#?}"
+    );
+}
+
+#[test]
 fn scoped_pool_binding_does_not_escape_its_with_block() {
     let source = br#"from core import pool as pools
 
@@ -537,6 +559,58 @@ fn build() -> Image:
 }
 
 #[test]
+fn sequential_same_named_pool_sites_have_distinct_stable_creation_identities() {
+    let original = br#"from core import pool as pools
+
+@image
+fn build() -> Image:
+    mut first = 0
+    mut second = 0
+    with pools.scoped(capacity=1) as scratch:
+        allocation = scratch.allocate(value=1)
+        first = scratch.reclaim(allocation=take allocation)
+    with pools.scoped(capacity=1) as scratch:
+        allocation = scratch.allocate(value=2)
+        second = scratch.reclaim(allocation=take allocation)
+    return Image.new(first=first, second=second)
+"#;
+    let harmless_edit = br#"from core import pool as pools
+
+# Binder spelling and byte offsets are not creation-site identity.
+@image
+fn build() -> Image:
+    mut first = 0
+    mut second = 0
+    with pools.scoped(capacity=1) as alpha:
+        allocation = alpha.allocate(value=1)
+        first = alpha.reclaim(allocation=take allocation)
+    with pools.scoped(capacity=1) as beta:
+        allocation = beta.allocate(value=2)
+        second = beta.reclaim(allocation=take allocation)
+    return Image.new(first=first, second=second)
+"#;
+
+    let pool_identities = |source| {
+        let outcome = compile_planned(source);
+        let CompilationOutcome::Accepted(accepted) = outcome else {
+            panic!("two sequential creation sites must remain distinct: {outcome:#?}");
+        };
+        let planning = accepted
+            .inspection()
+            .planning_foundation()
+            .expect("planning inspection");
+        assert_eq!(planning.pools().len(), 2);
+        planning
+            .pools()
+            .iter()
+            .map(|pool| pool.identity())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    assert_eq!(pool_identities(original), pool_identities(harmless_edit));
+}
+
+#[test]
 fn helper_and_caller_simultaneous_commitment_is_rejected_interprocedurally() {
     let source = br#"from core import pool as pools
 
@@ -594,6 +668,87 @@ fn build() -> Image:
 }
 
 #[test]
+fn returned_helper_permit_remains_committed_in_the_caller() {
+    let source = br#"from core import pool as pools
+
+fn reserve_for_caller[P: Pool](mut scratch: pools.Scope[P]) -> pools.Permit[P, i64]:
+    permit: pools.Permit[P, i64] = scratch.reserve()
+    return take permit
+
+@image
+fn build() -> Image:
+    mut value = 0
+    with pools.scoped(capacity=1) as scratch:
+        permit: pools.Permit[scratch, i64] = reserve_for_caller(mut scratch)
+        allocation = scratch.allocate(value=7)
+        scratch.release(permit=take permit)
+        value = scratch.reclaim(allocation=take allocation)
+    return Image.new(value=value)
+"#;
+
+    let outcome = compile_planned(source);
+    let CompilationOutcome::Rejected(rejected) = outcome else {
+        panic!("a returned Permit and caller Allocation commit two slots: {outcome:#?}");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "admission.pool_capacity"),
+        "{rejected:#?}"
+    );
+}
+
+#[test]
+fn bounded_recursive_permit_activations_have_exact_capacity_evidence() {
+    fn source(capacity: u8) -> Vec<u8> {
+        format!(
+            r#"from core import pool as pools
+
+fn hold_recursively[P: Pool](mut scratch: pools.Scope[P], remaining: u8):
+    if remaining == 0u8:
+        return
+    permit: pools.Permit[P, i64] = scratch.reserve()
+    hold_recursively(mut scratch, remaining - 1u8)
+    scratch.release(permit=take permit)
+
+@image
+fn build() -> Image:
+    with pools.scoped(capacity={capacity}) as scratch:
+        hold_recursively(mut scratch, 2u8)
+    return Image.new()
+"#
+        )
+        .into_bytes()
+    }
+
+    let insufficient = compile_planned(&source(1));
+    let CompilationOutcome::Rejected(rejected) = insufficient else {
+        panic!("two live recursive activations exceed one slot: {insufficient:#?}");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "admission.pool_capacity"),
+        "{rejected:#?}"
+    );
+
+    let exact = compile_planned(&source(2));
+    let CompilationOutcome::Accepted(accepted) = exact else {
+        panic!("two recursive activation commitments fit exactly two slots: {exact:#?}");
+    };
+    let planning = accepted
+        .inspection()
+        .planning_foundation()
+        .expect("planning inspection");
+    assert_eq!(planning.pools().len(), 1);
+    assert_eq!(planning.pools()[0].peak_outstanding_permits(), 2);
+    assert_eq!(planning.pools()[0].peak_commitment(), 2);
+    assert_eq!(planning.pool_admission_evidence().len(), 1);
+}
+
+#[test]
 fn inner_scope_permit_cleanup_releases_before_later_same_pool_allocation() {
     let source = br#"from core import pool as pools
 
@@ -612,6 +767,31 @@ fn build() -> Image:
     assert!(
         matches!(outcome, CompilationOutcome::Accepted(_)),
         "recoverable inner-scope cleanup must execute the Permit release transition: {outcome:#?}"
+    );
+}
+
+#[test]
+fn nested_permit_cleanup_releases_its_exact_reservation_once() {
+    let source = br#"from core import pool as pools
+
+resource struct PermitBox[P: Pool]:
+    permit: pools.Permit[P, i64]
+
+@image
+fn build() -> Image:
+    mut value = 0
+    with pools.scoped(capacity=1) as scratch:
+        if true:
+            box: PermitBox[scratch] = PermitBox(permit=scratch.reserve())
+        allocation = scratch.allocate(value=7)
+        value = scratch.reclaim(allocation=take allocation)
+    return Image.new(value=value)
+"#;
+
+    let outcome = compile_planned(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "nested compiler-owned Permit cleanup must release once before later admission: {outcome:#?}"
     );
 }
 

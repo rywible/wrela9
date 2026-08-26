@@ -69,28 +69,46 @@ impl CompilerInstallation {
 fn layer1_facilities_module() -> ProjectFile {
     ProjectFile::new(
         "src/core/facilities.wr",
-        br#"pub struct Display:
-    pub pure fn new() -> Display:
+        br#"pub interface FacilityActor:
+    pure fn facility_identity(read self) -> u64
+
+pub enum FacilityLossSelection:
+    ControlledShutdown
+    DisableAndContinue
+    SelectingImagePolicy
+
+pub enum FacilityReplayAuthority:
+    ReplayableGameplay
+    NonReplayableFacility
+
+pub const CONTROLLED_SHUTDOWN: FacilityLossSelection = FacilityLossSelection.ControlledShutdown
+pub const DISABLE_AND_CONTINUE: FacilityLossSelection = FacilityLossSelection.DisableAndContinue
+pub const SELECTING_IMAGE_POLICY: FacilityLossSelection = FacilityLossSelection.SelectingImagePolicy
+pub const REPLAYABLE_GAMEPLAY: FacilityReplayAuthority = FacilityReplayAuthority.ReplayableGameplay
+pub const NON_REPLAYABLE_FACILITY: FacilityReplayAuthority = FacilityReplayAuthority.NonReplayableFacility
+
+pub struct Display:
+    pub pure fn new(supervisor: any FacilityActor, loss: FacilityLossSelection, replay: FacilityReplayAuthority) -> Display:
         panic "sealed Display constructor"
 
 pub struct Input:
-    pub pure fn new() -> Input:
+    pub pure fn new(owner: any FacilityActor, supervisor: any FacilityActor, loss: FacilityLossSelection, replay: FacilityReplayAuthority) -> Input:
         panic "sealed Input constructor"
 
 pub struct EventStore:
-    pub pure fn new() -> EventStore:
+    pub pure fn new(supervisor: any FacilityActor, loss: FacilityLossSelection, replay: FacilityReplayAuthority) -> EventStore:
         panic "sealed Event Store constructor"
 
 pub struct MonotonicClock:
-    pub pure fn new() -> MonotonicClock:
+    pub pure fn new(supervisor: any FacilityActor, loss: FacilityLossSelection, replay: FacilityReplayAuthority) -> MonotonicClock:
         panic "sealed Monotonic Clock constructor"
 
 pub struct Entropy:
-    pub pure fn new() -> Entropy:
+    pub pure fn new(supervisor: any FacilityActor, loss: FacilityLossSelection, replay: FacilityReplayAuthority) -> Entropy:
         panic "sealed Entropy constructor"
 
 pub struct Telemetry:
-    pub pure fn new() -> Telemetry:
+    pub pure fn new(supervisor: any FacilityActor, loss: FacilityLossSelection, replay: FacilityReplayAuthority) -> Telemetry:
         panic "sealed Telemetry constructor"
 "#,
     )
@@ -654,15 +672,12 @@ impl Diagnostic {
 
     pub(crate) fn with_identity_parameter(
         mut self,
-        name: &'static str,
+        name: impl Into<Arc<str>>,
         domain: IdentityDomain,
         digest: u128,
     ) -> Self {
         let mut typed = self.typed_parameters.to_vec();
-        typed.push((
-            Arc::from(name),
-            DiagnosticValue::Identity { domain, digest },
-        ));
+        typed.push((name.into(), DiagnosticValue::Identity { domain, digest }));
         self.typed_parameters = typed.into();
         self
     }
@@ -2793,17 +2808,133 @@ impl Compiler {
                         Err(PlanningFailure::FacilityCardinality {
                             kind,
                             selected,
+                            minimum,
                             maximum,
+                            sites,
                         }) => {
+                            let primary = sites.first().map_or_else(
+                                || SourceRange::new(request.root.path(), 0, 0),
+                                |site| site.source.clone(),
+                            );
+                            let mut diagnostic = Diagnostic::new(
+                                "admission.facility_cardinality",
+                                primary,
+                                RecoveryAction::None,
+                            )
+                            .with_parameter("facility", format!("{kind:?}"))
+                            .with_unsigned_parameter("selected", u128::from(selected))
+                            .with_unsigned_parameter("minimum", u128::from(minimum))
+                            .with_unsigned_parameter("maximum", u128::from(maximum));
+                            for (ordinal, site) in sites.iter().enumerate() {
+                                diagnostic = diagnostic.with_identity_parameter(
+                                    format!("construction_{ordinal}"),
+                                    IdentityDomain::Construction,
+                                    site.identity,
+                                );
+                                if ordinal > 0 {
+                                    diagnostic = diagnostic.with_label(
+                                        site.source.clone(),
+                                        DiagnosticLabelRole::Related,
+                                    );
+                                }
+                            }
+                            diagnostics.push(diagnostic);
+                            None
+                        }
+                        Err(PlanningFailure::FacilityConfiguration {
+                            kind,
+                            instance,
+                            source,
+                            failure,
+                        }) => {
+                            use crate::image_planning::FacilityConfigurationFailure;
+                            let (code, selected, required) = match failure {
+                                FacilityConfigurationFailure::SupervisorNotActor => (
+                                    "admission.facility_supervisor",
+                                    "non_actor".to_owned(),
+                                    "actor".to_owned(),
+                                ),
+                                FacilityConfigurationFailure::InputOwnerNotActor => (
+                                    "admission.facility_owner",
+                                    "non_actor".to_owned(),
+                                    "actor".to_owned(),
+                                ),
+                                FacilityConfigurationFailure::LossPolicy { selected, required } => {
+                                    (
+                                        "admission.facility_loss_policy",
+                                        format!("{selected:?}"),
+                                        format!("{required:?}"),
+                                    )
+                                }
+                                FacilityConfigurationFailure::ReplayAuthority {
+                                    selected,
+                                    required,
+                                } => (
+                                    "admission.facility_replay",
+                                    format!("{selected:?}"),
+                                    format!("{required:?}"),
+                                ),
+                            };
+                            diagnostics.push(
+                                Diagnostic::new(code, source, RecoveryAction::None)
+                                    .with_parameter("facility", format!("{kind:?}"))
+                                    .with_parameter("selected", selected)
+                                    .with_parameter("required", required)
+                                    .with_identity_parameter(
+                                        "construction_identity",
+                                        IdentityDomain::Construction,
+                                        instance,
+                                    ),
+                            );
+                            None
+                        }
+                        Err(PlanningFailure::FacilityCompatibility {
+                            kind,
+                            instance,
+                            source,
+                            requirement,
+                            missing,
+                        }) => {
+                            use crate::image_planning::FacilityCompatibilityMissing;
+                            let (missing_kind, missing_value) = match missing {
+                                FacilityCompatibilityMissing::Capability(capability) => {
+                                    ("capability", format!("{capability:?}"))
+                                }
+                                FacilityCompatibilityMissing::Binding(binding) => {
+                                    ("binding", format!("{binding:?}"))
+                                }
+                                FacilityCompatibilityMissing::SharedRole {
+                                    role,
+                                    required_units,
+                                    available_units,
+                                } => (
+                                    "shared_role",
+                                    format!("{role:?}:{required_units}:{available_units}"),
+                                ),
+                            };
                             diagnostics.push(
                                 Diagnostic::new(
-                                    "admission.facility_cardinality",
-                                    SourceRange::new(request.root.path(), 0, 0),
+                                    "admission.facility_profile_incompatible",
+                                    source,
                                     RecoveryAction::None,
                                 )
                                 .with_parameter("facility", format!("{kind:?}"))
-                                .with_unsigned_parameter("selected", u128::from(selected))
-                                .with_unsigned_parameter("maximum", u128::from(maximum)),
+                                .with_parameter("missing_kind", missing_kind)
+                                .with_parameter("missing", missing_value)
+                                .with_identity_parameter(
+                                    "construction_identity",
+                                    IdentityDomain::Construction,
+                                    instance,
+                                )
+                                .with_identity_parameter(
+                                    "requirement_identity",
+                                    IdentityDomain::Generated,
+                                    requirement.identity(),
+                                )
+                                .with_unsigned_parameter(
+                                    "requirement_current_meaning",
+                                    requirement.current_meaning(),
+                                ),
                             );
                             None
                         }

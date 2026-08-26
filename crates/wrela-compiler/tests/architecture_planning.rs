@@ -68,7 +68,7 @@ fn current_aarch64_selection_authenticates_the_planning_contract() {
     assert_eq!(contract.contract_version(), 1);
     assert_eq!(
         contract.distribution_input_receipt(),
-        216_983_842_459_440_074_048_927_125_081_991_702_598
+        186_242_940_987_556_221_601_299_593_776_526_439_257
     );
     assert_eq!(
         contract.identity(),
@@ -76,7 +76,7 @@ fn current_aarch64_selection_authenticates_the_planning_contract() {
     );
     assert_eq!(
         contract.fingerprint(),
-        249_225_306_739_761_497_160_337_354_237_203_753_409
+        175_701_671_043_734_796_576_676_741_447_065_263_159
     );
     assert_eq!(contract.symbolic_core_count(), 4);
     assert_eq!(contract.page_quantum_bytes(), 4096);

@@ -569,7 +569,7 @@ fn compiler_open_seals_validated_versioned_distribution_content() {
     );
     assert_eq!(
         first.distribution_digest(),
-        87_658_205_080_477_179_640_569_295_596_212_372_978
+        9_117_373_366_381_991_851_885_225_110_983_602_955
     );
     assert_eq!(first.distribution_digest(), same.distribution_digest());
     assert_ne!(first.distribution_digest(), changed.distribution_digest());

@@ -56,11 +56,13 @@ pub use flow::{
 };
 pub use image_planning::{
     DomainPlanKind, DomainPlanObservation, ExecutableDemandObservation,
-    FacilityContractObservation, FacilityDomainPlanObservation, FacilityEndpointOwnership,
-    FacilityKind, FacilityLossPolicy, FacilitySemanticCapacity, FacilitySharing, FacilityShutdown,
-    GeneratedRoleKind, GeneratedRoleObservation, PlannerKind, PlannerObservation, PlanningBinding,
-    PlanningCapability, PlanningFoundationObservation, PlanningMultiplicity, PlanningReservation,
-    PoolAdmissionEvidenceObservation, PoolModelObservation, PoolObservation, RequirementBounds,
-    RequirementCategory, RequirementObservation, RequirementProvenance, RequirementSubject,
+    FacilityBindingAvailability, FacilityContractObservation, FacilityDomainPlanObservation,
+    FacilityEndpointOwnership, FacilityFlagshipRule, FacilityKind, FacilityLossPolicy,
+    FacilityReplayAuthority, FacilityReplayRule, FacilitySemanticCapacity, FacilitySharedRole,
+    FacilitySharing, FacilityShutdown, GeneratedRoleKind, GeneratedRoleObservation, PlannerKind,
+    PlannerObservation, PlanningBinding, PlanningCapability, PlanningFoundationObservation,
+    PlanningMultiplicity, PlanningReservation, PoolAdmissionEvidenceObservation,
+    PoolModelObservation, PoolObservation, RequirementBounds, RequirementCategory,
+    RequirementObservation, RequirementProvenance, RequirementSubject,
 };
 pub use typed_hir::PoolOperation;

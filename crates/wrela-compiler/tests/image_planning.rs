@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use wrela_compiler::{
     ArchitectureProfile, Cancellation, CompilationOutcome, CompilationRequest, Compiler,
-    CompilerInstallation, DiagnosticValue, FacilityEndpointOwnership, FacilityKind,
-    FacilityLossPolicy, FacilitySemanticCapacity, FacilitySharing, FacilityShutdown,
-    GeneratedRoleKind, InspectSelection, PlannerKind, PlanningBinding, PlanningCapability,
-    ProjectFile, ProjectSnapshot, RequirementBounds, RequirementCategory, Root,
+    CompilerInstallation, DiagnosticValue, FacilityBindingAvailability, FacilityEndpointOwnership,
+    FacilityFlagshipRule, FacilityKind, FacilityLossPolicy, FacilityReplayAuthority,
+    FacilityReplayRule, FacilitySemanticCapacity, FacilitySharedRole, FacilitySharing,
+    FacilityShutdown, GeneratedRoleKind, IdentityDomain, InspectSelection, PlannerKind,
+    PlanningBinding, PlanningCapability, ProjectFile, ProjectSnapshot, RequirementBounds,
+    RequirementCategory, Root,
 };
 
 fn deployment_request(inspection: InspectSelection) -> CompilationRequest {
@@ -20,13 +22,163 @@ fn deployment_request(inspection: InspectSelection) -> CompilationRequest {
 }
 
 #[test]
-fn duplicate_facility_instances_are_rejected_during_admission() {
+fn input_facility_requires_an_explicit_build_wired_owner() {
     let source = br#"from core import facilities
 
 @image
 fn build() -> Image:
-    first = facilities.Display.new()
-    second = facilities.Display.new()
+    input = facilities.Input.new()
+    return Image.new(input=input)
+"#;
+    let compiler = Compiler::open(CompilerInstallation::layer1()).unwrap();
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    );
+    let CompilationOutcome::Rejected(rejected) = outcome else {
+        panic!("Input without its explicit owning Actor must reject: {outcome:#?}");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.argument_count")
+    );
+}
+
+#[test]
+fn every_facility_requires_explicit_supervisor_and_loss_configuration() {
+    let source = br#"from core import facilities
+
+@image
+fn build() -> Image:
+    display = facilities.Display.new()
+    return Image.new(display=display)
+"#;
+    let compiler = Compiler::open(CompilerInstallation::layer1()).unwrap();
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    );
+    let CompilationOutcome::Rejected(rejected) = outcome else {
+        panic!("Facility without supervisor/loss configuration must reject: {outcome:#?}");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "semantic.argument_count")
+    );
+}
+
+#[test]
+fn entropy_is_rejected_from_replayable_gameplay() {
+    let source = br#"from core import facilities
+
+@actor
+struct Coordinator implements facilities.FacilityActor:
+    pure fn facility_identity(read self) -> u64:
+        return 1
+    pub async fn run(self):
+        pass
+
+@image
+fn build() -> Image:
+    coordinator = Coordinator()
+    entropy = facilities.Entropy.new(supervisor=coordinator, loss=facilities.SELECTING_IMAGE_POLICY, replay=facilities.REPLAYABLE_GAMEPLAY)
+    return Image.new(entropy=entropy)
+"#;
+    let compiler = Compiler::open(CompilerInstallation::layer1()).unwrap();
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    );
+    let CompilationOutcome::Rejected(rejected) = outcome else {
+        panic!("Entropy cannot enter replayable gameplay: {outcome:#?}");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "admission.facility_replay"),
+        "{:#?}",
+        (
+            rejected.diagnostics(),
+            rejected.inspection().constructions()
+        )
+    );
+}
+
+#[test]
+fn selected_loss_policy_must_match_the_authenticated_facility_rule() {
+    let source = br#"from core import facilities
+
+@actor
+struct Coordinator implements facilities.FacilityActor:
+    pure fn facility_identity(read self) -> u64:
+        return 1
+    pub async fn run(self):
+        pass
+
+@image
+fn build() -> Image:
+    coordinator = Coordinator()
+    display = facilities.Display.new(supervisor=coordinator, loss=facilities.SELECTING_IMAGE_POLICY, replay=facilities.REPLAYABLE_GAMEPLAY)
+    return Image.new(display=display)
+"#;
+    let outcome = Compiler::open(CompilerInstallation::layer1())
+        .unwrap()
+        .compile(
+            CompilationRequest::new(
+                ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+                Root::Image,
+            )
+            .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+            .with_inspection(InspectSelection::all()),
+            &Cancellation::new(),
+        );
+    let CompilationOutcome::Rejected(rejected) = outcome else {
+        panic!("a source-selected loss policy cannot disagree with its contract: {outcome:#?}");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "admission.facility_loss_policy")
+    );
+}
+
+#[test]
+fn duplicate_facility_instances_are_rejected_during_admission() {
+    let source = br#"from core import facilities
+
+@actor
+struct Coordinator implements facilities.FacilityActor:
+    pure fn facility_identity(read self) -> u64:
+        return 1
+    pub async fn run(self):
+        pass
+
+@image
+fn build() -> Image:
+    coordinator = Coordinator()
+    first = facilities.Display.new(supervisor=coordinator, loss=facilities.CONTROLLED_SHUTDOWN, replay=facilities.REPLAYABLE_GAMEPLAY)
+    second = facilities.Display.new(supervisor=coordinator, loss=facilities.CONTROLLED_SHUTDOWN, replay=facilities.REPLAYABLE_GAMEPLAY)
     return Image.new(first=first, second=second)
 "#;
     let compiler = Compiler::open(CompilerInstallation::layer1()).unwrap();
@@ -55,9 +207,104 @@ fn build() -> Image:
     assert!(
         diagnostic
             .typed_parameters()
+            .contains(&("minimum".into(), DiagnosticValue::Unsigned(0),))
+    );
+    assert!(
+        diagnostic
+            .typed_parameters()
             .contains(&("maximum".into(), DiagnosticValue::Unsigned(1),))
     );
+    assert_eq!(diagnostic.labels().len(), 1);
+    assert_eq!(diagnostic.labels()[0].role(), "related");
     assert!(rejected.inspection().planning_foundation().is_none());
+}
+
+#[test]
+fn helper_module_facility_cardinality_diagnostic_has_exact_stable_provenance() {
+    let root = ProjectFile::new(
+        "src/image.wr",
+        br#"from core import facilities
+from game import display_factory
+
+@actor
+struct Coordinator implements facilities.FacilityActor:
+    pure fn facility_identity(read self) -> u64:
+        return 1
+    pub async fn run(self):
+        pass
+
+@image
+fn build() -> Image:
+    coordinator = Coordinator()
+    first = display_factory.first(supervisor=coordinator)
+    second = display_factory.second(supervisor=coordinator)
+    return Image.new(first=first, second=second)
+"#,
+    );
+    let helper = ProjectFile::new(
+        "src/game/display_factory.wr",
+        br#"from core import facilities
+
+pub pure fn first(supervisor: any facilities.FacilityActor) -> facilities.Display:
+    return facilities.Display.new(supervisor=supervisor, loss=facilities.CONTROLLED_SHUTDOWN, replay=facilities.REPLAYABLE_GAMEPLAY)
+
+pub pure fn second(supervisor: any facilities.FacilityActor) -> facilities.Display:
+    return facilities.Display.new(supervisor=supervisor, loss=facilities.CONTROLLED_SHUTDOWN, replay=facilities.REPLAYABLE_GAMEPLAY)
+"#,
+    );
+    let compile = |reverse: bool| {
+        let files = if reverse {
+            vec![helper.clone(), root.clone()]
+        } else {
+            vec![root.clone(), helper.clone()]
+        };
+        Compiler::open(CompilerInstallation::layer1())
+            .unwrap()
+            .compile(
+                CompilationRequest::new(ProjectSnapshot::new(files), Root::Image)
+                    .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+                    .with_inspection(InspectSelection::all()),
+                &Cancellation::new(),
+            )
+    };
+    let extract = |outcome: CompilationOutcome| {
+        let CompilationOutcome::Rejected(rejected) = outcome else {
+            panic!("helper-created duplicate Display Facilities reject: {outcome:#?}");
+        };
+        let diagnostic = rejected
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code() == "admission.facility_cardinality")
+            .expect("Facility cardinality diagnostic")
+            .clone();
+        let mut sites = rejected
+            .inspection()
+            .constructions()
+            .iter()
+            .filter(|construction| construction.site().path() == "src/game/display_factory.wr")
+            .map(|construction| (construction.identity(), construction.site().clone()))
+            .collect::<Vec<_>>();
+        sites.sort_by_key(|(identity, _)| *identity);
+        (diagnostic, sites)
+    };
+    let (forward, forward_sites) = extract(compile(false));
+    let (reversed, reversed_sites) = extract(compile(true));
+    assert_eq!(forward, reversed);
+    assert_eq!(forward_sites, reversed_sites);
+    assert_eq!(forward_sites.len(), 2);
+    assert_eq!(forward.primary(), &forward_sites[0].1);
+    assert_eq!(forward.labels().len(), 1);
+    assert_eq!(forward.labels()[0].role(), "related");
+    assert_eq!(forward.labels()[0].range(), &forward_sites[1].1);
+    for (ordinal, (identity, _)) in forward_sites.iter().enumerate() {
+        assert!(forward.typed_parameters().contains(&(
+            format!("construction_{ordinal}").into(),
+            DiagnosticValue::Identity {
+                domain: IdentityDomain::Construction,
+                digest: *identity,
+            },
+        )));
+    }
 }
 
 fn valued_deployment_request(value: i64, inspection: InspectSelection) -> CompilationRequest {
@@ -122,14 +369,22 @@ fn accepted(request: CompilationRequest) -> wrela_compiler::AcceptedCompilation 
 fn selected_current_facilities_publish_complete_verified_domain_plans() {
     let source = br#"from core import facilities
 
+@actor
+struct Coordinator implements facilities.FacilityActor:
+    pure fn facility_identity(read self) -> u64:
+        return 1
+    pub async fn run(self):
+        pass
+
 @image
 fn build() -> Image:
-    display = facilities.Display.new()
-    input = facilities.Input.new()
-    events = facilities.EventStore.new()
-    clock = facilities.MonotonicClock.new()
-    entropy = facilities.Entropy.new()
-    telemetry = facilities.Telemetry.new()
+    coordinator = Coordinator()
+    display = facilities.Display.new(supervisor=coordinator, loss=facilities.CONTROLLED_SHUTDOWN, replay=facilities.REPLAYABLE_GAMEPLAY)
+    input = facilities.Input.new(owner=coordinator, supervisor=coordinator, loss=facilities.CONTROLLED_SHUTDOWN, replay=facilities.REPLAYABLE_GAMEPLAY)
+    events = facilities.EventStore.new(supervisor=coordinator, loss=facilities.CONTROLLED_SHUTDOWN, replay=facilities.REPLAYABLE_GAMEPLAY)
+    clock = facilities.MonotonicClock.new(supervisor=coordinator, loss=facilities.CONTROLLED_SHUTDOWN, replay=facilities.REPLAYABLE_GAMEPLAY)
+    entropy = facilities.Entropy.new(supervisor=coordinator, loss=facilities.SELECTING_IMAGE_POLICY, replay=facilities.NON_REPLAYABLE_FACILITY)
+    telemetry = facilities.Telemetry.new(supervisor=coordinator, loss=facilities.DISABLE_AND_CONTINUE, replay=facilities.REPLAYABLE_GAMEPLAY)
     return Image.new(display=display, input=input, events=events, clock=clock, entropy=entropy, telemetry=telemetry)
 "#;
     let accepted = accepted(
@@ -285,14 +540,14 @@ fn build() -> Image:
     assert_eq!(
         contracts[&FacilityKind::MonotonicClock].sharing(),
         FacilitySharing::RegisteredDisjoint {
-            role: 1,
+            role: FacilitySharedRole::MonotonicCounter,
             maximum_units: 1024,
         }
     );
     assert_eq!(
         contracts[&FacilityKind::Entropy].sharing(),
         FacilitySharing::RegisteredDisjoint {
-            role: 2,
+            role: FacilitySharedRole::EntropyQueue,
             maximum_units: 16,
         }
     );
@@ -318,6 +573,24 @@ fn build() -> Image:
         .find(|contract| contract.kind() == FacilityKind::Entropy)
         .unwrap();
     assert!(!entropy.allowed_in_replayable_gameplay());
+    assert_eq!(
+        entropy.replay_rule(),
+        FacilityReplayRule::ExcludedFromReplayableGameplay
+    );
+    assert_eq!(
+        entropy.flagship_rule(),
+        FacilityFlagshipRule::SelectingImageOptional
+    );
+    assert!(
+        planning
+            .facility_contracts()
+            .iter()
+            .filter(|contract| contract.kind() != FacilityKind::Entropy)
+            .all(|contract| contract.flagship_rule()
+                == FacilityFlagshipRule::Required {
+                    loss_policy: contract.loss_policy(),
+                })
+    );
     assert!(
         planning
             .facility_contracts()
@@ -345,10 +618,90 @@ fn build() -> Image:
     assert!(planning.facility_domain_plans().iter().all(|plan| {
         plan.instance_identity() != 0
             && plan.contract_fingerprint() != 0
+            && plan.contract_identity() != 0
+            && plan.contract_current_meaning() != 0
             && plan.generated_role_count() > 0
             && plan.requirement_count() > 0
             && plan.current_meaning() != 0
     }));
+    let facility_requirements = planning
+        .requirements()
+        .iter()
+        .filter(|requirement| {
+            matches!(
+                requirement.subject(),
+                wrela_compiler::RequirementSubject::FacilityInstance(_)
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(facility_requirements.len(), 81);
+    assert!(facility_requirements.iter().any(|requirement| matches!(
+        requirement.bounds(),
+        RequirementBounds::FacilityRecovery {
+            loss_policy: FacilityLossPolicy::SelectingImagePolicy,
+            maximum_attempts: 3,
+            ..
+        }
+    )));
+    assert!(facility_requirements.iter().any(|requirement| matches!(
+        requirement.bounds(),
+        RequirementBounds::FacilityReplay {
+            selected: FacilityReplayAuthority::NonReplayableFacility,
+            rule: FacilityReplayRule::ExcludedFromReplayableGameplay,
+        }
+    )));
+    assert!(facility_requirements.iter().any(|requirement| matches!(
+        requirement.bounds(),
+        RequirementBounds::FacilityFlagship(FacilityFlagshipRule::Required {
+            loss_policy: FacilityLossPolicy::ControlledShutdown,
+        })
+    )));
+    assert_eq!(
+        facility_requirements
+            .iter()
+            .filter(|requirement| matches!(
+                requirement.bounds(),
+                RequirementBounds::FacilityEndpoint {
+                    ownership: FacilityEndpointOwnership::BuildWiredActor,
+                    input_owner: Some(_),
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        facility_requirements
+            .iter()
+            .filter(|requirement| matches!(
+                requirement.bounds(),
+                RequirementBounds::FacilityRecovery { supervisor, .. } if *supervisor != 0
+            ))
+            .count(),
+        6
+    );
+    assert_eq!(
+        facility_requirements
+            .iter()
+            .filter(|requirement| matches!(
+                requirement.bounds(),
+                RequirementBounds::FacilityBindingAvailability(
+                    FacilityBindingAvailability::BootFailure
+                )
+            ))
+            .count(),
+        6
+    );
+    assert_eq!(
+        facility_requirements
+            .iter()
+            .filter(|requirement| matches!(
+                requirement.bounds(),
+                RequirementBounds::FacilityShutdown(_)
+            ))
+            .count(),
+        6
+    );
 }
 
 #[test]
@@ -435,7 +788,8 @@ fn deployment_image_derives_exact_mandatory_planning_closure() {
     assert!(planning.requirements().iter().all(|requirement| {
         let role = match requirement.subject() {
             wrela_compiler::RequirementSubject::GeneratedRole(role) => role,
-            wrela_compiler::RequirementSubject::Pool(_) => return true,
+            wrela_compiler::RequirementSubject::Pool(_)
+            | wrela_compiler::RequirementSubject::FacilityInstance(_) => return true,
         };
         requirement.reference() != 0
             && requirement.owner() == planning.planners()[0].identity()

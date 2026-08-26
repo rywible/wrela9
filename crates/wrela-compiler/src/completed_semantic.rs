@@ -569,14 +569,44 @@ pub(crate) struct ImagePlanningSemanticProgram<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PlanningConstructionNodeRef {
+pub(crate) enum PlanningConstructionValueRef {
+    Construction { kind: BuildKind, identity: u128 },
+    AuthenticatedVariant { owner: u128, variant: u128 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlanningActorRef<'a> {
+    context: u128,
+    identity: u128,
+    current_meaning: u128,
+    _program: std::marker::PhantomData<&'a CompletedSemanticProgram>,
+}
+
+impl<'a> PlanningActorRef<'a> {
+    pub(crate) const fn context(self) -> u128 {
+        self.context
+    }
+
+    pub(crate) const fn identity(self) -> u128 {
+        self.identity
+    }
+
+    pub(crate) const fn current_meaning(self) -> u128 {
+        self.current_meaning
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlanningConstructionNodeRef<'a> {
     context: u128,
     identity: u128,
     current_meaning: u128,
     kind: BuildKind,
+    source: &'a crate::SourceRange,
+    operands: &'a [crate::evaluator::ConstructionOperand],
 }
 
-impl PlanningConstructionNodeRef {
+impl<'a> PlanningConstructionNodeRef<'a> {
     pub(crate) const fn context(self) -> u128 {
         self.context
     }
@@ -591,6 +621,39 @@ impl PlanningConstructionNodeRef {
 
     pub(crate) const fn kind(self) -> BuildKind {
         self.kind
+    }
+
+    pub(crate) const fn source(self) -> &'a crate::SourceRange {
+        self.source
+    }
+
+    pub(crate) fn operand(self, label: &str) -> Option<PlanningConstructionValueRef> {
+        let operand = self
+            .operands
+            .iter()
+            .find(|operand| operand.label.as_ref() == label)?;
+        match &operand.value {
+            crate::evaluator::Value::SymbolicHandle { kind, identity } => {
+                Some(PlanningConstructionValueRef::Construction {
+                    kind: *kind,
+                    identity: *identity,
+                })
+            }
+            crate::evaluator::Value::Struct {
+                construction: Some((kind, identity)),
+                ..
+            } => Some(PlanningConstructionValueRef::Construction {
+                kind: *kind,
+                identity: *identity,
+            }),
+            crate::evaluator::Value::UserVariant { id, .. } => {
+                Some(PlanningConstructionValueRef::AuthenticatedVariant {
+                    owner: id.owner.0,
+                    variant: id.variant,
+                })
+            }
+            _ => None,
+        }
     }
 }
 
@@ -633,7 +696,7 @@ impl<'a> ImagePlanningSemanticProgram<'a> {
 
     pub(crate) fn construction_nodes(
         self,
-    ) -> impl ExactSizeIterator<Item = PlanningConstructionNodeRef> + 'a {
+    ) -> impl ExactSizeIterator<Item = PlanningConstructionNodeRef<'a>> + 'a {
         self.program
             .graph
             .nodes
@@ -643,7 +706,42 @@ impl<'a> ImagePlanningSemanticProgram<'a> {
                 identity: node.identity,
                 current_meaning: node.local_fingerprint,
                 kind: node.kind,
+                source: &node.site,
+                operands: &node.operands,
             })
+    }
+
+    pub(crate) fn actor_construction(self, identity: u128) -> Option<PlanningActorRef<'a>> {
+        let actor = self
+            .program
+            .actors
+            .iter()
+            .find(|actor| actor.construction_identity == identity)?;
+        Some(PlanningActorRef {
+            context: self.program.context.identity,
+            identity: actor.construction_identity,
+            current_meaning: actor.construction_current_meaning,
+            _program: std::marker::PhantomData,
+        })
+    }
+
+    pub(crate) fn authenticated_variant(
+        self,
+        path: &str,
+        enum_name: &str,
+        variant_name: &str,
+    ) -> Option<(u128, u128)> {
+        let owner = self.program.context.identity_catalog.definition(
+            path,
+            crate::syntax::DeclarationKind::Enum,
+            enum_name,
+        )?;
+        let variant = self
+            .program
+            .context
+            .identity_catalog
+            .variant(owner, variant_name)?;
+        Some((variant.owner.0, variant.variant))
     }
 
     pub(crate) fn authenticated_nominal_type(self, path: &str, name: &str) -> Option<u128> {

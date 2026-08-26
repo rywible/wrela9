@@ -7,12 +7,12 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::architecture_planning::{
-    BindingKind, ReservationKind, ReservationMultiplicity, VerifiedArchitecturePlanningContract,
-    VmAbiCapability,
+    BindingKind, FacilitySharedRoleKind, ReservationKind, ReservationMultiplicity,
+    VerifiedArchitecturePlanningContract, VmAbiCapability,
 };
 use crate::completed_semantic::{
     CompletedSemanticProgram, CorePlanningSemanticProgram, CoreSourceExecutableBody,
-    CoreSourceExecutableRef,
+    CoreSourceExecutableRef, PlanningConstructionValueRef,
 };
 use crate::model::{BuildKind, SpecializationId};
 use crate::typed_hir::{
@@ -87,6 +87,29 @@ pub enum FacilityLossPolicy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FacilityReplayAuthority {
+    ReplayableGameplay,
+    NonReplayableFacility,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FacilityReplayRule {
+    ReplayableGameplay,
+    ExcludedFromReplayableGameplay,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FacilityFlagshipRule {
+    Required { loss_policy: FacilityLossPolicy },
+    SelectingImageOptional,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FacilityBindingAvailability {
+    BootFailure,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FacilityShutdown {
     Quiesce,
     FlushCommittedAndQuiesce,
@@ -109,7 +132,25 @@ pub enum FacilitySemanticCapacity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FacilitySharing {
     Exclusive,
-    RegisteredDisjoint { role: u16, maximum_units: u32 },
+    RegisteredDisjoint {
+        role: FacilitySharedRole,
+        maximum_units: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FacilitySharedRole {
+    MonotonicCounter,
+    EntropyQueue,
+}
+
+impl FacilitySharedRole {
+    const fn architecture_kind(self) -> FacilitySharedRoleKind {
+        match self {
+            Self::MonotonicCounter => FacilitySharedRoleKind::MonotonicCounter,
+            Self::EntropyQueue => FacilitySharedRoleKind::EntropyQueue,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -165,6 +206,12 @@ pub enum RequirementCategory {
     Binding,
     LogicalLayout,
     CapacityPressure,
+    FacilityOwnership,
+    Recovery,
+    Shutdown,
+    Replay,
+    Flagship,
+    BootAvailability,
 }
 
 impl RequirementCategory {
@@ -178,6 +225,12 @@ impl RequirementCategory {
             Self::Binding => 6,
             Self::LogicalLayout => 7,
             Self::CapacityPressure => 8,
+            Self::FacilityOwnership => 9,
+            Self::Recovery => 10,
+            Self::Shutdown => 11,
+            Self::Replay => 12,
+            Self::Flagship => 13,
+            Self::BootAvailability => 14,
         }
     }
 }
@@ -342,12 +395,30 @@ pub enum RequirementBounds {
     },
     FacilityCapacity(FacilitySemanticCapacity),
     FacilitySharing(FacilitySharing),
+    FacilityEndpoint {
+        maximum: u32,
+        ownership: FacilityEndpointOwnership,
+        input_owner: Option<u128>,
+    },
+    FacilityRecovery {
+        supervisor: u128,
+        loss_policy: FacilityLossPolicy,
+        maximum_attempts: u16,
+    },
+    FacilityShutdown(FacilityShutdown),
+    FacilityReplay {
+        selected: FacilityReplayAuthority,
+        rule: FacilityReplayRule,
+    },
+    FacilityFlagship(FacilityFlagshipRule),
+    FacilityBindingAvailability(FacilityBindingAvailability),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RequirementSubject {
     GeneratedRole(u128),
     Pool(u128),
+    FacilityInstance(u128),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -387,8 +458,8 @@ pub struct FacilityContractObservation {
     maximum_instances: u32,
     maximum_exported_endpoints: u32,
     endpoint_ownership: FacilityEndpointOwnership,
-    required_by_flagship: bool,
-    allowed_in_replayable_gameplay: bool,
+    flagship_rule: FacilityFlagshipRule,
+    replay_rule: FacilityReplayRule,
     generated_roles: Arc<[GeneratedRoleKind]>,
     semantic_capacities: Arc<[FacilitySemanticCapacity]>,
     required_capabilities: Arc<[PlanningCapability]>,
@@ -397,6 +468,7 @@ pub struct FacilityContractObservation {
     loss_policy: FacilityLossPolicy,
     shutdown: FacilityShutdown,
     maximum_recovery_attempts: u16,
+    binding_availability: FacilityBindingAvailability,
 }
 
 impl FacilityContractObservation {
@@ -434,10 +506,16 @@ impl FacilityContractObservation {
         self.endpoint_ownership
     }
     pub const fn required_by_flagship(&self) -> bool {
-        self.required_by_flagship
+        matches!(self.flagship_rule, FacilityFlagshipRule::Required { .. })
     }
     pub const fn allowed_in_replayable_gameplay(&self) -> bool {
-        self.allowed_in_replayable_gameplay
+        matches!(self.replay_rule, FacilityReplayRule::ReplayableGameplay)
+    }
+    pub const fn flagship_rule(&self) -> FacilityFlagshipRule {
+        self.flagship_rule
+    }
+    pub const fn replay_rule(&self) -> FacilityReplayRule {
+        self.replay_rule
     }
     pub fn generated_roles(&self) -> &[GeneratedRoleKind] {
         &self.generated_roles
@@ -457,10 +535,7 @@ impl FacilityContractObservation {
     pub const fn physical_sharing_is_registered_disjoint_or_exclusive(&self) -> bool {
         match self.sharing {
             FacilitySharing::Exclusive => true,
-            FacilitySharing::RegisteredDisjoint {
-                role,
-                maximum_units,
-            } => role > 0 && maximum_units > 0,
+            FacilitySharing::RegisteredDisjoint { maximum_units, .. } => maximum_units > 0,
         }
     }
     pub const fn loss_policy(&self) -> FacilityLossPolicy {
@@ -473,7 +548,13 @@ impl FacilityContractObservation {
         self.maximum_recovery_attempts
     }
     pub const fn ambient_binding_unavailability_is_boot_failure(&self) -> bool {
-        true
+        matches!(
+            self.binding_availability,
+            FacilityBindingAvailability::BootFailure
+        )
+    }
+    pub const fn binding_availability(&self) -> FacilityBindingAvailability {
+        self.binding_availability
     }
 }
 
@@ -483,6 +564,8 @@ pub struct FacilityDomainPlanObservation {
     kind: FacilityKind,
     instance_identity: u128,
     contract_fingerprint: u128,
+    contract_identity: u128,
+    contract_current_meaning: u128,
     current_meaning: u128,
     generated_role_count: usize,
     requirement_count: usize,
@@ -501,6 +584,12 @@ impl FacilityDomainPlanObservation {
     pub const fn contract_fingerprint(&self) -> u128 {
         self.contract_fingerprint
     }
+    pub const fn contract_identity(&self) -> u128 {
+        self.contract_identity
+    }
+    pub const fn contract_current_meaning(&self) -> u128 {
+        self.contract_current_meaning
+    }
     pub const fn current_meaning(&self) -> u128 {
         self.current_meaning
     }
@@ -514,16 +603,46 @@ impl FacilityDomainPlanObservation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FacilityContract {
+    reference: FacilityContractRef,
     observation: FacilityContractObservation,
     authentication: u128,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FacilityContractRef {
+    context: u128,
+    identity: u128,
+    current_meaning: u128,
+    fingerprint: u128,
+    kind: FacilityKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FacilityActorRef {
+    context: u128,
+    identity: u128,
+    current_meaning: u128,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FacilitySubjectRef {
+    context: u128,
+    identity: u128,
+    current_meaning: u128,
+    kind: FacilityKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct FacilityInstanceRef {
     context: u128,
     identity: u128,
     current_meaning: u128,
     kind: FacilityKind,
+    source: SourceRange,
+    supervisor: FacilityActorRef,
+    input_owner: Option<FacilityActorRef>,
+    selected_loss_policy: FacilityLossPolicy,
+    replay_authority: FacilityReplayAuthority,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1022,7 +1141,7 @@ pub(crate) struct DomainPlan {
     generated_roles: Arc<[RoleRef]>,
     requirements: Arc<[RequirementRef]>,
     facility_instance: Option<FacilityInstanceRef>,
-    facility_contract_fingerprint: Option<u128>,
+    facility_contract: Option<FacilityContractRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1046,12 +1165,14 @@ pub(crate) struct Requirement {
     provenance: RequirementProvenance,
     category: RequirementCategory,
     bounds: RequirementBounds,
+    facility_contract: Option<FacilityContractRef>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequirementOwner {
     GeneratedRole(RoleRef),
     Pool(PoolRef),
+    Facility(FacilitySubjectRef),
 }
 
 impl RequirementOwner {
@@ -1059,6 +1180,7 @@ impl RequirementOwner {
         match self {
             Self::GeneratedRole(reference) => reference.context,
             Self::Pool(reference) => reference.context,
+            Self::Facility(reference) => reference.context,
         }
     }
 }
@@ -1319,6 +1441,9 @@ impl VerifiedPlanningFoundation {
                         RequirementOwner::Pool(reference) => {
                             RequirementSubject::Pool(reference.identity)
                         }
+                        RequirementOwner::Facility(reference) => {
+                            RequirementSubject::FacilityInstance(reference.identity)
+                        }
                     },
                     provenance: requirement.provenance,
                     category: requirement.category,
@@ -1377,12 +1502,14 @@ impl VerifiedPlanningFoundation {
                 .domain_plans
                 .iter()
                 .filter_map(|plan| {
-                    let instance = plan.facility_instance?;
+                    let instance = plan.facility_instance.clone()?;
                     Some(FacilityDomainPlanObservation {
                         identity: plan.reference.identity,
                         kind: instance.kind,
                         instance_identity: instance.identity,
-                        contract_fingerprint: plan.facility_contract_fingerprint?,
+                        contract_fingerprint: plan.facility_contract?.fingerprint,
+                        contract_identity: plan.facility_contract?.identity,
+                        contract_current_meaning: plan.facility_contract?.current_meaning,
                         current_meaning: plan.reference.current_meaning,
                         generated_role_count: plan.generated_roles.len(),
                         requirement_count: plan.requirements.len(),
@@ -1441,10 +1568,27 @@ fn producer_facility_contracts(distribution_digest: u128) -> Arc<[FacilityContra
 }
 
 fn producer_facility_contract(kind: FacilityKind, distribution_digest: u128) -> FacilityContract {
+    producer_facility_contract_with_cardinality(kind, distribution_digest, 0, 1)
+}
+
+fn producer_facility_contract_with_cardinality(
+    kind: FacilityKind,
+    distribution_digest: u128,
+    minimum_instances: u32,
+    maximum_instances: u32,
+) -> FacilityContract {
     let (roles, capacities, capabilities, binding, sharing, loss_policy, shutdown) =
         producer_facility_facts(kind);
-    let required_by_flagship = kind != FacilityKind::Entropy;
-    let allowed_in_replayable_gameplay = kind != FacilityKind::Entropy;
+    let flagship_rule = if kind == FacilityKind::Entropy {
+        FacilityFlagshipRule::SelectingImageOptional
+    } else {
+        FacilityFlagshipRule::Required { loss_policy }
+    };
+    let replay_rule = if kind == FacilityKind::Entropy {
+        FacilityReplayRule::ExcludedFromReplayableGameplay
+    } else {
+        FacilityReplayRule::ReplayableGameplay
+    };
     let identity = producer_hash(
         b"wrela.facility-contract.identity.v1",
         &[u128::from(kind.tag())],
@@ -1467,15 +1611,15 @@ fn producer_facility_contract(kind: FacilityKind, distribution_digest: u128) -> 
             distribution_digest,
             1,
             1,
-            0,
-            1,
+            u128::from(minimum_instances),
+            u128::from(maximum_instances),
             1,
             match endpoint_ownership {
                 FacilityEndpointOwnership::FacilityInstance => 1,
                 FacilityEndpointOwnership::BuildWiredActor => 2,
             },
-            u128::from(required_by_flagship),
-            u128::from(allowed_in_replayable_gameplay),
+            facility_flagship_tag(flagship_rule),
+            facility_replay_rule_tag(replay_rule),
             if kind == FacilityKind::Telemetry {
                 1
             } else {
@@ -1493,6 +1637,13 @@ fn producer_facility_contract(kind: FacilityKind, distribution_digest: u128) -> 
         ],
     );
     FacilityContract {
+        reference: FacilityContractRef {
+            context: context_receipt,
+            identity,
+            current_meaning: fingerprint,
+            fingerprint,
+            kind,
+        },
         observation: FacilityContractObservation {
             kind,
             identity,
@@ -1501,12 +1652,12 @@ fn producer_facility_contract(kind: FacilityKind, distribution_digest: u128) -> 
             current_meaning: fingerprint,
             allows_deployment: true,
             allows_test: true,
-            minimum_instances: 0,
-            maximum_instances: 1,
+            minimum_instances,
+            maximum_instances,
             maximum_exported_endpoints: 1,
             endpoint_ownership,
-            required_by_flagship,
-            allowed_in_replayable_gameplay,
+            flagship_rule,
+            replay_rule,
             generated_roles: roles,
             semantic_capacities: capacities,
             required_capabilities: capabilities,
@@ -1519,6 +1670,7 @@ fn producer_facility_contract(kind: FacilityKind, distribution_digest: u128) -> 
             } else {
                 3
             },
+            binding_availability: FacilityBindingAvailability::BootFailure,
         },
         authentication: producer_hash(
             b"wrela.facility-contract.authentication.v1",
@@ -1581,7 +1733,7 @@ fn producer_facility_facts(kind: FacilityKind) -> FacilityFacts {
             Arc::from([PlanningCapability::MonotonicCounter]),
             PlanningBinding::MonotonicClock,
             FacilitySharing::RegisteredDisjoint {
-                role: 1,
+                role: FacilitySharedRole::MonotonicCounter,
                 maximum_units: 1024,
             },
             FacilityLossPolicy::ControlledShutdown,
@@ -1593,7 +1745,7 @@ fn producer_facility_facts(kind: FacilityKind) -> FacilityFacts {
             virtio,
             PlanningBinding::Entropy,
             FacilitySharing::RegisteredDisjoint {
-                role: 2,
+                role: FacilitySharedRole::EntropyQueue,
                 maximum_units: 16,
             },
             FacilityLossPolicy::SelectingImagePolicy,
@@ -1657,7 +1809,13 @@ const fn facility_sharing_tag(sharing: FacilitySharing) -> u128 {
         FacilitySharing::RegisteredDisjoint {
             role,
             maximum_units,
-        } => (2_u128 << 96) | ((role as u128) << 64) | maximum_units as u128,
+        } => {
+            let role = match role {
+                FacilitySharedRole::MonotonicCounter => 1_u128,
+                FacilitySharedRole::EntropyQueue => 2_u128,
+            };
+            (2_u128 << 96) | (role << 64) | maximum_units as u128
+        }
     }
 }
 
@@ -1666,6 +1824,40 @@ const fn facility_loss_tag(loss: FacilityLossPolicy) -> u128 {
         FacilityLossPolicy::ControlledShutdown => 1,
         FacilityLossPolicy::DisableAndContinue => 2,
         FacilityLossPolicy::SelectingImagePolicy => 3,
+    }
+}
+
+const fn facility_flagship_tag(rule: FacilityFlagshipRule) -> u128 {
+    match rule {
+        FacilityFlagshipRule::Required { loss_policy } => 0x100 | facility_loss_tag(loss_policy),
+        FacilityFlagshipRule::SelectingImageOptional => 2,
+    }
+}
+
+const fn facility_replay_rule_tag(rule: FacilityReplayRule) -> u128 {
+    match rule {
+        FacilityReplayRule::ReplayableGameplay => 1,
+        FacilityReplayRule::ExcludedFromReplayableGameplay => 2,
+    }
+}
+
+const fn facility_replay_authority_tag(authority: FacilityReplayAuthority) -> u8 {
+    match authority {
+        FacilityReplayAuthority::ReplayableGameplay => 1,
+        FacilityReplayAuthority::NonReplayableFacility => 2,
+    }
+}
+
+const fn facility_endpoint_ownership_tag(ownership: FacilityEndpointOwnership) -> u8 {
+    match ownership {
+        FacilityEndpointOwnership::FacilityInstance => 1,
+        FacilityEndpointOwnership::BuildWiredActor => 2,
+    }
+}
+
+const fn facility_binding_availability_tag(availability: FacilityBindingAvailability) -> u8 {
+    match availability {
+        FacilityBindingAvailability::BootFailure => 1,
     }
 }
 
@@ -1692,6 +1884,38 @@ fn discover_facility_instances(
                 .map(|identity| (identity, kind))
         })
         .collect::<BTreeMap<_, _>>();
+    let loss_variants = [
+        ("ControlledShutdown", FacilityLossPolicy::ControlledShutdown),
+        ("DisableAndContinue", FacilityLossPolicy::DisableAndContinue),
+        (
+            "SelectingImagePolicy",
+            FacilityLossPolicy::SelectingImagePolicy,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, policy)| {
+        semantic
+            .authenticated_variant("src/core/facilities.wr", "FacilityLossSelection", name)
+            .map(|identity| (identity, policy))
+    })
+    .collect::<BTreeMap<_, _>>();
+    let replay_variants = [
+        (
+            "ReplayableGameplay",
+            FacilityReplayAuthority::ReplayableGameplay,
+        ),
+        (
+            "NonReplayableFacility",
+            FacilityReplayAuthority::NonReplayableFacility,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, authority)| {
+        semantic
+            .authenticated_variant("src/core/facilities.wr", "FacilityReplayAuthority", name)
+            .map(|identity| (identity, authority))
+    })
+    .collect::<BTreeMap<_, _>>();
     let mut instances = Vec::new();
     for node in semantic.construction_nodes() {
         checkpoint(cancellation)?;
@@ -1701,15 +1925,77 @@ fn discover_facility_instances(
         let Some(kind) = type_kinds.get(&type_identity.0).copied() else {
             continue;
         };
+        let supervisor = facility_actor_operand(semantic, node, "supervisor").ok_or_else(|| {
+            PlanningFailure::FacilityConfiguration {
+                kind,
+                instance: node.identity(),
+                source: node.source().clone(),
+                failure: FacilityConfigurationFailure::SupervisorNotActor,
+            }
+        })?;
+        let input_owner = if kind == FacilityKind::Input {
+            Some(
+                facility_actor_operand(semantic, node, "owner").ok_or_else(|| {
+                    PlanningFailure::FacilityConfiguration {
+                        kind,
+                        instance: node.identity(),
+                        source: node.source().clone(),
+                        failure: FacilityConfigurationFailure::InputOwnerNotActor,
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
+        let selected_loss_policy = facility_variant_operand(node, "loss", &loss_variants)
+            .ok_or_else(|| PlanningFailure::Defect(Arc::from("Facility loss fact is malformed")))?;
+        let replay_authority = facility_variant_operand(node, "replay", &replay_variants)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("Facility replay fact is malformed"))
+            })?;
         instances.push(FacilityInstanceRef {
             context: node.context(),
             identity: node.identity(),
             current_meaning: node.current_meaning(),
             kind,
+            source: node.source().clone(),
+            supervisor,
+            input_owner,
+            selected_loss_policy,
+            replay_authority,
         });
     }
     instances.sort_by_key(|instance| instance.identity);
     Ok(instances)
+}
+
+fn facility_actor_operand(
+    semantic: crate::completed_semantic::ImagePlanningSemanticProgram<'_>,
+    node: crate::completed_semantic::PlanningConstructionNodeRef<'_>,
+    label: &str,
+) -> Option<FacilityActorRef> {
+    let PlanningConstructionValueRef::Construction { identity, .. } = node.operand(label)? else {
+        return None;
+    };
+    let actor = semantic.actor_construction(identity)?;
+    Some(FacilityActorRef {
+        context: actor.context(),
+        identity: actor.identity(),
+        current_meaning: actor.current_meaning(),
+    })
+}
+
+fn facility_variant_operand<T: Copy>(
+    node: crate::completed_semantic::PlanningConstructionNodeRef<'_>,
+    label: &str,
+    variants: &BTreeMap<(u128, u128), T>,
+) -> Option<T> {
+    let PlanningConstructionValueRef::AuthenticatedVariant { owner, variant } =
+        node.operand(label)?
+    else {
+        return None;
+    };
+    variants.get(&(owner, variant)).copied()
 }
 
 #[allow(dead_code)]
@@ -1785,9 +2071,55 @@ pub(crate) enum PlanningFailure {
     FacilityCardinality {
         kind: FacilityKind,
         selected: u32,
+        minimum: u32,
         maximum: u32,
+        sites: Arc<[FacilityConflictSite]>,
+    },
+    FacilityConfiguration {
+        kind: FacilityKind,
+        instance: u128,
+        source: SourceRange,
+        failure: FacilityConfigurationFailure,
+    },
+    FacilityCompatibility {
+        kind: FacilityKind,
+        instance: u128,
+        source: SourceRange,
+        requirement: RequirementRef,
+        missing: FacilityCompatibilityMissing,
     },
     Defect(Arc<str>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FacilityConflictSite {
+    pub(crate) identity: u128,
+    pub(crate) source: SourceRange,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FacilityCompatibilityMissing {
+    Capability(PlanningCapability),
+    Binding(PlanningBinding),
+    SharedRole {
+        role: FacilitySharedRole,
+        required_units: u32,
+        available_units: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FacilityConfigurationFailure {
+    SupervisorNotActor,
+    InputOwnerNotActor,
+    LossPolicy {
+        selected: FacilityLossPolicy,
+        required: FacilityLossPolicy,
+    },
+    ReplayAuthority {
+        selected: FacilityReplayAuthority,
+        required: FacilityReplayAuthority,
+    },
 }
 
 impl ImagePlanningModule {
@@ -1838,19 +2170,7 @@ impl ImagePlanningModule {
         )?;
         let facility_contracts = producer_facility_contracts(semantic.distribution_digest());
         let facility_instances = discover_facility_instances(semantic, cancellation)?;
-        for kind in FACILITY_KINDS {
-            let selected = facility_instances
-                .iter()
-                .filter(|instance| instance.kind == kind)
-                .count();
-            if selected > 1 {
-                return Err(PlanningFailure::FacilityCardinality {
-                    kind,
-                    selected: checked_u32(selected)?,
-                    maximum: 1,
-                });
-            }
-        }
+        validate_facility_cardinality(&facility_instances, &facility_contracts, cancellation)?;
         let mut planners = vec![planner.clone()];
         let mut plans = vec![plan.clone()];
         for instance in &facility_instances {
@@ -1863,11 +2183,42 @@ impl ImagePlanningModule {
                         "selected Facility has no authenticated contract",
                     ))
                 })?;
-            let facility_planner =
-                produce_facility_planner(context, *instance, contract, architecture.fingerprint());
+            if instance.selected_loss_policy != contract.observation.loss_policy {
+                return Err(PlanningFailure::FacilityConfiguration {
+                    kind: instance.kind,
+                    instance: instance.identity,
+                    source: instance.source.clone(),
+                    failure: FacilityConfigurationFailure::LossPolicy {
+                        selected: instance.selected_loss_policy,
+                        required: contract.observation.loss_policy,
+                    },
+                });
+            }
+            let required_replay = if contract.observation.allowed_in_replayable_gameplay() {
+                FacilityReplayAuthority::ReplayableGameplay
+            } else {
+                FacilityReplayAuthority::NonReplayableFacility
+            };
+            if instance.replay_authority != required_replay {
+                return Err(PlanningFailure::FacilityConfiguration {
+                    kind: instance.kind,
+                    instance: instance.identity,
+                    source: instance.source.clone(),
+                    failure: FacilityConfigurationFailure::ReplayAuthority {
+                        selected: instance.replay_authority,
+                        required: required_replay,
+                    },
+                });
+            }
+            let facility_planner = produce_facility_planner(
+                context,
+                instance.clone(),
+                contract,
+                architecture.fingerprint(),
+            );
             let mut facility_plan = produce_facility_domain_plan(
                 context,
-                *instance,
+                instance.clone(),
                 facility_planner.reference,
                 contract,
             );
@@ -1879,19 +2230,19 @@ impl ImagePlanningModule {
                 architecture.fingerprint(),
                 cancellation,
             )?;
-            let selected = checked_u32(
-                facility_instances
-                    .iter()
-                    .filter(|candidate| candidate.kind == instance.kind)
-                    .count(),
-            )?;
             let facility_requirements = produce_facility_requirements(
                 context,
                 facility_planner.reference,
                 facility_plan.reference,
+                instance,
                 &facility_roles,
                 contract,
-                selected,
+                cancellation,
+            )?;
+            check_facility_compatibility(
+                architecture,
+                instance,
+                &facility_requirements,
                 cancellation,
             )?;
             facility_plan.generated_roles = facility_roles
@@ -2013,6 +2364,90 @@ impl ImagePlanningModule {
     }
 }
 
+fn validate_facility_cardinality(
+    instances: &[FacilityInstanceRef],
+    contracts: &[FacilityContract],
+    cancellation: &Cancellation,
+) -> Result<(), PlanningFailure> {
+    for contract in contracts {
+        checkpoint(cancellation)?;
+        let kind = contract.observation.kind;
+        let selected = checked_u32(
+            instances
+                .iter()
+                .filter(|instance| instance.kind == kind)
+                .count(),
+        )?;
+        if selected < contract.observation.minimum_instances
+            || selected > contract.observation.maximum_instances
+        {
+            return Err(PlanningFailure::FacilityCardinality {
+                kind,
+                selected,
+                minimum: contract.observation.minimum_instances,
+                maximum: contract.observation.maximum_instances,
+                sites: instances
+                    .iter()
+                    .filter(|instance| instance.kind == kind)
+                    .map(|instance| FacilityConflictSite {
+                        identity: instance.identity,
+                        source: instance.source.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn check_facility_compatibility(
+    architecture: crate::architecture_planning::ImagePlanningArchitecture<'_>,
+    instance: &FacilityInstanceRef,
+    requirements: &[Requirement],
+    cancellation: &Cancellation,
+) -> Result<(), PlanningFailure> {
+    for requirement in requirements {
+        checkpoint(cancellation)?;
+        let missing = match requirement.bounds {
+            RequirementBounds::Capability(capability)
+                if !architecture.has_capability(capability.contract_kind()) =>
+            {
+                Some(FacilityCompatibilityMissing::Capability(capability))
+            }
+            RequirementBounds::Binding { kind, .. }
+                if !architecture.has_binding(kind.contract_kind()) =>
+            {
+                Some(FacilityCompatibilityMissing::Binding(kind))
+            }
+            RequirementBounds::FacilitySharing(FacilitySharing::RegisteredDisjoint {
+                role,
+                maximum_units,
+            }) => {
+                let available = architecture
+                    .facility_share(role.architecture_kind())
+                    .map_or(0, |registration| registration.maximum_units);
+                (available < maximum_units).then_some(FacilityCompatibilityMissing::SharedRole {
+                    role,
+                    required_units: maximum_units,
+                    available_units: available,
+                })
+            }
+            _ => None,
+        };
+        if let Some(missing) = missing {
+            return Err(PlanningFailure::FacilityCompatibility {
+                kind: instance.kind,
+                instance: instance.identity,
+                source: instance.source.clone(),
+                requirement: requirement.reference,
+                missing,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn produce_planner(
     context: u128,
     root: Root,
@@ -2067,7 +2502,7 @@ fn produce_domain_plan(
         generated_roles: Arc::from([]),
         requirements: Arc::from([]),
         facility_instance: None,
-        facility_contract_fingerprint: None,
+        facility_contract: None,
     }
 }
 
@@ -2132,7 +2567,7 @@ fn produce_facility_domain_plan(
         generated_roles: Arc::from([]),
         requirements: Arc::from([]),
         facility_instance: Some(instance),
-        facility_contract_fingerprint: Some(contract.observation.fingerprint),
+        facility_contract: Some(contract.reference),
     }
 }
 
@@ -2202,13 +2637,17 @@ fn produce_facility_requirements(
     context: u128,
     planner: PlannerRef,
     plan: DomainPlanRef,
+    instance: &FacilityInstanceRef,
     roles: &[GeneratedRole],
     contract: &FacilityContract,
-    selected: u32,
     cancellation: &Cancellation,
 ) -> Result<Vec<Requirement>, PlanningFailure> {
     let mut requirements = Vec::new();
-    for role in roles {
+    for (role_ordinal, kind) in contract.observation.generated_roles.iter().enumerate() {
+        let role = roles
+            .iter()
+            .find(|role| role.kind == *kind)
+            .ok_or_else(|| PlanningFailure::Defect(Arc::from("Facility role is missing")))?;
         for spec in [
             RequirementSpec {
                 category: RequirementCategory::GeneratedRoleRealization,
@@ -2221,9 +2660,10 @@ fn produce_facility_requirements(
                 bounds: RequirementBounds::ImageLifetime,
             },
         ] {
-            let local_site = u16::try_from(requirements.len() + 1).map_err(|_| {
-                PlanningFailure::Defect(Arc::from("Facility requirement site overflow"))
-            })?;
+            let local_site = u16::try_from(100 + role_ordinal * 2 + requirements.len() % 2)
+                .map_err(|_| {
+                    PlanningFailure::Defect(Arc::from("Facility requirement site overflow"))
+                })?;
             requirements.push(produce_requirement(
                 context,
                 planner,
@@ -2234,32 +2674,44 @@ fn produce_facility_requirements(
             ));
         }
     }
-    let subject = roles.first().ok_or_else(|| {
-        PlanningFailure::Defect(Arc::from("Facility contract has no Generated Roles"))
-    })?;
+    let subject = FacilitySubjectRef {
+        context: instance.context,
+        identity: instance.identity,
+        current_meaning: instance.current_meaning,
+        kind: instance.kind,
+    };
     let mut specs = vec![
-        RequirementSpec {
-            category: RequirementCategory::Cardinality,
-            bounds: RequirementBounds::Cardinality {
-                minimum: selected,
-                maximum: 1,
+        (
+            1,
+            RequirementSpec {
+                category: RequirementCategory::Cardinality,
+                bounds: RequirementBounds::Cardinality {
+                    minimum: contract.observation.minimum_instances,
+                    maximum: contract.observation.maximum_instances,
+                },
             },
-        },
-        RequirementSpec {
-            category: RequirementCategory::Binding,
-            bounds: RequirementBounds::Binding {
-                kind: contract
-                    .observation
-                    .external_binding
-                    .expect("verified Facility binding"),
-                minimum: 1,
-                maximum: 1,
+        ),
+        (
+            2,
+            RequirementSpec {
+                category: RequirementCategory::Binding,
+                bounds: RequirementBounds::Binding {
+                    kind: contract
+                        .observation
+                        .external_binding
+                        .expect("verified Facility binding"),
+                    minimum: 1,
+                    maximum: contract.observation.maximum_exported_endpoints,
+                },
             },
-        },
-        RequirementSpec {
-            category: RequirementCategory::Binding,
-            bounds: RequirementBounds::FacilitySharing(contract.observation.sharing),
-        },
+        ),
+        (
+            3,
+            RequirementSpec {
+                category: RequirementCategory::Binding,
+                bounds: RequirementBounds::FacilitySharing(contract.observation.sharing),
+            },
+        ),
     ];
     specs.extend(
         contract
@@ -2267,9 +2719,15 @@ fn produce_facility_requirements(
             .required_capabilities
             .iter()
             .copied()
-            .map(|capability| RequirementSpec {
-                category: RequirementCategory::ArchitectureCapability,
-                bounds: RequirementBounds::Capability(capability),
+            .enumerate()
+            .map(|(ordinal, capability)| {
+                (
+                    10 + u16::try_from(ordinal).unwrap_or(u16::MAX),
+                    RequirementSpec {
+                        category: RequirementCategory::ArchitectureCapability,
+                        bounds: RequirementBounds::Capability(capability),
+                    },
+                )
             }),
     );
     specs.extend(
@@ -2278,27 +2736,127 @@ fn produce_facility_requirements(
             .semantic_capacities
             .iter()
             .copied()
-            .map(|capacity| RequirementSpec {
-                category: RequirementCategory::CapacityPressure,
-                bounds: RequirementBounds::FacilityCapacity(capacity),
+            .enumerate()
+            .map(|(ordinal, capacity)| {
+                (
+                    30 + u16::try_from(ordinal).unwrap_or(u16::MAX),
+                    RequirementSpec {
+                        category: RequirementCategory::CapacityPressure,
+                        bounds: RequirementBounds::FacilityCapacity(capacity),
+                    },
+                )
             }),
     );
-    for spec in specs {
+    specs.extend([
+        (
+            50,
+            RequirementSpec {
+                category: RequirementCategory::FacilityOwnership,
+                bounds: RequirementBounds::FacilityEndpoint {
+                    maximum: contract.observation.maximum_exported_endpoints,
+                    ownership: contract.observation.endpoint_ownership,
+                    input_owner: instance.input_owner.map(|owner| owner.identity),
+                },
+            },
+        ),
+        (
+            51,
+            RequirementSpec {
+                category: RequirementCategory::Recovery,
+                bounds: RequirementBounds::FacilityRecovery {
+                    supervisor: instance.supervisor.identity,
+                    loss_policy: instance.selected_loss_policy,
+                    maximum_attempts: contract.observation.maximum_recovery_attempts,
+                },
+            },
+        ),
+        (
+            52,
+            RequirementSpec {
+                category: RequirementCategory::Shutdown,
+                bounds: RequirementBounds::FacilityShutdown(contract.observation.shutdown),
+            },
+        ),
+        (
+            53,
+            RequirementSpec {
+                category: RequirementCategory::Replay,
+                bounds: RequirementBounds::FacilityReplay {
+                    selected: instance.replay_authority,
+                    rule: contract.observation.replay_rule,
+                },
+            },
+        ),
+        (
+            54,
+            RequirementSpec {
+                category: RequirementCategory::Flagship,
+                bounds: RequirementBounds::FacilityFlagship(contract.observation.flagship_rule),
+            },
+        ),
+        (
+            55,
+            RequirementSpec {
+                category: RequirementCategory::BootAvailability,
+                bounds: RequirementBounds::FacilityBindingAvailability(
+                    contract.observation.binding_availability,
+                ),
+            },
+        ),
+    ]);
+    for (local_site, spec) in specs {
         checkpoint(cancellation)?;
-        let local_site = u16::try_from(requirements.len() + 1).map_err(|_| {
-            PlanningFailure::Defect(Arc::from("Facility requirement site overflow"))
-        })?;
-        requirements.push(produce_requirement(
+        requirements.push(produce_facility_requirement(
             context,
             planner,
             plan,
-            subject.reference,
+            subject,
+            contract.reference,
             local_site,
             spec,
         ));
     }
     requirements.sort_by_key(|requirement| requirement.reference.identity);
     Ok(requirements)
+}
+
+fn produce_facility_requirement(
+    context: u128,
+    owner: PlannerRef,
+    plan: DomainPlanRef,
+    subject: FacilitySubjectRef,
+    contract: FacilityContractRef,
+    local_site: u16,
+    spec: RequirementSpec,
+) -> Requirement {
+    let identity =
+        produce_requirement_identity(owner.identity, subject.identity, spec.category, local_site);
+    let current_meaning = produce_requirement_current_meaning(
+        identity,
+        owner.current_meaning,
+        subject.current_meaning,
+        plan.current_meaning,
+        spec.category,
+        &spec.bounds,
+    );
+    Requirement {
+        context,
+        reference: RequirementRef {
+            context,
+            identity,
+            current_meaning,
+        },
+        owner,
+        subject: RequirementOwner::Facility(subject),
+        provenance: RequirementProvenance {
+            domain_plan: plan.identity,
+            generated_role: subject.identity,
+            local_site,
+        },
+        category: spec.category,
+        bounds: spec.bounds,
+        facility_contract: Some(contract),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2592,6 +3150,7 @@ fn produce_requirement(
         provenance,
         category: spec.category,
         bounds: spec.bounds,
+        facility_contract: None,
     }
 }
 
@@ -2762,6 +3321,7 @@ fn collect_pool_plans(
                         provenance,
                         category: RequirementCategory::CapacityPressure,
                         bounds,
+                        facility_contract: None,
                     });
                     admission_sites.push(PoolAdmissionSite {
                         executable_identity: site_executable,
@@ -4351,6 +4911,7 @@ fn audit_pool_foundation(
                 },
                 category: RequirementCategory::CapacityPressure,
                 bounds,
+                facility_contract: None,
             });
         }
     }
@@ -4487,6 +5048,20 @@ fn verify(
         cancellation,
     )?;
     let instances = discover_facility_instances(semantic, cancellation)?;
+    for contract in expected_contracts.iter() {
+        checkpoint(cancellation)?;
+        let selected = checked_u32(
+            instances
+                .iter()
+                .filter(|instance| instance.kind == contract.observation.kind)
+                .count(),
+        )?;
+        if selected < contract.observation.minimum_instances
+            || selected > contract.observation.maximum_instances
+        {
+            return defect("Facility cardinality violates its authenticated contract");
+        }
+    }
     let mut expected_planners = vec![expected_planner.clone()];
     let mut expected_plans = vec![expected_plan.clone()];
     for instance in &instances {
@@ -4496,14 +5071,29 @@ fn verify(
             .ok_or_else(|| {
                 PlanningFailure::Defect(Arc::from("verifier selected Facility has no contract"))
             })?;
+        let required_replay = match contract.observation.replay_rule {
+            FacilityReplayRule::ReplayableGameplay => FacilityReplayAuthority::ReplayableGameplay,
+            FacilityReplayRule::ExcludedFromReplayableGameplay => {
+                FacilityReplayAuthority::NonReplayableFacility
+            }
+        };
+        if instance.selected_loss_policy != contract.observation.loss_policy
+            || instance.replay_authority != required_replay
+        {
+            return defect("Facility instance configuration disagrees with its contract");
+        }
         let planner = verify_facility_planner(
             candidate.context,
-            *instance,
+            instance.clone(),
             contract,
             architecture.fingerprint(),
         );
-        let mut plan =
-            verify_facility_domain_plan(candidate.context, *instance, planner.reference, contract);
+        let mut plan = verify_facility_domain_plan(
+            candidate.context,
+            instance.clone(),
+            planner.reference,
+            contract,
+        );
         let roles = verify_facility_roles(
             candidate.context,
             planner.reference,
@@ -4516,14 +5106,9 @@ fn verify(
             candidate.context,
             planner.reference,
             plan.reference,
+            instance,
             &roles,
             contract,
-            checked_u32(
-                instances
-                    .iter()
-                    .filter(|candidate| candidate.kind == instance.kind)
-                    .count(),
-            )?,
             cancellation,
         )?;
         plan.generated_roles = roles
@@ -4655,95 +5240,118 @@ fn verify_planner(
 fn verify_facility_contracts(distribution_digest: u128) -> Arc<[FacilityContract]> {
     FACILITY_KINDS
         .into_iter()
-        .map(|kind| {
-            let (roles, capacities, capabilities, binding, sharing, loss_policy, shutdown) =
-                verifier_facility_facts(kind);
-            let required_by_flagship = kind != FacilityKind::Entropy;
-            let allowed_in_replayable_gameplay = kind != FacilityKind::Entropy;
-            let identity = verifier_hash(
-                b"wrela.facility-contract.identity.v1",
-                &[u128::from(kind.tag())],
-            );
-            let context_receipt = verifier_hash(
-                b"wrela.facility-contract.context.v1",
-                &[distribution_digest],
-            );
-            let endpoint_ownership = if kind == FacilityKind::Input {
-                FacilityEndpointOwnership::BuildWiredActor
-            } else {
-                FacilityEndpointOwnership::FacilityInstance
-            };
-            let facts = verifier_facility_facts_fingerprint(
-                &roles,
-                &capacities,
-                &capabilities,
-                binding,
-                sharing,
-                loss_policy,
-                shutdown,
-            );
-            let fingerprint = verifier_hash(
-                b"wrela.facility-contract.v1",
-                &[
-                    u128::from(kind.tag()),
-                    identity,
-                    context_receipt,
-                    distribution_digest,
-                    1,
-                    1,
-                    0,
-                    1,
-                    1,
-                    match endpoint_ownership {
-                        FacilityEndpointOwnership::FacilityInstance => 1,
-                        FacilityEndpointOwnership::BuildWiredActor => 2,
-                    },
-                    u128::from(required_by_flagship),
-                    u128::from(allowed_in_replayable_gameplay),
-                    if kind == FacilityKind::Telemetry {
-                        1
-                    } else {
-                        3
-                    },
-                    facts,
-                ],
-            );
-            FacilityContract {
-                observation: FacilityContractObservation {
-                    kind,
-                    identity,
-                    context_receipt,
-                    fingerprint,
-                    current_meaning: fingerprint,
-                    allows_deployment: true,
-                    allows_test: true,
-                    minimum_instances: 0,
-                    maximum_instances: 1,
-                    maximum_exported_endpoints: 1,
-                    endpoint_ownership,
-                    required_by_flagship,
-                    allowed_in_replayable_gameplay,
-                    generated_roles: roles,
-                    semantic_capacities: capacities,
-                    required_capabilities: capabilities,
-                    external_binding: Some(binding),
-                    sharing,
-                    loss_policy,
-                    shutdown,
-                    maximum_recovery_attempts: if kind == FacilityKind::Telemetry {
-                        1
-                    } else {
-                        3
-                    },
-                },
-                authentication: verifier_hash(
-                    b"wrela.facility-contract.authentication.v1",
-                    &[distribution_digest, identity, context_receipt, fingerprint],
-                ),
-            }
-        })
+        .map(|kind| verifier_facility_contract(kind, distribution_digest, 0, 1))
         .collect::<Vec<_>>()
         .into()
+}
+
+fn verifier_facility_contract(
+    kind: FacilityKind,
+    distribution_digest: u128,
+    minimum_instances: u32,
+    maximum_instances: u32,
+) -> FacilityContract {
+    let (roles, capacities, capabilities, binding, sharing, loss_policy, shutdown) =
+        verifier_facility_facts(kind);
+    let flagship_rule = if kind == FacilityKind::Entropy {
+        FacilityFlagshipRule::SelectingImageOptional
+    } else {
+        FacilityFlagshipRule::Required { loss_policy }
+    };
+    let replay_rule = if kind == FacilityKind::Entropy {
+        FacilityReplayRule::ExcludedFromReplayableGameplay
+    } else {
+        FacilityReplayRule::ReplayableGameplay
+    };
+    let identity = verifier_hash(
+        b"wrela.facility-contract.identity.v1",
+        &[u128::from(kind.tag())],
+    );
+    let context_receipt = verifier_hash(
+        b"wrela.facility-contract.context.v1",
+        &[distribution_digest],
+    );
+    let endpoint_ownership = if kind == FacilityKind::Input {
+        FacilityEndpointOwnership::BuildWiredActor
+    } else {
+        FacilityEndpointOwnership::FacilityInstance
+    };
+    let facts = verifier_facility_facts_fingerprint(
+        &roles,
+        &capacities,
+        &capabilities,
+        binding,
+        sharing,
+        loss_policy,
+        shutdown,
+    );
+    let fingerprint = verifier_hash(
+        b"wrela.facility-contract.v1",
+        &[
+            u128::from(kind.tag()),
+            identity,
+            context_receipt,
+            distribution_digest,
+            1,
+            1,
+            u128::from(minimum_instances),
+            u128::from(maximum_instances),
+            1,
+            match endpoint_ownership {
+                FacilityEndpointOwnership::FacilityInstance => 1,
+                FacilityEndpointOwnership::BuildWiredActor => 2,
+            },
+            facility_flagship_tag(flagship_rule),
+            facility_replay_rule_tag(replay_rule),
+            if kind == FacilityKind::Telemetry {
+                1
+            } else {
+                3
+            },
+            facts,
+        ],
+    );
+    FacilityContract {
+        reference: FacilityContractRef {
+            context: context_receipt,
+            identity,
+            current_meaning: fingerprint,
+            fingerprint,
+            kind,
+        },
+        observation: FacilityContractObservation {
+            kind,
+            identity,
+            context_receipt,
+            fingerprint,
+            current_meaning: fingerprint,
+            allows_deployment: true,
+            allows_test: true,
+            minimum_instances,
+            maximum_instances,
+            maximum_exported_endpoints: 1,
+            endpoint_ownership,
+            flagship_rule,
+            replay_rule,
+            generated_roles: roles,
+            semantic_capacities: capacities,
+            required_capabilities: capabilities,
+            external_binding: Some(binding),
+            sharing,
+            loss_policy,
+            shutdown,
+            maximum_recovery_attempts: if kind == FacilityKind::Telemetry {
+                1
+            } else {
+                3
+            },
+            binding_availability: FacilityBindingAvailability::BootFailure,
+        },
+        authentication: verifier_hash(
+            b"wrela.facility-contract.authentication.v1",
+            &[distribution_digest, identity, context_receipt, fingerprint],
+        ),
+    }
 }
 
 fn verifier_facility_facts(kind: FacilityKind) -> FacilityFacts {
@@ -4790,7 +5398,7 @@ fn verifier_facility_facts(kind: FacilityKind) -> FacilityFacts {
             Arc::from([PlanningCapability::MonotonicCounter]),
             PlanningBinding::MonotonicClock,
             FacilitySharing::RegisteredDisjoint {
-                role: 1,
+                role: FacilitySharedRole::MonotonicCounter,
                 maximum_units: 1024,
             },
             FacilityLossPolicy::ControlledShutdown,
@@ -4802,7 +5410,7 @@ fn verifier_facility_facts(kind: FacilityKind) -> FacilityFacts {
             virtio,
             PlanningBinding::Entropy,
             FacilitySharing::RegisteredDisjoint {
-                role: 2,
+                role: FacilitySharedRole::EntropyQueue,
                 maximum_units: 16,
             },
             FacilityLossPolicy::SelectingImagePolicy,
@@ -4910,7 +5518,7 @@ fn verify_facility_domain_plan(
         generated_roles: Arc::from([]),
         requirements: Arc::from([]),
         facility_instance: Some(instance),
-        facility_contract_fingerprint: Some(contract.observation.fingerprint),
+        facility_contract: Some(contract.reference),
     }
 }
 
@@ -4984,39 +5592,214 @@ fn verify_facility_requirements(
     context: u128,
     planner: PlannerRef,
     plan: DomainPlanRef,
+    instance: &FacilityInstanceRef,
     roles: &[GeneratedRole],
     contract: &FacilityContract,
-    selected: u32,
     cancellation: &Cancellation,
 ) -> Result<Vec<Requirement>, PlanningFailure> {
-    let produced = produce_facility_requirements(
-        context,
-        planner,
-        plan,
-        roles,
-        contract,
-        selected,
-        cancellation,
-    )?;
-    let mut verified = produced
+    let mut verified = Vec::new();
+    for (role_ordinal, kind) in contract.observation.generated_roles.iter().enumerate() {
+        checkpoint(cancellation)?;
+        let role = roles
+            .iter()
+            .find(|role| role.kind == *kind)
+            .ok_or_else(|| PlanningFailure::Defect(Arc::from("verifier Facility role missing")))?;
+        for (offset, (category, bounds)) in [
+            (
+                RequirementCategory::GeneratedRoleRealization,
+                RequirementBounds::RealizeExactlyOnce {
+                    executable: role.executable.identity,
+                },
+            ),
+            (
+                RequirementCategory::Lifetime,
+                RequirementBounds::ImageLifetime,
+            ),
+        ]
         .into_iter()
-        .map(|requirement| {
-            let RequirementOwner::GeneratedRole(subject) = requirement.subject else {
-                unreachable!("Facility requirements use Generated Role subjects")
-            };
-            verify_requirement(
+        .enumerate()
+        {
+            let local_site = u16::try_from(100 + role_ordinal * 2 + offset).map_err(|_| {
+                PlanningFailure::Defect(Arc::from("verifier Facility requirement site overflow"))
+            })?;
+            verified.push(verify_requirement(
                 context,
                 planner,
                 plan,
-                subject,
-                requirement.provenance.local_site,
-                requirement.category,
-                requirement.bounds,
-            )
-        })
-        .collect::<Vec<_>>();
+                role.reference,
+                local_site,
+                category,
+                bounds,
+            ));
+        }
+    }
+    let subject = FacilitySubjectRef {
+        context: instance.context,
+        identity: instance.identity,
+        current_meaning: instance.current_meaning,
+        kind: instance.kind,
+    };
+    let binding = contract
+        .observation
+        .external_binding
+        .ok_or_else(|| PlanningFailure::Defect(Arc::from("verifier Facility binding missing")))?;
+    let mut specs = vec![
+        (
+            1,
+            RequirementCategory::Cardinality,
+            RequirementBounds::Cardinality {
+                minimum: contract.observation.minimum_instances,
+                maximum: contract.observation.maximum_instances,
+            },
+        ),
+        (
+            2,
+            RequirementCategory::Binding,
+            RequirementBounds::Binding {
+                kind: binding,
+                minimum: 1,
+                maximum: contract.observation.maximum_exported_endpoints,
+            },
+        ),
+        (
+            3,
+            RequirementCategory::Binding,
+            RequirementBounds::FacilitySharing(contract.observation.sharing),
+        ),
+    ];
+    for (ordinal, capability) in contract
+        .observation
+        .required_capabilities
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        checkpoint(cancellation)?;
+        specs.push((
+            10 + u16::try_from(ordinal).map_err(|_| {
+                PlanningFailure::Defect(Arc::from("verifier capability ordinal overflow"))
+            })?,
+            RequirementCategory::ArchitectureCapability,
+            RequirementBounds::Capability(capability),
+        ));
+    }
+    for (ordinal, capacity) in contract
+        .observation
+        .semantic_capacities
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        checkpoint(cancellation)?;
+        specs.push((
+            30 + u16::try_from(ordinal).map_err(|_| {
+                PlanningFailure::Defect(Arc::from("verifier capacity ordinal overflow"))
+            })?,
+            RequirementCategory::CapacityPressure,
+            RequirementBounds::FacilityCapacity(capacity),
+        ));
+    }
+    specs.extend([
+        (
+            50,
+            RequirementCategory::FacilityOwnership,
+            RequirementBounds::FacilityEndpoint {
+                maximum: contract.observation.maximum_exported_endpoints,
+                ownership: contract.observation.endpoint_ownership,
+                input_owner: instance.input_owner.map(|owner| owner.identity),
+            },
+        ),
+        (
+            51,
+            RequirementCategory::Recovery,
+            RequirementBounds::FacilityRecovery {
+                supervisor: instance.supervisor.identity,
+                loss_policy: instance.selected_loss_policy,
+                maximum_attempts: contract.observation.maximum_recovery_attempts,
+            },
+        ),
+        (
+            52,
+            RequirementCategory::Shutdown,
+            RequirementBounds::FacilityShutdown(contract.observation.shutdown),
+        ),
+        (
+            53,
+            RequirementCategory::Replay,
+            RequirementBounds::FacilityReplay {
+                selected: instance.replay_authority,
+                rule: contract.observation.replay_rule,
+            },
+        ),
+        (
+            54,
+            RequirementCategory::Flagship,
+            RequirementBounds::FacilityFlagship(contract.observation.flagship_rule),
+        ),
+        (
+            55,
+            RequirementCategory::BootAvailability,
+            RequirementBounds::FacilityBindingAvailability(
+                contract.observation.binding_availability,
+            ),
+        ),
+    ]);
+    for (local_site, category, bounds) in specs {
+        checkpoint(cancellation)?;
+        verified.push(verify_facility_requirement(
+            context,
+            planner,
+            plan,
+            subject,
+            contract.reference,
+            local_site,
+            category,
+            bounds,
+        ));
+    }
     verified.sort_by_key(|requirement| requirement.reference.identity);
     Ok(verified)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_facility_requirement(
+    context: u128,
+    owner: PlannerRef,
+    plan: DomainPlanRef,
+    subject: FacilitySubjectRef,
+    contract: FacilityContractRef,
+    local_site: u16,
+    category: RequirementCategory,
+    bounds: RequirementBounds,
+) -> Requirement {
+    let identity =
+        verify_requirement_identity(owner.identity, subject.identity, category, local_site);
+    let current_meaning = verify_requirement_current_meaning(
+        identity,
+        owner.current_meaning,
+        subject.current_meaning,
+        plan.current_meaning,
+        category,
+        &bounds,
+    );
+    Requirement {
+        context,
+        reference: RequirementRef {
+            context,
+            identity,
+            current_meaning,
+        },
+        owner,
+        subject: RequirementOwner::Facility(subject),
+        provenance: RequirementProvenance {
+            domain_plan: plan.identity,
+            generated_role: subject.identity,
+            local_site,
+        },
+        category,
+        bounds,
+        facility_contract: Some(contract),
+    }
 }
 
 fn verify_domain_plan(
@@ -5049,7 +5832,7 @@ fn verify_domain_plan(
         generated_roles: Arc::from([]),
         requirements: Arc::from([]),
         facility_instance: None,
-        facility_contract_fingerprint: None,
+        facility_contract: None,
     }
 }
 
@@ -5325,6 +6108,7 @@ fn verify_requirement(
         },
         category,
         bounds,
+        facility_contract: None,
     }
 }
 
@@ -5403,6 +6187,7 @@ fn verify_architecture_evidence(
     cancellation: &Cancellation,
 ) -> Result<(), PlanningFailure> {
     let architecture = candidate.architecture_contract.for_image_planning();
+    let mut selected_shared_roles = BTreeSet::new();
     for requirement in candidate.requirements.iter() {
         checkpoint(cancellation)?;
         match requirement.bounds {
@@ -5432,6 +6217,21 @@ fn verify_architecture_evidence(
                     return defect("mandatory role reservation multiplicity is invalid");
                 }
             }
+            RequirementBounds::FacilitySharing(FacilitySharing::RegisteredDisjoint {
+                role,
+                maximum_units,
+            }) => {
+                let Some(registration) = architecture.facility_share(role.architecture_kind())
+                else {
+                    return defect("Facility sharing role is not registered by the profile");
+                };
+                if maximum_units > registration.maximum_units {
+                    return defect("Facility sharing exceeds its registered semantic capacity");
+                }
+                if !selected_shared_roles.insert(role) {
+                    return defect("Facility sharing roles are not pairwise disjoint");
+                }
+            }
             _ => {}
         }
     }
@@ -5451,6 +6251,24 @@ fn verify_requirement_bounds(
         let provenance_subject = match requirement.subject {
             RequirementOwner::GeneratedRole(reference) => reference.identity,
             RequirementOwner::Pool(_) => 0,
+            RequirementOwner::Facility(reference) => reference.identity,
+        };
+        let facility_reference_is_exact = match (requirement.subject, requirement.facility_contract)
+        {
+            (RequirementOwner::Facility(subject), Some(contract)) => {
+                owning_plan.is_some_and(|plan| {
+                    plan.facility_instance.as_ref().is_some_and(|instance| {
+                        instance.identity == subject.identity
+                            && instance.context == subject.context
+                            && instance.current_meaning == subject.current_meaning
+                            && instance.kind == subject.kind
+                    }) && plan.facility_contract == Some(contract)
+                        && contract.kind == subject.kind
+                })
+            }
+            (RequirementOwner::Facility(_), None) => false,
+            (_, None) => true,
+            (_, Some(_)) => false,
         };
         if requirement.context != candidate.context
             || requirement.reference.context != candidate.context
@@ -5459,6 +6277,7 @@ fn verify_requirement_bounds(
             || owning_plan.is_none()
             || requirement.provenance.generated_role != provenance_subject
             || requirement.provenance.local_site == 0
+            || !facility_reference_is_exact
         {
             return defect(
                 "Planning Requirement has dangling, wrong-owner, wrong-role, mixed-context, or invalid provenance",
@@ -5506,16 +6325,53 @@ fn verify_requirement_bounds(
             (
                 RequirementCategory::CapacityPressure,
                 RequirementBounds::FacilityCapacity(capacity),
-            ) => facility_capacity_tag(*capacity) & u128::from(u64::MAX) > 0,
-            (RequirementCategory::Binding, RequirementBounds::FacilitySharing(sharing)) => {
-                match sharing {
-                    FacilitySharing::Exclusive => true,
-                    FacilitySharing::RegisteredDisjoint {
-                        role,
-                        maximum_units,
-                    } => *role > 0 && *maximum_units > 0,
-                }
+            ) => {
+                facility_capacity_tag(*capacity) & u128::from(u64::MAX) > 0
+                    && matches!(requirement.subject, RequirementOwner::Facility(_))
             }
+            (RequirementCategory::Binding, RequirementBounds::FacilitySharing(sharing)) => {
+                matches!(requirement.subject, RequirementOwner::Facility(_))
+                    && match sharing {
+                        FacilitySharing::Exclusive => true,
+                        FacilitySharing::RegisteredDisjoint { maximum_units, .. } => {
+                            *maximum_units > 0
+                        }
+                    }
+            }
+            (
+                RequirementCategory::FacilityOwnership,
+                RequirementBounds::FacilityEndpoint {
+                    maximum,
+                    ownership,
+                    input_owner,
+                },
+            ) => {
+                *maximum > 0
+                    && matches!(requirement.subject, RequirementOwner::Facility(_))
+                    && match ownership {
+                        FacilityEndpointOwnership::FacilityInstance => input_owner.is_none(),
+                        FacilityEndpointOwnership::BuildWiredActor => input_owner.is_some(),
+                    }
+            }
+            (
+                RequirementCategory::Recovery,
+                RequirementBounds::FacilityRecovery {
+                    supervisor,
+                    maximum_attempts,
+                    ..
+                },
+            ) => {
+                *supervisor != 0
+                    && *maximum_attempts > 0
+                    && matches!(requirement.subject, RequirementOwner::Facility(_))
+            }
+            (RequirementCategory::Shutdown, RequirementBounds::FacilityShutdown(_))
+            | (RequirementCategory::Replay, RequirementBounds::FacilityReplay { .. })
+            | (RequirementCategory::Flagship, RequirementBounds::FacilityFlagship(_))
+            | (
+                RequirementCategory::BootAvailability,
+                RequirementBounds::FacilityBindingAvailability(_),
+            ) => matches!(requirement.subject, RequirementOwner::Facility(_)),
             _ => false,
         };
         if !valid {
@@ -5740,6 +6596,40 @@ fn produce_bounds_encoding(hash: &mut Xxh3, bounds: &RequirementBounds) {
             hash.update(&[10]);
             hash.update(&facility_sharing_tag(*sharing).to_le_bytes());
         }
+        RequirementBounds::FacilityEndpoint {
+            maximum,
+            ownership,
+            input_owner,
+        } => {
+            hash.update(&[11, facility_endpoint_ownership_tag(*ownership)]);
+            hash.update(&maximum.to_le_bytes());
+            hash.update(&input_owner.unwrap_or(0).to_le_bytes());
+        }
+        RequirementBounds::FacilityRecovery {
+            supervisor,
+            loss_policy,
+            maximum_attempts,
+        } => {
+            hash.update(&[12]);
+            hash.update(&supervisor.to_le_bytes());
+            hash.update(&facility_loss_tag(*loss_policy).to_le_bytes());
+            hash.update(&maximum_attempts.to_le_bytes());
+        }
+        RequirementBounds::FacilityShutdown(shutdown) => {
+            hash.update(&[13]);
+            hash.update(&facility_shutdown_tag(*shutdown).to_le_bytes());
+        }
+        RequirementBounds::FacilityReplay { selected, rule } => {
+            hash.update(&[14, facility_replay_authority_tag(*selected)]);
+            hash.update(&facility_replay_rule_tag(*rule).to_le_bytes());
+        }
+        RequirementBounds::FacilityFlagship(rule) => {
+            hash.update(&[15]);
+            hash.update(&facility_flagship_tag(*rule).to_le_bytes());
+        }
+        RequirementBounds::FacilityBindingAvailability(availability) => {
+            hash.update(&[16, facility_binding_availability_tag(*availability)]);
+        }
     }
 }
 
@@ -5791,6 +6681,40 @@ fn verify_bounds_encoding(verifier: &mut Xxh3, bounds: &RequirementBounds) {
         RequirementBounds::FacilitySharing(sharing) => {
             verifier.update(&[10]);
             verifier.update(&facility_sharing_tag(*sharing).to_le_bytes());
+        }
+        RequirementBounds::FacilityEndpoint {
+            maximum,
+            ownership,
+            input_owner,
+        } => {
+            verifier.update(&[11, facility_endpoint_ownership_tag(*ownership)]);
+            verifier.update(&maximum.to_le_bytes());
+            verifier.update(&input_owner.unwrap_or(0).to_le_bytes());
+        }
+        RequirementBounds::FacilityRecovery {
+            supervisor,
+            loss_policy,
+            maximum_attempts,
+        } => {
+            verifier.update(&[12]);
+            verifier.update(&supervisor.to_le_bytes());
+            verifier.update(&facility_loss_tag(*loss_policy).to_le_bytes());
+            verifier.update(&maximum_attempts.to_le_bytes());
+        }
+        RequirementBounds::FacilityShutdown(shutdown) => {
+            verifier.update(&[13]);
+            verifier.update(&facility_shutdown_tag(*shutdown).to_le_bytes());
+        }
+        RequirementBounds::FacilityReplay { selected, rule } => {
+            verifier.update(&[14, facility_replay_authority_tag(*selected)]);
+            verifier.update(&facility_replay_rule_tag(*rule).to_le_bytes());
+        }
+        RequirementBounds::FacilityFlagship(rule) => {
+            verifier.update(&[15]);
+            verifier.update(&facility_flagship_tag(*rule).to_le_bytes());
+        }
+        RequirementBounds::FacilityBindingAvailability(availability) => {
+            verifier.update(&[16, facility_binding_availability_tag(*availability)]);
         }
     }
 }
@@ -6137,10 +7061,18 @@ fn build() -> Image:
             "src/image.wr",
             br#"from core import facilities
 
+@actor
+struct Coordinator implements facilities.FacilityActor:
+    pure fn facility_identity(read self) -> u64:
+        return 1
+    pub async fn run(self):
+        pass
+
 @image
 fn build() -> Image:
-    display = facilities.Display.new()
-    entropy = facilities.Entropy.new()
+    coordinator = Coordinator()
+    display = facilities.Display.new(supervisor=coordinator, loss=facilities.CONTROLLED_SHUTDOWN, replay=facilities.REPLAYABLE_GAMEPLAY)
+    entropy = facilities.Entropy.new(supervisor=coordinator, loss=facilities.SELECTING_IMAGE_POLICY, replay=facilities.NON_REPLAYABLE_FACILITY)
     return Image.new(display=display, entropy=entropy)
 "#,
             Root::Image,
@@ -6166,6 +7098,43 @@ fn build() -> Image:
             &candidate.pool_model,
             &candidate.executable_demand,
         );
+    }
+
+    fn resign_facility_requirement_set(candidate: &mut VerifiedPlanningFoundation) {
+        let mut requirements = candidate.requirements.to_vec();
+        for requirement in &mut requirements {
+            let subject_meaning = match requirement.subject {
+                RequirementOwner::GeneratedRole(reference) => reference.current_meaning,
+                RequirementOwner::Pool(reference) => reference.current_meaning,
+                RequirementOwner::Facility(reference) => reference.current_meaning,
+            };
+            let plan = candidate
+                .domain_plans
+                .iter()
+                .find(|plan| plan.reference.identity == requirement.provenance.domain_plan)
+                .unwrap();
+            requirement.reference.current_meaning = produce_requirement_current_meaning(
+                requirement.reference.identity,
+                requirement.owner.current_meaning,
+                subject_meaning,
+                plan.reference.current_meaning,
+                requirement.category,
+                &requirement.bounds,
+            );
+        }
+        candidate.requirements = requirements.into();
+        let mut plans = candidate.domain_plans.to_vec();
+        for plan in &mut plans {
+            plan.requirements = candidate
+                .requirements
+                .iter()
+                .filter(|requirement| requirement.owner == plan.planner)
+                .map(|requirement| requirement.reference)
+                .collect::<Vec<_>>()
+                .into();
+        }
+        candidate.domain_plans = plans.into();
+        resign(candidate);
     }
 
     #[test]
@@ -6355,7 +7324,7 @@ fn build() -> Image:
         let mut sharing = original.clone();
         let mut contracts = sharing.facility_contracts.to_vec();
         contracts[display].observation.sharing = FacilitySharing::RegisteredDisjoint {
-            role: 0,
+            role: FacilitySharedRole::EntropyQueue,
             maximum_units: 0,
         };
         sharing.facility_contracts = contracts.into();
@@ -6382,9 +7351,7 @@ fn build() -> Image:
 
         let mut replay_context = original.clone();
         let mut contracts = replay_context.facility_contracts.to_vec();
-        contracts[entropy]
-            .observation
-            .allowed_in_replayable_gameplay = true;
+        contracts[entropy].observation.replay_rule = FacilityReplayRule::ReplayableGameplay;
         replay_context.facility_contracts = contracts.into();
         rejects(&replay_context);
 
@@ -6400,19 +7367,490 @@ fn build() -> Image:
     }
 
     #[test]
-    fn verifier_rejects_facility_requirements_incompatible_with_profile_capabilities_and_bindings()
-    {
+    fn verifier_rejects_wrong_kind_context_and_stale_typed_facility_references() {
+        let original = facility_fixture();
+        let display_plan =
+            |plan: &DomainPlan| plan.kind == DomainPlanKind::Facility(FacilityKind::Display);
+
+        let mut wrong_contract_kind = original.clone();
+        let mut plans = wrong_contract_kind.domain_plans.to_vec();
+        plans
+            .iter_mut()
+            .find(|plan| display_plan(plan))
+            .unwrap()
+            .facility_contract
+            .as_mut()
+            .unwrap()
+            .kind = FacilityKind::Input;
+        wrong_contract_kind.domain_plans = plans.into();
+        resign(&mut wrong_contract_kind);
+        rejects(&wrong_contract_kind);
+
+        let mut wrong_contract_context = original.clone();
+        let mut plans = wrong_contract_context.domain_plans.to_vec();
+        plans
+            .iter_mut()
+            .find(|plan| display_plan(plan))
+            .unwrap()
+            .facility_contract
+            .as_mut()
+            .unwrap()
+            .context ^= 1;
+        wrong_contract_context.domain_plans = plans.into();
+        resign(&mut wrong_contract_context);
+        rejects(&wrong_contract_context);
+
+        let mut stale_contract = original.clone();
+        let mut plans = stale_contract.domain_plans.to_vec();
+        plans
+            .iter_mut()
+            .find(|plan| display_plan(plan))
+            .unwrap()
+            .facility_contract
+            .as_mut()
+            .unwrap()
+            .current_meaning ^= 1;
+        stale_contract.domain_plans = plans.into();
+        resign(&mut stale_contract);
+        rejects(&stale_contract);
+
+        let mut wrong_requirement_contract = original.clone();
+        let mut requirements = wrong_requirement_contract.requirements.to_vec();
+        requirements
+            .iter_mut()
+            .find(|requirement| {
+                matches!(
+                    requirement.subject,
+                    RequirementOwner::Facility(FacilitySubjectRef {
+                        kind: FacilityKind::Display,
+                        ..
+                    })
+                )
+            })
+            .unwrap()
+            .facility_contract
+            .as_mut()
+            .unwrap()
+            .fingerprint ^= 1;
+        wrong_requirement_contract.requirements = requirements.into();
+        resign_facility_requirement_set(&mut wrong_requirement_contract);
+        rejects(&wrong_requirement_contract);
+
+        let mut wrong_subject_kind = original.clone();
+        let mut requirements = wrong_subject_kind.requirements.to_vec();
+        let requirement = requirements
+            .iter_mut()
+            .find(|requirement| {
+                matches!(
+                    requirement.subject,
+                    RequirementOwner::Facility(FacilitySubjectRef {
+                        kind: FacilityKind::Display,
+                        ..
+                    })
+                )
+            })
+            .unwrap();
+        let RequirementOwner::Facility(subject) = &mut requirement.subject else {
+            unreachable!();
+        };
+        subject.kind = FacilityKind::Input;
+        wrong_subject_kind.requirements = requirements.into();
+        resign_facility_requirement_set(&mut wrong_subject_kind);
+        rejects(&wrong_subject_kind);
+    }
+
+    #[test]
+    fn selected_facility_profile_incompatibility_is_admission_while_malformed_artifacts_are_defects()
+     {
         let original = facility_fixture();
 
         let mut capability = original.clone();
         Arc::make_mut(&mut capability.architecture_contract)
             .corrupt_remove_capability(VmAbiCapability::PciVirtioModern);
+        assert!(matches!(
+            ImagePlanningModule.plan(
+                Arc::clone(&capability.semantic_program),
+                Arc::clone(&capability.architecture_contract),
+                &Cancellation::new(),
+            ),
+            Err(PlanningFailure::FacilityCompatibility {
+                kind: FacilityKind::Display,
+                missing: FacilityCompatibilityMissing::Capability(
+                    PlanningCapability::PciVirtioModern
+                ),
+                ..
+            })
+        ));
         rejects(&capability);
 
         let mut binding = original.clone();
         Arc::make_mut(&mut binding.architecture_contract)
             .corrupt_remove_binding(BindingKind::Display);
+        assert!(matches!(
+            ImagePlanningModule.plan(
+                Arc::clone(&binding.semantic_program),
+                Arc::clone(&binding.architecture_contract),
+                &Cancellation::new(),
+            ),
+            Err(PlanningFailure::FacilityCompatibility {
+                kind: FacilityKind::Display,
+                missing: FacilityCompatibilityMissing::Binding(PlanningBinding::Display),
+                ..
+            })
+        ));
         rejects(&binding);
+
+        let mut sharing = original.clone();
+        Arc::make_mut(&mut sharing.architecture_contract)
+            .corrupt_facility_share(FacilitySharedRoleKind::EntropyQueue, Some(8));
+        assert!(matches!(
+            ImagePlanningModule.plan(
+                Arc::clone(&sharing.semantic_program),
+                Arc::clone(&sharing.architecture_contract),
+                &Cancellation::new(),
+            ),
+            Err(PlanningFailure::FacilityCompatibility {
+                kind: FacilityKind::Entropy,
+                missing: FacilityCompatibilityMissing::SharedRole {
+                    role: FacilitySharedRole::EntropyQueue,
+                    required_units: 16,
+                    available_units: 8,
+                },
+                ..
+            })
+        ));
+        rejects(&sharing);
+    }
+
+    #[test]
+    fn facility_cardinality_and_wide_requirements_follow_the_authenticated_contract() {
+        let original = facility_fixture();
+        let semantic = original.semantic_program.for_image_planning();
+        let architecture = original.architecture_contract.for_image_planning();
+        let mut instances = discover_facility_instances(semantic, &Cancellation::new()).unwrap();
+        let display = instances
+            .iter()
+            .find(|instance| instance.kind == FacilityKind::Display)
+            .unwrap()
+            .clone();
+        let mut second = display.clone();
+        second.identity ^= 0x4000;
+        second.current_meaning ^= 0x8000;
+        second.source = SourceRange::new("src/alternate.wr", 10, 20);
+        instances.push(second);
+        instances.sort_by_key(|instance| instance.identity);
+
+        let producer = producer_facility_contract_with_cardinality(
+            FacilityKind::Display,
+            semantic.distribution_digest(),
+            0,
+            2,
+        );
+        let verifier =
+            verifier_facility_contract(FacilityKind::Display, semantic.distribution_digest(), 0, 2);
+        assert_eq!(producer, verifier);
+        validate_facility_cardinality(
+            &instances,
+            std::slice::from_ref(&producer),
+            &Cancellation::new(),
+        )
+        .expect("two instances fit a contract-authenticated maximum of two");
+        let singleton =
+            producer_facility_contract(FacilityKind::Display, semantic.distribution_digest());
+        assert!(matches!(
+            validate_facility_cardinality(
+                &instances,
+                std::slice::from_ref(&singleton),
+                &Cancellation::new(),
+            ),
+            Err(PlanningFailure::FacilityCardinality {
+                selected: 2,
+                minimum: 0,
+                maximum: 1,
+                ..
+            })
+        ));
+
+        let planner = produce_facility_planner(
+            original.context,
+            display.clone(),
+            &producer,
+            architecture.fingerprint(),
+        );
+        let plan = produce_facility_domain_plan(
+            original.context,
+            display.clone(),
+            planner.reference,
+            &producer,
+        );
+        let roles = produce_facility_roles(
+            original.context,
+            planner.reference,
+            plan.reference,
+            &producer,
+            architecture.fingerprint(),
+            &Cancellation::new(),
+        )
+        .unwrap();
+        let produced = produce_facility_requirements(
+            original.context,
+            planner.reference,
+            plan.reference,
+            &display,
+            &roles,
+            &producer,
+            &Cancellation::new(),
+        )
+        .unwrap();
+        let verified = verify_facility_requirements(
+            original.context,
+            planner.reference,
+            plan.reference,
+            &display,
+            &roles,
+            &verifier,
+            &Cancellation::new(),
+        )
+        .unwrap();
+        assert_eq!(produced, verified);
+        assert!(produced.iter().any(|requirement| {
+            matches!(
+                requirement.bounds,
+                RequirementBounds::Cardinality {
+                    minimum: 0,
+                    maximum: 2,
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn independent_facility_requirement_verifier_rejects_correlated_producer_drift() {
+        let original = facility_fixture();
+        let display_requirement = |requirement: &Requirement| {
+            matches!(
+                requirement.subject,
+                RequirementOwner::Facility(FacilitySubjectRef {
+                    kind: FacilityKind::Display,
+                    ..
+                })
+            )
+        };
+
+        let mut omission = original.clone();
+        let omitted = omission
+            .requirements
+            .iter()
+            .position(|requirement| {
+                display_requirement(requirement)
+                    && requirement.category == RequirementCategory::BootAvailability
+            })
+            .expect("Display boot-availability requirement");
+        let mut requirements = omission.requirements.to_vec();
+        requirements.remove(omitted);
+        omission.requirements = requirements.into();
+        resign_facility_requirement_set(&mut omission);
+        rejects(&omission);
+
+        let mut wrong_binding = original.clone();
+        let mut requirements = wrong_binding.requirements.to_vec();
+        let requirement = requirements
+            .iter_mut()
+            .find(|requirement| {
+                display_requirement(requirement)
+                    && requirement.category == RequirementCategory::Binding
+            })
+            .expect("Display binding requirement");
+        requirement.bounds = RequirementBounds::Binding {
+            kind: PlanningBinding::Input,
+            minimum: 1,
+            maximum: 1,
+        };
+        wrong_binding.requirements = requirements.into();
+        resign_facility_requirement_set(&mut wrong_binding);
+        rejects(&wrong_binding);
+
+        let mut wrong_cardinality = original.clone();
+        let mut requirements = wrong_cardinality.requirements.to_vec();
+        let requirement = requirements
+            .iter_mut()
+            .find(|requirement| {
+                display_requirement(requirement)
+                    && requirement.category == RequirementCategory::Cardinality
+            })
+            .expect("Display cardinality requirement");
+        requirement.bounds = RequirementBounds::Cardinality {
+            minimum: 0,
+            maximum: 2,
+        };
+        wrong_cardinality.requirements = requirements.into();
+        resign_facility_requirement_set(&mut wrong_cardinality);
+        rejects(&wrong_cardinality);
+
+        let mut wrong_sharing = original.clone();
+        let mut requirements = wrong_sharing.requirements.to_vec();
+        let requirement = requirements
+            .iter_mut()
+            .find(|requirement| {
+                display_requirement(requirement)
+                    && matches!(requirement.bounds, RequirementBounds::FacilitySharing(_))
+            })
+            .expect("Display sharing requirement");
+        requirement.bounds =
+            RequirementBounds::FacilitySharing(FacilitySharing::RegisteredDisjoint {
+                role: FacilitySharedRole::EntropyQueue,
+                maximum_units: 16,
+            });
+        wrong_sharing.requirements = requirements.into();
+        resign_facility_requirement_set(&mut wrong_sharing);
+        rejects(&wrong_sharing);
+
+        let mut wrong_capacity = original.clone();
+        let mut requirements = wrong_capacity.requirements.to_vec();
+        let requirement = requirements
+            .iter_mut()
+            .find(|requirement| {
+                display_requirement(requirement)
+                    && requirement.category == RequirementCategory::CapacityPressure
+            })
+            .expect("Display capacity requirement");
+        requirement.bounds =
+            RequirementBounds::FacilityCapacity(FacilitySemanticCapacity::FrameBuffers(4));
+        wrong_capacity.requirements = requirements.into();
+        resign_facility_requirement_set(&mut wrong_capacity);
+        rejects(&wrong_capacity);
+    }
+
+    #[test]
+    fn facility_wide_requirement_identity_is_independent_of_generated_role_order() {
+        let original = facility_fixture();
+        let semantic = original.semantic_program.for_image_planning();
+        let architecture = original.architecture_contract.for_image_planning();
+        let instance = discover_facility_instances(semantic, &Cancellation::new())
+            .unwrap()
+            .into_iter()
+            .find(|instance| instance.kind == FacilityKind::Display)
+            .unwrap();
+        let contract = original
+            .facility_contracts
+            .iter()
+            .find(|contract| contract.observation.kind == FacilityKind::Display)
+            .unwrap();
+        let planner = produce_facility_planner(
+            original.context,
+            instance.clone(),
+            contract,
+            architecture.fingerprint(),
+        );
+        let plan = produce_facility_domain_plan(
+            original.context,
+            instance.clone(),
+            planner.reference,
+            contract,
+        );
+        let baseline_roles = produce_facility_roles(
+            original.context,
+            planner.reference,
+            plan.reference,
+            contract,
+            architecture.fingerprint(),
+            &Cancellation::new(),
+        )
+        .unwrap();
+        let baseline = produce_facility_requirements(
+            original.context,
+            planner.reference,
+            plan.reference,
+            &instance,
+            &baseline_roles,
+            contract,
+            &Cancellation::new(),
+        )
+        .unwrap();
+
+        let mut reordered_contract = contract.clone();
+        reordered_contract.observation.generated_roles = Arc::from([
+            GeneratedRoleKind::TelemetryDriver,
+            GeneratedRoleKind::DisplayDriver,
+        ]);
+        let reordered_roles = produce_facility_roles(
+            original.context,
+            planner.reference,
+            plan.reference,
+            &reordered_contract,
+            architecture.fingerprint(),
+            &Cancellation::new(),
+        )
+        .unwrap();
+        let reordered = produce_facility_requirements(
+            original.context,
+            planner.reference,
+            plan.reference,
+            &instance,
+            &reordered_roles,
+            &reordered_contract,
+            &Cancellation::new(),
+        )
+        .unwrap();
+
+        let wide = |requirements: Vec<Requirement>| {
+            requirements
+                .into_iter()
+                .filter(|requirement| matches!(requirement.subject, RequirementOwner::Facility(_)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(wide(baseline), wide(reordered));
+    }
+
+    #[test]
+    fn verifier_rejects_correlated_duplicate_and_over_capacity_shared_roles() {
+        let original = facility_fixture();
+
+        let mut duplicate = original.clone();
+        let mut requirements = duplicate.requirements.to_vec();
+        let display_sharing = requirements
+            .iter_mut()
+            .find(|requirement| {
+                matches!(
+                    requirement.subject,
+                    RequirementOwner::Facility(FacilitySubjectRef {
+                        kind: FacilityKind::Display,
+                        ..
+                    })
+                ) && matches!(requirement.bounds, RequirementBounds::FacilitySharing(_))
+            })
+            .unwrap();
+        display_sharing.bounds =
+            RequirementBounds::FacilitySharing(FacilitySharing::RegisteredDisjoint {
+                role: FacilitySharedRole::EntropyQueue,
+                maximum_units: 16,
+            });
+        duplicate.requirements = requirements.into();
+        resign_facility_requirement_set(&mut duplicate);
+        rejects(&duplicate);
+
+        let mut over_capacity = original.clone();
+        let mut requirements = over_capacity.requirements.to_vec();
+        let entropy_sharing = requirements
+            .iter_mut()
+            .find(|requirement| {
+                matches!(
+                    requirement.subject,
+                    RequirementOwner::Facility(FacilitySubjectRef {
+                        kind: FacilityKind::Entropy,
+                        ..
+                    })
+                ) && matches!(requirement.bounds, RequirementBounds::FacilitySharing(_))
+            })
+            .unwrap();
+        entropy_sharing.bounds =
+            RequirementBounds::FacilitySharing(FacilitySharing::RegisteredDisjoint {
+                role: FacilitySharedRole::EntropyQueue,
+                maximum_units: 17,
+            });
+        over_capacity.requirements = requirements.into();
+        resign_facility_requirement_set(&mut over_capacity);
+        rejects(&over_capacity);
     }
 
     #[test]

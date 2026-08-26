@@ -453,6 +453,28 @@ impl VerifiedArchitecturePlanningContract {
             .collect::<Vec<_>>()
             .into();
     }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_facility_share(
+        &mut self,
+        role: FacilitySharedRoleKind,
+        maximum_units: Option<u32>,
+    ) {
+        self.facts.facility_shares = self
+            .facts
+            .facility_shares
+            .iter()
+            .copied()
+            .filter_map(|mut registration| {
+                if registration.role != role {
+                    return Some(registration);
+                }
+                registration.maximum_units = maximum_units?;
+                Some(registration)
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -499,6 +521,18 @@ impl ImagePlanningArchitecture<'_> {
             .binding_slots
             .iter()
             .any(|slot| slot.kind == binding)
+    }
+
+    pub(crate) fn facility_share(
+        self,
+        role: FacilitySharedRoleKind,
+    ) -> Option<FacilityShareRegistration> {
+        self.contract
+            .facts
+            .facility_shares
+            .iter()
+            .copied()
+            .find(|registration| registration.role == role)
     }
 
     pub(crate) fn has_reservation(self, reservation: ReservationKind) -> bool {
@@ -627,6 +661,7 @@ struct ContractFacts {
     regions: Arc<[RegionRule]>,
     device_slots: Arc<[DeviceSlot]>,
     binding_slots: Arc<[BindingSlot]>,
+    facility_shares: Arc<[FacilityShareRegistration]>,
     interrupts: InterruptRules,
     dma: DmaRules,
     service: ServiceCostBaseline,
@@ -819,6 +854,18 @@ pub(crate) enum BindingKind {
     Telemetry,
     Terminal,
     Panic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum FacilitySharedRoleKind {
+    MonotonicCounter,
+    EntropyQueue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FacilityShareRegistration {
+    pub(crate) role: FacilitySharedRoleKind,
+    pub(crate) maximum_units: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1092,6 +1139,16 @@ fn producer_current_aarch64_facts() -> ContractFacts {
                 .collect::<Vec<_>>(),
         ),
         binding_slots: canonical_bindings(),
+        facility_shares: Arc::from([
+            FacilityShareRegistration {
+                role: FacilitySharedRoleKind::MonotonicCounter,
+                maximum_units: 1024,
+            },
+            FacilityShareRegistration {
+                role: FacilitySharedRoleKind::EntropyQueue,
+                maximum_units: 16,
+            },
+        ]),
         interrupts: InterruptRules {
             route_slots: 4,
             maximum_sources_per_route: 8,
@@ -1371,6 +1428,16 @@ fn verifier_current_aarch64_facts() -> ContractFacts {
             BindingSlot {
                 ordinal: 7,
                 kind: BindingKind::Panic,
+            },
+        ]),
+        facility_shares: Arc::from([
+            FacilityShareRegistration {
+                role: FacilitySharedRoleKind::MonotonicCounter,
+                maximum_units: 1024,
+            },
+            FacilityShareRegistration {
+                role: FacilitySharedRoleKind::EntropyQueue,
+                maximum_units: 16,
             },
         ]),
         interrupts: InterruptRules {
@@ -1750,6 +1817,20 @@ fn reconstruct_and_validate(
             "device or binding slots are invalid",
         ));
     }
+    if source.facility_shares.is_empty()
+        || source
+            .facility_shares
+            .windows(2)
+            .any(|pair| pair[0].role >= pair[1].role)
+        || source
+            .facility_shares
+            .iter()
+            .any(|registration| registration.maximum_units == 0)
+    {
+        return Err(ContractFailure::malformed(
+            "Facility shared-role registry is invalid",
+        ));
+    }
     if source.interrupts.route_slots == 0
         || source.interrupts.maximum_sources_per_route == 0
         || source.interrupts.maximum_causes_per_service == 0
@@ -1803,6 +1884,7 @@ fn reconstruct_and_validate(
         regions: Arc::from(source.regions.to_vec()),
         device_slots: Arc::from(source.device_slots.to_vec()),
         binding_slots: Arc::from(source.binding_slots.to_vec()),
+        facility_shares: Arc::from(source.facility_shares.to_vec()),
         interrupts: source.interrupts,
         dma: source.dma,
         service: source.service,
@@ -1911,6 +1993,11 @@ fn canonical_fingerprint(
     hash_len(&mut hasher, facts.binding_slots.len());
     for slot in &*facts.binding_slots {
         hasher.update(&[slot.ordinal, binding_tag(slot.kind)]);
+    }
+    hash_len(&mut hasher, facts.facility_shares.len());
+    for registration in &*facts.facility_shares {
+        hasher.update(&[facility_shared_role_tag(registration.role)]);
+        hasher.update(&registration.maximum_units.to_be_bytes());
     }
     hasher.update(&[
         facts.interrupts.route_slots,
@@ -2044,6 +2131,13 @@ const fn binding_tag(value: BindingKind) -> u8 {
         BindingKind::Telemetry => 6,
         BindingKind::Terminal => 7,
         BindingKind::Panic => 8,
+    }
+}
+
+const fn facility_shared_role_tag(value: FacilitySharedRoleKind) -> u8 {
+    match value {
+        FacilitySharedRoleKind::MonotonicCounter => 1,
+        FacilitySharedRoleKind::EntropyQueue => 2,
     }
 }
 
@@ -2238,6 +2332,28 @@ mod tests {
         assert_eq!(
             failure.reproduction().detail(),
             "reservation rules are invalid"
+        );
+    }
+
+    #[test]
+    fn profile_neutral_verification_rejects_malformed_facility_share_registry() {
+        let mut duplicate = producer_current_aarch64_facts();
+        Arc::make_mut(&mut duplicate.facility_shares)[1].role =
+            FacilitySharedRoleKind::MonotonicCounter;
+        let failure = reconstruct_and_validate(&duplicate, &Cancellation::new()).unwrap_err();
+        assert_eq!(failure.kind(), ContractFailureKind::MalformedFacts);
+        assert_eq!(
+            failure.reproduction().detail(),
+            "Facility shared-role registry is invalid"
+        );
+
+        let mut zero_capacity = producer_current_aarch64_facts();
+        Arc::make_mut(&mut zero_capacity.facility_shares)[0].maximum_units = 0;
+        let failure = reconstruct_and_validate(&zero_capacity, &Cancellation::new()).unwrap_err();
+        assert_eq!(failure.kind(), ContractFailureKind::MalformedFacts);
+        assert_eq!(
+            failure.reproduction().detail(),
+            "Facility shared-role registry is invalid"
         );
     }
 

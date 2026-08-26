@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use wrela_compiler::{
     ArchitectureProfile, Cancellation, CompilationOutcome, CompilationRequest, Compiler,
     CompilerInstallation, GeneratedRoleKind, InspectSelection, PlannerKind, ProjectFile,
@@ -111,6 +111,40 @@ fn deployment_image_derives_exact_mandatory_planning_closure() {
             .all(|roles| roles[0].identity() < roles[1].identity()),
         "Generated Roles publish in stable identity order"
     );
+    let role_kinds = planning
+        .generated_roles()
+        .iter()
+        .map(|role| (role.identity(), role.kind()))
+        .collect::<BTreeMap<_, _>>();
+    for role in planning
+        .generated_roles()
+        .iter()
+        .filter(|role| role.dependencies().len() > 1)
+    {
+        assert!(
+            role.dependencies()
+                .windows(2)
+                .all(|dependencies| dependencies[0] < dependencies[1]),
+            "multi-dependency Generated Roles publish direct references in identity order"
+        );
+        let actual = role
+            .dependencies()
+            .iter()
+            .map(|identity| role_kinds[identity])
+            .collect::<BTreeSet<_>>();
+        let expected = match role.kind() {
+            GeneratedRoleKind::Shutdown => {
+                BTreeSet::from([GeneratedRoleKind::Scheduler, GeneratedRoleKind::Terminal])
+            }
+            GeneratedRoleKind::TestRuntime => BTreeSet::from([
+                GeneratedRoleKind::Scheduler,
+                GeneratedRoleKind::Terminal,
+                GeneratedRoleKind::Shutdown,
+            ]),
+            kind => panic!("unexpected multi-dependency role: {kind:?}"),
+        };
+        assert_eq!(actual, expected);
+    }
     assert_eq!(planning.requirements().len(), 21);
     assert_eq!(
         planning
@@ -168,6 +202,34 @@ fn test_image_adds_only_the_mandatory_test_runtime_closure() {
         test.generated_roles()
             .iter()
             .any(|role| role.kind() == GeneratedRoleKind::TestRuntime)
+    );
+    let role_kinds = test
+        .generated_roles()
+        .iter()
+        .map(|role| (role.identity(), role.kind()))
+        .collect::<BTreeMap<_, _>>();
+    let runtime = test
+        .generated_roles()
+        .iter()
+        .find(|role| role.kind() == GeneratedRoleKind::TestRuntime)
+        .unwrap();
+    assert!(
+        runtime
+            .dependencies()
+            .windows(2)
+            .all(|dependencies| dependencies[0] < dependencies[1])
+    );
+    assert_eq!(
+        runtime
+            .dependencies()
+            .iter()
+            .map(|identity| role_kinds[identity])
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            GeneratedRoleKind::Scheduler,
+            GeneratedRoleKind::Terminal,
+            GeneratedRoleKind::Shutdown,
+        ])
     );
     assert_ne!(
         deployment.planners()[0].identity(),

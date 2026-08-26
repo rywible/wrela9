@@ -203,6 +203,43 @@ impl ExecutableReference {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CoreSourceExecutableKind {
+    Specialization,
+    TestBody,
+    ClosureBody,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CoreSourceExecutableRef {
+    context: u128,
+    kind: CoreSourceExecutableKind,
+    identity: u128,
+    current_meaning: u128,
+}
+
+#[allow(
+    dead_code,
+    reason = "crate-private handoff reserved for the Core planner"
+)]
+impl CoreSourceExecutableRef {
+    pub(crate) const fn context(self) -> u128 {
+        self.context
+    }
+
+    pub(crate) const fn kind(self) -> CoreSourceExecutableKind {
+        self.kind
+    }
+
+    pub(crate) const fn identity(self) -> u128 {
+        self.identity
+    }
+
+    pub(crate) const fn current_meaning(self) -> u128 {
+        self.current_meaning
+    }
+}
+
 #[derive(Clone, Debug)]
 struct VerifiedMarker;
 
@@ -334,6 +371,60 @@ impl CompletedSemanticProgram {
 
     pub(crate) fn for_image_planning(&self) -> ImagePlanningSemanticProgram<'_> {
         ImagePlanningSemanticProgram { program: self }
+    }
+
+    pub(crate) fn for_core_planning(&self) -> CorePlanningSemanticProgram<'_> {
+        CorePlanningSemanticProgram { program: self }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CorePlanningSemanticProgram<'a> {
+    program: &'a CompletedSemanticProgram,
+}
+
+#[allow(dead_code)]
+impl<'a> CorePlanningSemanticProgram<'a> {
+    pub(crate) fn context_identity(self) -> u128 {
+        self.program.context.identity
+    }
+
+    pub(crate) const fn fingerprint(self) -> u128 {
+        self.program.fingerprint
+    }
+
+    pub(crate) fn exact_source_executables(
+        self,
+    ) -> impl ExactSizeIterator<Item = CoreSourceExecutableRef> + 'a {
+        self.program
+            .demand
+            .executables
+            .iter()
+            .copied()
+            .map(core_source_executable_reference)
+    }
+}
+
+fn core_source_executable_reference(reference: ExecutableReference) -> CoreSourceExecutableRef {
+    let (kind, raw) = match reference {
+        ExecutableReference::Specialization(reference) => {
+            (CoreSourceExecutableKind::Specialization, reference.raw)
+        }
+        ExecutableReference::TestBody(reference) => {
+            (CoreSourceExecutableKind::TestBody, reference.raw)
+        }
+        ExecutableReference::ClosureBody(reference) => {
+            (CoreSourceExecutableKind::ClosureBody, reference.raw)
+        }
+        ExecutableReference::Generated(_) => {
+            unreachable!("verified Completed Semantic Program source demand cannot be generated")
+        }
+    };
+    CoreSourceExecutableRef {
+        context: raw.context,
+        kind,
+        identity: raw.identity,
+        current_meaning: raw.current_meaning,
     }
 }
 

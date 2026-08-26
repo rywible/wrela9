@@ -10,7 +10,9 @@ use crate::architecture_planning::{
     BindingKind, ReservationKind, ReservationMultiplicity, VerifiedArchitecturePlanningContract,
     VmAbiCapability,
 };
-use crate::completed_semantic::CompletedSemanticProgram;
+use crate::completed_semantic::{
+    CompletedSemanticProgram, CorePlanningSemanticProgram, CoreSourceExecutableRef,
+};
 use crate::{Cancellation, Root};
 
 pub(crate) const PHASE_SCHEMA: &str = "wrela.image-planning-foundation.v1";
@@ -641,8 +643,28 @@ impl GeneratedRole {
         self.executable
     }
 
+    pub(crate) const fn owner(&self) -> PlannerRef {
+        self.owner
+    }
+
+    pub(crate) const fn generator(&self) -> PlannerRef {
+        self.generator
+    }
+
+    pub(crate) const fn kind(&self) -> GeneratedRoleKind {
+        self.kind
+    }
+
+    pub(crate) const fn local_key(&self) -> u16 {
+        self.local_key
+    }
+
     pub(crate) fn dependencies(&self) -> &[RoleRef] {
         &self.dependencies
+    }
+
+    pub(crate) const fn provenance(&self) -> DomainPlanRef {
+        self.provenance
     }
 }
 
@@ -654,6 +676,22 @@ impl Requirement {
 
     pub(crate) const fn subject(&self) -> RoleRef {
         self.subject
+    }
+
+    pub(crate) const fn owner(&self) -> PlannerRef {
+        self.owner
+    }
+
+    pub(crate) const fn provenance(&self) -> RequirementProvenance {
+        self.provenance
+    }
+
+    pub(crate) const fn category(&self) -> RequirementCategory {
+        self.category
+    }
+
+    pub(crate) const fn bounds(&self) -> &RequirementBounds {
+        &self.bounds
     }
 }
 
@@ -794,17 +832,23 @@ pub(crate) struct CorePlanningInput<'a> {
 }
 
 #[allow(dead_code)]
-impl CorePlanningInput<'_> {
+impl<'a> CorePlanningInput<'a> {
     pub(crate) const fn context_identity(&self) -> u128 {
         self.foundation.context
     }
 
-    pub(crate) fn completed_semantic_program(&self) -> &CompletedSemanticProgram {
-        &self.foundation.semantic_program
+    pub(crate) fn completed_semantic_program(self) -> CorePlanningSemanticProgram<'a> {
+        self.foundation.semantic_program.for_core_planning()
     }
 
     pub(crate) const fn source_executable_demand(&self) -> DemandInputRef {
         self.foundation.executable_demand.source
+    }
+
+    pub(crate) fn exact_source_executables(
+        self,
+    ) -> impl ExactSizeIterator<Item = CoreSourceExecutableRef> + 'a {
+        self.completed_semantic_program().exact_source_executables()
     }
 
     pub(crate) fn domain_plans(&self) -> &[DomainPlan] {
@@ -1052,7 +1096,7 @@ fn produce_roles(
     let mut roles = Vec::<GeneratedRole>::new();
     for (ordinal, spec) in producer_role_specs(root).into_iter().enumerate() {
         checkpoint(cancellation)?;
-        let dependencies = spec
+        let mut dependencies = spec
             .dependencies
             .iter()
             .map(|kind| {
@@ -1067,6 +1111,7 @@ fn produce_roles(
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        dependencies.sort_by_key(|reference| reference.identity);
         let local_key = u16::try_from(ordinal + 1)
             .map_err(|_| PlanningFailure::Defect(Arc::from("generated role local key overflow")))?;
         let identity = produce_role_identity(planner, spec.kind, local_key);
@@ -1493,7 +1538,7 @@ fn verify_roles(
     let mut expected = Vec::<GeneratedRole>::new();
     for (ordinal, (kind, dependency_kinds)) in verifier_role_specs(root).into_iter().enumerate() {
         checkpoint(cancellation)?;
-        let dependencies = dependency_kinds
+        let mut dependencies = dependency_kinds
             .iter()
             .map(|dependency_kind| {
                 expected
@@ -1507,6 +1552,7 @@ fn verify_roles(
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        dependencies.sort_by_key(|reference| reference.identity);
         let local_key = u16::try_from(ordinal + 1)
             .map_err(|_| PlanningFailure::Defect(Arc::from("verifier role key overflow")))?;
         let identity = verify_role_identity(planner, kind, local_key);
@@ -2333,13 +2379,13 @@ mod tests {
     };
 
     fn fixture(root: Root) -> VerifiedPlanningFoundation {
-        let path = match root {
-            Root::Image => "src/image.wr",
-            Root::Test => "src/test.wr",
-        };
-        let source: &[u8] = match root {
-            Root::Image => b"@image\nfn build() -> Image:\n    return Image.new()\n",
-            Root::Test => {
+        let (path, source): (&str, &[u8]) = match root {
+            Root::Image => (
+                "src/image.wr",
+                b"@image\nfn build() -> Image:\n    return Image.new()\n",
+            ),
+            Root::Test => (
+                "src/test.wr",
                 br#"pub suite smoke:
     test passes():
         expect true
@@ -2348,9 +2394,13 @@ mod tests {
 fn build() -> Image:
     tests = Test.new(cases=[smoke.passes()])
     return Image.new(tests=tests)
-"#
-            }
+"#,
+            ),
         };
+        fixture_from_source(path, source, root)
+    }
+
+    fn fixture_from_source(path: &str, source: &[u8], root: Root) -> VerifiedPlanningFoundation {
         let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
         let CompilationOutcome::Accepted(accepted) = compiler.compile(
             CompilationRequest::new(
@@ -2481,6 +2531,20 @@ fn build() -> Image:
         cycle.generated_roles = roles.into();
         rejects(&cycle);
 
+        let mut noncanonical_dependencies = original.clone();
+        let mut roles = noncanonical_dependencies.generated_roles.to_vec();
+        let position = roles
+            .iter()
+            .position(|role| role.dependencies.len() > 1)
+            .expect("fixture has a multi-dependency role");
+        let mut role = roles[position].clone();
+        let mut dependencies = role.dependencies.to_vec();
+        dependencies.reverse();
+        role.dependencies = dependencies.into();
+        roles[position] = role;
+        noncanonical_dependencies.generated_roles = roles.into();
+        rejects(&noncanonical_dependencies);
+
         let mut mixed_context = original.clone();
         let mut roles = mixed_context.generated_roles.to_vec();
         roles[1].executable.context ^= 1;
@@ -2594,10 +2658,17 @@ fn build() -> Image:
         let core = foundation.for_core();
 
         assert_eq!(core.context_identity(), foundation.context);
-        assert!(std::ptr::eq(
-            core.completed_semantic_program(),
-            foundation.semantic_program.as_ref()
-        ));
+        assert_eq!(
+            core.completed_semantic_program().context_identity(),
+            foundation
+                .semantic_program
+                .for_image_planning()
+                .context_identity()
+        );
+        assert_eq!(
+            core.completed_semantic_program().fingerprint(),
+            foundation.semantic_program.fingerprint()
+        );
         assert_eq!(
             core.source_executable_demand(),
             foundation.executable_demand.source
@@ -2620,5 +2691,106 @@ fn build() -> Image:
                     .iter()
                     .all(|reference| reference.context == core.context_identity())
         }));
+        for role in core.generated_roles() {
+            assert_eq!(role.reference(), role.reference);
+            assert_eq!(role.executable(), role.executable);
+            assert_eq!(role.owner(), role.owner);
+            assert_eq!(role.generator(), role.generator);
+            assert_eq!(role.kind(), role.kind);
+            assert_eq!(role.local_key(), role.local_key);
+            assert_eq!(role.dependencies(), role.dependencies.as_ref());
+            assert_eq!(role.provenance(), role.provenance);
+            assert_eq!(role.reference().context(), core.context_identity());
+            assert_eq!(role.executable().context(), core.context_identity());
+            assert_eq!(role.owner().context(), core.context_identity());
+            assert_eq!(role.generator().context(), core.context_identity());
+            assert_eq!(role.provenance().context(), core.context_identity());
+            assert!(
+                role.dependencies()
+                    .iter()
+                    .all(|dependency| dependency.context() == core.context_identity())
+            );
+        }
+        for requirement in core.requirements() {
+            assert_eq!(requirement.reference(), requirement.reference);
+            assert_eq!(requirement.owner(), requirement.owner);
+            assert_eq!(requirement.subject(), requirement.subject);
+            assert_eq!(requirement.provenance(), requirement.provenance);
+            assert_eq!(requirement.category(), requirement.category);
+            assert_eq!(requirement.bounds(), &requirement.bounds);
+            assert_eq!(requirement.reference().context(), core.context_identity());
+            assert_eq!(requirement.owner().context(), core.context_identity());
+            assert_eq!(requirement.subject().context(), core.context_identity());
+        }
+    }
+
+    #[test]
+    fn core_input_exposes_exact_completed_semantic_source_demand() {
+        use crate::completed_semantic::CoreSourceExecutableKind;
+
+        let test_foundation = fixture(Root::Test);
+        let test_core = test_foundation.for_core();
+        let test_sources = test_core.exact_source_executables().collect::<Vec<_>>();
+        assert_eq!(
+            test_sources.len(),
+            test_foundation.executable_demand.source_count
+        );
+        assert!(
+            test_sources
+                .iter()
+                .all(|reference| reference.context() == test_core.context_identity())
+        );
+        assert!(
+            test_sources
+                .iter()
+                .all(|reference| reference.identity() != 0 && reference.current_meaning() != 0)
+        );
+        assert!(
+            test_sources
+                .iter()
+                .any(|reference| reference.kind() == CoreSourceExecutableKind::Specialization)
+        );
+        assert!(
+            test_sources
+                .iter()
+                .any(|reference| reference.kind() == CoreSourceExecutableKind::TestBody)
+        );
+
+        let closure_foundation = fixture_from_source(
+            "src/image.wr",
+            br#"@image
+fn build() -> Image:
+    offset = 2
+    callback = |value: i64| value + offset
+    return Image.new(callback=callback)
+"#,
+            Root::Image,
+        );
+        let closure_core = closure_foundation.for_core();
+        let closure_sources = closure_core.exact_source_executables().collect::<Vec<_>>();
+        assert_eq!(
+            closure_sources.len(),
+            closure_foundation.executable_demand.source_count
+        );
+        assert!(
+            closure_sources
+                .iter()
+                .all(|reference| reference.context() == closure_core.context_identity())
+        );
+        assert!(
+            closure_sources
+                .iter()
+                .all(|reference| reference.identity() != 0 && reference.current_meaning() != 0)
+        );
+        assert!(
+            closure_sources
+                .iter()
+                .any(|reference| reference.kind() == CoreSourceExecutableKind::Specialization)
+        );
+        assert!(
+            closure_sources
+                .iter()
+                .any(|reference| reference.kind() == CoreSourceExecutableKind::ClosureBody)
+        );
     }
 }

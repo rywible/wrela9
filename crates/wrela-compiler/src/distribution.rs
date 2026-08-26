@@ -8,6 +8,7 @@ use xxhash_rust::xxh3::Xxh3;
 use crate::architecture_planning::{ArchitecturePlanningModule, ContractContext};
 use crate::compiler::{CompilerInstallation, OpenError, ProjectFile, Root};
 use crate::identity::{self, IdentityCatalog, IdentityFailure};
+use crate::image_planning::ImagePlanningModule;
 use crate::model::BuildKind;
 use crate::semantic;
 use crate::syntax::{DeclarationKind, DeclarationSyntax, FunctionModifier, TypeSyntax};
@@ -48,6 +49,7 @@ pub(crate) struct CompilerDistribution {
     build_authority: BuildAuthority,
     pool_authority: PoolAuthority,
     architecture_planning: ArchitecturePlanningModule,
+    image_planning: ImagePlanningModule,
     digest: u128,
 }
 
@@ -164,6 +166,7 @@ impl CompilerDistribution {
                 DISTRIBUTION_VERSION,
                 digest,
             )),
+            image_planning: ImagePlanningModule,
             digest,
         })
     }
@@ -182,6 +185,10 @@ impl CompilerDistribution {
 
     pub(crate) const fn architecture_planning(&self) -> &ArchitecturePlanningModule {
         &self.architecture_planning
+    }
+
+    pub(crate) const fn image_planning(&self) -> &ImagePlanningModule {
+        &self.image_planning
     }
 
     pub(crate) const fn digest(&self) -> u128 {

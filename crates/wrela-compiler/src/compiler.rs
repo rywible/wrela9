@@ -11,6 +11,9 @@ use crate::architecture_planning::{
     ArchitecturePlanningObservation, ArchitectureProfile, ContractFailureKind,
     VerifiedArchitecturePlanningContract,
 };
+use crate::image_planning::{
+    PlanningFailure, PlanningFoundationObservation, VerifiedPlanningFoundation,
+};
 use crate::syntax;
 use crate::typed_hir::AuthorityContext;
 use crate::{
@@ -214,6 +217,7 @@ pub struct InspectSelection {
     construction: bool,
     tests: bool,
     architecture_planning: bool,
+    planning: bool,
 }
 
 impl InspectSelection {
@@ -228,6 +232,7 @@ impl InspectSelection {
             construction: false,
             tests: false,
             architecture_planning: false,
+            planning: false,
         }
     }
 
@@ -235,6 +240,15 @@ impl InspectSelection {
     pub const fn syntax() -> Self {
         Self {
             syntax: true,
+            ..Self::none()
+        }
+    }
+
+    #[must_use]
+    pub const fn planning() -> Self {
+        Self {
+            architecture_planning: true,
+            planning: true,
             ..Self::none()
         }
     }
@@ -250,6 +264,7 @@ impl InspectSelection {
             construction: true,
             tests: true,
             architecture_planning: true,
+            planning: true,
         }
     }
 }
@@ -968,6 +983,7 @@ pub struct Inspection {
     test_plan: Arc<[TestApplicationObservation]>,
     architecture_planning_contract: Option<ArchitecturePlanningObservation>,
     completed_semantic_program: Option<CompletedSemanticProgramObservation>,
+    planning_foundation: Option<PlanningFoundationObservation>,
 }
 
 impl Inspection {
@@ -1064,6 +1080,11 @@ impl Inspection {
     #[must_use]
     pub const fn completed_semantic_program(&self) -> Option<&CompletedSemanticProgramObservation> {
         self.completed_semantic_program.as_ref()
+    }
+
+    #[must_use]
+    pub const fn planning_foundation(&self) -> Option<&PlanningFoundationObservation> {
+        self.planning_foundation.as_ref()
     }
 }
 
@@ -2090,6 +2111,7 @@ pub struct AcceptedCompilation {
     diagnostics: Arc<[Diagnostic]>,
     inspection: Inspection,
     completed_semantic_program: Arc<crate::completed_semantic::CompletedSemanticProgram>,
+    planning_foundation: Option<Arc<VerifiedPlanningFoundation>>,
 }
 
 impl AcceptedCompilation {
@@ -2106,6 +2128,13 @@ impl AcceptedCompilation {
     #[must_use]
     pub fn semantic_program_fingerprint(&self) -> u128 {
         self.completed_semantic_program.fingerprint()
+    }
+
+    #[must_use]
+    pub fn planning_foundation_fingerprint(&self) -> Option<u128> {
+        self.planning_foundation
+            .as_ref()
+            .map(|planning| planning.fingerprint())
     }
 
     #[allow(dead_code)]
@@ -2491,7 +2520,7 @@ impl Compiler {
                     .architecture_planning()
                     .authenticate(profile, cancellation)
                 {
-                    Ok(contract) => Some(contract),
+                    Ok(contract) => Some(Arc::new(contract)),
                     Err(failure) if failure.kind() == ContractFailureKind::Cancelled => {
                         return CompilationOutcome::Cancelled;
                     }
@@ -2518,6 +2547,33 @@ impl Compiler {
                 .then(left.primary.start.cmp(&right.primary.start))
                 .then(left.code.cmp(&right.code))
         });
+
+        let planning_foundation = if diagnostics.is_empty() {
+            match (
+                completed_semantic_program.as_ref(),
+                architecture_contract.as_ref(),
+            ) {
+                (Some(semantic_program), Some(architecture_contract)) => {
+                    match self.distribution.image_planning().plan(
+                        Arc::clone(semantic_program),
+                        Arc::clone(architecture_contract),
+                        cancellation,
+                    ) {
+                        Ok(planning) => Some(Arc::new(planning)),
+                        Err(PlanningFailure::Cancelled) => return CompilationOutcome::Cancelled,
+                        Err(PlanningFailure::Defect(evidence)) => {
+                            return CompilationOutcome::Defect(Defect::new(
+                                "Image Planning Foundation",
+                                evidence,
+                            ));
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         let Some(unreachable_project_syntax) = parse_unreachable_project_syntax(
             &request.project,
@@ -2579,13 +2635,20 @@ impl Compiler {
             constructions: semantic_projection.constructions,
             test_plan: semantic_projection.test_plan,
             architecture_planning_contract: architecture_observation(
-                architecture_contract.as_ref(),
+                architecture_contract.as_deref(),
                 request.inspection,
             ),
             completed_semantic_program: if diagnostics.is_empty() && request.inspection.semantics {
                 completed_semantic_program
                     .as_ref()
                     .map(|completed| completed.observation())
+            } else {
+                None
+            },
+            planning_foundation: if request.inspection.planning {
+                planning_foundation
+                    .as_ref()
+                    .map(|planning| planning.observation())
             } else {
                 None
             },
@@ -2602,6 +2665,7 @@ impl Compiler {
                 diagnostics: Arc::from([]),
                 inspection,
                 completed_semantic_program,
+                planning_foundation,
             })
         } else {
             CompilationOutcome::Rejected(RejectedCompilation {

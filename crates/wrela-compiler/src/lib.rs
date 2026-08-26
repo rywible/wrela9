@@ -11,6 +11,7 @@ mod evaluator;
 mod graph;
 mod identity;
 mod image_evaluation;
+mod image_planning;
 mod model;
 mod project_closure;
 mod semantic;
@@ -35,4 +36,10 @@ pub use compiler::{
     SyntaxInvalidKind, SyntaxLayoutKind, SyntaxMissingKind, SyntaxNodeKind, SyntaxNodeObservation,
     SyntaxObservation, SyntaxTokenKind, SyntaxTriviaKind, TestApplicationObservation,
     TestBindingObservation, TypeObservation, TypeRole,
+};
+pub use image_planning::{
+    DomainPlanKind, DomainPlanObservation, ExecutableDemandObservation, GeneratedRoleKind,
+    GeneratedRoleObservation, PlannerKind, PlannerObservation, PlanningBinding, PlanningCapability,
+    PlanningFoundationObservation, PlanningMultiplicity, PlanningReservation, RequirementBounds,
+    RequirementCategory, RequirementObservation, RequirementProvenance, RequirementSubject,
 };

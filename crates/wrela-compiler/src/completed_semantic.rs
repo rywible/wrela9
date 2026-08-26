@@ -331,6 +331,53 @@ impl CompletedSemanticProgram {
                 _ => None,
             })
     }
+
+    pub(crate) fn for_image_planning(&self) -> ImagePlanningSemanticProgram<'_> {
+        ImagePlanningSemanticProgram { program: self }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ImagePlanningSemanticProgram<'a> {
+    program: &'a CompletedSemanticProgram,
+}
+
+impl ImagePlanningSemanticProgram<'_> {
+    pub(crate) fn context_identity(self) -> u128 {
+        self.program.context.identity
+    }
+
+    pub(crate) fn distribution_digest(self) -> u128 {
+        self.program.context.distribution_digest
+    }
+
+    pub(crate) fn root(self) -> Root {
+        self.program.context.root
+    }
+
+    pub(crate) const fn fingerprint(self) -> u128 {
+        self.program.fingerprint
+    }
+
+    pub(crate) const fn construction_graph_fingerprint(self) -> u128 {
+        self.program.graph.fingerprint
+    }
+
+    pub(crate) const fn executable_demand_fingerprint(self) -> u128 {
+        self.program.demand.fingerprint
+    }
+
+    pub(crate) const fn custody_fingerprint(self) -> u128 {
+        self.program.custody_fingerprint
+    }
+
+    pub(crate) fn source_executable_count(self) -> usize {
+        self.program.demand.executables.len()
+    }
+
+    pub(crate) fn test_application_count(self) -> usize {
+        self.program.graph.test_applications.len()
+    }
 }
 
 pub(crate) fn complete(

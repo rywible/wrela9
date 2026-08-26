@@ -388,6 +388,7 @@ pub(crate) struct VerifiedArchitecturePlanningContract {
     version: u16,
     fingerprint: u128,
     distribution_input_receipt: u128,
+    distribution_digest: u128,
     facts: ContractFacts,
     _verified: Verified,
 }
@@ -423,6 +424,65 @@ impl VerifiedArchitecturePlanningContract {
 
     pub(crate) const fn for_logical_layout(&self) -> LogicalLayoutArchitecture<'_> {
         LogicalLayoutArchitecture { facts: &self.facts }
+    }
+
+    pub(crate) const fn for_image_planning(&self) -> ImagePlanningArchitecture<'_> {
+        ImagePlanningArchitecture { contract: self }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ImagePlanningArchitecture<'a> {
+    contract: &'a VerifiedArchitecturePlanningContract,
+}
+
+impl ImagePlanningArchitecture<'_> {
+    pub(crate) const fn identity(self) -> u128 {
+        self.contract.identity
+    }
+
+    pub(crate) const fn fingerprint(self) -> u128 {
+        self.contract.fingerprint
+    }
+
+    pub(crate) const fn distribution_input_receipt(self) -> u128 {
+        self.contract.distribution_input_receipt
+    }
+
+    pub(crate) const fn distribution_digest(self) -> u128 {
+        self.contract.distribution_digest
+    }
+
+    pub(crate) fn core_count(self) -> usize {
+        self.contract.facts.cores.len()
+    }
+
+    pub(crate) const fn capacity(self) -> CapacityRules {
+        self.contract.facts.capacity
+    }
+
+    pub(crate) fn has_capability(self, capability: VmAbiCapability) -> bool {
+        self.contract.facts.capabilities.contains(&capability)
+    }
+
+    pub(crate) const fn service(self) -> ServiceCostBaseline {
+        self.contract.facts.service
+    }
+
+    pub(crate) fn has_binding(self, binding: BindingKind) -> bool {
+        self.contract
+            .facts
+            .binding_slots
+            .iter()
+            .any(|slot| slot.kind == binding)
+    }
+
+    pub(crate) fn has_reservation(self, reservation: ReservationKind) -> bool {
+        self.contract
+            .facts
+            .reservations
+            .iter()
+            .any(|rule| rule.kind == reservation)
     }
 }
 
@@ -1527,6 +1587,7 @@ fn verify(
         version: candidate.version,
         fingerprint: expected_fingerprint,
         distribution_input_receipt: expected_input_receipt,
+        distribution_digest: candidate.context.distribution_digest,
         facts,
         _verified: Verified,
     })

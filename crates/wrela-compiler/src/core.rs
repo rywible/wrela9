@@ -1616,6 +1616,42 @@ impl FlowCoreView<'_> {
         sites
     }
 
+    pub(crate) fn terminal_panic_sites(&self) -> Vec<FlowCoreTerminalPanicSite> {
+        let executable_identities = stable_executable_identities(&self.core.executables);
+        let mut sites = Vec::new();
+        for executable in self.core.executables.iter() {
+            let executable_identity = executable_identities
+                .get(&executable.reference.identity)
+                .copied()
+                .unwrap_or(u128::MAX);
+            for operation in executable
+                .regions
+                .iter()
+                .flat_map(|region| region.operations.iter())
+                .filter(|operation| operation.kind == CoreOperationKind::TerminalPanic)
+            {
+                let mut identity = Xxh3::new();
+                identity.update(b"wrela.core.terminal-panic-site\0\x01");
+                identity.update(&executable_identity.to_be_bytes());
+                identity.update(&operation.identity.to_be_bytes());
+                let identity = identity.digest128();
+                let mut meaning = Xxh3::new();
+                meaning.update(b"wrela.core.terminal-panic-meaning\0\x01");
+                meaning.update(&identity.to_be_bytes());
+                meaning.update(&operation.type_identity.unwrap_or(0).to_be_bytes());
+                sites.push(FlowCoreTerminalPanicSite {
+                    handler: executable.reference.identity,
+                    identity,
+                    current_meaning: meaning.digest128(),
+                    program_order: operation.identity,
+                    source: operation.provenance.clone(),
+                });
+            }
+        }
+        sites.sort_by_key(|site| (site.handler, site.program_order, site.identity));
+        sites
+    }
+
     pub(crate) fn group_sites(&self) -> Vec<FlowCoreGroupSite> {
         let executable_identities = stable_executable_identities(&self.core.executables);
         let mut groups = Vec::new();
@@ -1624,55 +1660,90 @@ impl FlowCoreView<'_> {
                 .get(&executable.reference.identity)
                 .copied()
                 .unwrap_or(u128::MAX);
-            let mut calls = executable
+            let operations = executable
                 .regions
                 .iter()
                 .flat_map(|region| region.operations.iter())
+                .collect::<Vec<_>>();
+            let result_places = operations
+                .iter()
+                .filter(|operation| {
+                    operation.kind == CoreOperationKind::Store && operation.details.len() >= 2
+                })
+                .filter_map(|operation| {
+                    let value = operation.operands.last().copied()?;
+                    let place = operation
+                        .details
+                        .get(..operation.details.len().saturating_sub(1))?;
+                    Some((value, Arc::<[u128]>::from(place)))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let mut calls = operations
+                .iter()
                 .filter_map(|operation| {
                     flow_group_call(operation).map(|(kind, arguments)| (operation, kind, arguments))
                 })
                 .collect::<Vec<_>>();
             calls.sort_by_key(|(operation, _, _)| operation.identity);
-            let mut active: Option<FlowCoreGroupSite> = None;
+            let mut active = BTreeMap::<Arc<[u128]>, FlowCoreGroupSite>::new();
             for (operation, kind, arguments) in calls {
                 match kind {
                     GroupOperation::OpenAll
                     | GroupOperation::OpenCollect
                     | GroupOperation::OpenRace
                     | GroupOperation::OpenSupervise => {
-                        if let Some(previous) = active.take() {
-                            groups.push(previous);
-                        }
+                        let place = operation
+                            .result
+                            .and_then(|result| result_places.get(&result).cloned())
+                            .unwrap_or_default();
                         let mut identity = Xxh3::new();
                         identity.update(b"wrela.core.group-site\0\x01");
                         identity.update(&executable_identity.to_be_bytes());
                         identity.update(&operation.identity.to_be_bytes());
+                        for part in place.iter() {
+                            identity.update(&part.to_be_bytes());
+                        }
                         let reference_identity = identity.digest128();
+                        let mut place_meaning = Xxh3::new();
+                        place_meaning.update(b"wrela.core.group-place-meaning\0\x01");
+                        place_meaning.update(&executable_identity.to_be_bytes());
+                        for part in place.iter() {
+                            place_meaning.update(&part.to_be_bytes());
+                        }
                         let bound = arguments.first().map_or(u64::MAX, |argument| {
                             u64::try_from(argument.literal).unwrap_or(u64::MAX)
                         });
-                        active = Some(FlowCoreGroupSite {
-                            handler: executable.reference.identity,
-                            reference_identity,
-                            reference_current_meaning: 0,
-                            policy: match kind {
-                                GroupOperation::OpenAll => FlowCoreGroupPolicy::All,
-                                GroupOperation::OpenCollect => FlowCoreGroupPolicy::Collect,
-                                GroupOperation::OpenRace => FlowCoreGroupPolicy::Race,
-                                GroupOperation::OpenSupervise => FlowCoreGroupPolicy::Supervise,
-                                _ => unreachable!("matched open Group operation"),
+                        active.insert(
+                            Arc::clone(&place),
+                            FlowCoreGroupSite {
+                                handler: executable.reference.identity,
+                                reference_identity,
+                                reference_current_meaning: 0,
+                                place,
+                                place_current_meaning: place_meaning.digest128(),
+                                policy: match kind {
+                                    GroupOperation::OpenAll => FlowCoreGroupPolicy::All,
+                                    GroupOperation::OpenCollect => FlowCoreGroupPolicy::Collect,
+                                    GroupOperation::OpenRace => FlowCoreGroupPolicy::Race,
+                                    GroupOperation::OpenSupervise => FlowCoreGroupPolicy::Supervise,
+                                    _ => unreachable!("matched open Group operation"),
+                                },
+                                child_activation_bound: bound,
+                                children: Arc::from([]),
+                                deadline: None,
+                                open_program_order: operation.identity,
+                                terminal_program_order: u32::MAX,
+                                cancelled: false,
+                                source: operation.provenance.clone(),
                             },
-                            child_activation_bound: bound,
-                            children: Arc::from([]),
-                            deadline: None,
-                            open_program_order: operation.identity,
-                            terminal_program_order: u32::MAX,
-                            cancelled: false,
-                            source: operation.provenance.clone(),
-                        });
+                        );
                     }
                     GroupOperation::Child => {
-                        let Some(group) = active.as_mut() else {
+                        let Some(receiver) = arguments.first().map(|argument| &argument.place)
+                        else {
+                            continue;
+                        };
+                        let Some(group) = active.get_mut(receiver) else {
                             continue;
                         };
                         let Some(argument) = arguments.last() else {
@@ -1688,11 +1759,15 @@ impl FlowCoreView<'_> {
                         meaning.update(&identity.to_be_bytes());
                         meaning.update(&argument.type_identity.to_be_bytes());
                         meaning.update(&argument.access.to_be_bytes());
+                        for part in argument.place.iter() {
+                            meaning.update(&part.to_be_bytes());
+                        }
                         let child = FlowCoreGroupChild {
                             identity,
                             current_meaning: meaning.digest128(),
                             type_identity: argument.type_identity,
                             moved: argument.access == 4,
+                            place: Arc::clone(&argument.place),
                             program_order: operation.identity,
                             source: operation.provenance.clone(),
                         };
@@ -1701,7 +1776,8 @@ impl FlowCoreView<'_> {
                         group.children = children.into();
                     }
                     GroupOperation::LogicalDeadline => {
-                        if let Some(group) = active.as_mut() {
+                        let receiver = arguments.first().map(|argument| &argument.place);
+                        if let Some(group) = receiver.and_then(|place| active.get_mut(place)) {
                             let epoch = arguments
                                 .iter()
                                 .rev()
@@ -1717,39 +1793,59 @@ impl FlowCoreView<'_> {
                             group.deadline = Some(FlowCoreGroupDeadline {
                                 class: FlowCoreDeadlineClass::Logical,
                                 authority: authority.digest128(),
+                                authority_current_meaning: epoch,
                                 capture_authority: None,
+                                capture_current_meaning: None,
                                 slack,
                                 epoch,
                             });
                         }
                     }
                     GroupOperation::RealtimeDeadline => {
-                        if let Some(group) = active.as_mut() {
-                            let clock = arguments
-                                .get(arguments.len().saturating_sub(3))
-                                .map_or(0, |argument| argument.type_identity);
-                            let capture = arguments
-                                .get(arguments.len().saturating_sub(2))
-                                .map_or(0, |argument| argument.type_identity);
+                        let receiver = arguments.first().map(|argument| &argument.place);
+                        if let Some(group) = receiver.and_then(|place| active.get_mut(place)) {
+                            let clock = arguments.get(arguments.len().saturating_sub(3)).cloned();
+                            let capture = arguments.get(arguments.len().saturating_sub(2)).cloned();
                             let slack = arguments.last().map_or(u64::MAX, |argument| {
                                 u64::try_from(argument.literal).unwrap_or(u64::MAX)
                             });
+                            let authority = flow_group_resource_authority(
+                                b"wrela.core.monotonic-clock-authority\0\x01",
+                                executable_identity,
+                                clock.as_ref(),
+                            );
+                            let capture_authority = flow_group_resource_authority(
+                                b"wrela.core.replay-capture-authority\0\x01",
+                                executable_identity,
+                                capture.as_ref(),
+                            );
                             group.deadline = Some(FlowCoreGroupDeadline {
                                 class: FlowCoreDeadlineClass::Realtime,
-                                authority: clock,
-                                capture_authority: (capture != 0).then_some(capture),
+                                authority,
+                                authority_current_meaning: clock
+                                    .as_ref()
+                                    .map_or(0, flow_group_resource_meaning),
+                                capture_authority: (capture_authority != 0)
+                                    .then_some(capture_authority),
+                                capture_current_meaning: capture
+                                    .as_ref()
+                                    .map(flow_group_resource_meaning),
                                 slack,
                                 epoch: 0,
                             });
                         }
                     }
                     GroupOperation::Complete | GroupOperation::Cancel => {
-                        if let Some(mut group) = active.take() {
+                        let receiver = arguments
+                            .first()
+                            .map(|argument| Arc::clone(&argument.place));
+                        if let Some(mut group) = receiver.and_then(|place| active.remove(&place)) {
                             group.terminal_program_order = operation.identity;
                             group.cancelled = kind == GroupOperation::Cancel;
                             let mut meaning = Xxh3::new();
                             meaning.update(b"wrela.core.group-site-meaning\0\x01");
                             meaning.update(&group.reference_identity.to_be_bytes());
+                            meaning.update(&group.place_current_meaning.to_be_bytes());
                             meaning.update(&[group.policy.tag()]);
                             meaning.update(&group.child_activation_bound.to_be_bytes());
                             meaning.update(&group.terminal_program_order.to_be_bytes());
@@ -1760,8 +1856,12 @@ impl FlowCoreView<'_> {
                             if let Some(deadline) = group.deadline {
                                 meaning.update(&[deadline.class.tag()]);
                                 meaning.update(&deadline.authority.to_be_bytes());
+                                meaning.update(&deadline.authority_current_meaning.to_be_bytes());
                                 meaning
                                     .update(&deadline.capture_authority.unwrap_or(0).to_be_bytes());
+                                meaning.update(
+                                    &deadline.capture_current_meaning.unwrap_or(0).to_be_bytes(),
+                                );
                                 meaning.update(&deadline.slack.to_be_bytes());
                                 meaning.update(&deadline.epoch.to_be_bytes());
                             }
@@ -1769,11 +1869,10 @@ impl FlowCoreView<'_> {
                             groups.push(group);
                         }
                     }
+                    GroupOperation::ReplyFulfill | GroupOperation::ReplyCancel => {}
                 }
             }
-            if let Some(group) = active {
-                groups.push(group);
-            }
+            groups.extend(active.into_values());
         }
         groups.sort_by_key(|group| (group.handler, group.open_program_order));
         groups
@@ -1787,11 +1886,18 @@ impl FlowCoreView<'_> {
                 .get(&executable.reference.identity)
                 .copied()
                 .unwrap_or(u128::MAX);
-            for operation in executable
+            for (operation, kind, arguments) in executable
                 .regions
                 .iter()
                 .flat_map(|region| region.operations.iter())
-                .filter(|operation| operation.kind == CoreOperationKind::Return)
+                .filter_map(|operation| {
+                    let (kind, arguments) = flow_group_call(operation)?;
+                    matches!(
+                        kind,
+                        GroupOperation::ReplyFulfill | GroupOperation::ReplyCancel
+                    )
+                    .then_some((operation, kind, arguments))
+                })
             {
                 let mut identity = Xxh3::new();
                 identity.update(b"wrela.core.reply-fulfillment\0\x01");
@@ -1801,18 +1907,27 @@ impl FlowCoreView<'_> {
                 let mut meaning = Xxh3::new();
                 meaning.update(b"wrela.core.reply-fulfillment-meaning\0\x01");
                 meaning.update(&identity.to_be_bytes());
-                meaning.update(
-                    &operation
-                        .operands
-                        .first()
-                        .map_or(0, |operand| u128::from(operand.0))
-                        .to_be_bytes(),
-                );
+                meaning.update(&[kind.canonical_tag()]);
+                for argument in &arguments {
+                    meaning.update(&argument.type_identity.to_be_bytes());
+                    meaning.update(&argument.access.to_be_bytes());
+                    for part in argument.place.iter() {
+                        meaning.update(&part.to_be_bytes());
+                    }
+                }
+                let endpoint = arguments.first();
+                let response = (kind == GroupOperation::ReplyFulfill)
+                    .then(|| arguments.last())
+                    .flatten();
                 sites.push(FlowCoreReplyFulfillmentSite {
                     handler: executable.reference.identity,
                     reference_identity: identity,
                     reference_current_meaning: meaning.digest128(),
-                    response_type_identity: executable.signature.return_type.identity,
+                    response_type_identity: response.map_or(0, |value| value.type_identity),
+                    endpoint_place: endpoint
+                        .map_or_else(Arc::default, |value| Arc::clone(&value.place)),
+                    response_place: response.map(|value| Arc::clone(&value.place)),
+                    cancelled: kind == GroupOperation::ReplyCancel,
                     program_order: operation.identity,
                     source: operation.provenance.clone(),
                 });
@@ -1823,11 +1938,41 @@ impl FlowCoreView<'_> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FlowGroupCallArgument {
     type_identity: u128,
     access: u128,
     literal: u128,
+    place: Arc<[u128]>,
+}
+
+fn flow_group_resource_authority(
+    domain: &[u8],
+    executable: u128,
+    argument: Option<&FlowGroupCallArgument>,
+) -> u128 {
+    let Some(argument) = argument else {
+        return 0;
+    };
+    let mut hash = Xxh3::new();
+    hash.update(domain);
+    hash.update(&executable.to_be_bytes());
+    hash.update(&argument.type_identity.to_be_bytes());
+    for part in argument.place.iter() {
+        hash.update(&part.to_be_bytes());
+    }
+    hash.digest128()
+}
+
+fn flow_group_resource_meaning(argument: &FlowGroupCallArgument) -> u128 {
+    let mut hash = Xxh3::new();
+    hash.update(b"wrela.core.group-authority-meaning\0\x01");
+    hash.update(&argument.type_identity.to_be_bytes());
+    hash.update(&argument.access.to_be_bytes());
+    for part in argument.place.iter() {
+        hash.update(&part.to_be_bytes());
+    }
+    hash.digest128()
 }
 
 fn flow_group_call(operation: &Operation) -> Option<(GroupOperation, Vec<FlowGroupCallArgument>)> {
@@ -1838,17 +1983,26 @@ fn flow_group_call(operation: &Operation) -> Option<(GroupOperation, Vec<FlowGro
     let kind = GroupOperation::from_canonical_tag(*operation.details.get(marker + 1)?)?;
     let count = usize::try_from(*operation.details.get(marker + 2)?).ok()?;
     let encoded = operation.details.get(marker + 3..)?;
-    if encoded.len() != count.checked_mul(3)? {
+    let mut cursor = 0_usize;
+    let mut arguments = Vec::with_capacity(count);
+    for _ in 0..count {
+        let type_identity = *encoded.get(cursor)?;
+        let access = *encoded.get(cursor + 1)?;
+        let literal = *encoded.get(cursor + 2)?;
+        let place_len = usize::try_from(*encoded.get(cursor + 3)?).ok()?;
+        cursor = cursor.checked_add(4)?;
+        let place = encoded.get(cursor..cursor.checked_add(place_len)?)?;
+        cursor = cursor.checked_add(place_len)?;
+        arguments.push(FlowGroupCallArgument {
+            type_identity,
+            access,
+            literal,
+            place: Arc::from(place),
+        });
+    }
+    if cursor != encoded.len() {
         return None;
     }
-    let arguments = encoded
-        .chunks_exact(3)
-        .map(|parts| FlowGroupCallArgument {
-            type_identity: parts[0],
-            access: parts[1],
-            literal: parts[2],
-        })
-        .collect();
     Some((kind, arguments))
 }
 
@@ -1922,6 +2076,15 @@ pub(crate) struct FlowCoreCleanupSite {
     pub(crate) source: SourceRange,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FlowCoreTerminalPanicSite {
+    pub(crate) handler: u128,
+    pub(crate) identity: u128,
+    pub(crate) current_meaning: u128,
+    pub(crate) program_order: u32,
+    pub(crate) source: SourceRange,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FlowCoreGroupPolicy {
     All,
@@ -1960,7 +2123,9 @@ impl FlowCoreDeadlineClass {
 pub(crate) struct FlowCoreGroupDeadline {
     pub(crate) class: FlowCoreDeadlineClass,
     pub(crate) authority: u128,
+    pub(crate) authority_current_meaning: u128,
     pub(crate) capture_authority: Option<u128>,
+    pub(crate) capture_current_meaning: Option<u128>,
     pub(crate) slack: u64,
     pub(crate) epoch: u128,
 }
@@ -1971,6 +2136,7 @@ pub(crate) struct FlowCoreGroupChild {
     pub(crate) current_meaning: u128,
     pub(crate) type_identity: u128,
     pub(crate) moved: bool,
+    pub(crate) place: Arc<[u128]>,
     pub(crate) program_order: u32,
     pub(crate) source: SourceRange,
 }
@@ -1980,6 +2146,8 @@ pub(crate) struct FlowCoreGroupSite {
     pub(crate) handler: u128,
     pub(crate) reference_identity: u128,
     pub(crate) reference_current_meaning: u128,
+    pub(crate) place: Arc<[u128]>,
+    pub(crate) place_current_meaning: u128,
     pub(crate) policy: FlowCoreGroupPolicy,
     pub(crate) child_activation_bound: u64,
     pub(crate) children: Arc<[FlowCoreGroupChild]>,
@@ -1996,6 +2164,9 @@ pub(crate) struct FlowCoreReplyFulfillmentSite {
     pub(crate) reference_identity: u128,
     pub(crate) reference_current_meaning: u128,
     pub(crate) response_type_identity: u128,
+    pub(crate) endpoint_place: Arc<[u128]>,
+    pub(crate) response_place: Option<Arc<[u128]>>,
+    pub(crate) cancelled: bool,
     pub(crate) program_order: u32,
     pub(crate) source: SourceRange,
 }
@@ -4560,6 +4731,9 @@ fn producer_group_call_details(target: &CallTarget, arguments: &[Expression]) ->
             }
             _ => u128::MAX,
         });
+        let place = root_place(argument).map_or_else(Vec::new, |place| place_details(&place));
+        details.push(u128::try_from(place.len()).unwrap_or(u128::MAX));
+        details.extend(place);
     }
     details
 }
@@ -6120,6 +6294,10 @@ fn verifier_group_call_details(target: &CallTarget, arguments: &[Expression]) ->
             }
             _ => u128::MAX,
         });
+        let place =
+            root_place(argument).map_or_else(Vec::new, |place| verifier_place_details(&place));
+        details.push(u128::try_from(place.len()).unwrap_or(u128::MAX));
+        details.extend(place);
     }
     details
 }

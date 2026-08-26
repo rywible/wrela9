@@ -1049,6 +1049,11 @@ fn analyze_with_probe(
             DeclarationKind::ResourceStruct,
             "MessageFull",
         ),
+        reply_endpoint_definition: identity_catalog.definition(
+            "src/core/actor.wr",
+            DeclarationKind::ResourceStruct,
+            "Reply",
+        ),
         ..ProgramInput::default()
     };
     for (path, parsed) in parsed_sources {

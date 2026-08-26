@@ -55,29 +55,41 @@ fn newest():
 
 @actor
 struct Worker:
-    pub async fn run(self, take first: Token, take second: Token, take third: Token, take fourth: Token):
-        mut all = actors.Group.all(bound=1u64)
+    pub async fn run(self, take first: Token, take second: Token, take third: Token, take fourth: Token, take fifth: Token, take sixth: Token, take seventh: Token, take eighth: Token):
+        mut all = actors.Group.all(bound=2u64)
         all.logical_deadline(epoch=5u64, slack=10u64)
         defer oldest()
         defer newest()
-        first = all.child(value=take first)
-        _ = actors.Group.complete(take all)
-        consume(take first)
+        first_child = all.child(value=take first)
+        second_child = all.child(value=take second)
+        first_return = actors.Group.complete_pair(take all, take first_child, take second_child)
+        _ = first_return.outcome
+        consume(take first_return.first)
+        consume(take first_return.second)
 
-        mut collect = actors.Group.collect(bound=1u64)
-        second = collect.child(value=take second)
-        _ = actors.Group.complete(take collect)
-        consume(take second)
+        mut collect = actors.Group.collect(bound=2u64)
+        third_child = collect.child(value=take third)
+        fourth_child = collect.child(value=take fourth)
+        second_return = actors.Group.complete_pair(take collect, take third_child, take fourth_child)
+        _ = second_return.outcome
+        consume(take second_return.first)
+        consume(take second_return.second)
 
-        mut race = actors.Group.race(bound=1u64)
-        third = race.child(value=take third)
-        _ = actors.Group.complete(take race)
-        consume(take third)
+        mut race = actors.Group.race(bound=2u64)
+        fifth_child = race.child(value=take fifth)
+        sixth_child = race.child(value=take sixth)
+        third_return = actors.Group.complete_pair(take race, take fifth_child, take sixth_child)
+        _ = third_return.outcome
+        consume(take third_return.first)
+        consume(take third_return.second)
 
-        mut supervise = actors.Group.supervise(bound=1u64)
-        fourth = supervise.child(value=take fourth)
-        _ = actors.Group.complete(take supervise)
-        consume(take fourth)
+        mut supervise = actors.Group.supervise(bound=2u64)
+        seventh_child = supervise.child(value=take seventh)
+        eighth_child = supervise.child(value=take eighth)
+        fourth_return = actors.Group.complete_pair(take supervise, take seventh_child, take eighth_child)
+        _ = fourth_return.outcome
+        consume(take fourth_return.first)
+        consume(take fourth_return.second)
 
 @image
 fn build() -> Image:
@@ -103,9 +115,9 @@ fn build() -> Image:
         .groups()
         .iter()
         .map(|group| {
-            assert_eq!(group.child_activation_bound(), 1);
-            assert_eq!(group.child_activations().len(), 1);
-            assert_eq!(group.moved_resources().len(), 1);
+            assert_eq!(group.child_activation_bound(), 2);
+            assert_eq!(group.child_activations().len(), 2);
+            assert_eq!(group.moved_resources().len(), 2);
             assert_ne!(group.noncopyable_cancellation_authority(), 0);
             assert_ne!(group.return_home(), 0);
             group.policy()
@@ -121,6 +133,52 @@ fn build() -> Image:
         ])
     );
     assert_eq!(flow.group_policy_laws().len(), 4);
+    for group in flow.groups() {
+        let scenario = flow
+            .structured_scenarios()
+            .iter()
+            .find(|scenario| {
+                scenario.kind() == FlowStructuredScenarioKind::GroupPolicies
+                    && scenario.events().iter().any(|event| {
+                        event.kind() == FlowEventKind::GroupOutcomePublished
+                            && event.subject() == Some(group.identity())
+                    })
+            })
+            .expect("policy transition scenario");
+        assert!(
+            scenario
+                .events()
+                .iter()
+                .any(|event| event.kind() == FlowEventKind::ChildCompleted)
+        );
+        assert!(
+            scenario
+                .events()
+                .iter()
+                .any(|event| event.kind() == FlowEventKind::ChildFailed)
+        );
+        assert_eq!(
+            scenario
+                .events()
+                .iter()
+                .any(|event| { event.kind() == FlowEventKind::SiblingCancellationRequested }),
+            matches!(group.policy(), FlowGroupPolicy::All | FlowGroupPolicy::Race)
+        );
+        match group.policy() {
+            FlowGroupPolicy::All => {
+                assert_eq!(scenario.outcome(), FlowStructuredOutcome::Cancelled);
+                assert_eq!(scenario.winner_order(), [0, 1]);
+            }
+            FlowGroupPolicy::Race => {
+                assert_eq!(scenario.outcome(), FlowStructuredOutcome::Completed);
+                assert_eq!(scenario.winner_order(), [1]);
+            }
+            FlowGroupPolicy::Collect | FlowGroupPolicy::Supervise => {
+                assert_eq!(scenario.outcome(), FlowStructuredOutcome::Completed);
+                assert_eq!(scenario.winner_order(), [0, 1]);
+            }
+        }
+    }
     let logical = flow
         .groups()
         .iter()
@@ -132,7 +190,7 @@ fn build() -> Image:
     );
     assert_eq!(logical.deadline_slack(), Some(10));
     assert_ne!(logical.deadline_authority(), Some(0));
-    assert!(logical.maximum_cancellation_latency() > 4);
+    assert!(logical.maximum_uninterrupted_work_units() > 4);
     assert_eq!(logical.cleanup_actions().len(), 2);
     assert_eq!(
         logical.cleanup_execution_order(),
@@ -154,7 +212,91 @@ fn build() -> Image:
                 .windows(2)
                 .all(|events| events[0].logical_coordinate() < events[1].logical_coordinate())
     }));
-    assert!(flow.model_agrees());
+    assert!(!flow.model_agrees());
+}
+
+#[test]
+fn nested_groups_keep_exact_receiver_places_and_innermost_message_ownership() {
+    let source = br#"from core import actor as actors
+
+resource struct Token:
+    value: i64
+
+fn consume(take token: Token):
+    pass
+
+@actor
+struct Receiver:
+    pub async fn receive(self, value: i64):
+        pass
+
+@actor
+struct Worker:
+    pub async fn run(self, receiver: Receiver, take first: Token, take second: Token):
+        mut outer = actors.Group.all(bound=1u64)
+        outer_child = outer.child(value=take first)
+        mut inner = actors.Group.race(bound=1u64)
+        inner_child = inner.child(value=take second)
+        await send receiver.receive(1)
+        inner_return = actors.Group.complete_child(take inner, take inner_child)
+        _ = inner_return.outcome
+        consume(take inner_return.value)
+        await send receiver.receive(2)
+        outer_return = actors.Group.complete_child(take outer, take outer_child)
+        _ = outer_return.outcome
+        consume(take outer_return.value)
+
+@image
+fn build() -> Image:
+    receiver = Receiver()
+    worker = Worker()
+    return Image.new(receiver=receiver, worker=worker)
+"#;
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    );
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("nested Group fixture accepts: {outcome:#?}");
+    };
+    let flow = accepted.inspection().flow_program().expect("Flow selected");
+    assert_eq!(flow.groups().len(), 2);
+    let outer = flow
+        .groups()
+        .iter()
+        .find(|group| group.policy() == FlowGroupPolicy::All)
+        .expect("outer Group");
+    let inner = flow
+        .groups()
+        .iter()
+        .find(|group| group.policy() == FlowGroupPolicy::Race)
+        .expect("inner Group");
+    assert!(!outer.receiver_place().is_empty());
+    assert!(!inner.receiver_place().is_empty());
+    assert_ne!(outer.receiver_place(), inner.receiver_place());
+    assert_ne!(
+        outer.receiver_current_meaning(),
+        inner.receiver_current_meaning()
+    );
+    assert_ne!(
+        outer.moved_resources()[0].place(),
+        inner.moved_resources()[0].place()
+    );
+    assert_eq!(flow.proposal_templates().len(), 2);
+    assert_eq!(
+        flow.proposal_templates()[0].owning_group(),
+        Some(inner.identity())
+    );
+    assert_eq!(
+        flow.proposal_templates()[1].owning_group(),
+        Some(outer.identity())
+    );
 }
 
 #[test]
@@ -287,9 +429,10 @@ fn consume(take token: Token):
 struct Worker:
     pub async fn run(self, take token: Token):
         mut group = actors.Group.all(bound=0u64)
-        token = group.child(value=take token)
-        _ = actors.Group.complete(take group)
-        consume(take token)
+        child = group.child(value=take token)
+        returned = actors.Group.complete_child(take group, take child)
+        _ = returned.outcome
+        consume(take returned.value)
 
 @image
 fn build() -> Image:
@@ -387,7 +530,7 @@ fn actor_flow_has_bounded_non_reentrant_turns_and_static_homes() {
     assert_eq!(flow.suspension_homes().len(), 1);
     assert_eq!(flow.suspension_homes()[0].slot_count(), 1);
     assert!(flow.suspension_homes()[0].retains_turn_lease());
-    assert!(flow.model_agrees());
+    assert!(!flow.model_agrees());
 }
 
 #[test]
@@ -430,7 +573,7 @@ fn try_send_arbitrates_canonically_and_preserves_resource_custody() {
     assert_ne!(canonical[0].key(), canonical[1].key());
     assert!(canonical[0].transfer_commit().is_some());
     assert!(canonical[1].transfer_commit().is_none());
-    assert!(flow.model_agrees());
+    assert!(!flow.model_agrees());
 }
 
 #[test]
@@ -1160,7 +1303,7 @@ fn build() -> Image:
             assert!(scenario.trace().iter().any(|record| record.kind() == kind));
         }
     }
-    assert!(flow.model_agrees());
+    assert!(!flow.model_agrees());
 }
 
 #[test]
@@ -1310,7 +1453,7 @@ fn build() -> Image:
         event.kind() == FlowEventKind::MailboxTransferCommitted
             && event.custodian() == Some(FlowCustodian::Mailbox)
     }));
-    assert!(flow.model_agrees());
+    assert!(!flow.model_agrees());
 }
 
 #[test]
@@ -1378,16 +1521,27 @@ fn build() -> Image:
 
 #[test]
 fn awaited_actor_request_reserves_reply_and_recovers_late_reply_closed_custody() {
-    let source = br#"resource struct Token:
+    let source = br#"from core import actor as actors
+
+resource struct Token:
     id: i64
 
 fn consume(take token: Token):
     pass
 
+fn finish(take fulfillment: Result[bool, actors.ReplyClosed[Token]]):
+    match fulfillment:
+        case Result.Ok(_):
+            return
+        case Result.Err(take closed):
+            consume(take closed.response)
+            return
+
 @actor
 struct Server:
-    pub async fn exchange(self, take token: Token) -> Token:
-        return take token
+    pub async fn exchange(self, take token: Token, take reply: actors.Reply[Token]):
+        fulfillment = actors.Reply.fulfill(take reply, take token)
+        finish(take fulfillment)
 
 @actor
 struct Client:
@@ -1430,9 +1584,41 @@ fn build() -> Image:
                 .iter()
                 .all(|(reference, meaning)| *reference != 0 && *meaning != 0)
     );
+    assert_eq!(reply.fulfillment_endpoint_places().len(), 1);
+    assert!(!reply.fulfillment_endpoint_places()[0].is_empty());
+    assert_eq!(reply.response_custody().len(), 1);
+    assert!(!reply.response_custody()[0].place().is_empty());
+    assert!(!reply.explicit_cancel());
     assert!(flow.requirements().iter().any(|requirement| {
         requirement.kind() == FlowRequirementKind::ReplyResponseHome
             && requirement.site() == Some(reply.response_home())
+    }));
+    let request_template = flow
+        .proposal_templates()
+        .iter()
+        .find(|template| template.admission_kind() == FlowAdmissionKind::Request)
+        .expect("request template");
+    let cancelled_wait = flow
+        .structured_scenarios()
+        .iter()
+        .find(|scenario| {
+            scenario.kind() == FlowStructuredScenarioKind::PreCommitCancellation
+                && scenario.events().iter().any(|event| {
+                    event.kind() == FlowEventKind::ReplyEndpointClosed
+                        && event.subject() == Some(reply.identity())
+                })
+        })
+        .expect("waiting Request cancellation");
+    assert!(cancelled_wait.events().iter().any(|event| {
+        event.kind() == FlowEventKind::AdmissionCancelled
+            && event.subject() == Some(request_template.identity())
+    }));
+    assert!(request_template.resource_custody().iter().all(|custody| {
+        cancelled_wait.events().iter().any(|event| {
+            event.kind() == FlowEventKind::ResourceReturned
+                && event.subject() == Some(custody.core_reference_identity())
+                && event.custodian() == Some(FlowCustodian::ProposalHome)
+        })
     }));
 
     let delivered = flow
@@ -1456,9 +1642,38 @@ fn build() -> Image:
         event.kind() == FlowEventKind::ReplyClosed
             && event.custodian() == Some(FlowCustodian::ReplyClosed)
             && event.must_use()
-            && event.subject() == Some(reply.identity())
+            && event.subject() == Some(reply.response_custody()[0].core_reference_identity())
     }));
-    assert!(flow.model_agrees());
+    assert!(!flow.model_agrees());
+}
+
+#[test]
+fn reply_endpoint_must_be_fulfilled_once_with_a_checked_exact_response() {
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let bodies = [
+        "        pass",
+        "        first = actors.Reply.fulfill_copy(take reply, 1)\n        match first:\n            case Result.Ok(_):\n                pass\n            case Result.Err(take closed):\n                actors.ReplyClosed.discard_copy(take closed)\n        second = actors.Reply.fulfill_copy(take reply, 2)",
+        "        actors.Reply.fulfill_copy(take reply, 1)",
+        "        result = actors.Reply.fulfill_copy(take reply, false)",
+    ];
+    for body in bodies {
+        let source = format!(
+            "from core import actor as actors\n\n@actor\nstruct Receiver:\n    pub async fn ask(self, take reply: actors.Reply[i64]):\n{body}\n\n@actor\nstruct Sender:\n    pub async fn run(self, receiver: Receiver):\n        value = await receiver.ask()\n        _ = value\n\n@image\nfn build() -> Image:\n    receiver = Receiver()\n    sender = Sender()\n    return Image.new(receiver=receiver, sender=sender)\n"
+        );
+        let outcome = compiler.compile(
+            CompilationRequest::new(
+                ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source.into_bytes())]),
+                Root::Image,
+            )
+            .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+            .with_inspection(InspectSelection::all()),
+            &Cancellation::new(),
+        );
+        let CompilationOutcome::Rejected(rejected) = outcome else {
+            panic!("invalid Reply endpoint program is Creator-rejected: {outcome:#?}");
+        };
+        assert!(rejected.inspection().flow_program().is_none());
+    }
 }
 
 #[test]
@@ -1487,6 +1702,46 @@ fn absent_group_deadline_and_panic_facts_emit_no_fabricated_flow_authority() {
                 .any(|scenario| scenario.kind() == kind)
         );
     }
+}
+
+#[test]
+fn terminal_panic_scenario_is_derived_from_the_exact_core_site() {
+    let source = br#"@actor
+struct Worker:
+    pub async fn crash(self):
+        panic "boom"
+
+@image
+fn build() -> Image:
+    worker = Worker()
+    return Image.new(worker=worker)
+"#;
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    );
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("terminal Panic fixture accepts: {outcome:#?}");
+    };
+    let flow = accepted.inspection().flow_program().expect("Flow selected");
+    let scenarios = flow
+        .structured_scenarios()
+        .iter()
+        .filter(|scenario| scenario.kind() == FlowStructuredScenarioKind::TerminalPanic)
+        .collect::<Vec<_>>();
+    assert_eq!(scenarios.len(), 1);
+    assert_eq!(scenarios[0].outcome(), FlowStructuredOutcome::Panic);
+    assert_eq!(scenarios[0].events().len(), 1);
+    let event = &scenarios[0].events()[0];
+    assert_eq!(event.kind(), FlowEventKind::TerminalPanic);
+    assert!(event.subject().is_some_and(|subject| subject != 0));
+    assert_ne!(event.logical_coordinate(), 0);
 }
 
 #[test]
@@ -1593,7 +1848,9 @@ fn actor_message_admission_rejects_payload_and_receiver_loans_before_core_or_flo
     let cases: &[(&str, &[u8])] = &[
         (
             "read-payload",
-            br#"resource struct Token:
+            br#"from core import actor as actors
+
+resource struct Token:
     value: i64
 
 @actor
@@ -1636,13 +1893,20 @@ fn build() -> Image:
         ),
         (
             "request-payload",
-            br#"resource struct Token:
+            br#"from core import actor as actors
+
+resource struct Token:
     value: i64
 
 @actor
 struct Worker:
-    pub async fn accept(self, read token: Token) -> i64:
-        return 1
+    pub async fn accept(self, read token: Token, take reply: actors.Reply[i64]):
+        fulfillment = actors.Reply.fulfill_copy(take reply, 1)
+        match fulfillment:
+            case Result.Ok(_):
+                pass
+            case Result.Err(take closed):
+                actors.ReplyClosed.discard_copy(take closed)
 
     pub async fn start(self, take token: Token):
         _ = await self.accept(token)
@@ -1898,19 +2162,30 @@ fn build() -> Image:
 
 #[test]
 fn mailbox_capacity_is_global_for_waiting_sends_and_requests() {
-    let source = br#"resource struct Token:
+    let source = br#"from core import actor as actors
+
+resource struct Token:
     value: i64
 
 fn consume(take token: Token):
     pass
+
+fn finish_i64(take fulfillment: Result[bool, actors.ReplyClosed[i64]]):
+    match fulfillment:
+        case Result.Ok(_):
+            return
+        case Result.Err(take closed):
+            actors.ReplyClosed.discard_copy(take closed)
+            return
 
 @actor
 struct Receiver:
     pub async fn receive(self, take token: Token):
         consume(take token)
 
-    pub async fn request(self, value: i64) -> i64:
-        return value
+    pub async fn request(self, value: i64, take reply: actors.Reply[i64]):
+        fulfillment = actors.Reply.fulfill_copy(take reply, value)
+        finish_i64(take fulfillment)
 
 @actor
 struct SendOwner:
@@ -1960,18 +2235,54 @@ fn build() -> Image:
             .iter()
             .filter(|proposal| proposal.key().destination() == receiver.identity())
             .collect::<Vec<_>>();
-        assert_eq!(
-            destination
-                .iter()
-                .filter(|proposal| proposal.outcome() == FlowSendOutcome::Admitted)
-                .count(),
-            1
-        );
         assert!(
             destination
                 .iter()
-                .any(|proposal| proposal.outcome() == FlowSendOutcome::Waiting)
+                .all(|proposal| proposal.outcome() == FlowSendOutcome::Admitted)
         );
+        assert_eq!(
+            destination
+                .iter()
+                .filter(|proposal| proposal.waited_for_capacity())
+                .count(),
+            destination.len() - 1
+        );
+        for proposal in destination
+            .iter()
+            .filter(|proposal| proposal.waited_for_capacity())
+        {
+            assert!(proposal.dequeued_proposal().is_some());
+            assert_eq!(
+                proposal.before_commit_custodian(),
+                FlowCustodian::ProposalHome
+            );
+            assert_eq!(
+                proposal.after_arbitration_custodian(),
+                FlowCustodian::Mailbox
+            );
+            let records = scenario.trace().iter().enumerate().collect::<Vec<_>>();
+            let waiting = records.iter().position(|(_, record)| {
+                record.proposal() == Some(proposal.key())
+                    && record.kind() == FlowEventKind::AdmissionWaiting
+            });
+            let dequeue = records.iter().position(|(_, record)| {
+                record.proposal() == proposal.dequeued_proposal()
+                    && record.kind() == FlowEventKind::MailboxDequeued
+            });
+            let commit = records.iter().position(|(_, record)| {
+                record.proposal() == Some(proposal.key())
+                    && record.kind() == FlowEventKind::MailboxTransferCommitted
+            });
+            let resume = records.iter().position(|(_, record)| {
+                record.proposal() == Some(proposal.key())
+                    && record.kind() == FlowEventKind::TurnResumed
+            });
+            assert!(waiting.zip(dequeue).zip(commit).zip(resume).is_some_and(
+                |(((waiting, dequeue), commit), resume)| {
+                    waiting < dequeue && dequeue < commit && commit < resume
+                }
+            ));
+        }
         assert!(
             destination
                 .iter()

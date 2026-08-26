@@ -293,7 +293,11 @@ fn authenticated_pool_authority(
                 ("realtime_deadline", GroupOperation::RealtimeDeadline),
                 ("child", GroupOperation::Child),
                 ("complete", GroupOperation::Complete),
+                ("complete_child", GroupOperation::Complete),
+                ("complete_pair", GroupOperation::Complete),
                 ("cancel", GroupOperation::Cancel),
+                ("cancel_child", GroupOperation::Cancel),
+                ("cancel_pair", GroupOperation::Cancel),
             ]
             .into_iter()
             .filter_map(move |(name, operation)| {
@@ -301,8 +305,40 @@ fn authenticated_pool_authority(
                     .associated_function(group, name)
                     .map(|definition| (definition, operation))
             })
-        });
-    PoolAuthority::from_authenticated_pool(scoped_factory, operations, group_operations)
+        })
+        .chain(
+            identities
+                .definition(
+                    "src/core/actor.wr",
+                    DeclarationKind::ResourceStruct,
+                    "Reply",
+                )
+                .into_iter()
+                .flat_map(|reply| {
+                    [
+                        ("fulfill", GroupOperation::ReplyFulfill),
+                        ("fulfill_copy", GroupOperation::ReplyFulfill),
+                        ("cancel", GroupOperation::ReplyCancel),
+                    ]
+                    .into_iter()
+                    .filter_map(move |(name, operation)| {
+                        identities
+                            .associated_function(reply, name)
+                            .map(|definition| (definition, operation))
+                    })
+                }),
+        );
+    let reply_endpoint = identities.definition(
+        "src/core/actor.wr",
+        DeclarationKind::ResourceStruct,
+        "Reply",
+    );
+    PoolAuthority::from_authenticated_pool(
+        scoped_factory,
+        operations,
+        group_operations,
+        reply_endpoint,
+    )
 }
 
 fn authenticated_build_authority(

@@ -759,6 +759,7 @@ pub(crate) struct ProgramInput {
     pub(crate) actor_definitions: BTreeSet<DefinitionId>,
     pub(crate) actor_handlers: BTreeSet<DefinitionId>,
     pub(crate) message_full_definition: Option<DefinitionId>,
+    pub(crate) reply_endpoint_definition: Option<DefinitionId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1442,6 +1443,8 @@ pub(crate) enum GroupOperation {
     Child,
     Complete,
     Cancel,
+    ReplyFulfill,
+    ReplyCancel,
 }
 
 impl GroupOperation {
@@ -1456,6 +1459,8 @@ impl GroupOperation {
             Self::Child => 7,
             Self::Complete => 8,
             Self::Cancel => 9,
+            Self::ReplyFulfill => 10,
+            Self::ReplyCancel => 11,
         }
     }
 
@@ -1470,6 +1475,8 @@ impl GroupOperation {
             7 => Some(Self::Child),
             8 => Some(Self::Complete),
             9 => Some(Self::Cancel),
+            10 => Some(Self::ReplyFulfill),
+            11 => Some(Self::ReplyCancel),
             _ => None,
         }
     }
@@ -1494,6 +1501,7 @@ pub(crate) struct PoolAuthority {
     scoped_factory: Option<DefinitionId>,
     operations: BTreeMap<DefinitionId, PoolOperation>,
     group_operations: BTreeMap<DefinitionId, GroupOperation>,
+    reply_endpoint: Option<DefinitionId>,
     _sealed: SealedPoolAuthority,
 }
 
@@ -1529,6 +1537,7 @@ impl PoolAuthority {
             scoped_factory,
             operations: BTreeMap::new(),
             group_operations: BTreeMap::new(),
+            reply_endpoint: None,
             _sealed: SealedPoolAuthority,
         }
     }
@@ -1537,11 +1546,13 @@ impl PoolAuthority {
         scoped_factory: Option<DefinitionId>,
         operations: impl IntoIterator<Item = (DefinitionId, PoolOperation)>,
         group_operations: impl IntoIterator<Item = (DefinitionId, GroupOperation)>,
+        reply_endpoint: Option<DefinitionId>,
     ) -> Self {
         Self {
             scoped_factory,
             operations: operations.into_iter().collect(),
             group_operations: group_operations.into_iter().collect(),
+            reply_endpoint,
             _sealed: SealedPoolAuthority,
         }
     }
@@ -1556,6 +1567,13 @@ impl PoolAuthority {
 
     pub(crate) fn group_operation(&self, definition: DefinitionId) -> Option<GroupOperation> {
         self.group_operations.get(&definition).copied()
+    }
+
+    fn is_reply_endpoint_type(&self, type_: &Type) -> bool {
+        matches!(
+            (self.reply_endpoint, type_),
+            (Some(expected), Type::Nominal { definition, .. }) if expected == *definition
+        )
     }
 
     pub(crate) fn canonical_grants(
@@ -2217,6 +2235,7 @@ pub(crate) fn verify(
         structs: &input.structs,
         interfaces: &input.interfaces,
         message_full_definition: input.message_full_definition,
+        reply_endpoint_definition: input.reply_endpoint_definition,
         discharge_laws: Some(&discharge_laws),
     };
     verify_lowered_artifact(&artifact_catalog, &test_bodies)?;
@@ -3422,6 +3441,7 @@ struct ArtifactCatalog<'a> {
     structs: &'a BTreeMap<DefinitionId, ResolvedStruct>,
     interfaces: &'a BTreeMap<DefinitionId, ResolvedInterface>,
     message_full_definition: Option<DefinitionId>,
+    reply_endpoint_definition: Option<DefinitionId>,
     discharge_laws: Option<&'a VerifiedDischargeLaws>,
 }
 
@@ -5603,11 +5623,26 @@ fn verify_expression_artifact_with_cleanup(
                         .map(|index| function.parameter_definitions[usize::from(*index)])
                         .collect::<Vec<_>>();
                     let ordered = reorder_types(&argument_types, argument_order)?;
+                    let parameters = if function.parameters.len() == ordered.len().saturating_add(1)
+                        && matches!(
+                            (
+                                catalog.reply_endpoint_definition,
+                                function.parameters.last().map(|parameter| &parameter.1)
+                            ),
+                            (
+                                Some(expected),
+                                Some(Type::Nominal { definition, .. })
+                            ) if expected == *definition
+                        ) {
+                        &function.parameters[..function.parameters.len().saturating_sub(1)]
+                    } else {
+                        function.parameters.as_slice()
+                    };
                     if function.id != *definition
                         || function.group_operation != *group_operation
                         || argument_parameters.as_ref() != expected_parameters
-                        || !arguments_match(&ordered, &function.parameters)
-                        || !argument_accesses_match(arguments, argument_order, &function.parameters)
+                        || !arguments_match(&ordered, parameters)
+                        || !argument_accesses_match(arguments, argument_order, parameters)
                     {
                         return defect("concrete call operands disagree with specialization");
                     }
@@ -6024,7 +6059,7 @@ fn verify_expression_artifact_with_cleanup(
         }
         ExpressionKind::Request(value) => {
             let ExpressionKind::Call {
-                target: CallTarget::Function { .. },
+                target: CallTarget::Function { specialization, .. },
                 ..
             } = &value.kind
             else {
@@ -6041,10 +6076,25 @@ fn verify_expression_artifact_with_cleanup(
                 &expression.source,
                 cleanup_captures,
             )?;
-            if expression.type_ != returned {
+            let explicit_response = catalog
+                .specialized
+                .get(specialization)
+                .and_then(|function| function.parameters.last())
+                .and_then(|parameter| match &parameter.1 {
+                    Type::Nominal {
+                        definition,
+                        arguments,
+                        ..
+                    } if Some(*definition) == catalog.reply_endpoint_definition => {
+                        arguments.first().cloned()
+                    }
+                    _ => None,
+                });
+            if expression.type_ != returned && explicit_response.as_ref() != Some(&expression.type_)
+            {
                 return defect("lowered request lost its exact response type");
             }
-            returned
+            expression.type_.clone()
         }
         ExpressionKind::TrySend(value) => {
             let ExpressionKind::Call {
@@ -6343,6 +6393,7 @@ struct Lowerer<'a> {
     concrete_context: bool,
     test_application_context: u16,
     expected_expression_type: Option<Type>,
+    allow_hidden_reply_endpoint: bool,
     pending_scoped_pool: Option<PoolId>,
     next_scoped_pool_site: u32,
     scoped_pool_types: BTreeMap<String, PoolId>,
@@ -6401,6 +6452,7 @@ impl<'a> Lowerer<'a> {
             concrete_context,
             test_application_context: 0,
             expected_expression_type: None,
+            allow_hidden_reply_endpoint: false,
             pending_scoped_pool: None,
             next_scoped_pool_site: 0,
             scoped_pool_types: BTreeMap::new(),
@@ -8363,7 +8415,11 @@ impl<'a> Lowerer<'a> {
                     }
                     (ExpressionKind::Send(Box::new(message)), Type::Unit)
                 } else {
-                    let value = self.expression(value)?;
+                    let previous = self.allow_hidden_reply_endpoint;
+                    self.allow_hidden_reply_endpoint = true;
+                    let lowered = self.expression(value);
+                    self.allow_hidden_reply_endpoint = previous;
+                    let value = lowered?;
                     let actor_request = matches!(
                         &value.kind,
                         ExpressionKind::Call {
@@ -8371,6 +8427,26 @@ impl<'a> Lowerer<'a> {
                             ..
                         } if self.input.actor_handlers.contains(definition)
                     );
+                    let explicit_reply_type = match &value.kind {
+                        ExpressionKind::Call {
+                            target: CallTarget::Function { definition, .. },
+                            ..
+                        } if actor_request => self
+                            .functions
+                            .get(definition)
+                            .and_then(|function| function.parameters.last())
+                            .and_then(|parameter| match &parameter.type_ {
+                                Type::Nominal { arguments, .. }
+                                    if self
+                                        .pool_authority
+                                        .is_reply_endpoint_type(&parameter.type_) =>
+                                {
+                                    arguments.first().cloned()
+                                }
+                                _ => None,
+                            }),
+                        _ => None,
+                    };
                     if let Some(loan) = if actor_request {
                         message_call_loan(&value)
                     } else {
@@ -8388,7 +8464,7 @@ impl<'a> Lowerer<'a> {
                             Some(loan.source.clone()),
                         ));
                     }
-                    let type_ = value.type_.clone();
+                    let type_ = explicit_reply_type.unwrap_or_else(|| value.type_.clone());
                     if matches!(value.kind, ExpressionKind::Send(_)) {
                         (value.kind, type_)
                     } else if actor_request {
@@ -10952,8 +11028,20 @@ impl<'a> Lowerer<'a> {
                         .join(", ")
                 )),
             })?;
+        let hidden_reply_endpoint = self.allow_hidden_reply_endpoint
+            && self.input.actor_handlers.contains(&id)
+            && function.parameters.len() == arguments.len().saturating_add(1)
+            && function.parameters.last().is_some_and(|parameter| {
+                parameter.ownership == OwnershipSyntax::Take
+                    && self.pool_authority.is_reply_endpoint_type(&parameter.type_)
+            });
+        let callable_parameters = if hidden_reply_endpoint {
+            &function.parameters[..function.parameters.len().saturating_sub(1)]
+        } else {
+            function.parameters.as_slice()
+        };
         let argument_order = check_callable(
-            &function.parameters,
+            callable_parameters,
             arguments,
             labels,
             LabelMode::Optional,
@@ -13410,6 +13498,7 @@ mod tests {
             structs: &structs,
             interfaces: &interfaces,
             message_full_definition: None,
+            reply_endpoint_definition: None,
             discharge_laws: None,
         };
         assert!(matches!(
@@ -13477,6 +13566,7 @@ mod tests {
             structs: &structs,
             interfaces: &interfaces,
             message_full_definition: Some(authenticated),
+            reply_endpoint_definition: None,
             discharge_laws: None,
         };
 
@@ -13560,6 +13650,7 @@ mod tests {
             structs: &structs,
             interfaces: &interfaces,
             message_full_definition: None,
+            reply_endpoint_definition: None,
             discharge_laws: None,
         };
         assert!(matches!(
@@ -13637,6 +13728,7 @@ mod tests {
             structs: &structs,
             interfaces: &interfaces,
             message_full_definition: None,
+            reply_endpoint_definition: None,
             discharge_laws: None,
         };
 
@@ -13734,6 +13826,7 @@ mod tests {
             structs: &structs,
             interfaces: &interfaces,
             message_full_definition: None,
+            reply_endpoint_definition: None,
             discharge_laws: None,
         };
         let mut locals = BTreeMap::from([(
@@ -13801,6 +13894,7 @@ mod tests {
             structs: &structs,
             interfaces: &interfaces,
             message_full_definition: None,
+            reply_endpoint_definition: None,
             discharge_laws: None,
         };
         assert!(matches!(
@@ -13877,6 +13971,7 @@ mod tests {
             structs: &structs,
             interfaces: &interfaces,
             message_full_definition: None,
+            reply_endpoint_definition: None,
             discharge_laws: None,
         };
         let mut locals = BTreeMap::from([
@@ -13987,6 +14082,7 @@ mod tests {
             structs: &structs,
             interfaces: &interfaces,
             message_full_definition: None,
+            reply_endpoint_definition: None,
             discharge_laws: None,
         };
         let mut previous = owner.start();
@@ -14112,6 +14208,7 @@ mod tests {
             structs: &structs,
             interfaces: &interfaces,
             message_full_definition: None,
+            reply_endpoint_definition: None,
             discharge_laws: None,
         };
         let read_from = |local, access| Expression {

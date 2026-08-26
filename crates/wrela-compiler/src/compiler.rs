@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -28,12 +28,14 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct CompilerInstallation {
     pub(crate) authenticated_modules: Arc<[ProjectFile]>,
+    cache_layer1: bool,
 }
 
 impl Default for CompilerInstallation {
     fn default() -> Self {
         Self {
             authenticated_modules: Arc::from([]),
+            cache_layer1: false,
         }
     }
 }
@@ -51,12 +53,15 @@ impl CompilerInstallation {
         modules.push(layer1_actor_module());
         Self {
             authenticated_modules: modules.into(),
+            cache_layer1: false,
         }
     }
 
     #[must_use]
     pub fn layer1() -> Self {
-        Self::with_authenticated_modules(Vec::new())
+        let mut installation = Self::with_authenticated_modules(Vec::new());
+        installation.cache_layer1 = true;
+        installation
     }
 }
 
@@ -69,10 +74,37 @@ fn layer1_actor_module() -> ProjectFile {
 pub resource struct ReplyClosed[T]:
     pub response: T
 
+    pub fn discard_copy(take self):
+        pass
+
+pub resource struct Reply[T]:
+    identity: u64
+
+    pub fn fulfill(take self, take response: T) -> Result[bool, ReplyClosed[T]]:
+        panic "sealed Reply fulfill"
+
+    pub fn fulfill_copy(take self, response: T) -> Result[bool, ReplyClosed[T]]:
+        panic "sealed Reply fulfill copy"
+
+    pub fn cancel(take self):
+        pass
+
 pub enum GroupOutcome:
     Completed
     Cancelled
     DeadlineExceeded
+
+pub resource struct GroupChild[T]:
+    value: T
+
+pub resource struct GroupReturn[T]:
+    pub outcome: GroupOutcome
+    pub value: T
+
+pub resource struct GroupPairReturn[A, B]:
+    pub outcome: GroupOutcome
+    pub first: A
+    pub second: B
 
 pub resource struct MonotonicClock:
     identity: u64
@@ -101,8 +133,20 @@ pub resource struct Group:
     pub fn realtime_deadline(mut self, read clock: MonotonicClock, read capture: ReplayCapture, slack: u64):
         pass
 
-    pub fn child[T](mut self, take value: T) -> T:
+    pub fn child[T](mut self, take value: T) -> GroupChild[T]:
         panic "sealed Group child"
+
+    pub fn complete_child[T](take self, take child: GroupChild[T]) -> GroupReturn[T]:
+        panic "sealed Group complete child"
+
+    pub fn complete_pair[A, B](take self, take first: GroupChild[A], take second: GroupChild[B]) -> GroupPairReturn[A, B]:
+        panic "sealed Group complete pair"
+
+    pub fn cancel_child[T](take self, take child: GroupChild[T]) -> GroupReturn[T]:
+        panic "sealed Group cancel child"
+
+    pub fn cancel_pair[A, B](take self, take first: GroupChild[A], take second: GroupChild[B]) -> GroupPairReturn[A, B]:
+        panic "sealed Group cancel pair"
 
     pub fn complete(take self) -> GroupOutcome:
         return GroupOutcome.Completed
@@ -2384,9 +2428,17 @@ pub struct Compiler {
 
 impl Compiler {
     pub fn open(installation: CompilerInstallation) -> Result<Self, OpenError> {
-        let distribution = CompilerDistribution::seal(installation)?;
+        static LAYER1_DISTRIBUTION: OnceLock<Result<Arc<CompilerDistribution>, OpenError>> =
+            OnceLock::new();
+        let distribution = if installation.cache_layer1 {
+            LAYER1_DISTRIBUTION
+                .get_or_init(|| CompilerDistribution::seal(installation).map(Arc::new))
+                .clone()?
+        } else {
+            Arc::new(CompilerDistribution::seal(installation)?)
+        };
         Ok(Self {
-            distribution: Arc::new(distribution),
+            distribution,
             poisoned: AtomicBool::new(false),
         })
     }

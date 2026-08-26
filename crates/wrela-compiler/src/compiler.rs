@@ -65,6 +65,9 @@ fn layer1_actor_module() -> ProjectFile {
         "src/core/actor.wr",
         br#"pub resource struct MessageFull[T]:
     pub arguments: T
+
+pub resource struct ReplyClosed[T]:
+    pub response: T
 "#,
     )
 }
@@ -2700,6 +2703,20 @@ impl Compiler {
             ) {
                 Ok(flow) => Some(Arc::new(flow)),
                 Err(FlowFailure::Cancelled) => return CompilationOutcome::Cancelled,
+                Err(FlowFailure::Admission { source, cycle }) => {
+                    let mut diagnostic = Diagnostic::new(
+                        "admission.reply_wait_cycle",
+                        source.clone(),
+                        RecoveryAction::None,
+                    )
+                    .with_unsigned_parameter("cycle_length", cycle.len() as u128);
+                    for _ in cycle.iter().skip(1).take(1) {
+                        diagnostic =
+                            diagnostic.with_label(source.clone(), DiagnosticLabelRole::Related);
+                    }
+                    diagnostics.push(diagnostic);
+                    None
+                }
                 Err(FlowFailure::Defect(evidence)) => {
                     return CompilationOutcome::Defect(Defect::new("Flow", evidence));
                 }
@@ -2740,6 +2757,12 @@ impl Compiler {
             {
                 Ok(observation) => observation,
                 Err(FlowFailure::Cancelled) => return CompilationOutcome::Cancelled,
+                Err(FlowFailure::Admission { .. }) => {
+                    return CompilationOutcome::Defect(Defect::new(
+                        "Flow inspection",
+                        "verified Flow inspection produced a Creator admission rejection",
+                    ));
+                }
                 Err(FlowFailure::Defect(evidence)) => {
                     return CompilationOutcome::Defect(Defect::new("Flow inspection", evidence));
                 }

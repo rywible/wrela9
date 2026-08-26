@@ -1055,6 +1055,8 @@ impl Expression {
             | ExpressionKind::BitNot(value)
             | ExpressionKind::Not(value)
             | ExpressionKind::Await(value)
+            | ExpressionKind::Send(value)
+            | ExpressionKind::Request(value)
             | ExpressionKind::TrySend(value)
             | ExpressionKind::Propagate(value) => visitor(value),
             ExpressionKind::Index { value, index }
@@ -1113,6 +1115,8 @@ pub(crate) enum ExpressionKind {
     BitNot(Box<Expression>),
     Not(Box<Expression>),
     Await(Box<Expression>),
+    Send(Box<Expression>),
+    Request(Box<Expression>),
     TrySend(Box<Expression>),
     Propagate(Box<Expression>),
     Is {
@@ -1301,6 +1305,8 @@ pub(crate) enum CreatorFailureKind {
     MustUseValue,
     TrySendRequiresActorHandler,
     TrySendRequiresActorContext,
+    SendRequiresActorHandler,
+    SendRequiresActorContext,
 }
 
 impl CreatorFailureKind {
@@ -1358,6 +1364,8 @@ impl CreatorFailureKind {
             Self::MustUseValue => "semantic.must_use_value",
             Self::TrySendRequiresActorHandler => "semantic.try_send_requires_actor_handler",
             Self::TrySendRequiresActorContext => "semantic.try_send_requires_actor_context",
+            Self::SendRequiresActorHandler => "semantic.send_requires_actor_handler",
+            Self::SendRequiresActorContext => "semantic.send_requires_actor_context",
         }
     }
 }
@@ -2580,6 +2588,8 @@ fn collect_expression_demands(
         | ExpressionKind::BitNot(value)
         | ExpressionKind::Not(value)
         | ExpressionKind::Await(value)
+        | ExpressionKind::Send(value)
+        | ExpressionKind::Request(value)
         | ExpressionKind::TrySend(value)
         | ExpressionKind::Propagate(value) => {
             collect_expression_demands(value, constants, functions);
@@ -3817,7 +3827,10 @@ fn statements_suspend(statements: &[Statement]) -> bool {
     fn expression_suspends(expression: &Expression) -> bool {
         if matches!(
             expression.kind,
-            ExpressionKind::Await(_) | ExpressionKind::TrySend(_)
+            ExpressionKind::Await(_)
+                | ExpressionKind::Send(_)
+                | ExpressionKind::Request(_)
+                | ExpressionKind::TrySend(_)
         ) {
             return true;
         }
@@ -5910,6 +5923,48 @@ fn verify_expression_artifact_with_cleanup(
                 &expression.source,
                 cleanup_captures,
             )?
+        }
+        ExpressionKind::Send(value) => {
+            let ExpressionKind::Call {
+                target: CallTarget::Function { .. },
+                ..
+            } = &value.kind
+            else {
+                return defect("lowered send does not contain an Actor message call");
+            };
+            let _ = verify_expression_artifact_with_cleanup(
+                value,
+                locals,
+                moved,
+                catalog,
+                &expression.source,
+                cleanup_captures,
+            )?;
+            if expression.type_ != Type::Unit {
+                return defect("lowered send does not return Unit admission completion");
+            }
+            Type::Unit
+        }
+        ExpressionKind::Request(value) => {
+            let ExpressionKind::Call {
+                target: CallTarget::Function { .. },
+                ..
+            } = &value.kind
+            else {
+                return defect("lowered request does not contain an Actor handler call");
+            };
+            let returned = verify_expression_artifact_with_cleanup(
+                value,
+                locals,
+                moved,
+                catalog,
+                &expression.source,
+                cleanup_captures,
+            )?;
+            if expression.type_ != returned {
+                return defect("lowered request lost its exact response type");
+            }
+            returned
         }
         ExpressionKind::TrySend(value) => {
             let ExpressionKind::Call {
@@ -8170,7 +8225,14 @@ impl<'a> Lowerer<'a> {
             }
             ExpressionSyntaxKind::Await(value) => {
                 let value = self.expression(value)?;
-                if let Some(loan) = call_loan(&value) {
+                let actor_request = matches!(
+                    &value.kind,
+                    ExpressionKind::Call {
+                        target: CallTarget::Function { definition, .. },
+                        ..
+                    } if self.input.actor_handlers.contains(definition)
+                );
+                if !actor_request && let Some(loan) = call_loan(&value) {
                     let place = root_place(loan).ok_or_else(|| VerificationFailure::Defect {
                         evidence: Arc::from("lowered Resource loan has no source place"),
                     })?;
@@ -8183,7 +8245,33 @@ impl<'a> Lowerer<'a> {
                     ));
                 }
                 let type_ = value.type_.clone();
-                (ExpressionKind::Await(Box::new(value)), type_)
+                if matches!(value.kind, ExpressionKind::Send(_)) {
+                    (value.kind, type_)
+                } else if actor_request {
+                    (ExpressionKind::Request(Box::new(value)), type_)
+                } else {
+                    (ExpressionKind::Await(Box::new(value)), type_)
+                }
+            }
+            ExpressionSyntaxKind::Send(value) => {
+                if self
+                    .owner_identity
+                    .is_none_or(|owner| !self.input.actor_handlers.contains(&owner))
+                {
+                    return creator(CreatorFailureKind::SendRequiresActorContext, &syntax.range);
+                }
+                let value = self.expression(value)?;
+                let ExpressionKind::Call {
+                    target: CallTarget::Function { definition, .. },
+                    ..
+                } = &value.kind
+                else {
+                    return creator(CreatorFailureKind::SendRequiresActorHandler, &syntax.range);
+                };
+                if !self.input.actor_handlers.contains(definition) {
+                    return creator(CreatorFailureKind::SendRequiresActorHandler, &syntax.range);
+                }
+                (ExpressionKind::Send(Box::new(value)), Type::Unit)
             }
             ExpressionSyntaxKind::TrySend(value) => {
                 if self
@@ -9114,6 +9202,12 @@ impl<'a> Lowerer<'a> {
                 self.normalize_cleanup_expression(*value, captures)?,
             )),
             ExpressionKind::Await(value) => ExpressionKind::Await(Box::new(
+                self.normalize_cleanup_expression(*value, captures)?,
+            )),
+            ExpressionKind::Send(value) => ExpressionKind::Send(Box::new(
+                self.normalize_cleanup_expression(*value, captures)?,
+            )),
+            ExpressionKind::Request(value) => ExpressionKind::Request(Box::new(
                 self.normalize_cleanup_expression(*value, captures)?,
             )),
             ExpressionKind::TrySend(value) => ExpressionKind::TrySend(Box::new(
@@ -12777,6 +12871,14 @@ fn append_expression(bytes: &mut impl ByteSink, expression: &Expression) {
         }
         ExpressionKind::Await(value) => {
             bytes.push(6);
+            append_expression(bytes, value);
+        }
+        ExpressionKind::Send(value) => {
+            bytes.push(23);
+            append_expression(bytes, value);
+        }
+        ExpressionKind::Request(value) => {
+            bytes.push(24);
             append_expression(bytes, value);
         }
         ExpressionKind::TrySend(value) => {

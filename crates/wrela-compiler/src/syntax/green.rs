@@ -632,6 +632,10 @@ fn expression_region(expression: &ExpressionSyntax) -> SyntaxRegion {
             SyntaxNodeKind::AwaitExpression,
             vec![expression_region(value)],
         ),
+        ExpressionSyntaxKind::Send(value) => (
+            SyntaxNodeKind::SendExpression,
+            vec![expression_region(value)],
+        ),
         ExpressionSyntaxKind::TrySend(value) => (
             SyntaxNodeKind::TrySendExpression,
             vec![expression_region(value)],

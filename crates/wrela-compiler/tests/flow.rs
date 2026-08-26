@@ -1,7 +1,8 @@
 use wrela_compiler::{
     ArchitectureProfile, Cancellation, CompilationOutcome, CompilationRequest, Compiler,
-    CompilerInstallation, FlowCustodian, FlowSendOutcome, InspectSelection, ProjectFile,
-    ProjectSnapshot, Root,
+    CompilerInstallation, FlowAdmissionKind, FlowCustodian, FlowDeadlineClass, FlowEventKind,
+    FlowGroupPolicy, FlowRequirementKind, FlowSendOutcome, FlowStructuredOutcome,
+    FlowStructuredScenarioKind, InspectSelection, ProjectFile, ProjectSnapshot, Root,
 };
 
 fn actor_request(inspection: InspectSelection) -> CompilationRequest {
@@ -950,4 +951,361 @@ fn build() -> Image:
             .count(),
         2
     );
+}
+
+#[test]
+fn waiting_send_owns_future_admission_cancellation_and_durable_commit_obligations() {
+    let source = br#"resource struct Token:
+    id: i64
+
+fn consume(take token: Token):
+    pass
+
+@actor
+struct Receiver:
+    pub async fn receive(self, take token: Token):
+        consume(take token)
+
+@actor
+struct Sender:
+    receiver: Receiver
+
+    pub async fn deliver(self, receiver: Receiver, take token: Token):
+        await send receiver.receive(take token)
+
+@image
+fn build() -> Image:
+    receiver = Receiver()
+    sender = Sender(receiver=receiver)
+    return Image.new(receiver=receiver, sender=sender)
+"#;
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    );
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("waiting send fixture accepts: {outcome:#?}");
+    };
+    let flow = accepted.inspection().flow_program().expect("Flow selected");
+    let template = flow.proposal_templates().first().expect("send template");
+    assert_eq!(template.admission_kind(), FlowAdmissionKind::WaitingSend);
+    assert!(template.owning_group().is_some());
+    assert_eq!(template.deadline_class(), Some(FlowDeadlineClass::Logical));
+    assert!(flow.requirements().iter().any(|requirement| {
+        requirement.kind() == FlowRequirementKind::CancellationMaximumLatency
+            && requirement.bound() > 0
+    }));
+
+    let pre_commit = flow
+        .structured_scenarios()
+        .iter()
+        .find(|scenario| scenario.kind() == FlowStructuredScenarioKind::PreCommitCancellation)
+        .expect("pre-commit cancellation scenario");
+    assert_eq!(pre_commit.outcome(), FlowStructuredOutcome::Cancelled);
+    assert!(pre_commit.events().iter().any(|event| {
+        event.kind() == FlowEventKind::AdmissionCancelled
+            && event.custodian() == Some(FlowCustodian::ProposalHome)
+    }));
+
+    let committed = flow
+        .structured_scenarios()
+        .iter()
+        .find(|scenario| scenario.kind() == FlowStructuredScenarioKind::DurableCommit)
+        .expect("durable commit scenario");
+    assert!(committed.events().iter().any(|event| {
+        event.kind() == FlowEventKind::MailboxTransferCommitted
+            && event.custodian() == Some(FlowCustodian::Mailbox)
+    }));
+    assert!(flow.model_agrees());
+}
+
+#[test]
+fn waiting_send_source_mistakes_are_rejected_before_flow() {
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let compile = |source: &'static [u8]| {
+        compiler.compile(
+            CompilationRequest::new(
+                ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+                Root::Image,
+            )
+            .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+            .with_inspection(InspectSelection::all()),
+            &Cancellation::new(),
+        )
+    };
+    let non_handler = compile(
+        br#"async fn helper():
+    pass
+
+@actor
+struct Sender:
+    pub async fn deliver(self):
+        await send helper()
+
+@image
+fn build() -> Image:
+    sender = Sender()
+    return Image.new(sender=sender)
+"#,
+    );
+    let CompilationOutcome::Rejected(non_handler) = non_handler else {
+        panic!("send to non-handler rejects: {non_handler:#?}");
+    };
+    assert_eq!(
+        non_handler.diagnostics()[0].code(),
+        "semantic.send_requires_actor_handler"
+    );
+    assert!(non_handler.inspection().flow_program().is_none());
+
+    let outside_actor = compile(
+        br#"@actor
+struct Receiver:
+    pub async fn receive(self):
+        pass
+
+async fn helper(receiver: Receiver):
+    await send receiver.receive()
+
+@image
+fn build() -> Image:
+    receiver = Receiver()
+    return Image.new(receiver=receiver)
+"#,
+    );
+    let CompilationOutcome::Rejected(outside_actor) = outside_actor else {
+        panic!("send outside Actor rejects: {outside_actor:#?}");
+    };
+    assert_eq!(
+        outside_actor.diagnostics()[0].code(),
+        "semantic.send_requires_actor_context"
+    );
+    assert!(outside_actor.inspection().flow_program().is_none());
+}
+
+#[test]
+fn awaited_actor_request_reserves_reply_and_recovers_late_reply_closed_custody() {
+    let source = br#"resource struct Token:
+    id: i64
+
+fn consume(take token: Token):
+    pass
+
+@actor
+struct Server:
+    pub async fn exchange(self, take token: Token) -> Token:
+        return take token
+
+@actor
+struct Client:
+    server: Server
+
+    pub async fn request(self, server: Server, take token: Token):
+        answer = await server.exchange(take token)
+        consume(take answer)
+
+@image
+fn build() -> Image:
+    server = Server()
+    client = Client(server=server)
+    return Image.new(server=server, client=client)
+"#;
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    );
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("request fixture accepts: {outcome:#?}");
+    };
+    let flow = accepted.inspection().flow_program().expect("Flow selected");
+    assert_eq!(flow.reply_obligations().len(), 1);
+    let reply = &flow.reply_obligations()[0];
+    assert!(reply.endpoint() != 0 && reply.return_path() != 0 && reply.response_home() != 0);
+    assert_eq!(reply.capacity(), 1);
+    assert!(reply.fulfillment_capacity_infallible());
+    assert!(reply.acyclic_wait_requirement() != 0);
+    assert!(flow.requirements().iter().any(|requirement| {
+        requirement.kind() == FlowRequirementKind::ReplyResponseHome
+            && requirement.site() == Some(reply.response_home())
+    }));
+
+    let closed = flow
+        .structured_scenarios()
+        .iter()
+        .find(|scenario| scenario.kind() == FlowStructuredScenarioKind::ReplyClosedRecovery)
+        .expect("ReplyClosed scenario");
+    assert_eq!(closed.outcome(), FlowStructuredOutcome::ReplyClosed);
+    assert!(closed.events().iter().any(|event| {
+        event.kind() == FlowEventKind::ReplyClosed
+            && event.custodian() == Some(FlowCustodian::ReplyClosed)
+            && event.must_use()
+    }));
+    assert!(flow.model_agrees());
+}
+
+#[test]
+fn structured_group_deadline_cleanup_and_panic_scenarios_are_typed_and_deterministic() {
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let outcome = compiler.compile(actor_request(InspectSelection::all()), &Cancellation::new());
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("Actor Flow fixture accepts: {outcome:#?}");
+    };
+    let flow = accepted.inspection().flow_program().expect("Flow selected");
+    assert!(flow.groups().iter().all(|group| {
+        group.child_activation_bound() > 0
+            && group.noncopyable_cancellation_authority() != 0
+            && group.return_home() != 0
+            && group.maximum_cancellation_latency() > 0
+    }));
+    assert_eq!(
+        flow.group_policy_laws()
+            .iter()
+            .map(|law| law.policy())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            FlowGroupPolicy::All,
+            FlowGroupPolicy::Collect,
+            FlowGroupPolicy::Race,
+            FlowGroupPolicy::Supervise,
+        ])
+    );
+    let logical = flow
+        .deadline_laws()
+        .iter()
+        .find(|law| law.class() == FlowDeadlineClass::Logical)
+        .expect("logical deadline law");
+    assert!(logical.deterministic() && !logical.replay_capture_required());
+    let realtime = flow
+        .deadline_laws()
+        .iter()
+        .find(|law| law.class() == FlowDeadlineClass::Realtime)
+        .expect("realtime deadline law");
+    assert!(realtime.authority() != 0 && realtime.replay_capture_required());
+    for kind in [
+        FlowStructuredScenarioKind::GroupPolicies,
+        FlowStructuredScenarioKind::DeadlineUnmeetable,
+        FlowStructuredScenarioKind::DeadlineExceeded,
+        FlowStructuredScenarioKind::ReverseCleanup,
+        FlowStructuredScenarioKind::CustodyRecovery,
+        FlowStructuredScenarioKind::TerminalPanic,
+    ] {
+        assert!(
+            flow.structured_scenarios()
+                .iter()
+                .any(|scenario| scenario.kind() == kind)
+        );
+    }
+    let cleanup = flow
+        .structured_scenarios()
+        .iter()
+        .find(|scenario| scenario.kind() == FlowStructuredScenarioKind::ReverseCleanup)
+        .expect("cleanup scenario");
+    assert_eq!(cleanup.cleanup_order(), &[2, 1, 0]);
+    let panic = flow
+        .structured_scenarios()
+        .iter()
+        .find(|scenario| scenario.kind() == FlowStructuredScenarioKind::TerminalPanic)
+        .expect("Panic scenario");
+    assert_eq!(panic.outcome(), FlowStructuredOutcome::Panic);
+    assert!(panic.cleanup_order().is_empty());
+}
+
+#[test]
+fn group_static_cleanup_actions_are_exact_and_execute_in_reverse_registration_order() {
+    let source = br#"fn oldest():
+    pass
+
+fn newest():
+    pass
+
+async fn yield_once() -> i64:
+    return 1
+
+@actor
+struct Worker:
+    pub async fn run(self):
+        defer oldest()
+        defer newest()
+        _ = await yield_once()
+
+@image
+fn build() -> Image:
+    worker = Worker()
+    return Image.new(worker=worker)
+"#;
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    );
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("cleanup Group fixture accepts: {outcome:#?}");
+    };
+    let flow = accepted.inspection().flow_program().expect("Flow selected");
+    let group = flow
+        .groups()
+        .iter()
+        .find(|group| group.cleanup_actions().len() == 2)
+        .expect("handler Group owns both exact cleanup actions");
+    assert_eq!(
+        group.cleanup_execution_order(),
+        &group
+            .cleanup_actions()
+            .iter()
+            .rev()
+            .copied()
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn statically_knowable_reply_wait_cycle_is_creator_rejected_with_exact_evidence() {
+    let source = br#"@actor
+struct Loop:
+    pub async fn ping(self):
+        await self.ping()
+
+@image
+fn build() -> Image:
+    loop_actor = Loop()
+    return Image.new(loop_actor=loop_actor)
+"#;
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    );
+    let CompilationOutcome::Rejected(rejected) = outcome else {
+        panic!("Reply wait cycle is Creator-rejected, not Defect: {outcome:#?}");
+    };
+    let Some(diagnostic) = rejected
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.code() == "admission.reply_wait_cycle")
+    else {
+        panic!("exact cycle diagnostic: {:#?}", rejected.diagnostics());
+    };
+    assert_eq!(diagnostic.labels().len(), 1);
+    assert!(rejected.inspection().flow_program().is_none());
 }

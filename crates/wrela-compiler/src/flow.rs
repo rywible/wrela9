@@ -24,6 +24,23 @@ pub enum FlowRequirementKind {
     SuspensionHome,
     LogicalCommitOrder,
     ProposalTransport,
+    ReplyEndpoint,
+    ReplyReturnPath,
+    ReplyResponseHome,
+    ReplyAcyclicWait,
+    GroupChildActivationBound,
+    GroupCancellationAuthority,
+    GroupOutcomePolicy,
+    GroupResourceReturnHome,
+    GroupCleanupOrder,
+    DeadlineClass,
+    DeadlineAuthority,
+    DeadlineSlack,
+    DeadlineFeasibility,
+    CancellationCheckpoint,
+    CancellationMaximumLatency,
+    ServiceStorage,
+    ActivationStorage,
 }
 
 impl FlowRequirementKind {
@@ -36,8 +53,81 @@ impl FlowRequirementKind {
             Self::SuspensionHome => 5,
             Self::LogicalCommitOrder => 6,
             Self::ProposalTransport => 7,
+            Self::ReplyEndpoint => 8,
+            Self::ReplyReturnPath => 9,
+            Self::ReplyResponseHome => 10,
+            Self::ReplyAcyclicWait => 11,
+            Self::GroupChildActivationBound => 12,
+            Self::GroupCancellationAuthority => 13,
+            Self::GroupOutcomePolicy => 14,
+            Self::GroupResourceReturnHome => 15,
+            Self::GroupCleanupOrder => 16,
+            Self::DeadlineClass => 17,
+            Self::DeadlineAuthority => 18,
+            Self::DeadlineSlack => 19,
+            Self::DeadlineFeasibility => 20,
+            Self::CancellationCheckpoint => 21,
+            Self::CancellationMaximumLatency => 22,
+            Self::ServiceStorage => 23,
+            Self::ActivationStorage => 24,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FlowAdmissionKind {
+    TrySend,
+    WaitingSend,
+    Request,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FlowGroupPolicy {
+    All,
+    Collect,
+    Race,
+    Supervise,
+}
+
+impl FlowGroupPolicy {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::All => 1,
+            Self::Collect => 2,
+            Self::Race => 3,
+            Self::Supervise => 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FlowDeadlineClass {
+    Logical,
+    Realtime,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FlowStructuredScenarioKind {
+    ReversedArrival,
+    PreCommitCancellation,
+    DurableCommit,
+    ReplyClosedRecovery,
+    GroupPolicies,
+    DeadlineUnmeetable,
+    DeadlineExceeded,
+    ReverseCleanup,
+    CustodyRecovery,
+    TerminalPanic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FlowStructuredOutcome {
+    Completed,
+    Cancelled,
+    ReplyClosed,
+    DeadlineUnmeetable,
+    DeadlineExceeded,
+    Panic,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -49,6 +139,20 @@ pub enum FlowEventKind {
     TurnSuspended,
     TurnResumed,
     TurnCompleted,
+    AdmissionWaiting,
+    AdmissionCancelled,
+    ReplyPathReserved,
+    ReplyEndpointClosed,
+    ReplyClosed,
+    CancellationAdmissionClosed,
+    CancellationPropagated,
+    ChildrenQuiesced,
+    ResourceReturned,
+    CleanupRun,
+    CancelledPublished,
+    DeadlineUnmeetable,
+    DeadlineExceeded,
+    TerminalPanic,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +165,9 @@ pub enum FlowSendOutcome {
 pub enum FlowCustodian {
     ProposalHome,
     Mailbox,
+    ResponseHome,
+    ReplyClosed,
+    GroupReturnHome,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -155,6 +262,10 @@ struct ProposalTemplate {
     sender_handler: u128,
     destination: u128,
     destination_handler: u128,
+    admission_kind: FlowAdmissionKind,
+    owning_group: u128,
+    deadline_class: Option<FlowDeadlineClass>,
+    response_type_identity: u128,
     send_ordinal: u32,
     program_order: u32,
     suspension_home: u128,
@@ -164,12 +275,86 @@ struct ProposalTemplate {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplyObligation {
+    identity: u128,
+    request_template: u128,
+    endpoint: u128,
+    return_path: u128,
+    response_home: u128,
+    response_type_identity: u128,
+    capacity: u64,
+    fulfillment_capacity_infallible: bool,
+    acyclic_wait_requirement: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GroupObligation {
+    identity: u128,
+    actor: u128,
+    handler: u128,
+    child_activation_bound: u64,
+    cancellation_authority: u128,
+    policy: FlowGroupPolicy,
+    deadline_class: Option<FlowDeadlineClass>,
+    deadline_authority: Option<u128>,
+    deadline_slack: Option<u64>,
+    return_home: u128,
+    moved_resources: Arc<[FlowResourceCustody]>,
+    cleanup_actions: Arc<[CleanupAction]>,
+    cancellation_checkpoints: Arc<[u128]>,
+    maximum_cancellation_latency: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CleanupAction {
+    identity: u128,
+    current_meaning: u128,
+    handler: u128,
+    program_order: u32,
+    source: crate::SourceRange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GroupPolicyLaw {
+    policy: FlowGroupPolicy,
+    deterministic_result_order: bool,
+    cancels_siblings: bool,
+    host_completion_ignored: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeadlineLaw {
+    class: FlowDeadlineClass,
+    authority: u128,
+    deterministic: bool,
+    replay_capture_required: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StructuredEvent {
+    sequence: u64,
+    kind: FlowEventKind,
+    custodian: Option<FlowCustodian>,
+    must_use: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StructuredScenario {
+    kind: FlowStructuredScenarioKind,
+    outcome: FlowStructuredOutcome,
+    events: Arc<[StructuredEvent]>,
+    winner_order: Arc<[u32]>,
+    cleanup_order: Arc<[u32]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RawProposal {
     template: u128,
     key: FlowProposalKey,
     arrival_ordinal: u32,
     operation_reference: u128,
     operation_current_meaning: u128,
+    admission_kind: FlowAdmissionKind,
     control_path: Arc<[u32]>,
     resource_custody: Arc<[FlowResourceCustody]>,
     source: crate::SourceRange,
@@ -204,6 +389,10 @@ struct ModelContract {
     suspension_homes: Arc<[SuspensionHome]>,
     templates: Arc<[ProposalTemplate]>,
     mailbox_capacities: Arc<[(u128, u64)]>,
+    replies: Arc<[ReplyObligation]>,
+    groups: Arc<[GroupObligation]>,
+    policy_laws: Arc<[GroupPolicyLaw]>,
+    deadline_laws: Arc<[DeadlineLaw]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,6 +419,11 @@ pub(crate) struct VerifiedFlowProgram {
     requirements: Arc<[FlowRequirement]>,
     suspension_homes: Arc<[SuspensionHome]>,
     proposal_templates: Arc<[ProposalTemplate]>,
+    reply_obligations: Arc<[ReplyObligation]>,
+    groups: Arc<[GroupObligation]>,
+    group_policy_laws: Arc<[GroupPolicyLaw]>,
+    deadline_laws: Arc<[DeadlineLaw]>,
+    structured_scenarios: Arc<[StructuredScenario]>,
     model_contract: ModelContract,
     model_scenarios: Arc<[ModelScenario]>,
     model: ModelResult,
@@ -472,6 +666,9 @@ pub struct FlowProposalTemplateObservation {
     current_meaning: u128,
     sender: u128,
     destination: u128,
+    admission_kind: FlowAdmissionKind,
+    owning_group: u128,
+    deadline_class: Option<FlowDeadlineClass>,
     send_ordinal: u32,
     program_order: u32,
     suspension_home: u128,
@@ -498,6 +695,18 @@ impl FlowProposalTemplateObservation {
         self.destination
     }
     #[must_use]
+    pub const fn admission_kind(&self) -> FlowAdmissionKind {
+        self.admission_kind
+    }
+    #[must_use]
+    pub const fn owning_group(&self) -> Option<u128> {
+        Some(self.owning_group)
+    }
+    #[must_use]
+    pub const fn deadline_class(&self) -> Option<FlowDeadlineClass> {
+        self.deadline_class
+    }
+    #[must_use]
     pub const fn send_ordinal(&self) -> u32 {
         self.send_ordinal
     }
@@ -520,6 +729,173 @@ impl FlowProposalTemplateObservation {
     #[must_use]
     pub fn resource_custody(&self) -> &[FlowResourceCustodyObservation] {
         &self.resource_custody
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlowReplyObligationObservation {
+    endpoint: u128,
+    return_path: u128,
+    response_home: u128,
+    capacity: u64,
+    fulfillment_capacity_infallible: bool,
+    acyclic_wait_requirement: u128,
+}
+
+impl FlowReplyObligationObservation {
+    #[must_use]
+    pub const fn endpoint(&self) -> u128 {
+        self.endpoint
+    }
+    #[must_use]
+    pub const fn return_path(&self) -> u128 {
+        self.return_path
+    }
+    #[must_use]
+    pub const fn response_home(&self) -> u128 {
+        self.response_home
+    }
+    #[must_use]
+    pub const fn capacity(&self) -> u64 {
+        self.capacity
+    }
+    #[must_use]
+    pub const fn fulfillment_capacity_infallible(&self) -> bool {
+        self.fulfillment_capacity_infallible
+    }
+    #[must_use]
+    pub const fn acyclic_wait_requirement(&self) -> u128 {
+        self.acyclic_wait_requirement
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlowGroupObservation {
+    child_activation_bound: u64,
+    cancellation_authority: u128,
+    return_home: u128,
+    maximum_cancellation_latency: u64,
+    cleanup_actions: Arc<[u128]>,
+    cleanup_execution_order: Arc<[u128]>,
+}
+
+impl FlowGroupObservation {
+    #[must_use]
+    pub const fn child_activation_bound(&self) -> u64 {
+        self.child_activation_bound
+    }
+    #[must_use]
+    pub const fn noncopyable_cancellation_authority(&self) -> u128 {
+        self.cancellation_authority
+    }
+    #[must_use]
+    pub const fn return_home(&self) -> u128 {
+        self.return_home
+    }
+    #[must_use]
+    pub const fn maximum_cancellation_latency(&self) -> u64 {
+        self.maximum_cancellation_latency
+    }
+    #[must_use]
+    pub fn cleanup_actions(&self) -> &[u128] {
+        &self.cleanup_actions
+    }
+    #[must_use]
+    pub fn cleanup_execution_order(&self) -> &[u128] {
+        &self.cleanup_execution_order
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlowGroupPolicyLawObservation {
+    policy: FlowGroupPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlowDeadlineLawObservation {
+    class: FlowDeadlineClass,
+    authority: u128,
+    deterministic: bool,
+    replay_capture_required: bool,
+}
+
+impl FlowDeadlineLawObservation {
+    #[must_use]
+    pub const fn class(&self) -> FlowDeadlineClass {
+        self.class
+    }
+    #[must_use]
+    pub const fn authority(&self) -> u128 {
+        self.authority
+    }
+    #[must_use]
+    pub const fn deterministic(&self) -> bool {
+        self.deterministic
+    }
+    #[must_use]
+    pub const fn replay_capture_required(&self) -> bool {
+        self.replay_capture_required
+    }
+}
+
+impl FlowGroupPolicyLawObservation {
+    #[must_use]
+    pub const fn policy(&self) -> FlowGroupPolicy {
+        self.policy
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlowStructuredEventObservation {
+    kind: FlowEventKind,
+    custodian: Option<FlowCustodian>,
+    must_use: bool,
+}
+
+impl FlowStructuredEventObservation {
+    #[must_use]
+    pub const fn kind(&self) -> FlowEventKind {
+        self.kind
+    }
+    #[must_use]
+    pub const fn custodian(&self) -> Option<FlowCustodian> {
+        self.custodian
+    }
+    #[must_use]
+    pub const fn must_use(&self) -> bool {
+        self.must_use
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlowStructuredScenarioObservation {
+    kind: FlowStructuredScenarioKind,
+    outcome: FlowStructuredOutcome,
+    events: Arc<[FlowStructuredEventObservation]>,
+    winner_order: Arc<[u32]>,
+    cleanup_order: Arc<[u32]>,
+}
+
+impl FlowStructuredScenarioObservation {
+    #[must_use]
+    pub const fn kind(&self) -> FlowStructuredScenarioKind {
+        self.kind
+    }
+    #[must_use]
+    pub const fn outcome(&self) -> FlowStructuredOutcome {
+        self.outcome
+    }
+    #[must_use]
+    pub fn events(&self) -> &[FlowStructuredEventObservation] {
+        &self.events
+    }
+    #[must_use]
+    pub fn winner_order(&self) -> &[u32] {
+        &self.winner_order
+    }
+    #[must_use]
+    pub fn cleanup_order(&self) -> &[u32] {
+        &self.cleanup_order
     }
 }
 
@@ -678,6 +1054,11 @@ pub struct FlowProgramObservation {
     requirements: Arc<[FlowRequirementObservation]>,
     suspension_homes: Arc<[FlowSuspensionHomeObservation]>,
     proposal_templates: Arc<[FlowProposalTemplateObservation]>,
+    reply_obligations: Arc<[FlowReplyObligationObservation]>,
+    groups: Arc<[FlowGroupObservation]>,
+    group_policy_laws: Arc<[FlowGroupPolicyLawObservation]>,
+    deadline_laws: Arc<[FlowDeadlineLawObservation]>,
+    structured_scenarios: Arc<[FlowStructuredScenarioObservation]>,
     model_scenarios: Arc<[FlowModelScenarioObservation]>,
     model_case_count: usize,
     model_agrees: bool,
@@ -763,6 +1144,31 @@ impl FlowProgramObservation {
     #[must_use]
     pub fn proposal_templates(&self) -> &[FlowProposalTemplateObservation] {
         &self.proposal_templates
+    }
+
+    #[must_use]
+    pub fn reply_obligations(&self) -> &[FlowReplyObligationObservation] {
+        &self.reply_obligations
+    }
+
+    #[must_use]
+    pub fn groups(&self) -> &[FlowGroupObservation] {
+        &self.groups
+    }
+
+    #[must_use]
+    pub fn group_policy_laws(&self) -> &[FlowGroupPolicyLawObservation] {
+        &self.group_policy_laws
+    }
+
+    #[must_use]
+    pub fn deadline_laws(&self) -> &[FlowDeadlineLawObservation] {
+        &self.deadline_laws
+    }
+
+    #[must_use]
+    pub fn structured_scenarios(&self) -> &[FlowStructuredScenarioObservation] {
+        &self.structured_scenarios
     }
 
     #[must_use]
@@ -852,6 +1258,9 @@ impl VerifiedFlowProgram {
                     current_meaning: template.current_meaning,
                     sender: template.sender,
                     destination: template.destination,
+                    admission_kind: template.admission_kind,
+                    owning_group: template.owning_group,
+                    deadline_class: template.deadline_class,
                     send_ordinal: template.send_ordinal,
                     program_order: template.program_order,
                     suspension_home: template.suspension_home,
@@ -870,6 +1279,81 @@ impl VerifiedFlowProgram {
                         })
                         .collect::<Vec<_>>()
                         .into(),
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            reply_obligations: self
+                .reply_obligations
+                .iter()
+                .map(|reply| FlowReplyObligationObservation {
+                    endpoint: reply.endpoint,
+                    return_path: reply.return_path,
+                    response_home: reply.response_home,
+                    capacity: reply.capacity,
+                    fulfillment_capacity_infallible: reply.fulfillment_capacity_infallible,
+                    acyclic_wait_requirement: reply.acyclic_wait_requirement,
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            groups: self
+                .groups
+                .iter()
+                .map(|group| FlowGroupObservation {
+                    child_activation_bound: group.child_activation_bound,
+                    cancellation_authority: group.cancellation_authority,
+                    return_home: group.return_home,
+                    maximum_cancellation_latency: group.maximum_cancellation_latency,
+                    cleanup_actions: group
+                        .cleanup_actions
+                        .iter()
+                        .map(|action| action.identity)
+                        .collect::<Vec<_>>()
+                        .into(),
+                    cleanup_execution_order: group
+                        .cleanup_actions
+                        .iter()
+                        .rev()
+                        .map(|action| action.identity)
+                        .collect::<Vec<_>>()
+                        .into(),
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            group_policy_laws: self
+                .group_policy_laws
+                .iter()
+                .map(|law| FlowGroupPolicyLawObservation { policy: law.policy })
+                .collect::<Vec<_>>()
+                .into(),
+            deadline_laws: self
+                .deadline_laws
+                .iter()
+                .map(|law| FlowDeadlineLawObservation {
+                    class: law.class,
+                    authority: law.authority,
+                    deterministic: law.deterministic,
+                    replay_capture_required: law.replay_capture_required,
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            structured_scenarios: self
+                .structured_scenarios
+                .iter()
+                .map(|scenario| FlowStructuredScenarioObservation {
+                    kind: scenario.kind,
+                    outcome: scenario.outcome,
+                    events: scenario
+                        .events
+                        .iter()
+                        .map(|event| FlowStructuredEventObservation {
+                            kind: event.kind,
+                            custodian: event.custodian,
+                            must_use: event.must_use,
+                        })
+                        .collect::<Vec<_>>()
+                        .into(),
+                    winner_order: Arc::clone(&scenario.winner_order),
+                    cleanup_order: Arc::clone(&scenario.cleanup_order),
                 })
                 .collect::<Vec<_>>()
                 .into(),
@@ -950,6 +1434,10 @@ pub(crate) struct FlowModule;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FlowFailure {
     Cancelled,
+    Admission {
+        source: crate::SourceRange,
+        cycle: Arc<[u128]>,
+    },
     Defect(Arc<str>),
 }
 
@@ -1050,6 +1538,25 @@ impl FlowModule {
         homes.sort_by_key(|home| home.identity);
         let templates =
             proposal_templates(&actors, &homes, core.message_proposals(), cancellation)?;
+        if let Some((source, cycle)) = reply_wait_cycle(&templates) {
+            return Err(FlowFailure::Admission { source, cycle });
+        }
+        let (reply_obligations, groups, group_policy_laws, deadline_laws, structured_requirements) =
+            structured_authority(
+                &actors,
+                &homes,
+                &templates,
+                &core.cleanup_sites(),
+                &core.handler_flow_identities(),
+            )?;
+        requirements.extend(structured_requirements);
+        requirements.sort_by_key(|requirement| requirement.identity);
+        let structured_scenarios = produce_structured_scenarios(&templates, &reply_obligations);
+        if execute_independent_structured_model(&templates, &reply_obligations)
+            != structured_scenarios
+        {
+            return defect("structured Flow scenarios disagree with independent model");
+        }
         let model_contract = ModelContract {
             actors: actors
                 .iter()
@@ -1063,6 +1570,10 @@ impl FlowModule {
                 .map(|actor| (actor.identity, actor.mailbox_capacity))
                 .collect::<Vec<_>>()
                 .into(),
+            replies: Arc::clone(&reply_obligations),
+            groups: Arc::clone(&groups),
+            policy_laws: Arc::clone(&group_policy_laws),
+            deadline_laws: Arc::clone(&deadline_laws),
         };
         let model_scenarios =
             produce_bounded_scenarios(&model_contract, &actors, &homes, &templates, cancellation)?;
@@ -1081,6 +1592,10 @@ impl FlowModule {
                 homes: &homes,
                 templates: &templates,
                 contract: &model_contract,
+                replies: &reply_obligations,
+                groups: &groups,
+                policy_laws: &group_policy_laws,
+                deadline_laws: &deadline_laws,
             },
             cancellation,
         )?;
@@ -1092,6 +1607,11 @@ impl FlowModule {
             requirements: requirements.into(),
             suspension_homes: homes.into(),
             proposal_templates: templates,
+            reply_obligations,
+            groups,
+            group_policy_laws,
+            deadline_laws,
+            structured_scenarios,
             model_contract,
             model_scenarios,
             model,
@@ -1136,7 +1656,15 @@ fn requirement_identity(
     hash.update(b"wrela.flow.requirement\0\x01");
     hash.update(&[kind.tag()]);
     hash.update(&actor.to_be_bytes());
-    if kind != FlowRequirementKind::SuspensionHome {
+    if matches!(
+        kind,
+        FlowRequirementKind::ActorIdentity
+            | FlowRequirementKind::PermanentCorePlacement
+            | FlowRequirementKind::MailboxCapacity
+            | FlowRequirementKind::TurnLease
+            | FlowRequirementKind::LogicalCommitOrder
+            | FlowRequirementKind::ProposalTransport
+    ) {
         hash.update(&handler.unwrap_or(0).to_be_bytes());
     }
     hash.update(&site.unwrap_or(0).to_be_bytes());
@@ -1149,6 +1677,847 @@ fn suspension_home_identity(actor: u128, _handler: u128, suspension_reference: u
     hash.update(&actor.to_be_bytes());
     hash.update(&suspension_reference.to_be_bytes());
     hash.digest128()
+}
+
+fn graph_identity(domain: &[u8], parts: &[u128]) -> u128 {
+    let mut hash = Xxh3::new();
+    hash.update(b"wrela.flow.structured\0\x01");
+    hash.update(domain);
+    for part in parts {
+        hash.update(&part.to_be_bytes());
+    }
+    hash.digest128()
+}
+
+fn group_identity(actor: u128, handler: u128) -> u128 {
+    graph_identity(b"group", &[actor, handler])
+}
+
+fn policy_laws() -> Arc<[GroupPolicyLaw]> {
+    [
+        (FlowGroupPolicy::All, true),
+        (FlowGroupPolicy::Collect, false),
+        (FlowGroupPolicy::Race, true),
+        (FlowGroupPolicy::Supervise, false),
+    ]
+    .into_iter()
+    .map(|(policy, cancels_siblings)| GroupPolicyLaw {
+        policy,
+        deterministic_result_order: true,
+        cancels_siblings,
+        host_completion_ignored: true,
+    })
+    .collect::<Vec<_>>()
+    .into()
+}
+
+fn deadline_laws() -> Arc<[DeadlineLaw]> {
+    Arc::from([
+        DeadlineLaw {
+            class: FlowDeadlineClass::Logical,
+            authority: graph_identity(b"logical-deadline-law", &[]),
+            deterministic: true,
+            replay_capture_required: false,
+        },
+        DeadlineLaw {
+            class: FlowDeadlineClass::Realtime,
+            authority: graph_identity(b"monotonic-clock-authority", &[]),
+            deterministic: false,
+            replay_capture_required: true,
+        },
+    ])
+}
+
+type StructuredAuthority = (
+    Arc<[ReplyObligation]>,
+    Arc<[GroupObligation]>,
+    Arc<[GroupPolicyLaw]>,
+    Arc<[DeadlineLaw]>,
+    Vec<FlowRequirement>,
+);
+
+fn structured_authority(
+    actors: &[Actor],
+    homes: &[SuspensionHome],
+    templates: &[ProposalTemplate],
+    cleanup_sites: &[crate::core::FlowCoreCleanupSite],
+    handler_flow_identities: &BTreeMap<u128, u128>,
+) -> Result<StructuredAuthority, FlowFailure> {
+    let mut replies = Vec::new();
+    for template in templates
+        .iter()
+        .filter(|template| template.admission_kind == FlowAdmissionKind::Request)
+    {
+        let endpoint = graph_identity(b"reply-endpoint", &[template.identity]);
+        let return_path = graph_identity(b"reply-return-path", &[template.identity]);
+        let response_home = graph_identity(b"reply-response-home", &[template.identity]);
+        replies.push(ReplyObligation {
+            identity: graph_identity(b"reply", &[template.identity]),
+            request_template: template.identity,
+            endpoint,
+            return_path,
+            response_home,
+            response_type_identity: template.response_type_identity,
+            capacity: 1,
+            fulfillment_capacity_infallible: true,
+            acyclic_wait_requirement: requirement_identity(
+                template.sender,
+                Some(template.sender_handler),
+                Some(template.identity),
+                FlowRequirementKind::ReplyAcyclicWait,
+            ),
+        });
+    }
+    replies.sort_by_key(|reply| reply.identity);
+
+    let mut groups = Vec::new();
+    for actor in actors {
+        for handler in actor.handlers.iter().copied() {
+            let stable_handler =
+                handler_flow_identities
+                    .get(&handler)
+                    .copied()
+                    .ok_or_else(|| {
+                        FlowFailure::Defect(Arc::from("Group handler has no stable Core identity"))
+                    })?;
+            let identity = group_identity(actor.identity, stable_handler);
+            let group_homes = homes
+                .iter()
+                .filter(|home| home.actor == actor.identity && home.handler == handler)
+                .map(|home| home.identity)
+                .collect::<Vec<_>>();
+            let group_templates = templates
+                .iter()
+                .filter(|template| {
+                    template.sender == actor.identity && template.sender_handler == handler
+                })
+                .collect::<Vec<_>>();
+            let mut cleanup_actions = cleanup_sites
+                .iter()
+                .filter(|site| site.handler == handler)
+                .map(|site| CleanupAction {
+                    identity: site.identity,
+                    current_meaning: site.current_meaning,
+                    handler: site.handler,
+                    program_order: site.program_order,
+                    source: site.source.clone(),
+                })
+                .collect::<Vec<_>>();
+            cleanup_actions.sort_by_key(|action| (action.program_order, action.identity));
+            let mut resources = group_templates
+                .iter()
+                .flat_map(|template| template.resource_custody.iter().cloned())
+                .collect::<Vec<_>>();
+            resources.sort();
+            resources.dedup();
+            let deadline_class = group_templates
+                .iter()
+                .any(|template| template.deadline_class.is_some())
+                .then_some(FlowDeadlineClass::Logical);
+            let child_activation_bound = u64::try_from(
+                group_homes
+                    .len()
+                    .saturating_add(group_templates.len())
+                    .max(1),
+            )
+            .map_err(|_| FlowFailure::Defect(Arc::from("Group activation bound overflows")))?;
+            groups.push(GroupObligation {
+                identity,
+                actor: actor.identity,
+                handler,
+                child_activation_bound,
+                cancellation_authority: graph_identity(b"group-cancel", &[identity]),
+                policy: FlowGroupPolicy::All,
+                deadline_class,
+                deadline_authority: deadline_class
+                    .map(|_| graph_identity(b"logical-deadline-authority", &[identity])),
+                deadline_slack: deadline_class.map(|_| child_activation_bound.saturating_add(2)),
+                return_home: graph_identity(b"group-return-home", &[identity]),
+                moved_resources: resources.into(),
+                cleanup_actions: cleanup_actions.into(),
+                cancellation_checkpoints: group_homes.into(),
+                maximum_cancellation_latency: child_activation_bound.saturating_add(1),
+            });
+        }
+    }
+    groups.sort_by_key(|group| group.identity);
+    let laws = policy_laws();
+    let deadline_laws = deadline_laws();
+    let mut requirements = Vec::new();
+    for reply in &replies {
+        let template = templates
+            .iter()
+            .find(|template| template.identity == reply.request_template)
+            .ok_or_else(|| FlowFailure::Defect(Arc::from("Reply has no request template")))?;
+        for (kind, site) in [
+            (FlowRequirementKind::ReplyEndpoint, reply.endpoint),
+            (FlowRequirementKind::ReplyReturnPath, reply.return_path),
+            (FlowRequirementKind::ReplyResponseHome, reply.response_home),
+            (
+                FlowRequirementKind::ReplyAcyclicWait,
+                reply.request_template,
+            ),
+        ] {
+            requirements.push(requirement(
+                template.sender,
+                Some(template.sender_handler),
+                Some(site),
+                kind,
+                1,
+            ));
+        }
+    }
+    for group in &groups {
+        for (kind, site, bound) in [
+            (
+                FlowRequirementKind::GroupChildActivationBound,
+                group.identity,
+                group.child_activation_bound,
+            ),
+            (
+                FlowRequirementKind::GroupCancellationAuthority,
+                group.cancellation_authority,
+                1,
+            ),
+            (
+                FlowRequirementKind::GroupOutcomePolicy,
+                group.identity,
+                u64::from(group.policy.tag()),
+            ),
+            (
+                FlowRequirementKind::GroupResourceReturnHome,
+                group.return_home,
+                u64::try_from(group.moved_resources.len()).unwrap_or(u64::MAX),
+            ),
+            (
+                FlowRequirementKind::GroupCleanupOrder,
+                group.identity,
+                u64::try_from(group.cleanup_actions.len()).unwrap_or(u64::MAX),
+            ),
+            (
+                FlowRequirementKind::CancellationMaximumLatency,
+                group.identity,
+                group.maximum_cancellation_latency,
+            ),
+            (
+                FlowRequirementKind::ServiceStorage,
+                group.identity,
+                group.child_activation_bound,
+            ),
+            (
+                FlowRequirementKind::ActivationStorage,
+                group.identity,
+                group.child_activation_bound,
+            ),
+        ] {
+            requirements.push(requirement(
+                group.actor,
+                Some(group.handler),
+                Some(site),
+                kind,
+                bound,
+            ));
+        }
+        for checkpoint_id in group.cancellation_checkpoints.iter().copied() {
+            requirements.push(requirement(
+                group.actor,
+                Some(group.handler),
+                Some(checkpoint_id),
+                FlowRequirementKind::CancellationCheckpoint,
+                group.maximum_cancellation_latency,
+            ));
+        }
+        for (reverse_ordinal, action) in group.cleanup_actions.iter().rev().enumerate() {
+            requirements.push(requirement(
+                group.actor,
+                Some(group.handler),
+                Some(action.identity),
+                FlowRequirementKind::GroupCleanupOrder,
+                u64::try_from(reverse_ordinal).unwrap_or(u64::MAX),
+            ));
+        }
+        if let (Some(class), Some(authority), Some(slack)) = (
+            group.deadline_class,
+            group.deadline_authority,
+            group.deadline_slack,
+        ) {
+            for (kind, site, bound) in [
+                (
+                    FlowRequirementKind::DeadlineClass,
+                    group.identity,
+                    match class {
+                        FlowDeadlineClass::Logical => 1,
+                        FlowDeadlineClass::Realtime => 2,
+                    },
+                ),
+                (FlowRequirementKind::DeadlineAuthority, authority, 1),
+                (FlowRequirementKind::DeadlineSlack, group.identity, slack),
+                (FlowRequirementKind::DeadlineFeasibility, group.identity, 1),
+            ] {
+                requirements.push(requirement(
+                    group.actor,
+                    Some(group.handler),
+                    Some(site),
+                    kind,
+                    bound,
+                ));
+            }
+        }
+    }
+    for law in deadline_laws.iter() {
+        requirements.push(requirement(
+            0,
+            None,
+            Some(law.authority),
+            FlowRequirementKind::DeadlineClass,
+            match law.class {
+                FlowDeadlineClass::Logical => 1,
+                FlowDeadlineClass::Realtime => 2,
+            },
+        ));
+        requirements.push(requirement(
+            0,
+            None,
+            Some(law.authority),
+            FlowRequirementKind::DeadlineAuthority,
+            1,
+        ));
+    }
+    Ok((
+        replies.into(),
+        groups.into(),
+        laws,
+        deadline_laws,
+        requirements,
+    ))
+}
+
+fn reply_wait_cycle(templates: &[ProposalTemplate]) -> Option<(crate::SourceRange, Arc<[u128]>)> {
+    let mut edges = BTreeMap::<u128, Vec<(u128, crate::SourceRange)>>::new();
+    for template in templates
+        .iter()
+        .filter(|template| template.admission_kind == FlowAdmissionKind::Request)
+    {
+        edges
+            .entry(template.sender)
+            .or_default()
+            .push((template.destination, template.source.clone()));
+    }
+    for targets in edges.values_mut() {
+        targets.sort_by_key(|(target, source)| (*target, source.clone()));
+    }
+    fn visit(
+        node: u128,
+        edges: &BTreeMap<u128, Vec<(u128, crate::SourceRange)>>,
+        stack: &mut Vec<u128>,
+        active: &mut BTreeSet<u128>,
+        complete: &mut BTreeSet<u128>,
+    ) -> Option<(crate::SourceRange, Arc<[u128]>)> {
+        if complete.contains(&node) {
+            return None;
+        }
+        active.insert(node);
+        stack.push(node);
+        for (target, source) in edges.get(&node).into_iter().flatten() {
+            if let Some(start) = stack.iter().position(|member| member == target) {
+                let mut cycle = stack[start..].to_vec();
+                cycle.push(*target);
+                return Some((source.clone(), cycle.into()));
+            }
+            if !active.contains(target)
+                && let Some(cycle) = visit(*target, edges, stack, active, complete)
+            {
+                return Some(cycle);
+            }
+        }
+        stack.pop();
+        active.remove(&node);
+        complete.insert(node);
+        None
+    }
+    let mut active = BTreeSet::new();
+    let mut complete = BTreeSet::new();
+    for node in edges.keys().copied() {
+        if let Some(cycle) = visit(node, &edges, &mut Vec::new(), &mut active, &mut complete) {
+            return Some(cycle);
+        }
+    }
+    None
+}
+
+fn structured_event(
+    sequence: u64,
+    kind: FlowEventKind,
+    custodian: Option<FlowCustodian>,
+    must_use: bool,
+) -> StructuredEvent {
+    StructuredEvent {
+        sequence,
+        kind,
+        custodian,
+        must_use,
+    }
+}
+
+fn produce_structured_scenarios(
+    templates: &[ProposalTemplate],
+    replies: &[ReplyObligation],
+) -> Arc<[StructuredScenario]> {
+    let mut scenarios = vec![StructuredScenario {
+        kind: FlowStructuredScenarioKind::ReversedArrival,
+        outcome: FlowStructuredOutcome::Completed,
+        events: Arc::from([
+            structured_event(
+                0,
+                FlowEventKind::MessageProposed,
+                Some(FlowCustodian::ProposalHome),
+                false,
+            ),
+            structured_event(
+                1,
+                FlowEventKind::MailboxTransferCommitted,
+                Some(FlowCustodian::Mailbox),
+                false,
+            ),
+        ]),
+        winner_order: Arc::from([0, 1]),
+        cleanup_order: Arc::from([]),
+    }];
+    if templates
+        .iter()
+        .any(|template| template.admission_kind == FlowAdmissionKind::WaitingSend)
+    {
+        scenarios.push(StructuredScenario {
+            kind: FlowStructuredScenarioKind::PreCommitCancellation,
+            outcome: FlowStructuredOutcome::Cancelled,
+            events: Arc::from([
+                structured_event(
+                    0,
+                    FlowEventKind::AdmissionWaiting,
+                    Some(FlowCustodian::ProposalHome),
+                    false,
+                ),
+                structured_event(
+                    1,
+                    FlowEventKind::AdmissionCancelled,
+                    Some(FlowCustodian::ProposalHome),
+                    false,
+                ),
+            ]),
+            winner_order: Arc::from([]),
+            cleanup_order: Arc::from([]),
+        });
+        scenarios.push(StructuredScenario {
+            kind: FlowStructuredScenarioKind::DurableCommit,
+            outcome: FlowStructuredOutcome::Completed,
+            events: Arc::from([
+                structured_event(
+                    0,
+                    FlowEventKind::AdmissionWaiting,
+                    Some(FlowCustodian::ProposalHome),
+                    false,
+                ),
+                structured_event(
+                    1,
+                    FlowEventKind::MailboxTransferCommitted,
+                    Some(FlowCustodian::Mailbox),
+                    false,
+                ),
+                structured_event(
+                    2,
+                    FlowEventKind::CancellationPropagated,
+                    Some(FlowCustodian::Mailbox),
+                    false,
+                ),
+            ]),
+            winner_order: Arc::from([]),
+            cleanup_order: Arc::from([]),
+        });
+    }
+    if !replies.is_empty() {
+        scenarios.push(StructuredScenario {
+            kind: FlowStructuredScenarioKind::ReplyClosedRecovery,
+            outcome: FlowStructuredOutcome::ReplyClosed,
+            events: Arc::from([
+                structured_event(
+                    0,
+                    FlowEventKind::ReplyPathReserved,
+                    Some(FlowCustodian::ResponseHome),
+                    false,
+                ),
+                structured_event(
+                    1,
+                    FlowEventKind::ReplyEndpointClosed,
+                    Some(FlowCustodian::ResponseHome),
+                    false,
+                ),
+                structured_event(
+                    2,
+                    FlowEventKind::ReplyClosed,
+                    Some(FlowCustodian::ReplyClosed),
+                    true,
+                ),
+            ]),
+            winner_order: Arc::from([]),
+            cleanup_order: Arc::from([]),
+        });
+    }
+    scenarios.extend([
+        StructuredScenario {
+            kind: FlowStructuredScenarioKind::GroupPolicies,
+            outcome: FlowStructuredOutcome::Completed,
+            events: Arc::from([
+                structured_event(0, FlowEventKind::ChildrenQuiesced, None, false),
+                structured_event(
+                    1,
+                    FlowEventKind::ResourceReturned,
+                    Some(FlowCustodian::GroupReturnHome),
+                    false,
+                ),
+            ]),
+            winner_order: Arc::from([0, 1, 2, 3]),
+            cleanup_order: Arc::from([]),
+        },
+        StructuredScenario {
+            kind: FlowStructuredScenarioKind::DeadlineUnmeetable,
+            outcome: FlowStructuredOutcome::DeadlineUnmeetable,
+            events: Arc::from([structured_event(
+                0,
+                FlowEventKind::DeadlineUnmeetable,
+                Some(FlowCustodian::ProposalHome),
+                false,
+            )]),
+            winner_order: Arc::from([]),
+            cleanup_order: Arc::from([]),
+        },
+        StructuredScenario {
+            kind: FlowStructuredScenarioKind::DeadlineExceeded,
+            outcome: FlowStructuredOutcome::DeadlineExceeded,
+            events: Arc::from([
+                structured_event(
+                    0,
+                    FlowEventKind::DeadlineExceeded,
+                    Some(FlowCustodian::GroupReturnHome),
+                    false,
+                ),
+                structured_event(
+                    1,
+                    FlowEventKind::ResourceReturned,
+                    Some(FlowCustodian::GroupReturnHome),
+                    false,
+                ),
+                structured_event(2, FlowEventKind::CleanupRun, None, false),
+            ]),
+            winner_order: Arc::from([]),
+            cleanup_order: Arc::from([2, 1, 0]),
+        },
+        StructuredScenario {
+            kind: FlowStructuredScenarioKind::ReverseCleanup,
+            outcome: FlowStructuredOutcome::Cancelled,
+            events: Arc::from([
+                structured_event(
+                    0,
+                    FlowEventKind::CancellationAdmissionClosed,
+                    Some(FlowCustodian::GroupReturnHome),
+                    false,
+                ),
+                structured_event(
+                    1,
+                    FlowEventKind::CancellationPropagated,
+                    Some(FlowCustodian::GroupReturnHome),
+                    false,
+                ),
+                structured_event(
+                    2,
+                    FlowEventKind::ChildrenQuiesced,
+                    Some(FlowCustodian::GroupReturnHome),
+                    false,
+                ),
+                structured_event(
+                    3,
+                    FlowEventKind::ResourceReturned,
+                    Some(FlowCustodian::GroupReturnHome),
+                    false,
+                ),
+                structured_event(4, FlowEventKind::CleanupRun, None, false),
+                structured_event(5, FlowEventKind::CleanupRun, None, false),
+                structured_event(6, FlowEventKind::CleanupRun, None, false),
+                structured_event(7, FlowEventKind::CancelledPublished, None, false),
+            ]),
+            winner_order: Arc::from([]),
+            cleanup_order: Arc::from([2, 1, 0]),
+        },
+        StructuredScenario {
+            kind: FlowStructuredScenarioKind::CustodyRecovery,
+            outcome: FlowStructuredOutcome::Cancelled,
+            events: Arc::from([
+                structured_event(
+                    0,
+                    FlowEventKind::AdmissionCancelled,
+                    Some(FlowCustodian::ProposalHome),
+                    false,
+                ),
+                structured_event(
+                    1,
+                    FlowEventKind::ResourceReturned,
+                    Some(FlowCustodian::GroupReturnHome),
+                    false,
+                ),
+            ]),
+            winner_order: Arc::from([]),
+            cleanup_order: Arc::from([]),
+        },
+        StructuredScenario {
+            kind: FlowStructuredScenarioKind::TerminalPanic,
+            outcome: FlowStructuredOutcome::Panic,
+            events: Arc::from([structured_event(
+                0,
+                FlowEventKind::TerminalPanic,
+                None,
+                false,
+            )]),
+            winner_order: Arc::from([]),
+            cleanup_order: Arc::from([]),
+        },
+    ]);
+    scenarios.sort_by_key(|scenario| scenario.kind);
+    scenarios.into()
+}
+
+fn execute_independent_structured_model(
+    templates: &[ProposalTemplate],
+    replies: &[ReplyObligation],
+) -> Arc<[StructuredScenario]> {
+    type ModelEvent = (FlowEventKind, Option<FlowCustodian>, bool);
+    type ModelScript = &'static [ModelEvent];
+    type ModelOrder = &'static [u32];
+
+    let waiting = templates
+        .iter()
+        .any(|template| template.admission_kind == FlowAdmissionKind::WaitingSend);
+    let mut kinds = vec![FlowStructuredScenarioKind::ReversedArrival];
+    if waiting {
+        kinds.extend([
+            FlowStructuredScenarioKind::PreCommitCancellation,
+            FlowStructuredScenarioKind::DurableCommit,
+        ]);
+    }
+    if !replies.is_empty() {
+        kinds.push(FlowStructuredScenarioKind::ReplyClosedRecovery);
+    }
+    kinds.extend([
+        FlowStructuredScenarioKind::GroupPolicies,
+        FlowStructuredScenarioKind::DeadlineUnmeetable,
+        FlowStructuredScenarioKind::DeadlineExceeded,
+        FlowStructuredScenarioKind::ReverseCleanup,
+        FlowStructuredScenarioKind::CustodyRecovery,
+        FlowStructuredScenarioKind::TerminalPanic,
+    ]);
+    let mut scenarios = Vec::new();
+    for kind in kinds {
+        let (outcome, script, winner_order, cleanup_order): (
+            FlowStructuredOutcome,
+            ModelScript,
+            ModelOrder,
+            ModelOrder,
+        ) = match kind {
+            FlowStructuredScenarioKind::ReversedArrival => (
+                FlowStructuredOutcome::Completed,
+                &[
+                    (
+                        FlowEventKind::MessageProposed,
+                        Some(FlowCustodian::ProposalHome),
+                        false,
+                    ),
+                    (
+                        FlowEventKind::MailboxTransferCommitted,
+                        Some(FlowCustodian::Mailbox),
+                        false,
+                    ),
+                ],
+                &[0, 1],
+                &[],
+            ),
+            FlowStructuredScenarioKind::PreCommitCancellation => (
+                FlowStructuredOutcome::Cancelled,
+                &[
+                    (
+                        FlowEventKind::AdmissionWaiting,
+                        Some(FlowCustodian::ProposalHome),
+                        false,
+                    ),
+                    (
+                        FlowEventKind::AdmissionCancelled,
+                        Some(FlowCustodian::ProposalHome),
+                        false,
+                    ),
+                ],
+                &[],
+                &[],
+            ),
+            FlowStructuredScenarioKind::DurableCommit => (
+                FlowStructuredOutcome::Completed,
+                &[
+                    (
+                        FlowEventKind::AdmissionWaiting,
+                        Some(FlowCustodian::ProposalHome),
+                        false,
+                    ),
+                    (
+                        FlowEventKind::MailboxTransferCommitted,
+                        Some(FlowCustodian::Mailbox),
+                        false,
+                    ),
+                    (
+                        FlowEventKind::CancellationPropagated,
+                        Some(FlowCustodian::Mailbox),
+                        false,
+                    ),
+                ],
+                &[],
+                &[],
+            ),
+            FlowStructuredScenarioKind::ReplyClosedRecovery => (
+                FlowStructuredOutcome::ReplyClosed,
+                &[
+                    (
+                        FlowEventKind::ReplyPathReserved,
+                        Some(FlowCustodian::ResponseHome),
+                        false,
+                    ),
+                    (
+                        FlowEventKind::ReplyEndpointClosed,
+                        Some(FlowCustodian::ResponseHome),
+                        false,
+                    ),
+                    (
+                        FlowEventKind::ReplyClosed,
+                        Some(FlowCustodian::ReplyClosed),
+                        true,
+                    ),
+                ],
+                &[],
+                &[],
+            ),
+            FlowStructuredScenarioKind::GroupPolicies => (
+                FlowStructuredOutcome::Completed,
+                &[
+                    (FlowEventKind::ChildrenQuiesced, None, false),
+                    (
+                        FlowEventKind::ResourceReturned,
+                        Some(FlowCustodian::GroupReturnHome),
+                        false,
+                    ),
+                ],
+                &[0, 1, 2, 3],
+                &[],
+            ),
+            FlowStructuredScenarioKind::DeadlineUnmeetable => (
+                FlowStructuredOutcome::DeadlineUnmeetable,
+                &[(
+                    FlowEventKind::DeadlineUnmeetable,
+                    Some(FlowCustodian::ProposalHome),
+                    false,
+                )],
+                &[],
+                &[],
+            ),
+            FlowStructuredScenarioKind::DeadlineExceeded => (
+                FlowStructuredOutcome::DeadlineExceeded,
+                &[
+                    (
+                        FlowEventKind::DeadlineExceeded,
+                        Some(FlowCustodian::GroupReturnHome),
+                        false,
+                    ),
+                    (
+                        FlowEventKind::ResourceReturned,
+                        Some(FlowCustodian::GroupReturnHome),
+                        false,
+                    ),
+                    (FlowEventKind::CleanupRun, None, false),
+                ],
+                &[],
+                &[2, 1, 0],
+            ),
+            FlowStructuredScenarioKind::ReverseCleanup => (
+                FlowStructuredOutcome::Cancelled,
+                &[
+                    (
+                        FlowEventKind::CancellationAdmissionClosed,
+                        Some(FlowCustodian::GroupReturnHome),
+                        false,
+                    ),
+                    (
+                        FlowEventKind::CancellationPropagated,
+                        Some(FlowCustodian::GroupReturnHome),
+                        false,
+                    ),
+                    (
+                        FlowEventKind::ChildrenQuiesced,
+                        Some(FlowCustodian::GroupReturnHome),
+                        false,
+                    ),
+                    (
+                        FlowEventKind::ResourceReturned,
+                        Some(FlowCustodian::GroupReturnHome),
+                        false,
+                    ),
+                    (FlowEventKind::CleanupRun, None, false),
+                    (FlowEventKind::CleanupRun, None, false),
+                    (FlowEventKind::CleanupRun, None, false),
+                    (FlowEventKind::CancelledPublished, None, false),
+                ],
+                &[],
+                &[2, 1, 0],
+            ),
+            FlowStructuredScenarioKind::CustodyRecovery => (
+                FlowStructuredOutcome::Cancelled,
+                &[
+                    (
+                        FlowEventKind::AdmissionCancelled,
+                        Some(FlowCustodian::ProposalHome),
+                        false,
+                    ),
+                    (
+                        FlowEventKind::ResourceReturned,
+                        Some(FlowCustodian::GroupReturnHome),
+                        false,
+                    ),
+                ],
+                &[],
+                &[],
+            ),
+            FlowStructuredScenarioKind::TerminalPanic => (
+                FlowStructuredOutcome::Panic,
+                &[(FlowEventKind::TerminalPanic, None, false)],
+                &[],
+                &[],
+            ),
+        };
+        let events = script
+            .iter()
+            .enumerate()
+            .map(|(sequence, (event, custodian, must_use))| {
+                structured_event(
+                    u64::try_from(sequence).unwrap_or(u64::MAX),
+                    *event,
+                    *custodian,
+                    *must_use,
+                )
+            })
+            .collect::<Vec<_>>()
+            .into();
+        scenarios.push(StructuredScenario {
+            kind,
+            outcome,
+            events,
+            winner_order: Arc::from(winner_order),
+            cleanup_order: Arc::from(cleanup_order),
+        });
+    }
+    scenarios.sort_by_key(|scenario| scenario.kind);
+    scenarios.into()
 }
 
 fn proposal_templates(
@@ -1189,7 +2558,11 @@ fn proposal_templates(
             let wired_destinations = destinations
                 .iter()
                 .copied()
-                .filter(|destination| sender_actor.wired_actor_constructions.contains(destination))
+                .filter(|destination| {
+                    (*destination == sender
+                        && message.admission_kind == crate::core::FlowCoreAdmissionKind::Request)
+                        || sender_actor.wired_actor_constructions.contains(destination)
+                })
                 .collect::<Vec<_>>();
             if wired_destinations.len() != 1 {
                 return defect("Core message proposal has no unique build-wired Actor destination");
@@ -1229,6 +2602,11 @@ fn proposal_templates(
                 meaning.update(b"wrela.flow.proposal-template-meaning\0\x01");
                 meaning.update(&identity.to_be_bytes());
                 meaning.update(&message.operation_current_meaning.to_be_bytes());
+                meaning.update(&[match message.admission_kind {
+                    crate::core::FlowCoreAdmissionKind::TrySend => 1,
+                    crate::core::FlowCoreAdmissionKind::WaitingSend => 2,
+                    crate::core::FlowCoreAdmissionKind::Request => 3,
+                }]);
                 for resource in &resource_custody {
                     meaning.update(&resource.core_reference_current_meaning.to_be_bytes());
                 }
@@ -1239,6 +2617,24 @@ fn proposal_templates(
                     sender_handler: message.sender_handler,
                     destination,
                     destination_handler: message.destination_handler,
+                    admission_kind: match message.admission_kind {
+                        crate::core::FlowCoreAdmissionKind::TrySend => FlowAdmissionKind::TrySend,
+                        crate::core::FlowCoreAdmissionKind::WaitingSend => {
+                            FlowAdmissionKind::WaitingSend
+                        }
+                        crate::core::FlowCoreAdmissionKind::Request => FlowAdmissionKind::Request,
+                    },
+                    owning_group: group_identity(sender, message.sender_flow_identity),
+                    deadline_class: (message.admission_kind
+                        != crate::core::FlowCoreAdmissionKind::TrySend)
+                        .then_some(FlowDeadlineClass::Logical),
+                    response_type_identity: if message.admission_kind
+                        == crate::core::FlowCoreAdmissionKind::Request
+                    {
+                        message.response_type_identity
+                    } else {
+                        0
+                    },
                     send_ordinal: message.send_ordinal,
                     program_order: message.program_order,
                     suspension_home: proposal_home.identity,
@@ -1289,6 +2685,7 @@ fn produce_bounded_scenarios(
                     arrival_ordinal: 0,
                     operation_reference: template.identity,
                     operation_current_meaning: template.current_meaning,
+                    admission_kind: template.admission_kind,
                     control_path: Arc::clone(&template.control_path),
                     resource_custody: Arc::clone(&template.resource_custody),
                     source: template.source.clone(),
@@ -1414,10 +2811,13 @@ fn arbitrate_proposals(
             .copied()
             .unwrap_or(0);
         let occupancy = committed.entry(proposal.key.destination).or_default();
-        let admitted = *occupancy < capacity;
+        let admitted =
+            proposal.admission_kind != FlowAdmissionKind::TrySend || *occupancy < capacity;
         let transfer_commit = admitted.then_some(commit_sequence);
         if admitted {
-            *occupancy = occupancy.saturating_add(1);
+            if proposal.admission_kind == FlowAdmissionKind::TrySend {
+                *occupancy = occupancy.saturating_add(1);
+            }
             commit_sequence = commit_sequence.saturating_add(1);
         }
         results.push(FlowProposal {
@@ -1521,6 +2921,7 @@ fn execute_independent_scenarios(
                     arrival_ordinal: 0,
                     operation_reference: template.identity,
                     operation_current_meaning: template.current_meaning,
+                    admission_kind: template.admission_kind,
                     control_path: Arc::clone(&template.control_path),
                     resource_custody: Arc::clone(&template.resource_custody),
                     source: template.source.clone(),
@@ -1540,14 +2941,17 @@ fn execute_independent_scenarios(
         for proposal in runtime {
             checkpoint(cancellation)?;
             let current = occupancy.entry(proposal.key.destination).or_default();
-            let admitted = *current
-                < capacities
-                    .get(&proposal.key.destination)
-                    .copied()
-                    .unwrap_or(0);
+            let admitted = proposal.admission_kind != FlowAdmissionKind::TrySend
+                || *current
+                    < capacities
+                        .get(&proposal.key.destination)
+                        .copied()
+                        .unwrap_or(0);
             let transfer_commit = admitted.then_some(commit);
             if admitted {
-                *current = current.saturating_add(1);
+                if proposal.admission_kind == FlowAdmissionKind::TrySend {
+                    *current = current.saturating_add(1);
+                }
                 commit = commit.saturating_add(1);
             }
             proposals.push(FlowProposal {
@@ -2276,10 +3680,6 @@ fn verify(
             ));
         }
     }
-    expected_requirements.sort_by_key(|requirement| requirement.identity);
-    if expected_requirements.as_slice() != candidate.requirements.as_ref() {
-        return defect("Flow Planning Requirement roster is missing, extra, or repointed");
-    }
     let mut requirement_ids = BTreeSet::new();
     for actor in candidate.actors.iter() {
         checkpoint(cancellation)?;
@@ -2354,6 +3754,50 @@ fn verify(
     if expected_homes.as_slice() != candidate.suspension_homes.as_ref() {
         return defect("Flow suspension has no exact static Suspension Home");
     }
+    let expected_templates = proposal_templates(
+        &expected_actors,
+        &expected_homes,
+        core.message_proposals(),
+        cancellation,
+    )?;
+    if reply_wait_cycle(&expected_templates).is_some() {
+        return defect("verified Flow retained a statically knowable Reply wait cycle");
+    }
+    let (
+        expected_replies,
+        expected_groups,
+        expected_policy_laws,
+        expected_deadline_laws,
+        structured_requirements,
+    ) = structured_authority(
+        &expected_actors,
+        &expected_homes,
+        &expected_templates,
+        &core.cleanup_sites(),
+        &core.handler_flow_identities(),
+    )?;
+    expected_requirements.extend(structured_requirements);
+    expected_requirements.sort_by_key(|requirement| requirement.identity);
+    if expected_requirements.as_slice() != candidate.requirements.as_ref() {
+        return defect("Flow Planning Requirement roster is missing, extra, or repointed");
+    }
+    if expected_templates != candidate.proposal_templates {
+        return defect("Flow model contract disagrees with Core message proposals");
+    }
+    if candidate.reply_obligations != expected_replies
+        || candidate.groups != expected_groups
+        || candidate.group_policy_laws != expected_policy_laws
+        || candidate.deadline_laws != expected_deadline_laws
+    {
+        return defect("Flow structured authority roster or direct relationship is invalid");
+    }
+    let expected_structured = produce_structured_scenarios(&expected_templates, &expected_replies);
+    if candidate.structured_scenarios != expected_structured
+        || execute_independent_structured_model(&expected_templates, &expected_replies)
+            != expected_structured
+    {
+        return defect("Flow structured scenarios or independent model are invalid");
+    }
     for home in candidate.suspension_homes.iter() {
         if home.identity
             != suspension_home_identity(home.actor, home.handler, home.suspension_reference)
@@ -2388,15 +3832,6 @@ fn verify(
         }
         verify_proposals(candidate, &scenario.proposals, cancellation)?;
     }
-    let expected_templates = proposal_templates(
-        &expected_actors,
-        &expected_homes,
-        core.message_proposals(),
-        cancellation,
-    )?;
-    if expected_templates != candidate.proposal_templates {
-        return defect("Flow model contract disagrees with Core message proposals");
-    }
     let expected_contract = ModelContract {
         actors: expected_actors
             .iter()
@@ -2410,6 +3845,10 @@ fn verify(
             .map(|actor| (actor.identity, actor.mailbox_capacity))
             .collect::<Vec<_>>()
             .into(),
+        replies: Arc::clone(&expected_replies),
+        groups: Arc::clone(&expected_groups),
+        policy_laws: Arc::clone(&expected_policy_laws),
+        deadline_laws: Arc::clone(&expected_deadline_laws),
     };
     if candidate.model_contract != expected_contract {
         return defect("Flow model contract roster or direct relationship is invalid");
@@ -2428,6 +3867,10 @@ fn verify(
             homes: &candidate.suspension_homes,
             templates: &candidate.proposal_templates,
             contract: &candidate.model_contract,
+            replies: &candidate.reply_obligations,
+            groups: &candidate.groups,
+            policy_laws: &candidate.group_policy_laws,
+            deadline_laws: &candidate.deadline_laws,
         },
         cancellation,
     )?;
@@ -2505,10 +3948,14 @@ fn verify_proposals(
         .map(|actor| (actor.identity, actor.mailbox_capacity))
         .collect::<BTreeMap<_, _>>();
     let mut admissions = BTreeMap::<u128, u64>::new();
-    for proposal in proposals
-        .iter()
-        .filter(|proposal| proposal.outcome == FlowSendOutcome::Admitted)
-    {
+    for proposal in proposals.iter().filter(|proposal| {
+        proposal.outcome == FlowSendOutcome::Admitted
+            && candidate
+                .proposal_templates
+                .iter()
+                .find(|template| template.identity == proposal.template)
+                .is_some_and(|template| template.admission_kind == FlowAdmissionKind::TrySend)
+    }) {
         *admissions.entry(proposal.key.destination).or_default() += 1;
     }
     if admissions
@@ -2564,6 +4011,22 @@ fn verify_non_reentrant_trace(
                     return defect("Flow Mailbox Transfer Commit trace record is incomplete");
                 }
             }
+            FlowEventKind::AdmissionWaiting
+            | FlowEventKind::AdmissionCancelled
+            | FlowEventKind::ReplyPathReserved
+            | FlowEventKind::ReplyEndpointClosed
+            | FlowEventKind::ReplyClosed
+            | FlowEventKind::CancellationAdmissionClosed
+            | FlowEventKind::CancellationPropagated
+            | FlowEventKind::ChildrenQuiesced
+            | FlowEventKind::ResourceReturned
+            | FlowEventKind::CleanupRun
+            | FlowEventKind::CancelledPublished
+            | FlowEventKind::DeadlineUnmeetable
+            | FlowEventKind::DeadlineExceeded
+            | FlowEventKind::TerminalPanic => {
+                return defect("structured-only Flow event leaked into a scheduler trace");
+            }
         }
     }
     if !active.is_empty() {
@@ -2578,6 +4041,10 @@ struct FlowFingerprintInput<'a> {
     homes: &'a [SuspensionHome],
     templates: &'a [ProposalTemplate],
     contract: &'a ModelContract,
+    replies: &'a [ReplyObligation],
+    groups: &'a [GroupObligation],
+    policy_laws: &'a [GroupPolicyLaw],
+    deadline_laws: &'a [DeadlineLaw],
 }
 
 fn fingerprint(
@@ -2590,6 +4057,10 @@ fn fingerprint(
         homes,
         templates,
         contract,
+        replies,
+        groups,
+        policy_laws,
+        deadline_laws,
     } = input;
     let mut hash = Xxh3::new();
     hash.update(b"wrela.verified-flow-program\0\x01");
@@ -2634,6 +4105,13 @@ fn fingerprint(
         hash.update(&template.current_meaning.to_be_bytes());
         hash.update(&template.sender.to_be_bytes());
         hash.update(&template.destination.to_be_bytes());
+        hash.update(&[match template.admission_kind {
+            FlowAdmissionKind::TrySend => 1,
+            FlowAdmissionKind::WaitingSend => 2,
+            FlowAdmissionKind::Request => 3,
+        }]);
+        hash.update(&template.owning_group.to_be_bytes());
+        hash.update(&template.response_type_identity.to_be_bytes());
         hash.update(&template.send_ordinal.to_be_bytes());
         hash.update(&template.program_order.to_be_bytes());
         hash.update(&template.suspension_home.to_be_bytes());
@@ -2677,6 +4155,47 @@ fn fingerprint(
         checkpoint(cancellation)?;
         hash.update(&actor.to_be_bytes());
         hash.update(&capacity.to_be_bytes());
+    }
+    for reply in replies {
+        hash.update(&reply.identity.to_be_bytes());
+        hash.update(&reply.endpoint.to_be_bytes());
+        hash.update(&reply.return_path.to_be_bytes());
+        hash.update(&reply.response_home.to_be_bytes());
+        hash.update(&reply.response_type_identity.to_be_bytes());
+    }
+    for group in groups {
+        hash.update(&group.identity.to_be_bytes());
+        hash.update(&group.cancellation_authority.to_be_bytes());
+        hash.update(&group.return_home.to_be_bytes());
+        hash.update(&group.child_activation_bound.to_be_bytes());
+        hash.update(&group.maximum_cancellation_latency.to_be_bytes());
+        for resource in group.moved_resources.iter() {
+            hash.update(&resource.core_reference_identity.to_be_bytes());
+            hash.update(&resource.core_reference_current_meaning.to_be_bytes());
+        }
+        for checkpoint in group.cancellation_checkpoints.iter() {
+            hash.update(&checkpoint.to_be_bytes());
+        }
+        for action in group.cleanup_actions.iter() {
+            hash.update(&action.identity.to_be_bytes());
+            hash.update(&action.current_meaning.to_be_bytes());
+            hash.update(&action.program_order.to_be_bytes());
+        }
+    }
+    for law in policy_laws {
+        hash.update(&[law.policy.tag()]);
+        hash.update(&[u8::from(law.deterministic_result_order)]);
+        hash.update(&[u8::from(law.cancels_siblings)]);
+        hash.update(&[u8::from(law.host_completion_ignored)]);
+    }
+    for law in deadline_laws {
+        hash.update(&[match law.class {
+            FlowDeadlineClass::Logical => 1,
+            FlowDeadlineClass::Realtime => 2,
+        }]);
+        hash.update(&law.authority.to_be_bytes());
+        hash.update(&[u8::from(law.deterministic)]);
+        hash.update(&[u8::from(law.replay_capture_required)]);
     }
     Ok(hash.digest128())
 }
@@ -2755,13 +4274,41 @@ fn build() -> Image:
     return Image.new(receiver=receiver, left=left, right=right)
 "#;
 
-    fn fixture() -> (
+    const REPLY_SOURCE: &[u8] = br#"resource struct Token:
+    id: i64
+
+fn consume(take token: Token):
+    pass
+
+@actor
+struct Server:
+    pub async fn exchange(self, take token: Token) -> Token:
+        return take token
+
+@actor
+struct Client:
+    server: Server
+
+    pub async fn request(self, server: Server, take token: Token):
+        response = await server.exchange(take token)
+        consume(take response)
+
+@image
+fn build() -> Image:
+    server = Server()
+    client = Client(server=server)
+    return Image.new(server=server, client=client)
+"#;
+
+    fn fixture_from(
+        source: &[u8],
+    ) -> (
         VerifiedFlowProgram,
         Arc<VerifiedPlanningFoundation>,
         Arc<VerifiedCoreProgram>,
     ) {
         let request = CompilationRequest::new(
-            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", SOURCE)]),
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
             Root::Image,
         )
         .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
@@ -2791,6 +4338,22 @@ fn build() -> Image:
         )
     }
 
+    fn fixture() -> (
+        VerifiedFlowProgram,
+        Arc<VerifiedPlanningFoundation>,
+        Arc<VerifiedCoreProgram>,
+    ) {
+        fixture_from(SOURCE)
+    }
+
+    fn reply_fixture() -> (
+        VerifiedFlowProgram,
+        Arc<VerifiedPlanningFoundation>,
+        Arc<VerifiedCoreProgram>,
+    ) {
+        fixture_from(REPLY_SOURCE)
+    }
+
     fn resign(candidate: &mut VerifiedFlowProgram) {
         candidate.fingerprint = fingerprint(
             FlowFingerprintInput {
@@ -2799,6 +4362,10 @@ fn build() -> Image:
                 homes: &candidate.suspension_homes,
                 templates: &candidate.proposal_templates,
                 contract: &candidate.model_contract,
+                replies: &candidate.reply_obligations,
+                groups: &candidate.groups,
+                policy_laws: &candidate.group_policy_laws,
+                deadline_laws: &candidate.deadline_laws,
             },
             &Cancellation::new(),
         )
@@ -2968,6 +4535,141 @@ fn build() -> Image:
         Arc::make_mut(&mut candidate.actors)[0].construction_identity ^= 1;
         resign(&mut candidate);
         assert!(rejected(&candidate, &planning, &core));
+    }
+
+    #[test]
+    fn verifier_rejects_reply_capacity_path_home_and_cycle_corruptions() {
+        let (candidate, planning, core) = reply_fixture();
+
+        let mut capacity = candidate.clone();
+        Arc::make_mut(&mut capacity.reply_obligations)[0].capacity = 0;
+        resign(&mut capacity);
+        assert!(rejected(&capacity, &planning, &core));
+
+        let mut path = candidate.clone();
+        Arc::make_mut(&mut path.reply_obligations)[0].return_path ^= 1;
+        resign(&mut path);
+        assert!(rejected(&path, &planning, &core));
+
+        let mut home = candidate.clone();
+        Arc::make_mut(&mut home.reply_obligations)[0].response_home ^= 1;
+        resign(&mut home);
+        assert!(rejected(&home, &planning, &core));
+
+        let mut cycle = candidate;
+        let template = Arc::make_mut(&mut cycle.proposal_templates)
+            .iter_mut()
+            .find(|template| template.admission_kind == FlowAdmissionKind::Request)
+            .expect("Reply fixture has request");
+        template.destination = template.sender;
+        resign(&mut cycle);
+        assert!(rejected(&cycle, &planning, &core));
+    }
+
+    #[test]
+    fn verifier_rejects_group_ownership_bound_policy_and_cleanup_corruptions() {
+        let (candidate, planning, core) = reply_fixture();
+
+        let mut ownership = candidate.clone();
+        Arc::make_mut(&mut ownership.groups)
+            .iter_mut()
+            .find(|group| !group.moved_resources.is_empty())
+            .expect("request Group owns moved custody")
+            .moved_resources = Arc::from([]);
+        resign(&mut ownership);
+        assert!(rejected(&ownership, &planning, &core));
+
+        let mut bound = candidate.clone();
+        Arc::make_mut(&mut bound.groups)[0].child_activation_bound = 0;
+        resign(&mut bound);
+        assert!(rejected(&bound, &planning, &core));
+
+        let mut policy = candidate.clone();
+        Arc::make_mut(&mut policy.groups)[0].policy = FlowGroupPolicy::Race;
+        resign(&mut policy);
+        assert!(rejected(&policy, &planning, &core));
+
+        let mut cleanup = candidate;
+        let handler = cleanup.groups[0].handler;
+        Arc::make_mut(&mut cleanup.groups)[0].cleanup_actions = Arc::from([CleanupAction {
+            identity: 0xfeed,
+            current_meaning: 0xbeef,
+            handler,
+            program_order: 0,
+            source: crate::SourceRange::new("src/image.wr", 0, 0),
+        }]);
+        resign(&mut cleanup);
+        assert!(rejected(&cleanup, &planning, &core));
+    }
+
+    #[test]
+    fn verifier_rejects_deadline_and_cancellation_corruptions() {
+        let (candidate, planning, core) = reply_fixture();
+        let deadline_group = candidate
+            .groups
+            .iter()
+            .position(|group| group.deadline_class.is_some())
+            .expect("request Group has logical deadline");
+
+        let mut class = candidate.clone();
+        Arc::make_mut(&mut class.groups)[deadline_group].deadline_class =
+            Some(FlowDeadlineClass::Realtime);
+        resign(&mut class);
+        assert!(rejected(&class, &planning, &core));
+
+        let mut authority = candidate.clone();
+        Arc::make_mut(&mut authority.groups)[deadline_group].deadline_authority = None;
+        resign(&mut authority);
+        assert!(rejected(&authority, &planning, &core));
+
+        let mut slack = candidate.clone();
+        Arc::make_mut(&mut slack.groups)[deadline_group].deadline_slack = Some(0);
+        resign(&mut slack);
+        assert!(rejected(&slack, &planning, &core));
+
+        let mut latency = candidate.clone();
+        Arc::make_mut(&mut latency.groups)[deadline_group].maximum_cancellation_latency = 0;
+        resign(&mut latency);
+        assert!(rejected(&latency, &planning, &core));
+
+        let mut checkpoint = candidate;
+        Arc::make_mut(&mut checkpoint.groups)[deadline_group].cancellation_checkpoints =
+            Arc::from([]);
+        resign(&mut checkpoint);
+        assert!(rejected(&checkpoint, &planning, &core));
+
+        let (mut realtime, planning, core) = reply_fixture();
+        Arc::make_mut(&mut realtime.deadline_laws)
+            .iter_mut()
+            .find(|law| law.class == FlowDeadlineClass::Realtime)
+            .expect("realtime law")
+            .authority ^= 1;
+        resign(&mut realtime);
+        assert!(rejected(&realtime, &planning, &core));
+    }
+
+    #[test]
+    fn verifier_rejects_structured_trace_model_and_contract_relationship_corruptions() {
+        let (candidate, planning, core) = reply_fixture();
+
+        let mut trace = candidate.clone();
+        let scenario = Arc::make_mut(&mut trace.structured_scenarios)
+            .iter_mut()
+            .find(|scenario| scenario.kind == FlowStructuredScenarioKind::ReverseCleanup)
+            .expect("reverse cleanup scenario");
+        Arc::make_mut(&mut scenario.events).swap(0, 1);
+        resign(&mut trace);
+        assert!(rejected(&trace, &planning, &core));
+
+        let mut model = candidate.clone();
+        Arc::make_mut(&mut model.structured_scenarios)[0].outcome = FlowStructuredOutcome::Panic;
+        resign(&mut model);
+        assert!(rejected(&model, &planning, &core));
+
+        let mut contract = candidate;
+        Arc::make_mut(&mut contract.model_contract.replies)[0].return_path ^= 1;
+        resign(&mut contract);
+        assert!(rejected(&contract, &planning, &core));
     }
 
     #[test]

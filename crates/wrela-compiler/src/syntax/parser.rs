@@ -2915,6 +2915,14 @@ impl<'a, 'tokens> SyntaxCursor<'a, 'tokens> {
                     range: SourceRange::from_u64_shared(path, start, end),
                 }
             }
+            TokenKind::Send => {
+                let value = self.parse_expression_at(12, depth + 1)?;
+                let end = value.range.end();
+                ExpressionSyntax {
+                    kind: ExpressionSyntaxKind::Send(Box::new(value)),
+                    range: SourceRange::from_u64_shared(path, start, end),
+                }
+            }
             TokenKind::TrySend => {
                 let value = self.parse_expression_at(12, depth + 1)?;
                 let end = value.range.end();

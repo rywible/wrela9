@@ -631,6 +631,18 @@ fn verifier_visit_statements(statements: &[Statement], facts: &mut FunctionFacts
 
 fn verifier_visit_expression(expression: &Expression, facts: &mut FunctionFacts) {
     facts.logical_cost = facts.logical_cost.saturating_add(1);
+    if let ExpressionKind::Send(value)
+    | ExpressionKind::Request(value)
+    | ExpressionKind::TrySend(value) = &expression.kind
+    {
+        facts.suspends = true;
+        if let ExpressionKind::Call { arguments, .. } = &value.kind {
+            for argument in arguments.iter() {
+                verifier_visit_expression(argument, facts);
+            }
+        }
+        return;
+    }
     if let ExpressionKind::Call { target, arguments } = &expression.kind {
         match target {
             CallTarget::TemplateFunction { definition, .. } => {
@@ -982,6 +994,16 @@ fn visit_statements(statements: &[Statement], facts: &mut FunctionFacts) {
 fn visit_expression(expression: &Expression, facts: &mut FunctionFacts) {
     facts.logical_cost = facts.logical_cost.saturating_add(1);
     match &expression.kind {
+        ExpressionKind::Send(value)
+        | ExpressionKind::Request(value)
+        | ExpressionKind::TrySend(value) => {
+            facts.suspends = true;
+            if let ExpressionKind::Call { arguments, .. } = &value.kind {
+                arguments
+                    .iter()
+                    .for_each(|argument| visit_expression(argument, facts));
+            }
+        }
         ExpressionKind::Call { target, arguments } => {
             match target {
                 CallTarget::TemplateFunction { definition, .. } => {

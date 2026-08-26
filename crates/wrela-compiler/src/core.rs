@@ -1443,6 +1443,10 @@ impl FlowCoreView<'_> {
             .map(|executable| executable.reference.identity)
     }
 
+    pub(crate) fn handler_flow_identities(&self) -> BTreeMap<u128, u128> {
+        stable_executable_identities(&self.core.executables)
+    }
+
     pub(crate) fn suspension_sites(&self) -> Vec<FlowCoreSuspensionSite> {
         let cancellation = Cancellation::new();
         let executable_identities = stable_executable_identities(&self.core.executables);
@@ -1548,7 +1552,15 @@ impl FlowCoreView<'_> {
                     .collect::<Vec<_>>();
                 proposals.push(FlowCoreMessageProposal {
                     sender_handler: executable.reference.identity,
+                    sender_flow_identity: executable_identity,
                     destination_handler: operation.details.first().copied().unwrap_or(0),
+                    admission_kind: operation
+                        .details
+                        .get(1)
+                        .copied()
+                        .and_then(FlowCoreAdmissionKind::from_tag)
+                        .unwrap_or(FlowCoreAdmissionKind::TrySend),
+                    response_type_identity: operation.type_identity.unwrap_or(0),
                     send_ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
                     program_order: operation.identity,
                     operation_reference,
@@ -1564,12 +1576,54 @@ impl FlowCoreView<'_> {
         }
         proposals
     }
+
+    pub(crate) fn cleanup_sites(&self) -> Vec<FlowCoreCleanupSite> {
+        let executable_identities = stable_executable_identities(&self.core.executables);
+        let mut sites = Vec::new();
+        for executable in self.core.executables.iter() {
+            let executable_identity = executable_identities
+                .get(&executable.reference.identity)
+                .copied()
+                .unwrap_or(u128::MAX);
+            for operation in executable
+                .regions
+                .iter()
+                .flat_map(|region| region.operations.iter())
+                .filter(|operation| operation.kind == CoreOperationKind::Cleanup)
+            {
+                let mut identity = Xxh3::new();
+                identity.update(b"wrela.core.cleanup-site\0\x01");
+                identity.update(&executable_identity.to_be_bytes());
+                identity.update(&operation.identity.to_be_bytes());
+                let identity = identity.digest128();
+                let mut meaning = Xxh3::new();
+                meaning.update(b"wrela.core.cleanup-site-meaning\0\x01");
+                meaning.update(&identity.to_be_bytes());
+                for effect in operation.custody.iter() {
+                    meaning.update(&[effect.operation.tag()]);
+                    meaning.update(&effect.type_identity.unwrap_or(0).to_be_bytes());
+                }
+                sites.push(FlowCoreCleanupSite {
+                    handler: executable.reference.identity,
+                    identity,
+                    current_meaning: meaning.digest128(),
+                    program_order: operation.identity,
+                    source: operation.provenance.clone(),
+                });
+            }
+        }
+        sites.sort_by_key(|site| (site.handler, site.program_order, site.identity));
+        sites
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct FlowCoreMessageProposal {
     pub(crate) sender_handler: u128,
+    pub(crate) sender_flow_identity: u128,
     pub(crate) destination_handler: u128,
+    pub(crate) admission_kind: FlowCoreAdmissionKind,
+    pub(crate) response_type_identity: u128,
     pub(crate) send_ordinal: u32,
     pub(crate) program_order: u32,
     pub(crate) operation_reference: u128,
@@ -1577,6 +1631,32 @@ pub(crate) struct FlowCoreMessageProposal {
     pub(crate) control_path: Arc<[u32]>,
     pub(crate) custody: Arc<[FlowCoreCustodyReference]>,
     pub(crate) source: SourceRange,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlowCoreAdmissionKind {
+    TrySend,
+    WaitingSend,
+    Request,
+}
+
+impl FlowCoreAdmissionKind {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::TrySend => 1,
+            Self::WaitingSend => 2,
+            Self::Request => 3,
+        }
+    }
+
+    fn from_tag(tag: u128) -> Option<Self> {
+        match tag {
+            1 => Some(Self::TrySend),
+            2 => Some(Self::WaitingSend),
+            3 => Some(Self::Request),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1597,6 +1677,15 @@ pub(crate) struct FlowCoreCustodyReference {
     pub(crate) place: Arc<[u128]>,
     pub(crate) source_home: u128,
     pub(crate) proposal_home: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FlowCoreCleanupSite {
+    pub(crate) handler: u128,
+    pub(crate) identity: u128,
+    pub(crate) current_meaning: u128,
+    pub(crate) program_order: u32,
+    pub(crate) source: SourceRange,
 }
 
 #[allow(dead_code)]
@@ -3800,6 +3889,29 @@ impl<'a> ProducerLowerer<'a> {
                 EffectBoundary::Suspension,
                 FailureLaw::PropagateInOrder,
             ),
+            ExpressionKind::Send(value) | ExpressionKind::Request(value) => {
+                let ExpressionKind::Call { target, arguments } = &value.kind else {
+                    return defect("verified Actor admission has no handler call");
+                };
+                let mut operands = Vec::with_capacity(arguments.len());
+                for argument in arguments.iter() {
+                    operands.push(self.lower_expression(argument, operations)?);
+                }
+                (
+                    CoreOperationKind::MessageProposal,
+                    operands,
+                    actor_admission_details(
+                        target,
+                        if matches!(expression.kind, ExpressionKind::Send(_)) {
+                            FlowCoreAdmissionKind::WaitingSend
+                        } else {
+                            FlowCoreAdmissionKind::Request
+                        },
+                    ),
+                    EffectBoundary::Suspension,
+                    FailureLaw::PropagateInOrder,
+                )
+            }
             ExpressionKind::TrySend(value) => {
                 let ExpressionKind::Call { target, arguments } = &value.kind else {
                     return defect("verified try_send has no Actor handler call");
@@ -3811,7 +3923,7 @@ impl<'a> ProducerLowerer<'a> {
                 (
                     CoreOperationKind::MessageProposal,
                     operands,
-                    try_send_details(target),
+                    actor_admission_details(target, FlowCoreAdmissionKind::TrySend),
                     EffectBoundary::Suspension,
                     FailureLaw::CheckBeforeSuccess,
                 )
@@ -4102,12 +4214,12 @@ fn call_target_details(target: &CallTarget) -> Vec<u128> {
     }
 }
 
-fn try_send_details(target: &CallTarget) -> Vec<u128> {
+fn actor_admission_details(target: &CallTarget, admission: FlowCoreAdmissionKind) -> Vec<u128> {
     let destination_handler = match target {
         CallTarget::Function { specialization, .. } => specialization.0,
         _ => 0,
     };
-    vec![destination_handler]
+    vec![destination_handler, u128::from(admission.tag())]
 }
 
 fn producer_call_binding(target: &CallTarget, argument_count: usize) -> Arc<[u16]> {
@@ -5251,6 +5363,30 @@ impl<'a> VerifierLowerer<'a> {
                 EffectBoundary::Suspension,
                 FailureLaw::PropagateInOrder,
             ),
+            ExpressionKind::Send(value) | ExpressionKind::Request(value) => {
+                let ExpressionKind::Call { target, arguments } = &value.kind else {
+                    return defect("verified Actor admission has no handler call");
+                };
+                let mut operands = Vec::with_capacity(arguments.len());
+                for argument in arguments.iter() {
+                    checkpoint(self.cancellation)?;
+                    operands.push(self.reconstruct_expression(argument, operations)?);
+                }
+                (
+                    CoreOperationKind::MessageProposal,
+                    operands,
+                    actor_admission_details(
+                        target,
+                        if matches!(expression.kind, ExpressionKind::Send(_)) {
+                            FlowCoreAdmissionKind::WaitingSend
+                        } else {
+                            FlowCoreAdmissionKind::Request
+                        },
+                    ),
+                    EffectBoundary::Suspension,
+                    FailureLaw::PropagateInOrder,
+                )
+            }
             ExpressionKind::TrySend(value) => {
                 let ExpressionKind::Call { target, arguments } = &value.kind else {
                     return defect("verified try_send has no Actor handler call");
@@ -5263,7 +5399,7 @@ impl<'a> VerifierLowerer<'a> {
                 (
                     CoreOperationKind::MessageProposal,
                     operands,
-                    try_send_details(target),
+                    actor_admission_details(target, FlowCoreAdmissionKind::TrySend),
                     EffectBoundary::Suspension,
                     FailureLaw::CheckBeforeSuccess,
                 )
@@ -7852,9 +7988,11 @@ fn source_custody_expression(
         | ExpressionKind::Is { value, .. } => {
             source_custody_expression(value, path, program, cancellation, events)?;
         }
-        ExpressionKind::TrySend(value) => {
+        ExpressionKind::Send(value)
+        | ExpressionKind::Request(value)
+        | ExpressionKind::TrySend(value) => {
             let ExpressionKind::Call { arguments, .. } = &value.kind else {
-                return defect("verified try_send has no Actor handler call");
+                return defect("verified Actor admission has no handler call");
             };
             for argument in arguments.iter() {
                 source_custody_expression(argument, path, program, cancellation, events)?;

@@ -46,8 +46,12 @@ pub use core::{
     CoreRewriteKind,
 };
 pub use flow::{
-    FlowActorObservation, FlowCustodian, FlowEventKind, FlowProgramObservation, FlowProposalKey,
-    FlowProposalObservation, FlowRequirementKind, FlowRequirementObservation, FlowSendOutcome,
+    FlowActorObservation, FlowAdmissionKind, FlowCustodian, FlowDeadlineClass,
+    FlowDeadlineLawObservation, FlowEventKind, FlowGroupObservation, FlowGroupPolicy,
+    FlowGroupPolicyLawObservation, FlowProgramObservation, FlowProposalKey,
+    FlowProposalObservation, FlowReplyObligationObservation, FlowRequirementKind,
+    FlowRequirementObservation, FlowSendOutcome, FlowStructuredEventObservation,
+    FlowStructuredOutcome, FlowStructuredScenarioKind, FlowStructuredScenarioObservation,
     FlowSuspensionHomeObservation, FlowTraceRecord,
 };
 pub use image_planning::{

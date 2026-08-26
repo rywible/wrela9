@@ -493,6 +493,7 @@ pub(crate) enum ExpressionSyntaxKind {
     BitNot(Box<ExpressionSyntax>),
     Not(Box<ExpressionSyntax>),
     Await(Box<ExpressionSyntax>),
+    Send(Box<ExpressionSyntax>),
     TrySend(Box<ExpressionSyntax>),
     Mut(Box<ExpressionSyntax>),
     Take(Box<ExpressionSyntax>),

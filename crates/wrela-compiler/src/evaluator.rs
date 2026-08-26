@@ -929,7 +929,10 @@ impl<'a> Engine<'a> {
                             controls.push(Control::FinishNot);
                             controls.push(Control::Expression(value));
                         }
-                        ExpressionKind::Await(_) | ExpressionKind::TrySend(_) => {
+                        ExpressionKind::Await(_)
+                        | ExpressionKind::Send(_)
+                        | ExpressionKind::Request(_)
+                        | ExpressionKind::TrySend(_) => {
                             return Err(EvalFailure::Creator(
                                 RejectKind::AwaitNotEvaluatorEligible,
                             ));

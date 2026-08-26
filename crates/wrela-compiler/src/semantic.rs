@@ -2330,6 +2330,7 @@ fn analyze_with_probe(
     let mut specialization_observations = Vec::new();
     let mut inferred_errors = Vec::new();
     let mut evaluations = Vec::new();
+    let mut semantic_evaluations = Vec::new();
     let mut constructions = Vec::new();
     let mut test_plan = Vec::new();
     let mut completion_facts = None;
@@ -2462,6 +2463,9 @@ fn analyze_with_probe(
                 {
                     return defect("constant evaluation", evidence);
                 }
+                if let Some(semantic) = run.semantic.clone() {
+                    semantic_evaluations.push(semantic);
+                }
                 evaluations.push(EvaluationObservation::new(
                     format!("{}.{}", module_displays[&constant.module], constant.name),
                     run.outcome,
@@ -2505,6 +2509,9 @@ fn analyze_with_probe(
                                         );
                                     }
                                 }
+                            }
+                            if let Some(semantic) = run.semantic.clone() {
+                                semantic_evaluations.push(semantic);
                             }
                             evaluations.push(EvaluationObservation::new(
                                 format!("{}.comptime_assert", module_displays[&module]),
@@ -2562,6 +2569,9 @@ fn analyze_with_probe(
                     }
                 }
                 let function = &program.functions()[image];
+                if let Some(semantic) = finished.semantic.clone() {
+                    semantic_evaluations.push(semantic);
+                }
                 evaluations.push(EvaluationObservation::new(
                     format!("{}.{}", function.module_display, function.name),
                     finished.outcome,
@@ -2574,6 +2584,7 @@ fn analyze_with_probe(
     function_facts.sort_by(|left, right| left.name().cmp(right.name()));
     inferred_errors.sort_by(|left, right| left.function().cmp(right.function()));
     evaluations.sort_by(|left, right| left.root().cmp(right.root()));
+    semantic_evaluations.sort_by_key(|evaluation| evaluation.root);
     constructions.sort_by_key(ConstructionObservation::identity);
     type_observations.sort_by(|left, right| {
         left.owner_identity()
@@ -2611,7 +2622,7 @@ fn analyze_with_probe(
                 identity_catalog: Arc::new(identity_catalog.clone()),
                 program,
                 facts,
-                evaluations: evaluations.clone(),
+                evaluations: semantic_evaluations,
                 image,
                 image_specialization,
             },
@@ -3756,7 +3767,7 @@ fn plan_tests(
                             OwnershipSyntax::Mut => OwnershipMode::Mut,
                             OwnershipSyntax::Take => OwnershipMode::Take,
                         },
-                        value.clone(),
+                        crate::evaluator::observe_value(value),
                     )
                 })
                 .collect(),

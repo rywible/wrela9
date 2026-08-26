@@ -770,14 +770,6 @@ impl EvaluationRoot {
             Self::Image(identity) => identity.0,
         }
     }
-
-    pub(crate) const fn tag(self) -> u8 {
-        match self {
-            Self::Constant(_) => 1,
-            Self::Condition(_) => 2,
-            Self::Image(_) => 3,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1488,6 +1480,22 @@ impl VerifiedProgram {
     pub(crate) fn closure(&self, id: ClosureId) -> Option<&HirClosure> {
         self.closures.get(&id).map(AsRef::as_ref)
     }
+    pub(crate) fn specialization_closures(&self, id: SpecializationId) -> BTreeSet<ClosureId> {
+        let mut closures = BTreeMap::new();
+        if let Some(function) = self.specialization_function(id) {
+            collect_statement_closures(&function.body, &mut closures)
+                .expect("verified specialization has unique Closure identities");
+        }
+        closures.into_keys().collect()
+    }
+    pub(crate) fn test_closures(&self, id: TestId) -> BTreeSet<ClosureId> {
+        let mut closures = BTreeMap::new();
+        if let Some(body) = self.test_body(id) {
+            collect_statement_closures(body, &mut closures)
+                .expect("verified Test body has unique Closure identities");
+        }
+        closures.into_keys().collect()
+    }
     pub(crate) const fn fingerprint(&self) -> u128 {
         self.fingerprint
     }
@@ -1519,27 +1527,16 @@ impl VerifiedProgram {
         roots
     }
 
-    pub(crate) fn evaluation_root(
-        &self,
-        policy: crate::EvaluationPolicy,
-        identity: u128,
-        image: SpecializationId,
-    ) -> Option<EvaluationRoot> {
-        let root = match policy {
-            crate::EvaluationPolicy::Constant => EvaluationRoot::Constant(DefinitionId(identity)),
-            crate::EvaluationPolicy::ComptimeAssertion => {
-                EvaluationRoot::Condition(ConditionSiteId(identity))
-            }
-            crate::EvaluationPolicy::ImageConstructor => EvaluationRoot::Image(image),
-        };
-        (root.identity() == identity && self.expected_evaluation_roots(image).contains(&root))
-            .then_some(root)
-    }
-
     pub(crate) fn comptime_root(&self, expression: &Expression) -> Option<ConditionSiteId> {
         self.comptime_expressions
             .get(&expression.source)
             .map(|root| root.root)
+    }
+    pub(crate) fn comptime_expression(&self, identity: ConditionSiteId) -> Option<&Expression> {
+        self.comptime_expressions
+            .values()
+            .find(|expression| expression.root == identity)
+            .map(|expression| &expression.expression)
     }
 
     pub(crate) fn custody_fingerprint(&self) -> u128 {

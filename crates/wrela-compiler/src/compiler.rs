@@ -289,6 +289,8 @@ impl CompilationRequest {
 #[derive(Clone, Debug, Default)]
 pub struct Cancellation {
     cancelled: Arc<AtomicBool>,
+    #[cfg(test)]
+    polls_before_cancel: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Cancellation {
@@ -302,7 +304,19 @@ impl Cancellation {
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
+        #[cfg(test)]
+        {
+            let remaining = self.polls_before_cancel.load(Ordering::Acquire);
+            if remaining > 0 && self.polls_before_cancel.fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.cancel();
+            }
+        }
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_after_private_polls(&self, polls: usize) {
+        self.polls_before_cancel.store(polls, Ordering::Release);
     }
 }
 
@@ -1547,6 +1561,12 @@ impl EvaluationReceipt {
         self.relevant_identity = relevant_identity;
         self.call_chain = call_chain.into();
         self.contributors = contributors.into();
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_tariff_schema(mut self, schema: &'static str) -> Self {
+        self.tariff_schema = Arc::from(schema);
         self
     }
 

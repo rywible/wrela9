@@ -41,7 +41,7 @@ enum EvalFailure {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Value {
+pub(crate) enum Value {
     Unavailable,
     Unit,
     Bool(bool),
@@ -94,7 +94,7 @@ struct CachedConstant {
     value: Value,
     fuel: u64,
     peak_memory: u64,
-    dependencies: Arc<[u128]>,
+    dependencies: Arc<[crate::typed_hir::EvaluationRoot]>,
 }
 
 enum RootWork<'hir> {
@@ -112,7 +112,7 @@ enum FrameKind<'hir> {
         type_: &'hir Type,
         fuel_before: u64,
         peak_before: u64,
-        dependencies_before: BTreeSet<u128>,
+        dependencies_before: BTreeSet<crate::typed_hir::EvaluationRoot>,
     },
 }
 
@@ -356,18 +356,30 @@ pub(crate) struct Engine<'a> {
     call_stack: Vec<(u128, String, SourceRange)>,
     semantic_owner_stack: Vec<u128>,
     evaluation_policy: EvaluationPolicy,
-    evaluation_root: u128,
+    evaluation_root: Option<crate::typed_hir::EvaluationRoot>,
     evaluation_provenance: Option<SourceRange>,
-    root_dependencies: BTreeSet<u128>,
+    root_dependencies: BTreeSet<crate::typed_hir::EvaluationRoot>,
     fuel_by_site: BTreeMap<SourceRange, u64>,
 }
 
 pub(crate) struct Run {
     pub(crate) outcome: EvaluationOutcome,
     pub(crate) receipt: EvaluationReceipt,
+    pub(crate) semantic: Option<SemanticEvaluation>,
     pub(crate) constructions: Vec<Construction>,
     pub(crate) test_applications: Vec<AppliedTest>,
     pub(crate) root_handle: Option<(BuildKind, u128)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SemanticEvaluation {
+    pub(crate) value: Value,
+    pub(crate) policy: EvaluationPolicy,
+    pub(crate) root: crate::typed_hir::EvaluationRoot,
+    pub(crate) argument_fingerprint: u128,
+    pub(crate) evaluator_eligible: bool,
+    pub(crate) dependencies: Arc<[crate::typed_hir::EvaluationRoot]>,
+    pub(crate) typed_program_fingerprint: u128,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -383,20 +395,13 @@ pub(crate) struct Construction {
 pub(crate) struct ConstructionOperand {
     pub(crate) label: Arc<str>,
     pub(crate) ownership: AccessMode,
-    pub(crate) value: CanonicalValue,
-    pub(crate) handles: Vec<ConstructionHandle>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ConstructionHandle {
-    pub(crate) kind: BuildKind,
-    pub(crate) identity: u128,
+    pub(crate) value: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AppliedTest {
     pub(crate) id: TestId,
-    pub(crate) payload: Vec<CanonicalValue>,
+    pub(crate) payload: Vec<Value>,
 }
 
 impl<'a> Engine<'a> {
@@ -418,7 +423,7 @@ impl<'a> Engine<'a> {
             call_stack: Vec::new(),
             semantic_owner_stack: Vec::new(),
             evaluation_policy: EvaluationPolicy::Constant,
-            evaluation_root: 0,
+            evaluation_root: None,
             evaluation_provenance: None,
             root_dependencies: BTreeSet::new(),
             fuel_by_site: BTreeMap::new(),
@@ -470,10 +475,14 @@ impl<'a> Engine<'a> {
                 .or_else(|| self.evaluation_provenance.clone()),
             Ok(_) => None,
         };
+        let root_identity = self
+            .evaluation_root
+            .expect("evaluator root is established before execution")
+            .identity();
         let relevant_identity = failed.then(|| {
             self.call_stack
                 .last()
-                .map_or(self.evaluation_root, |(identity, _, _)| *identity)
+                .map_or(root_identity, |(identity, _, _)| *identity)
         });
         let call_chain = if failed {
             self.call_stack
@@ -502,6 +511,17 @@ impl<'a> Engine<'a> {
             Ok(Value::SymbolicHandle { kind, identity }) => Some((*kind, *identity)),
             _ => None,
         };
+        let semantic = result.as_ref().ok().map(|value| SemanticEvaluation {
+            value: value.clone(),
+            policy: self.evaluation_policy,
+            root: self
+                .evaluation_root
+                .expect("evaluator root is established before execution"),
+            argument_fingerprint: xxh3_128(b"wrela.evaluation-arguments\0\x01"),
+            evaluator_eligible: true,
+            dependencies: self.root_dependencies.iter().copied().collect(),
+            typed_program_fingerprint: self.program.fingerprint(),
+        });
         Run {
             outcome: match result {
                 Ok(value) => EvaluationOutcome::Completed(canonical(value)),
@@ -521,8 +541,11 @@ impl<'a> Engine<'a> {
             },
             receipt: EvaluationReceipt::new(
                 self.evaluation_policy,
-                self.evaluation_root,
-                self.root_dependencies.iter().copied().collect(),
+                root_identity,
+                self.root_dependencies
+                    .iter()
+                    .map(|root| root.identity())
+                    .collect(),
                 self.program.fingerprint(),
                 self.fuel,
                 self.peak_memory,
@@ -533,6 +556,7 @@ impl<'a> Engine<'a> {
                 call_chain,
                 if failed { contributors } else { Vec::new() },
             ),
+            semantic,
             constructions: std::mem::take(&mut self.constructions),
             test_applications: std::mem::take(&mut self.test_applications),
             root_handle,
@@ -613,7 +637,7 @@ impl<'a> Engine<'a> {
         match work {
             RootWork::Constant(id) => {
                 self.evaluation_policy = EvaluationPolicy::Constant;
-                self.evaluation_root = id.0;
+                self.evaluation_root = Some(crate::typed_hir::EvaluationRoot::Constant(id));
                 self.evaluation_provenance = program
                     .constants()
                     .get(&id)
@@ -630,10 +654,11 @@ impl<'a> Engine<'a> {
             }
             RootWork::Expression(expression) => {
                 self.evaluation_policy = EvaluationPolicy::ComptimeAssertion;
-                self.evaluation_root = program
-                    .comptime_root(expression)
-                    .expect("verified comptime expression carries its typed root")
-                    .0;
+                self.evaluation_root = Some(crate::typed_hir::EvaluationRoot::Condition(
+                    program
+                        .comptime_root(expression)
+                        .expect("verified comptime expression carries its typed root"),
+                ));
                 self.evaluation_provenance = Some(expression.source.clone());
                 self.retain(64)?;
                 frames.push(MachineFrame {
@@ -653,7 +678,8 @@ impl<'a> Engine<'a> {
                     .specialization_function(specialization)
                     .ok_or(EvalFailure::Creator(RejectKind::UnresolvedCall))?;
                 self.evaluation_policy = EvaluationPolicy::ImageConstructor;
-                self.evaluation_root = specialization.0;
+                self.evaluation_root =
+                    Some(crate::typed_hir::EvaluationRoot::Image(specialization));
                 let site = program
                     .functions()
                     .get(&id)
@@ -932,7 +958,8 @@ impl<'a> Engine<'a> {
                 }
                 Control::Constant(id) => {
                     let dependencies_before = self.root_dependencies.clone();
-                    self.root_dependencies.insert(id.0);
+                    self.root_dependencies
+                        .insert(crate::typed_hir::EvaluationRoot::Constant(id));
                     if let Some(cached) = self.constant_values.get(&id).cloned() {
                         self.root_dependencies
                             .extend(cached.dependencies.iter().copied());
@@ -2509,21 +2536,18 @@ impl<'a> Engine<'a> {
         }
         let mut operands = Vec::with_capacity(arguments.len());
         for ((label, argument), ownership) in labels.iter().zip(arguments).zip(ownership) {
-            let mut handles = Vec::new();
-            collect_construction_handles(argument, &mut handles);
             if kind == BuildKind::Test {
                 collect_test_applications(argument, &mut self.test_applications);
             }
             operands.push(ConstructionOperand {
                 label: Arc::clone(label),
                 ownership: *ownership,
-                value: canonical(argument.clone()),
-                handles,
+                value: argument.clone(),
             });
         }
         let edge_count = operands
             .iter()
-            .map(|operand| operand.handles.len())
+            .map(|operand| construction_handle_count(&operand.value))
             .sum::<usize>();
         let construction_memory = 64_u64.saturating_add(
             u64::try_from(edge_count)
@@ -2534,7 +2558,11 @@ impl<'a> Engine<'a> {
             .semantic_owner_stack
             .last()
             .copied()
-            .unwrap_or(self.evaluation_root);
+            .unwrap_or_else(|| {
+                self.evaluation_root
+                    .expect("construction has an evaluation root")
+                    .identity()
+            });
         self.constructions.push(Construction {
             identity,
             kind,
@@ -2654,12 +2682,9 @@ fn value_size(value: &Value) -> u64 {
     }
 }
 
-fn collect_construction_handles(value: &Value, handles: &mut Vec<ConstructionHandle>) {
+pub(crate) fn visit_construction_handles(value: &Value, visitor: &mut impl FnMut(BuildKind, u128)) {
     match value {
-        Value::SymbolicHandle { kind, identity } => handles.push(ConstructionHandle {
-            kind: *kind,
-            identity: *identity,
-        }),
+        Value::SymbolicHandle { kind, identity } => visitor(*kind, *identity),
         Value::Array(values)
         | Value::Tuple(values)
         | Value::BuiltinVariant {
@@ -2672,12 +2697,12 @@ fn collect_construction_handles(value: &Value, handles: &mut Vec<ConstructionHan
             payload: values, ..
         } => {
             for value in &**values {
-                collect_construction_handles(value, handles);
+                visit_construction_handles(value, visitor);
             }
         }
         Value::Struct { fields, .. } => {
             for (_, value) in &**fields {
-                collect_construction_handles(value, handles);
+                visit_construction_handles(value, visitor);
             }
         }
         Value::Unavailable
@@ -2691,21 +2716,33 @@ fn collect_construction_handles(value: &Value, handles: &mut Vec<ConstructionHan
         | Value::Bytes(_) => {}
         Value::Closure { captures, .. } => {
             for (_, value) in &**captures {
-                collect_construction_handles(value, handles);
+                visit_construction_handles(value, visitor);
             }
         }
     }
 }
 
+fn construction_handle_count(value: &Value) -> usize {
+    let mut count = 0_usize;
+    visit_construction_handles(value, &mut |_, _| count = count.saturating_add(1));
+    count
+}
+
 fn collect_test_applications(value: &Value, applications: &mut Vec<AppliedTest>) {
+    visit_test_applications(value, &mut |id, payload| {
+        applications.push(AppliedTest {
+            id,
+            payload: payload.to_vec(),
+        });
+    });
+}
+
+pub(crate) fn visit_test_applications(value: &Value, visitor: &mut impl FnMut(TestId, &[Value])) {
     match value {
         Value::TestApplication { id, payload } => {
-            applications.push(AppliedTest {
-                id: *id,
-                payload: payload.iter().cloned().map(canonical).collect(),
-            });
+            visitor(*id, payload);
             for value in &**payload {
-                collect_test_applications(value, applications);
+                visit_test_applications(value, visitor);
             }
         }
         Value::Array(values)
@@ -2717,12 +2754,12 @@ fn collect_test_applications(value: &Value, applications: &mut Vec<AppliedTest>)
             payload: values, ..
         } => {
             for value in &**values {
-                collect_test_applications(value, applications);
+                visit_test_applications(value, visitor);
             }
         }
         Value::Struct { fields, .. } => {
             for (_, value) in &**fields {
-                collect_test_applications(value, applications);
+                visit_test_applications(value, visitor);
             }
         }
         Value::Unavailable
@@ -2737,7 +2774,7 @@ fn collect_test_applications(value: &Value, applications: &mut Vec<AppliedTest>)
         | Value::SymbolicHandle { .. } => {}
         Value::Closure { captures, .. } => {
             for (_, value) in &**captures {
-                collect_test_applications(value, applications);
+                visit_test_applications(value, visitor);
             }
         }
     }
@@ -3667,6 +3704,10 @@ fn canonical(value: Value) -> CanonicalValue {
             identity,
         },
     }
+}
+
+pub(crate) fn observe_value(value: &Value) -> CanonicalValue {
+    canonical(value.clone())
 }
 
 fn encode_float(kind: FloatType, value: f64) -> u64 {

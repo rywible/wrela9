@@ -12,6 +12,7 @@ use crate::model::BuildKind;
 pub(crate) struct FinishedImageEvaluation {
     pub(crate) outcome: EvaluationOutcome,
     pub(crate) receipt: EvaluationReceipt,
+    pub(crate) semantic: Option<crate::evaluator::SemanticEvaluation>,
     pub(crate) status: ImageEvaluationStatus,
 }
 
@@ -53,7 +54,14 @@ impl SealedImage {
                     construction
                         .operands
                         .iter()
-                        .flat_map(|operand| operand.handles.iter().map(|handle| handle.identity))
+                        .flat_map(|operand| {
+                            let mut identities = Vec::new();
+                            crate::evaluator::visit_construction_handles(
+                                &operand.value,
+                                &mut |_, identity| identities.push(identity),
+                            );
+                            identities
+                        })
                         .collect(),
                     construction
                         .operands
@@ -61,7 +69,7 @@ impl SealedImage {
                         .map(|operand| {
                             crate::ConstructionOperandObservation::new(
                                 Arc::clone(&operand.label),
-                                operand.value.clone(),
+                                crate::evaluator::observe_value(&operand.value),
                             )
                         })
                         .collect(),
@@ -93,6 +101,7 @@ pub(crate) fn finish(run: Run) -> FinishedImageEvaluation {
     FinishedImageEvaluation {
         outcome: run.outcome,
         receipt: run.receipt,
+        semantic: run.semantic,
         status,
     }
 }
@@ -125,7 +134,14 @@ fn seal_construction_graph(
                 construction
                     .operands
                     .iter()
-                    .flat_map(|operand| operand.handles.iter().map(|handle| handle.identity))
+                    .flat_map(|operand| {
+                        let mut identities = Vec::new();
+                        crate::evaluator::visit_construction_handles(
+                            &operand.value,
+                            &mut |_, identity| identities.push(identity),
+                        );
+                        identities
+                    })
                     .collect::<Vec<_>>(),
             )
             .is_some()
@@ -168,21 +184,22 @@ fn seal_construction_graph(
 mod tests {
     use super::*;
     use crate::compiler::{EvaluationPolicy, EvaluationReceipt, SourceRange};
-    use crate::evaluator::{ConstructionHandle, ConstructionOperand};
+    use crate::evaluator::{ConstructionOperand, Value};
     use crate::typed_hir::AccessMode;
 
     fn operand(edges: Vec<u128>) -> ConstructionOperand {
         ConstructionOperand {
             label: Arc::from("edge"),
             ownership: AccessMode::Copy,
-            value: crate::CanonicalValue::Unit,
-            handles: edges
-                .into_iter()
-                .map(|identity| ConstructionHandle {
-                    kind: BuildKind::Test,
-                    identity,
-                })
-                .collect(),
+            value: Value::Array(
+                edges
+                    .into_iter()
+                    .map(|identity| Value::SymbolicHandle {
+                        kind: BuildKind::Test,
+                        identity,
+                    })
+                    .collect(),
+            ),
         }
     }
 
@@ -200,6 +217,7 @@ mod tests {
                 0,
                 0,
             ),
+            semantic: None,
             constructions,
             test_applications: Vec::new(),
             root_handle,
@@ -220,6 +238,7 @@ mod tests {
                 0,
                 0,
             ),
+            semantic: None,
             constructions: Vec::new(),
             test_applications: Vec::new(),
             root_handle: None,

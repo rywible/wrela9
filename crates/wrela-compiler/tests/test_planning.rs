@@ -92,8 +92,36 @@ fn build() -> Image:
             .completed_semantic_program()
             .expect("semantic completion observation")
             .executable_count(),
-        2,
-        "the Image Constructor and applied Test helper are demanded; the unrelated function is not"
+        3,
+        "the Image Constructor, applied Test body, and Test helper are demanded; the unrelated function is not"
+    );
+}
+
+#[test]
+fn completed_semantic_demand_includes_applied_closure_bodies() {
+    let source = br#"pub suite behavior:
+    test uses_closure():
+        offset = 2
+        add = |value: i64| value + offset
+        expect add(40) == 42
+
+@image
+fn build() -> Image:
+    tests = Test.new(cases=[behavior.uses_closure()])
+    return Image.new(tests=tests)
+"#;
+    let outcome = compile(vec![ProjectFile::new("src/test.wr", source)], Root::Test);
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("Test closure demand must compile: {outcome:#?}");
+    };
+    assert_eq!(
+        accepted
+            .inspection()
+            .completed_semantic_program()
+            .expect("semantic completion observation")
+            .executable_count(),
+        3,
+        "the Image Constructor, applied Test body, and closure body are demanded"
     );
 }
 

@@ -1347,3 +1347,49 @@ fn build() -> Image:
                 .any(|discharge| discharge.requirement() == requirement.identity()))
     );
 }
+
+#[test]
+fn compiler_rejects_a_positive_but_unmeetable_verified_group_deadline() {
+    let source = |slack| {
+        format!(
+            r#"from core import actor as actors
+
+@actor
+struct Worker:
+    pub async fn run(self):
+        mut group = actors.Group.all(bound=1u64)
+        group.logical_deadline(epoch=1u64, slack={slack}u64)
+        _ = actors.Group.complete(take group)
+
+@image
+fn build() -> Image:
+    worker = Worker()
+    return Image.new(worker=worker)
+"#
+        )
+        .into_bytes()
+    };
+    let compiler = Compiler::open(CompilerInstallation::layer1()).unwrap();
+    let compile = |slack| {
+        compiler.compile(
+            CompilationRequest::new(
+                ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source(slack))]),
+                Root::Image,
+            )
+            .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+            .with_inspection(InspectSelection::all()),
+            &Cancellation::new(),
+        )
+    };
+    assert!(matches!(compile(7), CompilationOutcome::Accepted(_)));
+    let outcome = compile(6);
+    let CompilationOutcome::Rejected(rejected) = outcome else {
+        panic!("positive slack below verified Flow work must reject: {outcome:#?}");
+    };
+    assert_eq!(
+        rejected.diagnostics()[0].code(),
+        "admission.whole_image_conflict"
+    );
+    assert!(rejected.inspection().flow_program().is_some());
+    assert!(rejected.inspection().whole_image_assignment().is_none());
+}

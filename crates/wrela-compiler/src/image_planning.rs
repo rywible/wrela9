@@ -15,7 +15,9 @@ use crate::completed_semantic::{
     CoreSourceExecutableRef, PlanningConstructionValueRef,
 };
 use crate::core::VerifiedCoreProgram;
-use crate::flow::{FlowRequirementKind, FlowRequirementRef, VerifiedFlowProgram};
+use crate::flow::{
+    FlowDeadlineClass, FlowRequirementKind, FlowRequirementRef, VerifiedFlowProgram,
+};
 use crate::model::{BuildKind, SpecializationId};
 use crate::typed_hir::{
     AccessMode, CallTarget, Expression, ExpressionKind, HirMatchCase, Literal, LocalId,
@@ -2557,8 +2559,11 @@ fn translate_whole_requirement_set(
             FlowRequirementKind::PermanentCorePlacement if actor.2.is_empty() => {
                 SolverConstraint::Static { satisfied: true }
             }
-            FlowRequirementKind::PermanentCorePlacement => SolverConstraint::AffinityGroup {
+            FlowRequirementKind::PermanentCorePlacement => SolverConstraint::ActorPlacement {
                 executables: actor.2.clone().into(),
+                units: u64::from(architecture.service().actor_turn_units),
+                start: 0,
+                end: 1,
             },
             FlowRequirementKind::MailboxCapacity => SolverConstraint::Capacity {
                 required: requirement.bound(),
@@ -2575,22 +2580,202 @@ fn translate_whole_requirement_set(
                         "activation Requirement has no handler subject",
                     ))
                 })?;
-                SolverConstraint::Activation {
-                    executable,
-                    units: u16::try_from(requirement.bound()).map_err(|_| {
-                        PlanningFailure::Defect(Arc::from(
-                            "activation Requirement exceeds canonical solver width",
-                        ))
-                    })?,
-                    start: 0,
-                    end: 1,
+                let available = u64::from(architecture.capacity().maximum_activation_homes);
+                if requirement.bound() > available {
+                    SolverConstraint::Capacity {
+                        required: requirement.bound(),
+                        available,
+                    }
+                } else {
+                    SolverConstraint::Activation {
+                        executable,
+                        units: requirement.bound(),
+                        start: 0,
+                        end: 1,
+                    }
                 }
             }
             FlowRequirementKind::ServiceStorage => SolverConstraint::Capacity {
                 required: requirement.bound(),
                 available: u64::from(architecture.capacity().maximum_activation_homes),
             },
-            _ => SolverConstraint::Static { satisfied: true },
+            FlowRequirementKind::GroupChildActivationBound => {
+                let group = requirement
+                    .site()
+                    .and_then(|site| flow.group(site))
+                    .ok_or_else(|| {
+                        PlanningFailure::Defect(Arc::from(
+                            "Group activation Requirement has no owning Group",
+                        ))
+                    })?;
+                if group.actor() != requirement.actor()
+                    || group.handler() != requirement.handler().unwrap_or(0)
+                    || group.child_activation_bound() != requirement.bound()
+                {
+                    return defect("Group activation Requirement disagrees with verified Flow");
+                }
+                SolverConstraint::GroupActivation {
+                    executable: group.handler(),
+                    selected: u64::try_from(group.child_activation_count()).unwrap_or(u64::MAX),
+                    maximum: requirement
+                        .bound()
+                        .min(u64::from(architecture.capacity().maximum_activation_homes)),
+                    units: requirement
+                        .bound()
+                        .saturating_mul(u64::from(architecture.service().group_child_units)),
+                    start: 0,
+                    end: 1,
+                }
+            }
+            FlowRequirementKind::DeadlineSlack => {
+                let group = requirement
+                    .site()
+                    .and_then(|site| flow.group(site))
+                    .ok_or_else(|| {
+                        PlanningFailure::Defect(Arc::from(
+                            "deadline slack Requirement has no owning Group",
+                        ))
+                    })?;
+                if group.actor() != requirement.actor()
+                    || group.handler() != requirement.handler().unwrap_or(0)
+                    || group.deadline_slack() != Some(requirement.bound())
+                {
+                    return defect("deadline slack Requirement disagrees with verified Flow");
+                }
+                SolverConstraint::Capacity {
+                    required: group.maximum_uninterrupted_work_units(),
+                    available: requirement.bound(),
+                }
+            }
+            FlowRequirementKind::DeadlineFeasibility => {
+                let group = requirement
+                    .site()
+                    .and_then(|site| flow.group(site))
+                    .ok_or_else(|| {
+                        PlanningFailure::Defect(Arc::from(
+                            "deadline feasibility Requirement has no owning Group",
+                        ))
+                    })?;
+                if group.actor() != requirement.actor()
+                    || group.handler() != requirement.handler().unwrap_or(0)
+                    || requirement.bound() != 1
+                {
+                    return defect("deadline feasibility Requirement disagrees with verified Flow");
+                }
+                SolverConstraint::Capacity {
+                    required: group.maximum_uninterrupted_work_units(),
+                    available: group.deadline_slack().unwrap_or(0),
+                }
+            }
+            FlowRequirementKind::CancellationObservationWorkBound => {
+                let group = requirement
+                    .site()
+                    .and_then(|site| flow.group(site))
+                    .ok_or_else(|| {
+                        PlanningFailure::Defect(Arc::from(
+                            "cancellation work Requirement has no owning Group",
+                        ))
+                    })?;
+                if group.actor() != requirement.actor()
+                    || group.handler() != requirement.handler().unwrap_or(0)
+                    || group.maximum_uninterrupted_work_units() != requirement.bound()
+                {
+                    return defect("cancellation work Requirement disagrees with verified Flow");
+                }
+                SolverConstraint::Capacity {
+                    required: requirement.bound(),
+                    available: u64::from(architecture.service().maximum_cancellation_delay_units()),
+                }
+            }
+            FlowRequirementKind::GroupCancellationAuthority => SolverConstraint::Static {
+                satisfied: requirement.bound() == 1
+                    && requirement.site().is_some_and(|site| {
+                        flow.groups().any(|group| {
+                            group.actor() == requirement.actor()
+                                && group.handler() == requirement.handler().unwrap_or(0)
+                                && group.cancellation_authority() == site
+                        })
+                    }),
+            },
+            FlowRequirementKind::GroupOutcomePolicy => SolverConstraint::Static {
+                satisfied: requirement.bound() == 1
+                    && requirement.site().is_some_and(|site| {
+                        flow.group(site).is_some_and(|group| {
+                            group.actor() == requirement.actor()
+                                && group.handler() == requirement.handler().unwrap_or(0)
+                        })
+                    }),
+            },
+            FlowRequirementKind::GroupResourceReturnHome => SolverConstraint::Static {
+                satisfied: requirement.site().is_some_and(|site| {
+                    flow.groups().any(|group| {
+                        group.actor() == requirement.actor()
+                            && group.handler() == requirement.handler().unwrap_or(0)
+                            && group.return_home() == site
+                            && u64::try_from(group.moved_resource_count()).unwrap_or(u64::MAX)
+                                == requirement.bound()
+                    })
+                }),
+            },
+            FlowRequirementKind::GroupCleanupOrder => SolverConstraint::Static {
+                satisfied: requirement.site().is_some_and(|site| {
+                    flow.group(site).is_some_and(|group| {
+                        group.actor() == requirement.actor()
+                            && group.handler() == requirement.handler().unwrap_or(0)
+                            && u64::try_from(group.cleanup_action_count()).unwrap_or(u64::MAX)
+                                == requirement.bound()
+                    })
+                }),
+            },
+            FlowRequirementKind::DeadlineClass => SolverConstraint::Static {
+                satisfied: requirement.site().is_some_and(|site| {
+                    flow.group(site).is_some_and(|group| {
+                        let encoded = group
+                            .deadline_class()
+                            .map(|class| u64::from(class == FlowDeadlineClass::Realtime) + 1);
+                        group.actor() == requirement.actor()
+                            && group.handler() == requirement.handler().unwrap_or(0)
+                            && encoded == Some(requirement.bound())
+                            && (group.deadline_class() != Some(FlowDeadlineClass::Realtime)
+                                || architecture.has_capability(VmAbiCapability::MonotonicCounter))
+                    })
+                }),
+            },
+            FlowRequirementKind::DeadlineAuthority => SolverConstraint::Static {
+                satisfied: requirement.bound() == 1
+                    && requirement.site().is_some_and(|site| {
+                        flow.groups().any(|group| {
+                            group.actor() == requirement.actor()
+                                && group.handler() == requirement.handler().unwrap_or(0)
+                                && group.deadline_authority() == Some(site)
+                        })
+                    }),
+            },
+            FlowRequirementKind::CancellationCheckpoint => SolverConstraint::Static {
+                satisfied: requirement.bound() == 1
+                    && requirement.site().is_some_and(|site| {
+                        flow.groups().any(|group| {
+                            group.actor() == requirement.actor()
+                                && group.handler() == requirement.handler().unwrap_or(0)
+                                && group.has_cancellation_checkpoint(site)
+                        })
+                    }),
+            },
+            FlowRequirementKind::ActorIdentity
+            | FlowRequirementKind::LogicalCommitOrder
+            | FlowRequirementKind::ProposalTransport => SolverConstraint::Static {
+                satisfied: requirement.handler().is_none()
+                    && requirement.site().is_none()
+                    && requirement.bound() == 1,
+            },
+            FlowRequirementKind::ReplyEndpoint
+            | FlowRequirementKind::ReplyReturnPath
+            | FlowRequirementKind::ReplyResponseHome
+            | FlowRequirementKind::ReplyAcyclicWait => SolverConstraint::Static {
+                satisfied: requirement.handler().is_some()
+                    && requirement.site().is_some()
+                    && requirement.bound() == 1,
+            },
         };
         requirements.push(SolverRequirement {
             identity: requirement.reference().identity(),
@@ -2613,6 +2798,7 @@ fn translate_whole_requirement_set(
             .cores()
             .map(|core| CoreResource {
                 identity: core.ordinal,
+                maximum_activation_units: u64::from(core.maximum_service_units),
             })
             .collect(),
         executables,
@@ -2654,7 +2840,7 @@ const fn solver_domain_category(category: RequirementCategory) -> SolverRequirem
 
 const fn solver_flow_category(kind: FlowRequirementKind) -> SolverRequirementCategory {
     match kind {
-        FlowRequirementKind::PermanentCorePlacement => SolverRequirementCategory::Affinity,
+        FlowRequirementKind::PermanentCorePlacement => SolverRequirementCategory::Capacity,
         FlowRequirementKind::MailboxCapacity
         | FlowRequirementKind::ServiceStorage
         | FlowRequirementKind::ActivationStorage => SolverRequirementCategory::Capacity,
@@ -3398,21 +3584,15 @@ fn verify_whole_image_assignment(
         .cores()
         .map(|core| core.ordinal)
         .collect::<BTreeSet<_>>();
-    let canonical_core = core_ordinals.iter().next().copied().ok_or_else(|| {
-        PlanningFailure::Defect(Arc::from("assignment verifier found no symbolic core"))
-    })?;
     if actual_executables != expected_executables
         || candidate
             .placements
             .iter()
             .any(|placement| !core_ordinals.contains(&placement.core))
-        || candidate
-            .placements
-            .iter()
-            .any(|placement| placement.core != canonical_core)
     {
-        return defect("whole-Image assignment is not the canonical exact executable placement");
+        return defect("whole-Image assignment does not place the exact executable roster");
     }
+    verifier_validate_canonical_placements(candidate, core, flow, architecture, cancellation)?;
     let executable_ids = expected_executables
         .iter()
         .map(|(identity, _)| *identity)
@@ -3470,6 +3650,179 @@ fn verify_whole_image_assignment(
         return defect("whole-Image assignment fingerprint or Requirement Set disagrees");
     }
     Ok(())
+}
+
+fn verifier_validate_canonical_placements(
+    candidate: &VerifiedWholeImageAssignment,
+    core: crate::core::ImagePlanningCoreView<'_>,
+    flow: crate::flow::ImagePlanningFlowView<'_>,
+    architecture: crate::architecture_planning::ImagePlanningArchitecture<'_>,
+    cancellation: &Cancellation,
+) -> Result<(), PlanningFailure> {
+    let mut executables = core
+        .executables()
+        .map(|executable| executable.identity())
+        .collect::<Vec<_>>();
+    executables.sort_unstable();
+    let mut cores = architecture.cores().collect::<Vec<_>>();
+    cores.sort_by_key(|core| core.ordinal);
+    if cores.is_empty() {
+        return defect("assignment verifier found no symbolic core");
+    }
+
+    let mut activations = Vec::<(Arc<[u128]>, u64, u64, u64)>::new();
+    for requirement in candidate.planning_foundation.requirements.iter() {
+        if requirement.bounds != RequirementBounds::ImageLifetime {
+            continue;
+        }
+        let RequirementOwner::GeneratedRole(reference) = requirement.subject else {
+            return defect("assignment verifier found an unowned Image lifetime");
+        };
+        let executable = candidate
+            .planning_foundation
+            .generated_roles
+            .iter()
+            .find(|role| role.reference == reference)
+            .map(|role| role.executable.identity)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from(
+                    "assignment verifier found an unknown lifetime role",
+                ))
+            })?;
+        activations.push((Arc::from([executable]), 1, 0, 1));
+    }
+    for actor in flow.actors() {
+        let mut handlers = actor.handlers().collect::<Vec<_>>();
+        handlers.sort_unstable();
+        if !handlers.is_empty() {
+            activations.push((
+                handlers.into(),
+                u64::from(architecture.service().actor_turn_units),
+                0,
+                1,
+            ));
+        }
+    }
+    for requirement in flow.requirements() {
+        if requirement.kind() != FlowRequirementKind::GroupChildActivationBound {
+            continue;
+        }
+        let group = requirement
+            .site()
+            .and_then(|site| flow.group(site))
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from(
+                    "assignment verifier found an unowned Group activation",
+                ))
+            })?;
+        if group.handler() != requirement.handler().unwrap_or(0)
+            || group.child_activation_bound() != requirement.bound()
+            || u64::try_from(group.child_activation_count()).unwrap_or(u64::MAX)
+                > requirement
+                    .bound()
+                    .min(u64::from(architecture.capacity().maximum_activation_homes))
+        {
+            return defect("assignment verifier found a false Group activation bound");
+        }
+        activations.push((
+            Arc::from([group.handler()]),
+            requirement
+                .bound()
+                .saturating_mul(u64::from(architecture.service().group_child_units)),
+            0,
+            1,
+        ));
+    }
+
+    let candidate_digits = candidate
+        .placements
+        .iter()
+        .map(|placement| {
+            cores
+                .iter()
+                .position(|core| core.ordinal == placement.core)
+                .ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from(
+                        "assignment verifier found a foreign symbolic core",
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let radices = vec![cores.len(); executables.len()];
+    let mut digits = vec![0; executables.len()];
+    let mut checked = 0_usize;
+    loop {
+        checkpoint(cancellation)?;
+        checked = checked.saturating_add(1);
+        if checked > MAX_SOLVER_EXPLORATION_STATES {
+            return defect("assignment verifier exhausted its independent bounded prefix proof");
+        }
+        let placed = executables
+            .iter()
+            .zip(&digits)
+            .map(|(executable, digit)| (*executable, cores[*digit].ordinal))
+            .collect::<BTreeMap<_, _>>();
+        let feasible = verifier_production_placement_feasible(&placed, &activations, &cores);
+        if digits == candidate_digits {
+            if !feasible {
+                return defect("whole-Image assignment violates placement or per-core capacity");
+            }
+            return Ok(());
+        }
+        if feasible {
+            return defect("whole-Image assignment is feasible but not canonically first");
+        }
+        if !verifier_advance_placement(&mut digits, &radices) {
+            return defect("whole-Image assignment is not in the finite placement space");
+        }
+    }
+}
+
+fn verifier_production_placement_feasible(
+    placed: &BTreeMap<u128, u16>,
+    activations: &[(Arc<[u128]>, u64, u64, u64)],
+    cores: &[crate::architecture_planning::SymbolicCore],
+) -> bool {
+    if activations.iter().any(|(executables, _, _, _)| {
+        let mut assigned = executables
+            .iter()
+            .filter_map(|executable| placed.get(executable));
+        assigned
+            .next()
+            .is_some_and(|first| assigned.any(|core| core != first))
+    }) {
+        return false;
+    }
+    cores.iter().all(|core| {
+        activations
+            .iter()
+            .flat_map(|activation| [activation.2, activation.3.saturating_sub(1)])
+            .all(|point| {
+                let used = activations
+                    .iter()
+                    .filter(|(executables, _, start, end)| {
+                        executables
+                            .first()
+                            .and_then(|executable| placed.get(executable))
+                            == Some(&core.ordinal)
+                            && *start <= point
+                            && point < *end
+                    })
+                    .fold(0_u64, |sum, activation| sum.saturating_add(activation.1));
+                used <= u64::from(core.maximum_service_units)
+            })
+    })
+}
+
+fn verifier_advance_placement(digits: &mut [usize], radices: &[usize]) -> bool {
+    for ordinal in (0..digits.len()).rev() {
+        if digits[ordinal] + 1 < radices[ordinal] {
+            digits[ordinal] += 1;
+            digits[ordinal + 1..].fill(0);
+            return true;
+        }
+    }
+    false
 }
 
 fn verifier_binding_assignments(
@@ -3747,26 +4100,204 @@ fn verifier_flow_discharge(
             <= u64::from(architecture.capacity().maximum_activation_homes))
         .then_some(DischargeKind::CapacityProved)
         .ok_or_else(|| PlanningFailure::Defect(Arc::from("verifier found false storage evidence"))),
-        FlowRequirementKind::ActorIdentity
-        | FlowRequirementKind::ReplyEndpoint
+        FlowRequirementKind::CancellationObservationWorkBound => {
+            let group = requirement
+                .site()
+                .and_then(|site| flow.group(site))
+                .ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from(
+                        "verifier found cancellation work without its exact Group",
+                    ))
+                })?;
+            (group.handler() == requirement.handler().unwrap_or(0)
+                && group.maximum_uninterrupted_work_units() == requirement.bound()
+                && requirement.bound()
+                    <= u64::from(architecture.service().maximum_cancellation_delay_units()))
+            .then_some(DischargeKind::LifetimeProved)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from(
+                    "verifier found false cancellation observation evidence",
+                ))
+            })
+        }
+        FlowRequirementKind::ActorIdentity => (requirement.handler().is_none()
+            && requirement.site().is_none()
+            && requirement.bound() == 1)
+            .then_some(DischargeKind::LifetimeProved)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("verifier found false Actor identity evidence"))
+            }),
+        FlowRequirementKind::ReplyEndpoint
         | FlowRequirementKind::ReplyReturnPath
         | FlowRequirementKind::ReplyResponseHome
-        | FlowRequirementKind::ReplyAcyclicWait
-        | FlowRequirementKind::GroupChildActivationBound
-        | FlowRequirementKind::GroupCancellationAuthority
-        | FlowRequirementKind::GroupOutcomePolicy
-        | FlowRequirementKind::GroupResourceReturnHome
-        | FlowRequirementKind::GroupCleanupOrder
-        | FlowRequirementKind::DeadlineClass
-        | FlowRequirementKind::DeadlineAuthority
-        | FlowRequirementKind::DeadlineSlack
-        | FlowRequirementKind::DeadlineFeasibility
-        | FlowRequirementKind::CancellationCheckpoint
-        | FlowRequirementKind::CancellationObservationWorkBound => {
-            Ok(DischargeKind::LifetimeProved)
+        | FlowRequirementKind::ReplyAcyclicWait => (requirement.handler().is_some()
+            && requirement.site().is_some()
+            && requirement.bound() == 1)
+            .then_some(DischargeKind::LifetimeProved)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("verifier found false Reply evidence"))
+            }),
+        FlowRequirementKind::GroupChildActivationBound => {
+            let group = requirement
+                .site()
+                .and_then(|site| flow.group(site))
+                .ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from(
+                        "verifier found Group activation without its exact Group",
+                    ))
+                })?;
+            (group.actor() == requirement.actor()
+                && group.handler() == requirement.handler().unwrap_or(0)
+                && group.child_activation_bound() == requirement.bound()
+                && u64::try_from(group.child_activation_count()).unwrap_or(u64::MAX)
+                    <= requirement
+                        .bound()
+                        .min(u64::from(architecture.capacity().maximum_activation_homes)))
+            .then_some(DischargeKind::LifetimeProved)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("verifier found false Group activation evidence"))
+            })
         }
+        FlowRequirementKind::GroupCancellationAuthority => (requirement.bound() == 1
+            && requirement.site().is_some_and(|site| {
+                flow.groups().any(|group| {
+                    group.actor() == requirement.actor()
+                        && group.handler() == requirement.handler().unwrap_or(0)
+                        && group.cancellation_authority() == site
+                })
+            }))
+        .then_some(DischargeKind::LifetimeProved)
+        .ok_or_else(|| {
+            PlanningFailure::Defect(Arc::from(
+                "verifier found false Group cancellation authority evidence",
+            ))
+        }),
+        FlowRequirementKind::GroupOutcomePolicy => (requirement.bound() == 1
+            && requirement.site().is_some_and(|site| {
+                flow.group(site).is_some_and(|group| {
+                    group.actor() == requirement.actor()
+                        && group.handler() == requirement.handler().unwrap_or(0)
+                })
+            }))
+        .then_some(DischargeKind::LifetimeProved)
+        .ok_or_else(|| {
+            PlanningFailure::Defect(Arc::from("verifier found false Group outcome evidence"))
+        }),
+        FlowRequirementKind::GroupResourceReturnHome => requirement
+            .site()
+            .is_some_and(|site| {
+                flow.groups().any(|group| {
+                    group.actor() == requirement.actor()
+                        && group.handler() == requirement.handler().unwrap_or(0)
+                        && group.return_home() == site
+                        && u64::try_from(group.moved_resource_count()).unwrap_or(u64::MAX)
+                            == requirement.bound()
+                })
+            })
+            .then_some(DischargeKind::LifetimeProved)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from(
+                    "verifier found false Group return-home evidence",
+                ))
+            }),
+        FlowRequirementKind::GroupCleanupOrder => requirement
+            .site()
+            .and_then(|site| flow.group(site))
+            .is_some_and(|group| {
+                group.actor() == requirement.actor()
+                    && group.handler() == requirement.handler().unwrap_or(0)
+                    && u64::try_from(group.cleanup_action_count()).unwrap_or(u64::MAX)
+                        == requirement.bound()
+            })
+            .then_some(DischargeKind::LifetimeProved)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("verifier found false Group cleanup evidence"))
+            }),
+        FlowRequirementKind::DeadlineClass => requirement
+            .site()
+            .and_then(|site| flow.group(site))
+            .is_some_and(|group| {
+                group.actor() == requirement.actor()
+                    && group.handler() == requirement.handler().unwrap_or(0)
+                    && group
+                        .deadline_class()
+                        .map(|class| u64::from(class == FlowDeadlineClass::Realtime) + 1)
+                        == Some(requirement.bound())
+                    && (group.deadline_class() != Some(FlowDeadlineClass::Realtime)
+                        || architecture.has_capability(VmAbiCapability::MonotonicCounter))
+            })
+            .then_some(DischargeKind::LifetimeProved)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("verifier found false deadline class evidence"))
+            }),
+        FlowRequirementKind::DeadlineAuthority => (requirement.bound() == 1
+            && requirement.site().is_some_and(|site| {
+                flow.groups().any(|group| {
+                    group.actor() == requirement.actor()
+                        && group.handler() == requirement.handler().unwrap_or(0)
+                        && group.deadline_authority() == Some(site)
+                })
+            }))
+        .then_some(DischargeKind::LifetimeProved)
+        .ok_or_else(|| {
+            PlanningFailure::Defect(Arc::from(
+                "verifier found false deadline authority evidence",
+            ))
+        }),
+        FlowRequirementKind::DeadlineSlack => requirement
+            .site()
+            .and_then(|site| flow.group(site))
+            .is_some_and(|group| {
+                group.actor() == requirement.actor()
+                    && group.handler() == requirement.handler().unwrap_or(0)
+                    && group.deadline_slack() == Some(requirement.bound())
+                    && group.maximum_uninterrupted_work_units() <= requirement.bound()
+            })
+            .then_some(DischargeKind::LifetimeProved)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from("verifier found false deadline slack evidence"))
+            }),
+        FlowRequirementKind::DeadlineFeasibility => requirement
+            .site()
+            .and_then(|site| flow.group(site))
+            .is_some_and(|group| {
+                group.actor() == requirement.actor()
+                    && group.handler() == requirement.handler().unwrap_or(0)
+                    && requirement.bound() == 1
+                    && group
+                        .deadline_slack()
+                        .is_some_and(|slack| group.maximum_uninterrupted_work_units() <= slack)
+            })
+            .then_some(DischargeKind::LifetimeProved)
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from(
+                    "verifier found false deadline feasibility evidence",
+                ))
+            }),
+        FlowRequirementKind::CancellationCheckpoint => (requirement.bound() == 1
+            && requirement.site().is_some_and(|site| {
+                flow.groups().any(|group| {
+                    group.actor() == requirement.actor()
+                        && group.handler() == requirement.handler().unwrap_or(0)
+                        && group.has_cancellation_checkpoint(site)
+                })
+            }))
+        .then_some(DischargeKind::LifetimeProved)
+        .ok_or_else(|| {
+            PlanningFailure::Defect(Arc::from(
+                "verifier found false cancellation checkpoint evidence",
+            ))
+        }),
         FlowRequirementKind::LogicalCommitOrder | FlowRequirementKind::ProposalTransport => {
-            Ok(DischargeKind::ContractValidated)
+            (requirement.handler().is_none()
+                && requirement.site().is_none()
+                && requirement.bound() == 1)
+                .then_some(DischargeKind::ContractValidated)
+                .ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from(
+                        "verifier found false Flow contract evidence",
+                    ))
+                })
         }
     }
 }
@@ -8503,6 +9034,7 @@ struct CanonicalProblem {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct CoreResource {
     identity: u16,
+    maximum_activation_units: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -8566,7 +9098,7 @@ enum SolverConstraint {
     },
     CoreCapacity {
         core: u16,
-        maximum: u16,
+        maximum: u64,
     },
     AllowedCores {
         executable: u128,
@@ -8579,6 +9111,20 @@ enum SolverConstraint {
     AffinityGroup {
         executables: Arc<[u128]>,
     },
+    ActorPlacement {
+        executables: Arc<[u128]>,
+        units: u64,
+        start: u64,
+        end: u64,
+    },
+    GroupActivation {
+        executable: u128,
+        selected: u64,
+        maximum: u64,
+        units: u64,
+        start: u64,
+        end: u64,
+    },
     Separation {
         left: u128,
         right: u128,
@@ -8588,9 +9134,9 @@ enum SolverConstraint {
     },
     Activation {
         executable: u128,
-        units: u16,
-        start: u16,
-        end: u16,
+        units: u64,
+        start: u64,
+        end: u64,
     },
 }
 
@@ -8652,7 +9198,7 @@ fn solve_canonical_problem(
             discharges: discharges.into(),
         });
     }
-    if puzzle.requirements.len() > MAX_CONFLICT_REQUIREMENTS {
+    if conflict_candidate_ordinals(&puzzle).len() > MAX_CONFLICT_REQUIREMENTS {
         return defect("solver conflict minimization exhausted its authenticated finite bound");
     }
     let conflict = minimum_conflict(&puzzle, cancellation, &mut explored)?;
@@ -8727,6 +9273,27 @@ fn canonicalize_problem(puzzle: &CanonicalProblem) -> Result<CanonicalProblem, P
                         .iter()
                         .any(|executable| !puzzle.executables.contains(executable))
             }
+            SolverConstraint::ActorPlacement {
+                executables,
+                units,
+                start,
+                end,
+            } => {
+                executables.is_empty()
+                    || *units == 0
+                    || start >= end
+                    || executables
+                        .iter()
+                        .any(|executable| !puzzle.executables.contains(executable))
+            }
+            SolverConstraint::GroupActivation {
+                executable,
+                selected,
+                maximum,
+                start,
+                end,
+                ..
+            } => !puzzle.executables.contains(executable) || selected > maximum || start >= end,
             SolverConstraint::Exclusive { executable } => !puzzle.executables.contains(executable),
             SolverConstraint::Activation {
                 executable,
@@ -8891,11 +9458,19 @@ fn static_constraints_hold(puzzle: &CanonicalProblem, active: &[usize]) -> bool 
             } => required <= available,
             SolverConstraint::Static { satisfied } => *satisfied,
             SolverConstraint::Activation { start, end, .. } => start < end,
+            SolverConstraint::GroupActivation {
+                selected,
+                maximum,
+                start,
+                end,
+                ..
+            } => selected <= maximum && start < end,
             SolverConstraint::Binding { .. }
             | SolverConstraint::CoreCapacity { .. }
             | SolverConstraint::AllowedCores { .. }
             | SolverConstraint::Affinity { .. }
             | SolverConstraint::AffinityGroup { .. }
+            | SolverConstraint::ActorPlacement { .. }
             | SolverConstraint::Separation { .. }
             | SolverConstraint::Exclusive { .. } => true,
         })
@@ -8907,6 +9482,12 @@ fn placement_constraints_hold(
     placements: &[(u128, u16)],
 ) -> bool {
     let placed = placements.iter().copied().collect::<BTreeMap<_, _>>();
+    for core in &puzzle.cores {
+        let activations = active_activations(puzzle, active, &placed, core.identity);
+        if maximum_simultaneous_units(&activations) > core.maximum_activation_units {
+            return false;
+        }
+    }
     for ordinal in active {
         match &puzzle.requirements[*ordinal].constraint {
             SolverConstraint::AllowedCores { executable, cores } => {
@@ -8932,13 +9513,23 @@ fn placement_constraints_hold(
                     return false;
                 }
             }
+            SolverConstraint::ActorPlacement { executables, .. } => {
+                let mut cores = executables
+                    .iter()
+                    .filter_map(|executable| placed.get(executable));
+                if let Some(first) = cores.next()
+                    && cores.any(|core| core != first)
+                {
+                    return false;
+                }
+            }
             SolverConstraint::Separation { left, right } => {
                 if placed.get(left) == placed.get(right) {
                     return false;
                 }
             }
             SolverConstraint::CoreCapacity { core, maximum } => {
-                let activations = active_activations(puzzle, active, placements, *core);
+                let activations = active_activations(puzzle, active, &placed, *core);
                 if maximum_simultaneous_units(&activations) > *maximum {
                     return false;
                 }
@@ -8947,7 +9538,7 @@ fn placement_constraints_hold(
                 let Some(core) = placed.get(executable) else {
                     return false;
                 };
-                let activations = active_activations(puzzle, active, placements, *core);
+                let activations = active_activations(puzzle, active, &placed, *core);
                 let own = activations
                     .iter()
                     .filter(|activation| activation.0 == *executable)
@@ -8967,6 +9558,7 @@ fn placement_constraints_hold(
             | SolverConstraint::Capacity { .. }
             | SolverConstraint::Static { .. }
             | SolverConstraint::Binding { .. }
+            | SolverConstraint::GroupActivation { .. }
             | SolverConstraint::Activation { .. } => {}
         }
     }
@@ -8976,25 +9568,41 @@ fn placement_constraints_hold(
 fn active_activations(
     puzzle: &CanonicalProblem,
     active: &[usize],
-    placements: &[(u128, u16)],
+    placed: &BTreeMap<u128, u16>,
     core: u16,
-) -> Vec<(u128, u16, u16, u16)> {
-    let placed = placements.iter().copied().collect::<BTreeMap<_, _>>();
+) -> Vec<(u128, u64, u64, u64)> {
     active
         .iter()
-        .filter_map(|ordinal| match puzzle.requirements[*ordinal].constraint {
+        .filter_map(|ordinal| match &puzzle.requirements[*ordinal].constraint {
             SolverConstraint::Activation {
                 executable,
                 units,
                 start,
                 end,
-            } if placed.get(&executable) == Some(&core) => Some((executable, units, start, end)),
+            } if placed.get(executable) == Some(&core) => Some((*executable, *units, *start, *end)),
+            SolverConstraint::ActorPlacement {
+                executables,
+                units,
+                start,
+                end,
+            } => {
+                let executable = executables.iter().min().copied()?;
+                (placed.get(&executable) == Some(&core))
+                    .then_some((executable, *units, *start, *end))
+            }
+            SolverConstraint::GroupActivation {
+                executable,
+                units,
+                start,
+                end,
+                ..
+            } if placed.get(executable) == Some(&core) => Some((*executable, *units, *start, *end)),
             _ => None,
         })
         .collect()
 }
 
-fn maximum_simultaneous_units(activations: &[(u128, u16, u16, u16)]) -> u16 {
+fn maximum_simultaneous_units(activations: &[(u128, u64, u64, u64)]) -> u64 {
     activations
         .iter()
         .flat_map(|activation| [activation.2, activation.3.saturating_sub(1)])
@@ -9002,17 +9610,17 @@ fn maximum_simultaneous_units(activations: &[(u128, u16, u16, u16)]) -> u16 {
             activations
                 .iter()
                 .filter(|activation| activation.2 <= point && point < activation.3)
-                .fold(0_u16, |sum, activation| sum.saturating_add(activation.1))
+                .fold(0_u64, |sum, activation| sum.saturating_add(activation.1))
         })
         .max()
         .unwrap_or(0)
 }
 
 const fn intervals_overlap(
-    left_start: u16,
-    left_end: u16,
-    right_start: u16,
-    right_end: u16,
+    left_start: u64,
+    left_end: u64,
+    right_start: u64,
+    right_end: u64,
 ) -> bool {
     left_start < right_end && right_start < left_end
 }
@@ -9032,19 +9640,23 @@ fn find_minimum_conflict(
     cancellation: &Cancellation,
     explored: &mut usize,
 ) -> Result<VerifiedPrivateConflict, PlanningFailure> {
-    for size in 1..=puzzle.requirements.len() {
+    let candidates = conflict_candidate_ordinals(puzzle);
+    for size in 1..=candidates.len() {
         let mut combination = (0..size).collect::<Vec<_>>();
         loop {
             checkpoint(cancellation)?;
-            if search_canonical_assignment(puzzle, &combination, cancellation, explored)?.is_none()
-            {
-                let requirements = combination
+            let active = combination
+                .iter()
+                .map(|ordinal| candidates[*ordinal])
+                .collect::<Vec<_>>();
+            if search_canonical_assignment(puzzle, &active, cancellation, explored)?.is_none() {
+                let requirements = active
                     .iter()
                     .map(|ordinal| puzzle.requirements[*ordinal].identity)
                     .collect::<Vec<_>>();
                 let code = conflict_code(
-                    puzzle.requirements[combination[0]].category,
-                    combination
+                    puzzle.requirements[active[0]].category,
+                    active
                         .iter()
                         .map(|ordinal| puzzle.requirements[*ordinal].category),
                 );
@@ -9053,12 +9665,51 @@ fn find_minimum_conflict(
                     requirements: requirements.into(),
                 });
             }
-            if !advance_combination(&mut combination, puzzle.requirements.len()) {
+            if !advance_combination(&mut combination, candidates.len()) {
                 break;
             }
         }
     }
     defect("infeasible solver puzzle has no irreducible conflict")
+}
+
+fn conflict_candidate_ordinals(puzzle: &CanonicalProblem) -> Vec<usize> {
+    puzzle
+        .requirements
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, requirement)| {
+            let can_affect_feasibility = match &requirement.constraint {
+                SolverConstraint::Realize { executable } => {
+                    !puzzle.executables.contains(executable)
+                }
+                SolverConstraint::Capability { capability } => {
+                    !puzzle.capabilities.contains(capability)
+                }
+                SolverConstraint::Cardinality {
+                    selected,
+                    minimum,
+                    maximum,
+                } => selected < minimum || selected > maximum,
+                SolverConstraint::Capacity {
+                    required,
+                    available,
+                } => required > available,
+                SolverConstraint::Static { satisfied } => !satisfied,
+                SolverConstraint::Binding { .. }
+                | SolverConstraint::CoreCapacity { .. }
+                | SolverConstraint::AllowedCores { .. }
+                | SolverConstraint::Affinity { .. }
+                | SolverConstraint::AffinityGroup { .. }
+                | SolverConstraint::ActorPlacement { .. }
+                | SolverConstraint::GroupActivation { .. }
+                | SolverConstraint::Separation { .. }
+                | SolverConstraint::Exclusive { .. }
+                | SolverConstraint::Activation { .. } => true,
+            };
+            can_affect_feasibility.then_some(ordinal)
+        })
+        .collect()
 }
 
 fn advance_combination(combination: &mut [usize], length: usize) -> bool {
@@ -9356,6 +10007,49 @@ fn oracle_candidate_feasible(
             .find(|(candidate, _)| *candidate == executable)
             .map(|(_, core)| *core)
     };
+    let activations = active
+        .iter()
+        .filter_map(|ordinal| match &puzzle.requirements[*ordinal].constraint {
+            SolverConstraint::Activation {
+                executable,
+                units,
+                start,
+                end,
+            } => Some((*executable, *units, *start, *end)),
+            SolverConstraint::ActorPlacement {
+                executables,
+                units,
+                start,
+                end,
+            } => Some((executables.iter().min().copied()?, *units, *start, *end)),
+            SolverConstraint::GroupActivation {
+                executable,
+                units,
+                start,
+                end,
+                ..
+            } => Some((*executable, *units, *start, *end)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for core in &puzzle.cores {
+        for point in activations
+            .iter()
+            .flat_map(|activation| [activation.2, activation.3.saturating_sub(1)])
+        {
+            let used = activations
+                .iter()
+                .filter(|activation| {
+                    core_of(activation.0) == Some(core.identity)
+                        && activation.2 <= point
+                        && point < activation.3
+                })
+                .fold(0_u64, |sum, activation| sum.saturating_add(activation.1));
+            if used > core.maximum_activation_units {
+                return false;
+            }
+        }
+    }
     for ordinal in active {
         match &puzzle.requirements[*ordinal].constraint {
             SolverConstraint::Realize { executable } => {
@@ -9448,31 +10142,18 @@ fn oracle_candidate_feasible(
                 }
             }
             SolverConstraint::CoreCapacity { core, maximum } => {
-                let mut points = Vec::new();
-                for activation_ordinal in active {
-                    if let SolverConstraint::Activation { start, end, .. } =
-                        puzzle.requirements[*activation_ordinal].constraint
-                    {
-                        points.extend([start, end.saturating_sub(1)]);
-                    }
-                }
-                for point in points {
-                    let used = active.iter().fold(0_u16, |sum, activation_ordinal| {
-                        match puzzle.requirements[*activation_ordinal].constraint {
-                            SolverConstraint::Activation {
-                                executable,
-                                units,
-                                start,
-                                end,
-                            } if core_of(executable) == Some(*core)
-                                && start <= point
-                                && point < end =>
-                            {
-                                sum.saturating_add(units)
-                            }
-                            _ => sum,
-                        }
-                    });
+                for point in activations
+                    .iter()
+                    .flat_map(|activation| [activation.2, activation.3.saturating_sub(1)])
+                {
+                    let used = activations
+                        .iter()
+                        .filter(|activation| {
+                            core_of(activation.0) == Some(*core)
+                                && activation.2 <= point
+                                && point < activation.3
+                        })
+                        .fold(0_u64, |sum, activation| sum.saturating_add(activation.1));
                     if used > *maximum {
                         return false;
                     }
@@ -9496,6 +10177,25 @@ fn oracle_candidate_feasible(
                     return false;
                 }
             }
+            SolverConstraint::ActorPlacement { executables, .. } => {
+                let mut cores = executables.iter().map(|executable| core_of(*executable));
+                if let Some(first) = cores.next()
+                    && cores.any(|core| core != first)
+                {
+                    return false;
+                }
+            }
+            SolverConstraint::GroupActivation {
+                selected,
+                maximum,
+                start,
+                end,
+                ..
+            } => {
+                if selected > maximum || start >= end {
+                    return false;
+                }
+            }
             SolverConstraint::Separation { left, right } => {
                 if core_of(*left) == core_of(*right) {
                     return false;
@@ -9505,30 +10205,15 @@ fn oracle_candidate_feasible(
                 let Some(core) = core_of(*executable) else {
                     return false;
                 };
-                let own = active.iter().filter_map(|activation_ordinal| {
-                    match puzzle.requirements[*activation_ordinal].constraint {
-                        SolverConstraint::Activation {
-                            executable: candidate,
-                            start,
-                            end,
-                            ..
-                        } if candidate == *executable => Some((start, end)),
-                        _ => None,
-                    }
-                });
-                for (start, end) in own {
-                    if active.iter().any(|activation_ordinal| {
-                        matches!(
-                            puzzle.requirements[*activation_ordinal].constraint,
-                            SolverConstraint::Activation {
-                                executable: other,
-                                start: other_start,
-                                end: other_end,
-                                ..
-                            } if other != *executable
-                                && core_of(other) == Some(core)
-                                && start < other_end && other_start < end
-                        )
+                let own = activations
+                    .iter()
+                    .filter(|activation| activation.0 == *executable);
+                for activation in own {
+                    if activations.iter().any(|other| {
+                        other.0 != *executable
+                            && core_of(other.0) == Some(core)
+                            && activation.2 < other.3
+                            && other.2 < activation.3
                     }) {
                         return false;
                     }
@@ -9561,7 +10246,10 @@ fn solver_requirement(
 
 #[cfg(test)]
 fn named_tiny_solver_puzzles() -> Vec<CanonicalProblem> {
-    let core = |identity| CoreResource { identity };
+    let core = |identity| CoreResource {
+        identity,
+        maximum_activation_units: u64::MAX,
+    };
     let activation = |identity, executable, start, end| {
         solver_requirement(
             identity,
@@ -9788,6 +10476,8 @@ fn named_tiny_solver_puzzles() -> Vec<CanonicalProblem> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use super::*;
     use crate::architecture_planning::{
         ArchitecturePlanningModule, ArchitectureProfile, ContractContext,
@@ -9869,6 +10559,114 @@ fn build() -> Image:
             panic!("fixture Requirement Set is feasible");
         };
         assignment
+    }
+
+    fn semantic_capacity_fixture(source: &'static [u8]) -> Arc<CompletedSemanticProgram> {
+        let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+        let CompilationOutcome::Accepted(accepted) = compiler.compile(
+            CompilationRequest::new(
+                ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+                Root::Image,
+            ),
+            &Cancellation::new(),
+        ) else {
+            panic!("semantic fixture accepts");
+        };
+        Arc::new(accepted.completed_semantic_program().clone())
+    }
+
+    fn semantic_capacity_outcome(
+        semantic_program: &Arc<CompletedSemanticProgram>,
+        capacities: &[u32],
+        cancellation_limit: Option<u32>,
+    ) -> WholeImageSolveOutcome {
+        let digest = semantic_program.for_image_planning().distribution_digest();
+        let architecture =
+            ArchitecturePlanningModule::new(ContractContext::new("planning-capacity-test", digest));
+        let contract = if let Some(limit) = cancellation_limit {
+            architecture.authenticate_private_synthetic_with_cancellation_limit(
+                capacities,
+                limit,
+                &Cancellation::new(),
+            )
+        } else {
+            architecture.authenticate_private_synthetic(capacities, &Cancellation::new())
+        }
+        .expect("private profile-neutral contract verifies");
+        let foundation = Arc::new(
+            ImagePlanningModule
+                .plan(
+                    Arc::clone(semantic_program),
+                    Arc::new(contract),
+                    &Cancellation::new(),
+                )
+                .expect("planning foundation verifies"),
+        );
+        let core = Arc::new(
+            CoreModule
+                .derive(foundation.for_core(), &Cancellation::new())
+                .expect("Core verifies"),
+        );
+        let flow = Arc::new(
+            FlowModule
+                .derive(foundation.for_flow(), core.for_flow(), &Cancellation::new())
+                .expect("Flow verifies"),
+        );
+        ImagePlanningModule
+            .solve(foundation, core, flow, &Cancellation::new())
+            .expect("capacity solving is bounded")
+    }
+
+    const CAPACITY_SOURCE: &[u8] = br#"@actor
+struct First:
+    pub async fn run(self):
+        pass
+
+@actor
+struct Second:
+    pub async fn run(self):
+        pass
+
+@image
+fn build() -> Image:
+    first = First()
+    second = Second()
+    return Image.new(first=first, second=second)
+"#;
+
+    const GROUP_CAPACITY_SOURCE: &[u8] = br#"from core import actor as actors
+
+@actor
+struct Worker:
+    pub async fn run(self):
+        mut group = actors.Group.all(bound=1u64)
+        _ = actors.Group.complete(take group)
+
+@image
+fn build() -> Image:
+    worker = Worker()
+    return Image.new(worker=worker)
+"#;
+
+    fn capacity_outcome(capacities: &[u32]) -> WholeImageSolveOutcome {
+        static SEMANTIC: OnceLock<Arc<CompletedSemanticProgram>> = OnceLock::new();
+        semantic_capacity_outcome(
+            SEMANTIC.get_or_init(|| semantic_capacity_fixture(CAPACITY_SOURCE)),
+            capacities,
+            None,
+        )
+    }
+
+    fn group_capacity_outcome(
+        capacities: &[u32],
+        cancellation_limit: Option<u32>,
+    ) -> WholeImageSolveOutcome {
+        static SEMANTIC: OnceLock<Arc<CompletedSemanticProgram>> = OnceLock::new();
+        semantic_capacity_outcome(
+            SEMANTIC.get_or_init(|| semantic_capacity_fixture(GROUP_CAPACITY_SOURCE)),
+            capacities,
+            cancellation_limit,
+        )
     }
 
     fn pool_fixture() -> VerifiedPlanningFoundation {
@@ -11355,7 +12153,10 @@ fn build() -> Image:
 
         let exhausted = CanonicalProblem {
             name: "bounded_exhaustion",
-            cores: vec![CoreResource { identity: 0 }],
+            cores: vec![CoreResource {
+                identity: 0,
+                maximum_activation_units: u64::MAX,
+            }],
             executables: vec![1],
             bindings: Vec::new(),
             binding_subjects: Vec::new(),
@@ -11383,7 +12184,10 @@ fn build() -> Image:
     fn canonical_solver_rejects_duplicate_typed_identities() {
         let duplicate_binding = CanonicalProblem {
             name: "duplicate_binding",
-            cores: vec![CoreResource { identity: 0 }],
+            cores: vec![CoreResource {
+                identity: 0,
+                maximum_activation_units: u64::MAX,
+            }],
             executables: vec![1],
             bindings: vec![
                 BindingResource {
@@ -11408,7 +12212,10 @@ fn build() -> Image:
 
         let duplicate_requirement = CanonicalProblem {
             name: "duplicate_requirement",
-            cores: vec![CoreResource { identity: 0 }],
+            cores: vec![CoreResource {
+                identity: 0,
+                maximum_activation_units: u64::MAX,
+            }],
             executables: vec![1],
             bindings: Vec::new(),
             binding_subjects: Vec::new(),
@@ -11433,7 +12240,10 @@ fn build() -> Image:
 
         let exact_two = CanonicalProblem {
             name: "two_exact_bindings",
-            cores: vec![CoreResource { identity: 0 }],
+            cores: vec![CoreResource {
+                identity: 0,
+                maximum_activation_units: u64::MAX,
+            }],
             executables: vec![1],
             bindings: vec![
                 BindingResource {
@@ -11553,7 +12363,10 @@ fn build() -> Image:
         for (ordinal, constraint) in malformed.into_iter().enumerate() {
             let problem = CanonicalProblem {
                 name: "malformed_typed_subject",
-                cores: vec![CoreResource { identity: 0 }],
+                cores: vec![CoreResource {
+                    identity: 0,
+                    maximum_activation_units: u64::MAX,
+                }],
                 executables: vec![1],
                 bindings: vec![BindingResource {
                     identity: 0,
@@ -11619,7 +12432,10 @@ fn build() -> Image:
     fn canonical_solver_handles_an_authenticated_large_closure_without_host_recursion() {
         let problem = CanonicalProblem {
             name: "maximum_generated_closure",
-            cores: vec![CoreResource { identity: 0 }],
+            cores: vec![CoreResource {
+                identity: 0,
+                maximum_activation_units: u64::MAX,
+            }],
             executables: (1..=16_384).collect(),
             bindings: Vec::new(),
             binding_subjects: Vec::new(),
@@ -11645,7 +12461,10 @@ fn build() -> Image:
     fn private_conflict_verifier_rejects_wrong_code_and_noncanonical_irreducible_witness() {
         let problem = CanonicalProblem {
             name: "two_independent_missing_capabilities",
-            cores: vec![CoreResource { identity: 0 }],
+            cores: vec![CoreResource {
+                identity: 0,
+                maximum_activation_units: u64::MAX,
+            }],
             executables: vec![1],
             bindings: Vec::new(),
             binding_subjects: Vec::new(),
@@ -11789,6 +12608,159 @@ fn build() -> Image:
             solve_canonical_problem(&one_short, &Cancellation::new()).unwrap(),
             CanonicalSolveOutcome::Conflict(VerifiedPrivateConflict {
                 code: ConflictCode::Capacity,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn production_capacity_and_overlapping_lifetimes_spread_at_exact_fit_and_conflict_one_short() {
+        let WholeImageSolveOutcome::Assignment(exact_fit) = capacity_outcome(&[21, 16]) else {
+            panic!("five Image-lifetime roles plus two overlapping Actor Turns exactly fit");
+        };
+        assert_eq!(
+            exact_fit
+                .placements
+                .iter()
+                .map(|placement| placement.core)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1]),
+            "exact per-core capacity forces the canonical assignment to use core 1",
+        );
+
+        match capacity_outcome(&[20, 16]) {
+            WholeImageSolveOutcome::Conflict(VerifiedPrivateConflict {
+                code: ConflictCode::Capacity | ConflictCode::ActivationLifetime,
+                ..
+            }) => {}
+            other => panic!("one-short capacity must retain a capacity conflict: {other:#?}"),
+        }
+    }
+
+    #[test]
+    fn spread_assignment_verifier_rejects_resigned_noncanonical_and_invalid_placements() {
+        let WholeImageSolveOutcome::Assignment(canonical) = capacity_outcome(&[21, 16]) else {
+            panic!("capacity fixture has a canonical spread assignment");
+        };
+        verify_whole_image_assignment(&canonical, &Cancellation::new())
+            .expect("independent verifier accepts the canonical constrained assignment");
+
+        let placed = canonical
+            .placements
+            .iter()
+            .map(|placement| (placement.executable, placement.core))
+            .collect::<BTreeMap<_, _>>();
+        let actor_groups = canonical
+            .flow_program
+            .for_image_planning()
+            .actors()
+            .map(|actor| {
+                let handlers = actor.handlers().collect::<Vec<_>>();
+                let core = handlers
+                    .first()
+                    .and_then(|handler| placed.get(handler))
+                    .copied()
+                    .expect("Actor handler is placed");
+                (handlers, core)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actor_groups.len(), 2);
+        assert_ne!(actor_groups[0].1, actor_groups[1].1);
+
+        let mut noncanonical = canonical.clone();
+        let mut placements = noncanonical.placements.to_vec();
+        for placement in &mut placements {
+            if actor_groups[0].0.contains(&placement.executable) {
+                placement.core = actor_groups[1].1;
+            } else if actor_groups[1].0.contains(&placement.executable) {
+                placement.core = actor_groups[0].1;
+            }
+        }
+        noncanonical.placements = placements.into();
+        noncanonical.fingerprint = whole_assignment_fingerprint(
+            noncanonical.requirement_set_fingerprint,
+            &noncanonical.placements,
+            &noncanonical.bindings,
+            &noncanonical.discharges,
+        );
+        assert!(matches!(
+            verify_whole_image_assignment(&noncanonical, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut over_capacity = canonical.clone();
+        let mut placements = over_capacity.placements.to_vec();
+        for placement in &mut placements {
+            placement.core = 0;
+        }
+        over_capacity.placements = placements.into();
+        over_capacity.fingerprint = whole_assignment_fingerprint(
+            over_capacity.requirement_set_fingerprint,
+            &over_capacity.placements,
+            &over_capacity.bindings,
+            &over_capacity.discharges,
+        );
+        assert!(matches!(
+            verify_whole_image_assignment(&over_capacity, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut foreign_core = canonical.clone();
+        let mut placements = foreign_core.placements.to_vec();
+        placements[0].core = u16::MAX;
+        foreign_core.placements = placements.into();
+        foreign_core.fingerprint = whole_assignment_fingerprint(
+            foreign_core.requirement_set_fingerprint,
+            &foreign_core.placements,
+            &foreign_core.bindings,
+            &foreign_core.discharges,
+        );
+        assert!(matches!(
+            verify_whole_image_assignment(&foreign_core, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+    }
+
+    #[test]
+    fn production_group_child_bound_reserves_overlapping_per_core_service_exactly() {
+        assert!(matches!(
+            group_capacity_outcome(&[33], None),
+            WholeImageSolveOutcome::Assignment(_)
+        ));
+        assert!(matches!(
+            group_capacity_outcome(&[32], None),
+            WholeImageSolveOutcome::Conflict(VerifiedPrivateConflict {
+                code: ConflictCode::Capacity | ConflictCode::ActivationLifetime,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn production_cancellation_observation_work_respects_the_authenticated_maximum() {
+        let WholeImageSolveOutcome::Assignment(baseline) =
+            group_capacity_outcome(&[100], Some(100))
+        else {
+            panic!("large authenticated cancellation limit admits");
+        };
+        let required = baseline
+            .flow_program
+            .for_image_planning()
+            .requirements()
+            .find(|requirement| {
+                requirement.kind() == FlowRequirementKind::CancellationObservationWorkBound
+            })
+            .map(|requirement| requirement.bound())
+            .expect("source Group exports an exact cancellation work bound");
+        assert!(required > 0);
+        assert!(matches!(
+            group_capacity_outcome(&[100], Some(u32::try_from(required).unwrap())),
+            WholeImageSolveOutcome::Assignment(_)
+        ));
+        assert!(matches!(
+            group_capacity_outcome(&[100], Some(u32::try_from(required - 1).unwrap())),
+            WholeImageSolveOutcome::Conflict(VerifiedPrivateConflict {
+                code: ConflictCode::Capacity | ConflictCode::ActivationLifetime,
                 ..
             })
         ));

@@ -57,7 +57,7 @@ fn newest():
 struct Worker:
     pub async fn run(self, take first: Token, take second: Token, take third: Token, take fourth: Token, take fifth: Token, take sixth: Token, take seventh: Token, take eighth: Token):
         mut all = actors.Group.all(bound=2u64)
-        all.logical_deadline(epoch=5u64, slack=10u64)
+        all.logical_deadline(epoch=5u64, slack=100u64)
         defer oldest()
         defer newest()
         first_child = all.child(value=take first)
@@ -188,7 +188,7 @@ fn build() -> Image:
         logical.deadline_class(),
         Some(wrela_compiler::FlowDeadlineClass::Logical)
     );
-    assert_eq!(logical.deadline_slack(), Some(10));
+    assert_eq!(logical.deadline_slack(), Some(100));
     assert_ne!(logical.deadline_authority(), Some(0));
     assert!(logical.maximum_uninterrupted_work_units() > 4);
     assert_eq!(logical.cleanup_actions().len(), 2);

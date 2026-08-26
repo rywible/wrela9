@@ -245,6 +245,9 @@ pub(crate) struct ImagePlanningFlowRequirement<'a>(&'a FlowRequirement);
 #[derive(Clone, Copy)]
 pub(crate) struct ImagePlanningActor<'a>(&'a Actor);
 
+#[derive(Clone, Copy)]
+pub(crate) struct ImagePlanningGroup<'a>(&'a GroupObligation);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Actor {
     identity: u128,
@@ -1651,6 +1654,18 @@ impl<'a> ImagePlanningFlowView<'a> {
     pub(crate) fn actors(self) -> impl ExactSizeIterator<Item = ImagePlanningActor<'a>> {
         self.flow.actors.iter().map(ImagePlanningActor)
     }
+
+    pub(crate) fn groups(self) -> impl ExactSizeIterator<Item = ImagePlanningGroup<'a>> {
+        self.flow.groups.iter().map(ImagePlanningGroup)
+    }
+
+    pub(crate) fn group(self, identity: u128) -> Option<ImagePlanningGroup<'a>> {
+        self.flow
+            .groups
+            .iter()
+            .find(|group| group.identity == identity)
+            .map(ImagePlanningGroup)
+    }
 }
 
 impl ImagePlanningFlowRequirement<'_> {
@@ -1707,6 +1722,60 @@ impl<'a> ImagePlanningActor<'a> {
 
     pub(crate) const fn max_active_turns(self) -> u8 {
         self.0.max_active_turns
+    }
+}
+
+impl ImagePlanningGroup<'_> {
+    pub(crate) const fn actor(self) -> u128 {
+        self.0.actor
+    }
+
+    pub(crate) const fn handler(self) -> u128 {
+        self.0.handler
+    }
+
+    pub(crate) const fn child_activation_bound(self) -> u64 {
+        self.0.child_activation_bound
+    }
+
+    pub(crate) fn child_activation_count(self) -> usize {
+        self.0.child_activations.len()
+    }
+
+    pub(crate) const fn maximum_uninterrupted_work_units(self) -> u64 {
+        self.0.maximum_uninterrupted_work_units
+    }
+
+    pub(crate) const fn deadline_class(self) -> Option<FlowDeadlineClass> {
+        self.0.deadline_class
+    }
+
+    pub(crate) const fn deadline_authority(self) -> Option<u128> {
+        self.0.deadline_authority
+    }
+
+    pub(crate) const fn cancellation_authority(self) -> u128 {
+        self.0.cancellation_authority
+    }
+
+    pub(crate) const fn return_home(self) -> u128 {
+        self.0.return_home
+    }
+
+    pub(crate) const fn deadline_slack(self) -> Option<u64> {
+        self.0.deadline_slack
+    }
+
+    pub(crate) fn moved_resource_count(self) -> usize {
+        self.0.moved_resources.len()
+    }
+
+    pub(crate) fn cleanup_action_count(self) -> usize {
+        self.0.cleanup_actions.len()
+    }
+
+    pub(crate) fn has_cancellation_checkpoint(self, identity: u128) -> bool {
+        self.0.cancellation_checkpoints.contains(&identity)
     }
 }
 
@@ -6392,7 +6461,7 @@ fn clean():
 struct Worker:
     pub async fn run(self, take first: Token, take second: Token):
         mut outer = actors.Group.all(bound=1u64)
-        outer.logical_deadline(epoch=7u64, slack=12u64)
+        outer.logical_deadline(epoch=7u64, slack=100u64)
         defer clean()
         outer_child = outer.child(value=take first)
         mut inner = actors.Group.race(bound=1u64)

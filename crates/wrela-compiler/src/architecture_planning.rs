@@ -145,6 +145,93 @@ impl ArchitecturePlanningModule {
             )),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn authenticate_private_synthetic(
+        &self,
+        core_capacities: &[u32],
+        cancellation: &Cancellation,
+    ) -> Result<VerifiedArchitecturePlanningContract, ContractFailure> {
+        self.authenticate_private_synthetic_with_optional_cancellation_limit(
+            core_capacities,
+            None,
+            cancellation,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authenticate_private_synthetic_with_cancellation_limit(
+        &self,
+        core_capacities: &[u32],
+        cancellation_limit: u32,
+        cancellation: &Cancellation,
+    ) -> Result<VerifiedArchitecturePlanningContract, ContractFailure> {
+        self.authenticate_private_synthetic_with_optional_cancellation_limit(
+            core_capacities,
+            Some(cancellation_limit),
+            cancellation,
+        )
+    }
+
+    #[cfg(test)]
+    fn authenticate_private_synthetic_with_optional_cancellation_limit(
+        &self,
+        core_capacities: &[u32],
+        cancellation_limit: Option<u32>,
+        cancellation: &Cancellation,
+    ) -> Result<VerifiedArchitecturePlanningContract, ContractFailure> {
+        let mut facts = producer_current_aarch64_facts();
+        facts.cores = core_capacities
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(ordinal, maximum_service_units)| SymbolicCore {
+                ordinal: u16::try_from(ordinal).unwrap_or(u16::MAX),
+                role: if ordinal == 0 {
+                    CoreRole::Primary
+                } else {
+                    CoreRole::Secondary
+                },
+                maximum_service_units,
+            })
+            .collect::<Vec<_>>()
+            .into();
+        facts.service.maximum_cycle_units = core_capacities
+            .iter()
+            .copied()
+            .fold(0_u32, u32::saturating_add);
+        facts.service.maximum_cancellation_delay_units = cancellation_limit.unwrap_or_else(|| {
+            facts
+                .service
+                .maximum_cancellation_delay_units
+                .min(facts.service.maximum_cycle_units)
+        });
+        let facts = reconstruct_and_validate(&facts, cancellation)?;
+        let identity = canonical_identity(
+            ArchitectureProfile::CurrentAarch64,
+            CURRENT_AARCH64_CONTRACT_VERSION,
+        );
+        Ok(VerifiedArchitecturePlanningContract {
+            profile: ArchitectureProfile::CurrentAarch64,
+            identity,
+            schema_version: CONTRACT_SCHEMA_VERSION,
+            version: CURRENT_AARCH64_CONTRACT_VERSION,
+            fingerprint: canonical_fingerprint(
+                ArchitectureProfile::CurrentAarch64,
+                CONTRACT_SCHEMA_VERSION,
+                CURRENT_AARCH64_CONTRACT_VERSION,
+                identity,
+                &facts,
+            ),
+            distribution_input_receipt: canonical_distribution_input_receipt(
+                self.context,
+                CONTRACT_SCHEMA_VERSION,
+            ),
+            distribution_digest: self.context.distribution_digest,
+            facts,
+            _verified: Verified,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

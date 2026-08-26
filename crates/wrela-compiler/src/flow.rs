@@ -5293,6 +5293,28 @@ fn verifier_reconstruct_structured(
                 source: action.source.clone(),
             })
             .collect::<Vec<_>>();
+        let expected_cancellation_authority =
+            graph_identity(b"group-cancellation-authority", &[site.reference_identity]);
+        let mut expected_cancellation_checkpoints = site
+            .children
+            .iter()
+            .map(|child| child.identity)
+            .collect::<Vec<_>>();
+        expected_cancellation_checkpoints.push(site.reference_identity);
+        expected_cancellation_checkpoints.push(graph_identity(
+            b"group-terminal-checkpoint",
+            &[
+                site.reference_identity,
+                u128::from(site.terminal_program_order),
+            ],
+        ));
+        expected_cancellation_checkpoints.sort_unstable();
+        expected_cancellation_checkpoints.dedup();
+        let expected_maximum_uninterrupted_work_units = u64::from(
+            site.terminal_program_order
+                .saturating_sub(site.open_program_order),
+        )
+        .max(1);
         if group.actor != actor.identity
             || group.handler != site.handler
             || group.receiver_place != site.place
@@ -5304,6 +5326,9 @@ fn verifier_reconstruct_structured(
                     .iter()
                     .map(|child| child.identity)
                     .collect::<Vec<_>>()
+            || group.cancellation_authority != expected_cancellation_authority
+            || group.cancellation_checkpoints.as_ref() != expected_cancellation_checkpoints
+            || group.maximum_uninterrupted_work_units != expected_maximum_uninterrupted_work_units
             || group.policy != policy
             || group.deadline_class != deadline_class
             || group.deadline_authority != site.deadline.map(|deadline| deadline.authority)
@@ -6359,6 +6384,128 @@ fn build() -> Image:
         .expect("fresh cancellation permits fingerprinting");
     }
 
+    fn resign_correlated_group_candidate(
+        candidate: &mut VerifiedFlowProgram,
+        core: &VerifiedCoreProgram,
+    ) {
+        candidate.model_contract.groups = candidate.groups.clone();
+        let handler_current_meanings = core.for_flow().handler_flow_identities();
+        let mut requirements = candidate
+            .requirements
+            .iter()
+            .filter(|requirement| {
+                matches!(
+                    requirement.kind,
+                    FlowRequirementKind::ActorIdentity
+                        | FlowRequirementKind::PermanentCorePlacement
+                        | FlowRequirementKind::MailboxCapacity
+                        | FlowRequirementKind::TurnLease
+                        | FlowRequirementKind::SuspensionHome
+                        | FlowRequirementKind::LogicalCommitOrder
+                        | FlowRequirementKind::ProposalTransport
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for group in candidate.groups.iter() {
+            let actor_current_meaning = candidate
+                .actors
+                .iter()
+                .find(|actor| actor.identity == group.actor)
+                .map_or(u128::MAX, |actor| actor.construction_identity);
+            let handler_current_meaning = handler_current_meanings
+                .get(&group.handler)
+                .copied()
+                .unwrap_or(u128::MAX);
+            let subject_current_meaning = group_requirement_current_meaning(group);
+            for (kind, site, bound) in [
+                (
+                    FlowRequirementKind::GroupChildActivationBound,
+                    group.identity,
+                    group.child_activation_bound,
+                ),
+                (
+                    FlowRequirementKind::GroupCancellationAuthority,
+                    group.cancellation_authority,
+                    1,
+                ),
+                (FlowRequirementKind::GroupOutcomePolicy, group.identity, 1),
+                (
+                    FlowRequirementKind::GroupResourceReturnHome,
+                    group.return_home,
+                    u64::try_from(group.moved_resources.len()).unwrap_or(u64::MAX),
+                ),
+                (
+                    FlowRequirementKind::GroupCleanupOrder,
+                    group.identity,
+                    u64::try_from(group.cleanup_actions.len()).unwrap_or(u64::MAX),
+                ),
+                (
+                    FlowRequirementKind::CancellationObservationWorkBound,
+                    group.identity,
+                    group.maximum_uninterrupted_work_units,
+                ),
+            ] {
+                requirements.push(requirement_with_authority(
+                    group.actor,
+                    Some(group.handler),
+                    Some(site),
+                    kind,
+                    bound,
+                    actor_current_meaning,
+                    handler_current_meaning,
+                    subject_current_meaning,
+                ));
+            }
+            for checkpoint in group.cancellation_checkpoints.iter().copied() {
+                requirements.push(requirement_with_authority(
+                    group.actor,
+                    Some(group.handler),
+                    Some(checkpoint),
+                    FlowRequirementKind::CancellationCheckpoint,
+                    1,
+                    actor_current_meaning,
+                    handler_current_meaning,
+                    subject_current_meaning,
+                ));
+            }
+            if let Some(class) = group.deadline_class {
+                for (kind, site, bound) in [
+                    (
+                        FlowRequirementKind::DeadlineClass,
+                        group.identity,
+                        u64::from(class == FlowDeadlineClass::Realtime) + 1,
+                    ),
+                    (
+                        FlowRequirementKind::DeadlineAuthority,
+                        group.deadline_authority.unwrap_or(0),
+                        1,
+                    ),
+                    (
+                        FlowRequirementKind::DeadlineSlack,
+                        group.identity,
+                        group.deadline_slack.unwrap_or(0),
+                    ),
+                    (FlowRequirementKind::DeadlineFeasibility, group.identity, 1),
+                ] {
+                    requirements.push(requirement_with_authority(
+                        group.actor,
+                        Some(group.handler),
+                        Some(site),
+                        kind,
+                        bound,
+                        actor_current_meaning,
+                        handler_current_meaning,
+                        subject_current_meaning,
+                    ));
+                }
+            }
+        }
+        requirements.sort_by_key(|requirement| requirement.identity);
+        candidate.requirements = requirements.into();
+        resign(candidate);
+    }
+
     fn rejected(
         candidate: &VerifiedFlowProgram,
         planning: &VerifiedPlanningFoundation,
@@ -6696,6 +6843,43 @@ fn build() -> Image:
         correlated_omission.model_contract.groups = correlated_omission.groups.clone();
         resign(&mut correlated_omission);
         assert!(rejected(&correlated_omission, &planning, &core));
+    }
+
+    #[test]
+    fn verifier_rejects_correlated_group_cancellation_authority_repoint() {
+        let (mut candidate, planning, core) = group_fixture();
+        let group = Arc::make_mut(&mut candidate.groups)
+            .first_mut()
+            .expect("fixture has a Group");
+        group.cancellation_authority ^= 1;
+        resign_correlated_group_candidate(&mut candidate, &core);
+
+        assert!(rejected(&candidate, &planning, &core));
+    }
+
+    #[test]
+    fn verifier_rejects_correlated_group_cancellation_checkpoint_repoint() {
+        let (mut candidate, planning, core) = group_fixture();
+        let group = Arc::make_mut(&mut candidate.groups)
+            .first_mut()
+            .expect("fixture has a Group");
+        Arc::make_mut(&mut group.cancellation_checkpoints)[0] ^= 1;
+        resign_correlated_group_candidate(&mut candidate, &core);
+
+        assert!(rejected(&candidate, &planning, &core));
+    }
+
+    #[test]
+    fn verifier_rejects_correlated_group_cancellation_work_bound() {
+        let (mut candidate, planning, core) = group_fixture();
+        let group = Arc::make_mut(&mut candidate.groups)
+            .first_mut()
+            .expect("fixture has a Group");
+        group.maximum_uninterrupted_work_units =
+            group.maximum_uninterrupted_work_units.saturating_add(1);
+        resign_correlated_group_candidate(&mut candidate, &core);
+
+        assert!(rejected(&candidate, &planning, &core));
     }
 
     #[test]

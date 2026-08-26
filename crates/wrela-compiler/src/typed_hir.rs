@@ -457,7 +457,14 @@ impl DischargeLawBuilder {
 #[derive(Clone, Debug)]
 struct VerifiedDischargeLaws {
     laws: BTreeMap<TypeId, DischargeLaw>,
+    components: BTreeMap<TypeId, Arc<[ResourceComponentAuthority]>>,
     _verified: Verified,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResourceComponentAuthority {
+    pub(crate) projection: Arc<[u128]>,
+    pub(crate) type_id: TypeId,
 }
 
 #[derive(Clone, Debug)]
@@ -749,6 +756,8 @@ pub(crate) struct ProgramInput {
     pub(crate) nominal_displays: BTreeMap<DefinitionId, Arc<str>>,
     pub(crate) comptime_roots: Vec<(ModuleId, ExpressionSyntax)>,
     pub(crate) inferred_error_definitions: BTreeSet<DefinitionId>,
+    pub(crate) actor_handlers: BTreeSet<DefinitionId>,
+    pub(crate) message_full_definition: Option<DefinitionId>,
 }
 
 #[derive(Clone, Debug)]
@@ -988,14 +997,31 @@ pub(crate) enum HirMatchPattern {
     },
 }
 
-fn result_pattern_consumes_payload(pattern: &HirMatchPattern) -> bool {
+fn result_pattern_consumes_payload(
+    pattern: &HirMatchPattern,
+    matched: &Type,
+    owns_resource: impl Fn(&Type) -> bool,
+) -> bool {
+    let HirMatchPattern::BuiltinVariant { variant, payload } = pattern else {
+        return false;
+    };
+    let payload_type = match (variant, matched) {
+        (BuiltinVariant::ResultOk, Type::Result { success, .. }) => success.as_ref(),
+        (
+            BuiltinVariant::ResultErr,
+            Type::Result {
+                error: Some(error), ..
+            },
+        ) => error.as_ref(),
+        _ => return false,
+    };
     matches!(
-        pattern,
-        HirMatchPattern::BuiltinVariant {
-            variant: BuiltinVariant::ResultOk | BuiltinVariant::ResultErr,
-            payload,
-        } if matches!(payload.as_ref(), [HirMatchPattern::Binding { access: AccessMode::Move, .. }])
-    )
+        payload.as_ref(),
+        [HirMatchPattern::Binding {
+            access: AccessMode::Move,
+            ..
+        }]
+    ) || (!owns_resource(payload_type) && matches!(payload.as_ref(), [HirMatchPattern::Wildcard]))
 }
 
 #[derive(Clone, Debug)]
@@ -1270,6 +1296,7 @@ pub(crate) enum CreatorFailureKind {
     ResourceReplacementRequiresDischarge,
     ResourceNotDischarged,
     MustUseValue,
+    TrySendRequiresActorHandler,
 }
 
 impl CreatorFailureKind {
@@ -1325,6 +1352,7 @@ impl CreatorFailureKind {
             }
             Self::ResourceNotDischarged => "semantic.resource_not_discharged",
             Self::MustUseValue => "semantic.must_use_value",
+            Self::TrySendRequiresActorHandler => "semantic.try_send_requires_actor_handler",
         }
     }
 }
@@ -1648,6 +1676,16 @@ impl VerifiedProgram {
 
     pub(crate) fn owns_resource_type(&self, type_id: TypeId) -> bool {
         self._discharge_laws.laws.contains_key(&type_id)
+    }
+
+    pub(crate) fn resource_components(
+        &self,
+        type_id: TypeId,
+    ) -> Option<&[ResourceComponentAuthority]> {
+        self._discharge_laws
+            .components
+            .get(&type_id)
+            .map(Arc::as_ref)
     }
 
     pub(crate) fn requires_explicit_discharge(&self, type_id: TypeId) -> bool {
@@ -3141,10 +3179,118 @@ fn verify_discharge_laws(
             return defect("Resource TypeId has no Discharge Law");
         }
     }
+    let components = laws
+        .iter()
+        .map(|(type_id, law)| {
+            let type_ = observed
+                .get(type_id)
+                .expect("verified observed Resource type");
+            let mut components = Vec::new();
+            audit_resource_components(
+                type_,
+                law,
+                &[],
+                *type_id,
+                observed,
+                structs,
+                &mut components,
+            )?;
+            Ok((*type_id, Arc::from(components)))
+        })
+        .collect::<Result<BTreeMap<_, _>, VerificationFailure>>()?;
     Ok(VerifiedDischargeLaws {
         laws,
+        components,
         _verified: Verified,
     })
+}
+
+fn audit_resource_components(
+    type_: &Type,
+    law: &DischargeLaw,
+    projection: &[u128],
+    authority_type_id: TypeId,
+    observed: &BTreeMap<TypeId, Type>,
+    structs: &BTreeMap<DefinitionId, ResolvedStruct>,
+    output: &mut Vec<ResourceComponentAuthority>,
+) -> Result<(), VerificationFailure> {
+    match (type_, law) {
+        (
+            Type::Nominal {
+                definition,
+                arguments,
+                ..
+            },
+            DischargeLaw::Structural(components),
+        ) => {
+            let struct_ = structs
+                .get(definition)
+                .ok_or_else(|| VerificationFailure::Defect {
+                    evidence: Arc::from("structural Resource component has no Struct authority"),
+                })?;
+            let substitutions = struct_
+                .type_parameters
+                .iter()
+                .copied()
+                .zip(arguments.iter().cloned())
+                .collect::<BTreeMap<_, _>>();
+            for component in components.iter() {
+                let DischargeComponentIdentity::Field(field_definition) = component.identity else {
+                    continue;
+                };
+                let field = struct_
+                    .fields
+                    .iter()
+                    .find(|field| field.definition == field_definition)
+                    .ok_or_else(|| VerificationFailure::Defect {
+                        evidence: Arc::from("Resource component field is absent"),
+                    })?;
+                let field_type = substitute(&field.type_, &substitutions);
+                let mut child = projection.to_vec();
+                child.extend([1, field.definition.0, xxh3_128(field.name.as_bytes())]);
+                audit_resource_components(
+                    &field_type,
+                    &component.law,
+                    &child,
+                    observed
+                        .iter()
+                        .find_map(|(identity, observed)| {
+                            (observed == &field_type).then_some(*identity)
+                        })
+                        .unwrap_or(authority_type_id),
+                    observed,
+                    structs,
+                    output,
+                )?;
+            }
+        }
+        (_, DischargeLaw::Structural(_)) => {
+            let type_id = observed
+                .iter()
+                .find_map(|(identity, observed)| (observed == type_).then_some(*identity))
+                .unwrap_or(authority_type_id);
+            output.push(ResourceComponentAuthority {
+                projection: Arc::from(projection),
+                type_id,
+            });
+        }
+        (
+            _,
+            DischargeLaw::Explicit
+            | DischargeLaw::CompilerReclaim(_)
+            | DischargeLaw::ExistentialWitness(_),
+        ) => {
+            let type_id = observed
+                .iter()
+                .find_map(|(identity, observed)| (observed == type_).then_some(*identity))
+                .unwrap_or(authority_type_id);
+            output.push(ResourceComponentAuthority {
+                projection: Arc::from(projection),
+                type_id,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn construct_and_verify_discharge_laws(
@@ -3922,7 +4068,17 @@ fn verify_statements(
             || source.end() > provenance_owner.end()
             || source.start() < *previous_source_start
         {
-            return defect("lowered statement provenance is outside source order or ownership");
+            return Err(VerificationFailure::Defect {
+                evidence: Arc::from(format!(
+                    "lowered statement provenance is outside source order or ownership: {}:{}..{} after {} within {}..{}",
+                    source.path(),
+                    source.start(),
+                    source.end(),
+                    *previous_source_start,
+                    provenance_owner.start(),
+                    provenance_owner.end(),
+                )),
+            });
         }
         *previous_source_start = source.start();
         match statement {
@@ -4443,7 +4599,10 @@ fn verify_statements(
                                 &PlaceKey::from_place(&place),
                                 catalog,
                             )?;
-                            pattern_consumes = result_pattern_consumes_payload(pattern);
+                            pattern_consumes =
+                                result_pattern_consumes_payload(pattern, &matched, |type_| {
+                                    artifact_type_shape_owns_resource(type_, catalog)
+                                });
                             for moved_place in moved_places {
                                 if !case_moved.move_key(moved_place) {
                                     return defect(
@@ -4604,6 +4763,15 @@ fn artifact_type_owns_resource(
         .structs
         .iter()
         .map(|(definition, struct_)| (*definition, struct_.display.clone()))
+        .collect::<BTreeMap<_, _>>();
+    audit_expected_discharge_law(type_, catalog.structs, catalog.interfaces, &displays).is_some()
+}
+
+fn artifact_type_shape_owns_resource(type_: &Type, catalog: &ArtifactCatalog<'_>) -> bool {
+    let displays = catalog
+        .structs
+        .iter()
+        .map(|(definition, struct_)| (*definition, Arc::clone(&struct_.display)))
         .collect::<BTreeMap<_, _>>();
     audit_expected_discharge_law(type_, catalog.structs, catalog.interfaces, &displays).is_some()
 }
@@ -5697,17 +5865,57 @@ fn verify_expression_artifact_with_cleanup(
             )?
         }
         ExpressionKind::TrySend(value) => {
-            if !matches!(value.kind, ExpressionKind::Call { .. }) {
+            let ExpressionKind::Call {
+                target: CallTarget::Function { .. },
+                arguments,
+            } = &value.kind
+            else {
                 return defect("lowered try_send does not contain a message call");
-            }
-            verify_expression_artifact_with_cleanup(
+            };
+            let _ = verify_expression_artifact_with_cleanup(
                 value,
                 locals,
                 moved,
                 catalog,
                 &expression.source,
                 cleanup_captures,
-            )?
+            )?;
+            let moved_arguments = arguments
+                .iter()
+                .filter(|argument| argument.access == AccessMode::Move)
+                .map(|argument| argument.type_.clone())
+                .collect::<Vec<_>>();
+            let returned = match moved_arguments.as_slice() {
+                [] => Type::Unit,
+                [only] => only.clone(),
+                _ => Type::Tuple(moved_arguments.into()),
+            };
+            let Type::Result {
+                success,
+                error: Some(error),
+            } = &expression.type_
+            else {
+                return defect("lowered try_send result is not a checked admission Result");
+            };
+            let Type::Nominal {
+                definition,
+                display,
+                arguments: full_arguments,
+            } = error.as_ref()
+            else {
+                return defect("lowered try_send Full alternative is not nominal");
+            };
+            if success.as_ref() != &Type::Unit
+                || display.as_ref() != "MessageFull"
+                || full_arguments.as_ref() != [returned]
+                || catalog
+                    .structs
+                    .get(definition)
+                    .is_none_or(|full| !full.resource)
+            {
+                return defect("lowered try_send result lost its exact MessageFull arguments");
+            }
+            expression.type_.clone()
         }
         ExpressionKind::Propagate(value) => {
             let propagated = verify_expression_artifact_with_cleanup(
@@ -7091,7 +7299,10 @@ impl<'a> Lowerer<'a> {
                                 &value.type_,
                                 &PlaceKey::from_place(&place),
                             )?;
-                            pattern_consumes = result_pattern_consumes_payload(pattern);
+                            pattern_consumes =
+                                result_pattern_consumes_payload(pattern, &value.type_, |type_| {
+                                    self.type_owns_resource(type_)
+                                });
                             for moved in moved_keys {
                                 self.moved.move_key_at(moved, &case.pattern.range);
                             }
@@ -7932,10 +8143,46 @@ impl<'a> Lowerer<'a> {
             }
             ExpressionSyntaxKind::TrySend(value) => {
                 let value = self.expression(value)?;
-                if !matches!(value.kind, ExpressionKind::Call { .. }) {
-                    return creator(CreatorFailureKind::InvalidFunctionValue, &syntax.range);
+                let ExpressionKind::Call {
+                    target: CallTarget::Function { definition, .. },
+                    arguments,
+                } = &value.kind
+                else {
+                    return creator(
+                        CreatorFailureKind::TrySendRequiresActorHandler,
+                        &syntax.range,
+                    );
+                };
+                if !self.input.actor_handlers.contains(definition) {
+                    return creator(
+                        CreatorFailureKind::TrySendRequiresActorHandler,
+                        &syntax.range,
+                    );
                 }
-                let type_ = value.type_.clone();
+                let Some(message_full_definition) = self.input.message_full_definition else {
+                    return Err(VerificationFailure::Defect {
+                        evidence: Arc::from("authenticated MessageFull type is missing"),
+                    });
+                };
+                let moved_arguments = arguments
+                    .iter()
+                    .filter(|argument| argument.access == AccessMode::Move)
+                    .map(|argument| argument.type_.clone())
+                    .collect::<Vec<_>>();
+                let returned = match moved_arguments.as_slice() {
+                    [] => Type::Unit,
+                    [only] => only.clone(),
+                    _ => Type::Tuple(moved_arguments.into()),
+                };
+                let full = Type::Nominal {
+                    definition: message_full_definition,
+                    display: Arc::from("MessageFull"),
+                    arguments: Arc::from([returned]),
+                };
+                let type_ = Type::Result {
+                    success: Arc::new(Type::Unit),
+                    error: Some(Arc::new(full)),
+                };
                 (ExpressionKind::TrySend(Box::new(value)), type_)
             }
             ExpressionSyntaxKind::Mut(value) => {

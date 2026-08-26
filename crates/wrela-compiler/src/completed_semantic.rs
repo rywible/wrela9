@@ -282,6 +282,9 @@ pub(crate) struct CompletedSemanticProgram {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CompletedActor {
     identity: u128,
+    actor_type_identity: u128,
+    construction_identity: u128,
+    construction_current_meaning: u128,
     source: crate::SourceRange,
     handlers: Arc<[SpecializationId]>,
 }
@@ -424,6 +427,18 @@ pub(crate) struct FlowActorInput<'a> {
 impl<'a> FlowActorInput<'a> {
     pub(crate) const fn identity(self) -> u128 {
         self.actor.identity
+    }
+
+    pub(crate) const fn actor_type_identity(self) -> u128 {
+        self.actor.actor_type_identity
+    }
+
+    pub(crate) const fn construction_identity(self) -> u128 {
+        self.actor.construction_identity
+    }
+
+    pub(crate) const fn construction_current_meaning(self) -> u128 {
+        self.actor.construction_current_meaning
     }
 
     pub(crate) fn source(self) -> &'a crate::SourceRange {
@@ -629,7 +644,7 @@ pub(crate) fn complete(
     evaluations.sort_by_key(|evaluation| evaluation.authority.root);
     let evaluations_fingerprint = produce_evaluations_fingerprint(&evaluations, cancellation)?;
     checkpoint(cancellation)?;
-    let actors = complete_actors(&input.actors, &input.program, cancellation)?;
+    let actors = complete_actors(&input.actors, &input.program, &input.image, cancellation)?;
     let demand = produce_demand(
         DemandInput {
             context: context_identity,
@@ -823,15 +838,12 @@ fn verify_reference(
 fn complete_actors(
     inputs: &[ActorInput],
     program: &VerifiedProgram,
+    image: &SealedImage,
     cancellation: &Cancellation,
 ) -> Result<Vec<CompletedActor>, CompletionFailure> {
-    let mut actors = Vec::with_capacity(inputs.len());
-    let mut identities = BTreeSet::new();
+    let mut actor_types = BTreeMap::new();
     for input in inputs {
         checkpoint(cancellation)?;
-        if !identities.insert(input.definition.0) {
-            return defect("Actor identity is duplicated");
-        }
         let mut handlers = Vec::with_capacity(input.handlers.len());
         for definition in input.handlers.iter().copied() {
             checkpoint(cancellation)?;
@@ -848,14 +860,148 @@ fn complete_actors(
         }
         handlers.sort();
         handlers.dedup();
-        actors.push(CompletedActor {
-            identity: input.definition.0,
-            source: input.source.clone(),
-            handlers: handlers.into(),
-        });
+        if actor_types
+            .insert(
+                input.definition,
+                (input.source.clone(), Arc::from(handlers)),
+            )
+            .is_some()
+        {
+            return defect("Actor type identity is duplicated");
+        }
+    }
+    let mut actors = Vec::new();
+    let mut identities = BTreeSet::new();
+    for construction in image.constructions() {
+        checkpoint(cancellation)?;
+        let construction_current_meaning =
+            produce_node_local_fingerprint(construction, cancellation)?;
+        for (operand_index, operand) in construction.operands.iter().enumerate() {
+            let mut path = vec![u64::try_from(operand_index).unwrap_or(u64::MAX)];
+            collect_actor_instances(
+                &operand.value,
+                construction.identity,
+                construction_current_meaning,
+                &construction.site,
+                &actor_types,
+                &mut path,
+                &mut actors,
+                cancellation,
+            )?;
+        }
+    }
+    for actor in &actors {
+        if !identities.insert(actor.identity) {
+            return defect("Actor instance identity is duplicated");
+        }
     }
     actors.sort_by_key(|actor| actor.identity);
     Ok(actors)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_actor_instances(
+    value: &Value,
+    construction_identity: u128,
+    construction_current_meaning: u128,
+    source: &crate::SourceRange,
+    actor_types: &BTreeMap<DefinitionId, (crate::SourceRange, Arc<[SpecializationId]>)>,
+    path: &mut Vec<u64>,
+    actors: &mut Vec<CompletedActor>,
+    cancellation: &Cancellation,
+) -> Result<(), CompletionFailure> {
+    checkpoint(cancellation)?;
+    match value {
+        Value::Struct {
+            definition, fields, ..
+        } => {
+            if let Some((_, handlers)) = actor_types.get(definition) {
+                let mut hash = Xxh3::new();
+                hash.update(b"wrela.actor-instance\0\x01");
+                hash.update(&construction_identity.to_be_bytes());
+                hash.update(&definition.0.to_be_bytes());
+                for coordinate in path.iter().copied() {
+                    hash.update(&coordinate.to_be_bytes());
+                }
+                actors.push(CompletedActor {
+                    identity: hash.digest128(),
+                    actor_type_identity: definition.0,
+                    construction_identity,
+                    construction_current_meaning,
+                    source: source.clone(),
+                    handlers: Arc::clone(handlers),
+                });
+                return Ok(());
+            }
+            for (index, (_, field)) in fields.iter().enumerate() {
+                path.push(u64::try_from(index).unwrap_or(u64::MAX));
+                collect_actor_instances(
+                    field,
+                    construction_identity,
+                    construction_current_meaning,
+                    source,
+                    actor_types,
+                    path,
+                    actors,
+                    cancellation,
+                )?;
+                path.pop();
+            }
+        }
+        Value::Array(values)
+        | Value::Tuple(values)
+        | Value::BuiltinVariant {
+            payload: values, ..
+        }
+        | Value::UserVariant {
+            payload: values, ..
+        }
+        | Value::TestApplication {
+            payload: values, ..
+        } => {
+            for (index, nested) in values.iter().enumerate() {
+                path.push(u64::try_from(index).unwrap_or(u64::MAX));
+                collect_actor_instances(
+                    nested,
+                    construction_identity,
+                    construction_current_meaning,
+                    source,
+                    actor_types,
+                    path,
+                    actors,
+                    cancellation,
+                )?;
+                path.pop();
+            }
+        }
+        Value::Closure { captures, .. } => {
+            for (index, (_, nested)) in captures.iter().enumerate() {
+                path.push(u64::try_from(index).unwrap_or(u64::MAX));
+                collect_actor_instances(
+                    nested,
+                    construction_identity,
+                    construction_current_meaning,
+                    source,
+                    actor_types,
+                    path,
+                    actors,
+                    cancellation,
+                )?;
+                path.pop();
+            }
+        }
+        Value::Unavailable
+        | Value::Unit
+        | Value::Bool(_)
+        | Value::Integer { .. }
+        | Value::Float { .. }
+        | Value::Text(_)
+        | Value::Scalar(_)
+        | Value::Bytes(_)
+        | Value::Function(_)
+        | Value::SymbolicHandle { .. } => {}
+    }
+    Ok(())
 }
 
 struct DemandInput<'a> {

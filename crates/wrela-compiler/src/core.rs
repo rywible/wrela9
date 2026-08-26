@@ -75,6 +75,7 @@ pub enum CoreOperationKind {
     RecoverableExit,
     CleanupRun,
     MessageProposal,
+    PatternConsume,
 }
 
 impl CoreOperationKind {
@@ -114,6 +115,7 @@ impl CoreOperationKind {
             Self::RecoverableExit => 32,
             Self::CleanupRun => 33,
             Self::MessageProposal => 34,
+            Self::PatternConsume => 35,
         }
     }
 }
@@ -494,6 +496,8 @@ pub struct CoreExecutableObservation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoreCustodyEffectObservation {
     semantic_identity: u128,
+    reference_identity: u128,
+    reference_current_meaning: u128,
     provenance: SourceRange,
     operation: CoreCustodyOperation,
     initialization: CoreInitializationEffect,
@@ -501,7 +505,10 @@ pub struct CoreCustodyEffectObservation {
     loan: CoreLoanEffect,
     obligation: CoreObligationEffect,
     place_projection_count: usize,
+    place: Arc<[u128]>,
     type_identity: Option<u128>,
+    source_home: Option<u128>,
+    destination_home: Option<u128>,
     custody_continuous: bool,
     cleanup_identity: Option<u128>,
     cleanup_has_success_continuation: bool,
@@ -516,6 +523,16 @@ impl CoreCustodyEffectObservation {
     #[must_use]
     pub const fn semantic_identity(&self) -> u128 {
         self.semantic_identity
+    }
+
+    #[must_use]
+    pub const fn reference_identity(&self) -> u128 {
+        self.reference_identity
+    }
+
+    #[must_use]
+    pub const fn reference_current_meaning(&self) -> u128 {
+        self.reference_current_meaning
     }
 
     #[must_use]
@@ -554,8 +571,23 @@ impl CoreCustodyEffectObservation {
     }
 
     #[must_use]
+    pub fn place(&self) -> &[u128] {
+        &self.place
+    }
+
+    #[must_use]
     pub const fn type_identity(&self) -> Option<u128> {
         self.type_identity
+    }
+
+    #[must_use]
+    pub const fn source_home(&self) -> Option<u128> {
+        self.source_home
+    }
+
+    #[must_use]
+    pub const fn destination_home(&self) -> Option<u128> {
+        self.destination_home
     }
 
     #[must_use]
@@ -951,6 +983,42 @@ fn observation_control_paths(
     Ok(operations)
 }
 
+fn core_custody_reference(
+    executable: &CoreExecutable,
+    operation: &Operation,
+    effect_ordinal: usize,
+    effect: &CustodyEffect,
+) -> (u128, u128) {
+    let mut identity = Xxh3::new();
+    identity.update(b"wrela.core.custody-reference\0\x01");
+    identity.update(&executable.reference.identity.to_be_bytes());
+    identity.update(operation.provenance.path().as_bytes());
+    identity.update(&operation.provenance.start().to_be_bytes());
+    identity.update(&operation.provenance.end().to_be_bytes());
+    identity.update(&[operation.kind.tag(), effect.operation.tag()]);
+    identity.update(&(effect_ordinal as u64).to_be_bytes());
+    let identity = identity.digest128();
+
+    let mut meaning = Xxh3::new();
+    meaning.update(b"wrela.core.custody-reference-meaning\0\x01");
+    meaning.update(&identity.to_be_bytes());
+    meaning.update(&executable.reference.current_meaning.to_be_bytes());
+    meaning.update(&[
+        effect.initialization.tag(),
+        effect.custodian.tag(),
+        effect.loan.tag(),
+        effect.obligation.tag(),
+    ]);
+    meaning.update(&effect.type_identity.unwrap_or(0).to_be_bytes());
+    meaning.update(&effect.source_home.unwrap_or(0).to_be_bytes());
+    meaning.update(&effect.destination_home.unwrap_or(0).to_be_bytes());
+    meaning.update(&(effect.place.len() as u64).to_be_bytes());
+    for part in effect.place.iter() {
+        meaning.update(&part.to_be_bytes());
+    }
+    (identity, meaning.digest128())
+}
+
 fn observe_executable_custody(
     executable: &CoreExecutable,
     executables: &[CoreExecutable],
@@ -1234,11 +1302,15 @@ fn observe_executable_custody(
                     })
                 });
             let semantic_identity = hash.digest128();
+            let (reference_identity, reference_current_meaning) =
+                core_custody_reference(executable, operation, effect_role, effect);
             if !semantic_identities.insert(semantic_identity) {
                 return defect("Core custody observation identity collision");
             }
             observations.push(CoreCustodyEffectObservation {
                 semantic_identity,
+                reference_identity,
+                reference_current_meaning,
                 provenance: operation.provenance.clone(),
                 operation: effect.operation,
                 initialization: effect.initialization,
@@ -1246,7 +1318,10 @@ fn observe_executable_custody(
                 loan: effect.loan,
                 obligation: effect.obligation,
                 place_projection_count: effect.place.len().saturating_sub(1),
+                place: Arc::clone(&effect.place),
                 type_identity: effect.type_identity,
+                source_home: effect.source_home,
+                destination_home: effect.destination_home,
                 custody_continuous,
                 cleanup_identity,
                 cleanup_has_success_continuation: operation.kind == CoreOperationKind::CleanupRun
@@ -1354,28 +1429,131 @@ impl FlowCoreView<'_> {
             .map(|executable| executable.reference.identity)
     }
 
+    pub(crate) fn suspension_sites(&self) -> Vec<FlowCoreSuspensionSite> {
+        let cancellation = Cancellation::new();
+        let mut sites = Vec::new();
+        for executable in self.core.executables.iter() {
+            let paths = observation_control_paths(executable, &cancellation).unwrap_or_default();
+            let mut operations = executable
+                .regions
+                .iter()
+                .flat_map(|region| region.operations.iter())
+                .filter(|operation| operation.kind == CoreOperationKind::Suspension)
+                .collect::<Vec<_>>();
+            operations.sort_by(|left, right| {
+                (
+                    left.provenance.path(),
+                    left.provenance.start(),
+                    left.provenance.end(),
+                )
+                    .cmp(&(
+                        right.provenance.path(),
+                        right.provenance.start(),
+                        right.provenance.end(),
+                    ))
+            });
+            for operation in operations {
+                let mut identity = Xxh3::new();
+                identity.update(b"wrela.core.suspension-site\0\x01");
+                identity.update(&executable.reference.identity.to_be_bytes());
+                identity.update(operation.provenance.path().as_bytes());
+                identity.update(&operation.provenance.start().to_be_bytes());
+                identity.update(&operation.provenance.end().to_be_bytes());
+                let identity = identity.digest128();
+                let mut meaning = Xxh3::new();
+                meaning.update(b"wrela.core.suspension-site-meaning\0\x01");
+                meaning.update(&identity.to_be_bytes());
+                meaning.update(&executable.reference.current_meaning.to_be_bytes());
+                sites.push(FlowCoreSuspensionSite {
+                    handler: executable.reference.identity,
+                    reference_identity: identity,
+                    reference_current_meaning: meaning.digest128(),
+                    control_path: paths
+                        .get(&operation.identity)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::from([])),
+                    source: operation.provenance.clone(),
+                });
+            }
+        }
+        sites.sort_by_key(|site| (site.handler, site.reference_identity));
+        sites
+    }
+
     pub(crate) fn message_proposals(&self) -> Vec<FlowCoreMessageProposal> {
         let mut proposals = Vec::new();
         for executable in self.core.executables.iter() {
-            let mut ordinal = 0_u32;
-            for operation in executable
+            let control_paths =
+                observation_control_paths(executable, &Cancellation::new()).unwrap_or_default();
+            let mut operations = executable
                 .regions
                 .iter()
                 .flat_map(|region| region.operations.iter())
                 .filter(|operation| operation.kind == CoreOperationKind::MessageProposal)
-            {
+                .collect::<Vec<_>>();
+            operations.sort_by(|left, right| {
+                (
+                    left.provenance.path(),
+                    left.provenance.start(),
+                    left.provenance.end(),
+                )
+                    .cmp(&(
+                        right.provenance.path(),
+                        right.provenance.start(),
+                        right.provenance.end(),
+                    ))
+            });
+            for (ordinal, operation) in operations.into_iter().enumerate() {
+                let mut operation_reference = Xxh3::new();
+                operation_reference.update(b"wrela.core.message-proposal-site\0\x01");
+                operation_reference.update(&executable.reference.identity.to_be_bytes());
+                operation_reference.update(operation.provenance.path().as_bytes());
+                operation_reference.update(&operation.provenance.start().to_be_bytes());
+                operation_reference.update(&operation.provenance.end().to_be_bytes());
+                let operation_reference = operation_reference.digest128();
+                let mut operation_meaning = Xxh3::new();
+                operation_meaning.update(b"wrela.core.message-proposal-site-meaning\0\x01");
+                operation_meaning.update(&operation_reference.to_be_bytes());
+                operation_meaning.update(&executable.reference.current_meaning.to_be_bytes());
+                operation_meaning.update(
+                    &operation
+                        .details
+                        .first()
+                        .copied()
+                        .unwrap_or(0)
+                        .to_be_bytes(),
+                );
+                let custody = operation
+                    .custody
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, effect)| effect.operation == CoreCustodyOperation::Move)
+                    .map(|(effect_ordinal, effect)| {
+                        let (reference_identity, reference_current_meaning) =
+                            core_custody_reference(executable, operation, effect_ordinal, effect);
+                        FlowCoreCustodyReference {
+                            reference_identity,
+                            reference_current_meaning,
+                            type_identity: effect.type_identity.unwrap_or(0),
+                            place: Arc::clone(&effect.place),
+                            source_home: effect.source_home.unwrap_or(0),
+                            proposal_home: effect.destination_home.unwrap_or(0),
+                        }
+                    })
+                    .collect::<Vec<_>>();
                 proposals.push(FlowCoreMessageProposal {
                     sender_handler: executable.reference.identity,
                     destination_handler: operation.details.first().copied().unwrap_or(0),
-                    send_ordinal: ordinal,
-                    moved_resource_count: operation
-                        .details
-                        .get(1)
-                        .and_then(|count| usize::try_from(*count).ok())
-                        .unwrap_or(usize::MAX),
+                    send_ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
+                    operation_reference,
+                    operation_current_meaning: operation_meaning.digest128(),
+                    control_path: control_paths
+                        .get(&operation.identity)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::from([])),
+                    custody: custody.into(),
                     source: operation.provenance.clone(),
                 });
-                ordinal = ordinal.saturating_add(1);
             }
         }
         proposals
@@ -1387,8 +1565,30 @@ pub(crate) struct FlowCoreMessageProposal {
     pub(crate) sender_handler: u128,
     pub(crate) destination_handler: u128,
     pub(crate) send_ordinal: u32,
-    pub(crate) moved_resource_count: usize,
+    pub(crate) operation_reference: u128,
+    pub(crate) operation_current_meaning: u128,
+    pub(crate) control_path: Arc<[u32]>,
+    pub(crate) custody: Arc<[FlowCoreCustodyReference]>,
     pub(crate) source: SourceRange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FlowCoreSuspensionSite {
+    pub(crate) handler: u128,
+    pub(crate) reference_identity: u128,
+    pub(crate) reference_current_meaning: u128,
+    pub(crate) control_path: Arc<[u32]>,
+    pub(crate) source: SourceRange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FlowCoreCustodyReference {
+    pub(crate) reference_identity: u128,
+    pub(crate) reference_current_meaning: u128,
+    pub(crate) type_identity: u128,
+    pub(crate) place: Arc<[u128]>,
+    pub(crate) source_home: u128,
+    pub(crate) proposal_home: u128,
 }
 
 #[allow(dead_code)]
@@ -2102,10 +2302,14 @@ fn producer_attach_custody(
     let components = producer_resource_components(regions, program, cancellation)?;
     let mut value_types = BTreeMap::new();
     let mut value_access = BTreeMap::new();
+    let mut value_places = BTreeMap::new();
     for operation in regions.iter().flat_map(|region| region.operations.iter()) {
         if let (Some(value), Some(type_identity)) = (operation.result, operation.type_identity) {
             value_types.insert(value, type_identity);
             value_access.insert(value, operation.access);
+            if operation.kind == CoreOperationKind::Read {
+                value_places.insert(value, Arc::clone(&operation.details));
+            }
         }
     }
     let entry = signature
@@ -2127,6 +2331,7 @@ fn producer_attach_custody(
         regions,
         value_types: &value_types,
         value_access: &value_access,
+        value_places: &value_places,
         program,
         cancellation,
         components: &components,
@@ -2270,6 +2475,7 @@ struct ProducerCustodyFlow<'a> {
     regions: &'a [Region],
     value_types: &'a BTreeMap<ValueId, u128>,
     value_access: &'a BTreeMap<ValueId, CoreAccessLaw>,
+    value_places: &'a BTreeMap<ValueId, Arc<[u128]>>,
     program: &'a crate::typed_hir::VerifiedProgram,
     cancellation: &'a Cancellation,
     components: &'a ResourceComponents,
@@ -2308,6 +2514,7 @@ impl ProducerCustodyFlow<'_> {
                 operation,
                 self.value_types,
                 self.value_access,
+                self.value_places,
                 self.program,
                 self.cancellation,
             )?;
@@ -2460,6 +2667,11 @@ fn producer_update_live_places(
     components: &ResourceComponents,
     live_places: &mut BTreeMap<Arc<[u128]>, u128>,
 ) {
+    if operation.kind == CoreOperationKind::PatternConsume
+        && operation.access == CoreAccessLaw::Move
+    {
+        live_places.retain(|place, _| !places_overlap(place, &operation.details));
+    }
     if operation.kind == CoreOperationKind::Read
         && matches!(
             operation.access,
@@ -2523,10 +2735,21 @@ fn producer_operation_custody(
     operation: &Operation,
     value_types: &BTreeMap<ValueId, u128>,
     value_access: &BTreeMap<ValueId, CoreAccessLaw>,
+    value_places: &BTreeMap<ValueId, Arc<[u128]>>,
     program: &crate::typed_hir::VerifiedProgram,
     cancellation: &Cancellation,
 ) -> Result<Vec<CustodyEffect>, CoreFailure> {
     let mut effects = Vec::new();
+    if operation.kind == CoreOperationKind::PatternConsume {
+        let type_identity = operation.type_identity.ok_or_else(|| {
+            CoreFailure::Defect(Arc::from("Core pattern consumption has no source type"))
+        })?;
+        effects.push(producer_discharge_effect(
+            &operation.details,
+            type_identity,
+            program,
+        ));
+    }
     let resource_result = operation
         .type_identity
         .filter(|identity| program.owns_resource_type(TypeId(*identity)));
@@ -2641,6 +2864,7 @@ fn producer_operation_custody(
             ))
         .then_some((*operand, type_identity))
     });
+    let mut proposal_component_ordinal = 0usize;
     for (ordinal, (operand, type_identity)) in moved_resources.enumerate() {
         checkpoint(cancellation)?;
         let source = custody_home(b"value", u128::from(operand.0));
@@ -2658,7 +2882,39 @@ fn producer_operation_custody(
                 u128::from(operation.identity) << 32 | ordinal as u128,
             )
         };
-        if operation.kind == CoreOperationKind::Store {
+        if operation.kind == CoreOperationKind::MessageProposal {
+            let root_place = value_places
+                .get(&operand)
+                .cloned()
+                .unwrap_or_else(|| Arc::from([]));
+            let components = program
+                .resource_components(TypeId(type_identity))
+                .unwrap_or(&[]);
+            if components.is_empty() {
+                return defect("MessageProposal Resource has no component custody authority");
+            }
+            for component in components {
+                let mut place = root_place.to_vec();
+                place.extend(component.projection.iter().copied());
+                effects.push(custody_effect(
+                    CoreCustodyOperation::Move,
+                    (
+                        CoreInitializationEffect::Uninitialize,
+                        CoreCustodianEffect::Transfer,
+                        CoreLoanEffect::None,
+                        CoreObligationEffect::Transfer,
+                    ),
+                    place.into(),
+                    Some(component.type_id.0),
+                    Some(source),
+                    Some(custody_home(
+                        b"message-proposal",
+                        u128::from(operation.identity) << 32 | proposal_component_ordinal as u128,
+                    )),
+                ));
+                proposal_component_ordinal = proposal_component_ordinal.saturating_add(1);
+            }
+        } else if operation.kind == CoreOperationKind::Store {
             let initialize = operation.details.last().copied() == Some(1);
             effects.push(custody_effect(
                 if initialize {
@@ -3191,12 +3447,31 @@ impl<'a> ProducerLowerer<'a> {
                 source,
             } => {
                 let matched_place = root_place(value).map(|place| place_details(&place));
+                let matched_type = value.type_.clone();
+                let matched_type_identity = value.type_id.0;
                 let value = self.lower_expression(value, operations)?;
                 let mut successors = Vec::new();
                 let mut details = vec![u128::try_from(cases.len()).unwrap_or(u128::MAX)];
                 for case in cases.iter() {
                     let case_region = self.reserve_region();
                     let mut case_operations = Vec::new();
+                    if let (Some(pattern), Some(place)) = (&case.pattern, &matched_place)
+                        && producer_result_unit_wildcard(pattern, &matched_type)
+                    {
+                        self.push_operation(
+                            &mut case_operations,
+                            CoreOperationKind::PatternConsume,
+                            None,
+                            Some(matched_type_identity),
+                            [],
+                            [],
+                            place.iter().copied(),
+                            EffectBoundary::Ownership,
+                            FailureLaw::None,
+                            case.source.clone(),
+                            CoreAccessLaw::Move,
+                        );
+                    }
                     if let (Some(pattern), Some(place)) = (&case.pattern, &matched_place)
                         && let Some((binding, type_identity)) =
                             producer_result_payload_move_binding(pattern)
@@ -3498,13 +3773,22 @@ impl<'a> ProducerLowerer<'a> {
                 EffectBoundary::Suspension,
                 FailureLaw::PropagateInOrder,
             ),
-            ExpressionKind::TrySend(value) => (
-                CoreOperationKind::MessageProposal,
-                vec![self.lower_expression(value, operations)?],
-                try_send_details(value),
-                EffectBoundary::Suspension,
-                FailureLaw::CheckBeforeSuccess,
-            ),
+            ExpressionKind::TrySend(value) => {
+                let ExpressionKind::Call { target, arguments } = &value.kind else {
+                    return defect("verified try_send has no Actor handler call");
+                };
+                let mut operands = Vec::with_capacity(arguments.len());
+                for argument in arguments.iter() {
+                    operands.push(self.lower_expression(argument, operations)?);
+                }
+                (
+                    CoreOperationKind::MessageProposal,
+                    operands,
+                    try_send_details(target),
+                    EffectBoundary::Suspension,
+                    FailureLaw::CheckBeforeSuccess,
+                )
+            }
             ExpressionKind::Propagate(value) => (
                 CoreOperationKind::Propagate,
                 vec![self.lower_expression(value, operations)?],
@@ -3791,22 +4075,12 @@ fn call_target_details(target: &CallTarget) -> Vec<u128> {
     }
 }
 
-fn try_send_details(expression: &Expression) -> Vec<u128> {
-    let ExpressionKind::Call { target, arguments } = &expression.kind else {
-        return vec![0, 0];
-    };
+fn try_send_details(target: &CallTarget) -> Vec<u128> {
     let destination_handler = match target {
         CallTarget::Function { specialization, .. } => specialization.0,
         _ => 0,
     };
-    let moved_resources = arguments
-        .iter()
-        .filter(|argument| argument.access == crate::typed_hir::AccessMode::Move)
-        .count();
-    vec![
-        destination_handler,
-        u128::try_from(moved_resources).unwrap_or(u128::MAX),
-    ]
+    vec![destination_handler]
 }
 
 fn producer_call_binding(target: &CallTarget, argument_count: usize) -> Arc<[u16]> {
@@ -3850,6 +4124,20 @@ fn producer_result_payload_move_binding(pattern: &HirMatchPattern) -> Option<(u1
         },
         _ => None,
     }
+}
+
+fn producer_result_unit_wildcard(pattern: &HirMatchPattern, matched: &Type) -> bool {
+    matches!(
+        (pattern, matched),
+        (
+            HirMatchPattern::BuiltinVariant {
+                variant: BuiltinVariant::ResultOk,
+                payload,
+            },
+            Type::Result { success, .. }
+        ) if matches!(success.as_ref(), Type::Unit)
+            && matches!(payload.as_ref(), [HirMatchPattern::Wildcard])
+    )
 }
 
 fn append_pattern(pattern: &HirMatchPattern, output: &mut Vec<u128>) {
@@ -4193,7 +4481,10 @@ fn verify(
         || !candidate.oracle.agrees
         || !candidate.oracle.custody_agrees
     {
-        return defect("Core differential semantic oracle disagrees with evaluator meaning");
+        return defect(format!(
+            "Core differential semantic oracle disagrees with evaluator meaning: supplied {:?}; expected {:?}",
+            candidate.oracle, expected_oracle
+        ));
     }
     let fingerprint = verifier_fingerprint(candidate, cancellation)?;
     if candidate.fingerprint != fingerprint {
@@ -4602,6 +4893,8 @@ impl<'a> VerifierLowerer<'a> {
                 source,
             } => {
                 let matched_place = root_place(value).map(|place| place_details(&place));
+                let matched_type = value.type_.clone();
+                let matched_type_identity = value.type_id.0;
                 let value = self.reconstruct_expression(value, operations)?;
                 let mut successors = Vec::new();
                 let mut details = vec![u128::try_from(cases.len()).unwrap_or(u128::MAX)];
@@ -4609,6 +4902,23 @@ impl<'a> VerifierLowerer<'a> {
                     checkpoint(self.cancellation)?;
                     let case_region = self.reserve_region();
                     let mut case_operations = Vec::new();
+                    if let (Some(pattern), Some(place)) = (&case.pattern, &matched_place)
+                        && verifier_result_unit_wildcard(pattern, &matched_type)
+                    {
+                        self.emit(
+                            &mut case_operations,
+                            CoreOperationKind::PatternConsume,
+                            None,
+                            Some(matched_type_identity),
+                            [],
+                            [],
+                            place.iter().copied(),
+                            EffectBoundary::Ownership,
+                            FailureLaw::None,
+                            case.source.clone(),
+                            CoreAccessLaw::Move,
+                        );
+                    }
                     if let (Some(pattern), Some(place)) = (&case.pattern, &matched_place)
                         && let Some((binding, type_identity)) =
                             verifier_result_payload_move_binding(pattern)
@@ -4913,13 +5223,23 @@ impl<'a> VerifierLowerer<'a> {
                 EffectBoundary::Suspension,
                 FailureLaw::PropagateInOrder,
             ),
-            ExpressionKind::TrySend(value) => (
-                CoreOperationKind::MessageProposal,
-                vec![self.reconstruct_expression(value, operations)?],
-                try_send_details(value),
-                EffectBoundary::Suspension,
-                FailureLaw::CheckBeforeSuccess,
-            ),
+            ExpressionKind::TrySend(value) => {
+                let ExpressionKind::Call { target, arguments } = &value.kind else {
+                    return defect("verified try_send has no Actor handler call");
+                };
+                let mut operands = Vec::with_capacity(arguments.len());
+                for argument in arguments.iter() {
+                    checkpoint(self.cancellation)?;
+                    operands.push(self.reconstruct_expression(argument, operations)?);
+                }
+                (
+                    CoreOperationKind::MessageProposal,
+                    operands,
+                    try_send_details(target),
+                    EffectBoundary::Suspension,
+                    FailureLaw::CheckBeforeSuccess,
+                )
+            }
             ExpressionKind::Propagate(value) => (
                 CoreOperationKind::Propagate,
                 vec![self.reconstruct_expression(value, operations)?],
@@ -5358,6 +5678,18 @@ fn verifier_result_payload_move_binding(pattern: &HirMatchPattern) -> Option<(u1
         },
         _ => None,
     }
+}
+
+fn verifier_result_unit_wildcard(pattern: &HirMatchPattern, matched: &Type) -> bool {
+    let HirMatchPattern::BuiltinVariant { variant, payload } = pattern else {
+        return false;
+    };
+    let Type::Result { success, .. } = matched else {
+        return false;
+    };
+    *variant == BuiltinVariant::ResultOk
+        && matches!(success.as_ref(), Type::Unit)
+        && matches!(payload.as_ref(), [HirMatchPattern::Wildcard])
 }
 
 const fn verifier_access_tag(access: crate::typed_hir::AccessMode) -> u8 {
@@ -5944,10 +6276,22 @@ fn validate_custody(
             .flat_map(|region| region.operations.iter())
             .filter_map(|operation| Some((operation.result?, operation.access)))
             .collect::<BTreeMap<_, _>>();
+        let value_places = executable
+            .regions
+            .iter()
+            .flat_map(|region| region.operations.iter())
+            .filter_map(|operation| {
+                (operation.kind == CoreOperationKind::Read)
+                    .then_some(operation.result)
+                    .flatten()
+                    .map(|result| (result, Arc::clone(&operation.details)))
+            })
+            .collect::<BTreeMap<_, _>>();
         let context = CustodyVerifierContext {
             signature: &executable.signature,
             value_types: &value_types,
             value_access: &value_access,
+            value_places: &value_places,
             program,
         };
         let expected_trace =
@@ -5961,9 +6305,10 @@ fn validate_custody(
                     CoreFailure::Defect(Arc::from("Core custody trace is shorter than its graph"))
                 })?;
                 if operation.custody.as_ref() != exact_expected.as_ref() {
-                    return defect(
-                        "Core custody transition fields do not match their exact source authority",
-                    );
+                    return defect(format!(
+                        "Core custody transition fields do not match their exact source authority at operation {} {:?}: supplied {:?}; expected {:?}",
+                        operation.identity, operation.kind, operation.custody, exact_expected
+                    ));
                 }
                 let moved_resource_count = operation
                     .operands
@@ -6109,6 +6454,7 @@ struct CustodyVerifierContext<'a> {
     signature: &'a CoreSignature,
     value_types: &'a BTreeMap<ValueId, u128>,
     value_access: &'a BTreeMap<ValueId, CoreAccessLaw>,
+    value_places: &'a BTreeMap<ValueId, Arc<[u128]>>,
     program: &'a crate::typed_hir::VerifiedProgram,
 }
 
@@ -6125,6 +6471,7 @@ fn validate_operation_custody(
         signature,
         value_types,
         value_access,
+        value_places: _,
         program,
     } = context;
     let mut expected = BTreeMap::<CoreCustodyOperation, usize>::new();
@@ -6176,6 +6523,19 @@ fn validate_operation_custody(
     if let Some((transfers, reinitializations)) = expected_store_operation {
         expect(CoreCustodyOperation::TransferCommit, transfers);
         expect(CoreCustodyOperation::Reinitialize, reinitializations);
+    } else if operation.kind == CoreOperationKind::MessageProposal {
+        let component_count = operation
+            .operands
+            .iter()
+            .filter_map(|operand| value_types.get(operand).copied())
+            .filter(|identity| program.owns_resource_type(TypeId(*identity)))
+            .map(|identity| {
+                program
+                    .resource_components(TypeId(identity))
+                    .map_or(0, |components| components.len())
+            })
+            .sum();
+        expect(CoreCustodyOperation::Move, component_count);
     } else if matches!(
         operation.kind,
         CoreOperationKind::Call
@@ -6255,6 +6615,33 @@ fn verifier_operation_custody(
     discharges: &[(Arc<[u128]>, u128)],
 ) -> Vec<CustodyEffect> {
     let mut effects = Vec::new();
+    if operation.kind == CoreOperationKind::PatternConsume
+        && let Some(type_identity) = operation.type_identity
+    {
+        effects.push(verifier_effect(
+            CoreCustodyOperation::Discharge,
+            (
+                CoreInitializationEffect::Uninitialize,
+                CoreCustodianEffect::Discharge,
+                CoreLoanEffect::None,
+                CoreObligationEffect::Discharge,
+            ),
+            Arc::clone(&operation.details),
+            Some(type_identity),
+            Some(place_home(&operation.details)),
+            Some(custody_home(
+                if context
+                    .program
+                    .requires_explicit_discharge(TypeId(type_identity))
+                {
+                    b"explicit-discharge" as &[u8]
+                } else {
+                    b"compiler-reclaim"
+                },
+                place_home(&operation.details),
+            )),
+        ));
+    }
     let resource_result = operation
         .type_identity
         .filter(|identity| context.program.owns_resource_type(TypeId(*identity)));
@@ -6357,6 +6744,7 @@ fn verifier_operation_custody(
         };
         effects.extend(effect);
     }
+    let mut proposal_component_ordinal = 0usize;
     for (ordinal, operand) in operation
         .operands
         .iter()
@@ -6374,7 +6762,38 @@ fn verifier_operation_custody(
     {
         let type_identity = context.value_types[operand];
         let source = custody_home(b"value", u128::from(operand.0));
-        if operation.kind == CoreOperationKind::Store {
+        if operation.kind == CoreOperationKind::MessageProposal {
+            let root_place = context
+                .value_places
+                .get(operand)
+                .cloned()
+                .unwrap_or_else(|| Arc::from([]));
+            for component in context
+                .program
+                .resource_components(TypeId(type_identity))
+                .unwrap_or(&[])
+            {
+                let mut place = root_place.to_vec();
+                place.extend(component.projection.iter().copied());
+                effects.push(verifier_effect(
+                    CoreCustodyOperation::Move,
+                    (
+                        CoreInitializationEffect::Uninitialize,
+                        CoreCustodianEffect::Transfer,
+                        CoreLoanEffect::None,
+                        CoreObligationEffect::Transfer,
+                    ),
+                    place.into(),
+                    Some(component.type_id.0),
+                    Some(source),
+                    Some(custody_home(
+                        b"message-proposal",
+                        u128::from(operation.identity) << 32 | proposal_component_ordinal as u128,
+                    )),
+                ));
+                proposal_component_ordinal = proposal_component_ordinal.saturating_add(1);
+            }
+        } else if operation.kind == CoreOperationKind::Store {
             let place: Arc<[u128]> =
                 operation.details[..operation.details.len().saturating_sub(1)].into();
             let initialize = operation.details.last().copied() == Some(1);
@@ -7120,6 +7539,16 @@ fn source_flow_statements(
                     if let (Some(pattern), Some(place)) = (
                         &case.pattern,
                         root_place(value).map(|place| place_details(&place)),
+                    ) && source_result_unit_wildcard(pattern, &value.type_)
+                    {
+                        *discharges
+                            .entry((Arc::from(place.clone()), value.type_id.0))
+                            .or_insert(0) += 1;
+                        case_live.retain(|candidate, _| !places_overlap(candidate, &place));
+                    }
+                    if let (Some(pattern), Some(place)) = (
+                        &case.pattern,
+                        root_place(value).map(|place| place_details(&place)),
                     ) && let Some((binding, type_identity)) =
                         source_result_payload_move_binding(pattern)
                     {
@@ -7376,10 +7805,36 @@ fn source_custody_expression(
         | ExpressionKind::BitNot(value)
         | ExpressionKind::Not(value)
         | ExpressionKind::Await(value)
-        | ExpressionKind::TrySend(value)
         | ExpressionKind::Propagate(value)
         | ExpressionKind::Is { value, .. } => {
             source_custody_expression(value, path, program, cancellation, events)?;
+        }
+        ExpressionKind::TrySend(value) => {
+            let ExpressionKind::Call { arguments, .. } = &value.kind else {
+                return defect("verified try_send has no Actor handler call");
+            };
+            for argument in arguments.iter() {
+                source_custody_expression(argument, path, program, cancellation, events)?;
+                if argument.access == crate::typed_hir::AccessMode::Move
+                    && program.owns_resource_type(argument.type_id)
+                {
+                    let root = root_place(argument)
+                        .map(|place| place_details(&place))
+                        .unwrap_or_default();
+                    for component in program.resource_components(argument.type_id).unwrap_or(&[]) {
+                        let mut place = root.clone();
+                        place.extend(component.projection.iter().copied());
+                        source_custody_event(
+                            events,
+                            CoreCustodyOperation::Move,
+                            Some(component.type_id.0),
+                            Arc::from(place),
+                            &expression.source,
+                            path,
+                        );
+                    }
+                }
+            }
         }
         ExpressionKind::Index { value, index } => {
             source_custody_expression(value, path, program, cancellation, events)?;
@@ -7761,6 +8216,17 @@ fn source_result_payload_move_binding(pattern: &HirMatchPattern) -> Option<(u128
     }
 }
 
+fn source_result_unit_wildcard(pattern: &HirMatchPattern, matched: &Type) -> bool {
+    match (pattern, matched) {
+        (HirMatchPattern::BuiltinVariant { variant, payload }, Type::Result { success, .. }) => {
+            *variant == BuiltinVariant::ResultOk
+                && matches!(success.as_ref(), Type::Unit)
+                && matches!(payload.as_ref(), [HirMatchPattern::Wildcard])
+        }
+        _ => false,
+    }
+}
+
 fn core_custody_contract(
     executable: &CoreExecutable,
     cancellation: &Cancellation,
@@ -7885,10 +8351,22 @@ fn verifier_expected_custody_trace(
         .flat_map(|region| region.operations.iter())
         .filter_map(|operation| Some((operation.result?, operation.access)))
         .collect::<BTreeMap<_, _>>();
+    let value_places = executable
+        .regions
+        .iter()
+        .flat_map(|region| region.operations.iter())
+        .filter_map(|operation| {
+            (operation.kind == CoreOperationKind::Read)
+                .then_some(operation.result)
+                .flatten()
+                .map(|result| (result, Arc::clone(&operation.details)))
+        })
+        .collect::<BTreeMap<_, _>>();
     let context = CustodyVerifierContext {
         signature: &executable.signature,
         value_types: &value_types,
         value_access: &value_access,
+        value_places: &value_places,
         program,
     };
     let entry = executable
@@ -7992,6 +8470,11 @@ impl VerifierCustodyFlow<'_> {
         let mut terminal = false;
         for operation in &operations {
             checkpoint(self.cancellation)?;
+            if operation.kind == CoreOperationKind::PatternConsume
+                && operation.access == CoreAccessLaw::Move
+            {
+                state.retain(|place, _| !places_overlap(place, &operation.details));
+            }
             if operation.kind == CoreOperationKind::Read
                 && matches!(
                     operation.access,
@@ -8396,6 +8879,7 @@ fn oracle_supported(
             | CoreOperationKind::Index
             | CoreOperationKind::Propagate
             | CoreOperationKind::PatternTest
+            | CoreOperationKind::PatternConsume
             | CoreOperationKind::Match
             | CoreOperationKind::Cleanup
             | CoreOperationKind::CleanupRun

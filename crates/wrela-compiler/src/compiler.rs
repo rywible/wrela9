@@ -48,6 +48,7 @@ impl CompilerInstallation {
     pub fn with_authenticated_modules(mut modules: Vec<ProjectFile>) -> Self {
         modules.push(layer1_build_module());
         modules.push(layer1_pool_module());
+        modules.push(layer1_actor_module());
         Self {
             authenticated_modules: modules.into(),
         }
@@ -57,6 +58,15 @@ impl CompilerInstallation {
     pub fn layer1() -> Self {
         Self::with_authenticated_modules(Vec::new())
     }
+}
+
+fn layer1_actor_module() -> ProjectFile {
+    ProjectFile::new(
+        "src/core/actor.wr",
+        br#"pub resource struct MessageFull[T]:
+    pub arguments: T
+"#,
+    )
 }
 
 fn layer1_build_module() -> ProjectFile {
@@ -2455,6 +2465,9 @@ impl Compiler {
         };
 
         let mut pending = BTreeSet::from([request.root.path().to_owned()]);
+        if authenticated_paths.contains("src/core/actor.wr") {
+            pending.insert("src/core/actor.wr".to_owned());
+        }
         let mut parsed_sources = BTreeMap::new();
         while let Some(path) = pending.pop_first() {
             if parsed_sources.contains_key(path.as_str()) {
@@ -2744,6 +2757,7 @@ impl Compiler {
             syntax: if request.inspection.syntax {
                 let mut syntax = parsed_sources
                     .iter()
+                    .filter(|(path, _)| path.as_str() != "src/core/actor.wr")
                     .map(|(path, parsed)| {
                         SyntaxObservation::new(
                             files[path.as_str()],
@@ -2765,6 +2779,7 @@ impl Compiler {
             closure: if request.inspection.closure {
                 parsed_sources
                     .keys()
+                    .filter(|path| path.as_str() != "src/core/actor.wr")
                     .map(|path| Arc::<str>::from(path.as_str()))
                     .collect::<Vec<_>>()
                     .into()

@@ -1044,6 +1044,11 @@ fn analyze_with_probe(
         namespace,
         nominal_displays,
         aliases: alias_types.clone(),
+        message_full_definition: identity_catalog.definition(
+            "src/core/actor.wr",
+            DeclarationKind::ResourceStruct,
+            "MessageFull",
+        ),
         ..ProgramInput::default()
     };
     for (path, parsed) in parsed_sources {
@@ -1694,6 +1699,25 @@ fn analyze_with_probe(
                 );
                 for function in &member_functions {
                     input.functions.insert(function.id, function.clone());
+                }
+                if definition
+                    .declaration
+                    .attributes
+                    .contains(&AttributeSyntax::Actor)
+                {
+                    input.actor_handlers.extend(
+                        struct_
+                            .functions
+                            .iter()
+                            .filter(|member| {
+                                member.public
+                                    && member.function.modifier
+                                        == crate::syntax::FunctionModifier::Async
+                            })
+                            .filter_map(|member| {
+                                identity_catalog.associated_function(definition.id, &member.name)
+                            }),
+                    );
                 }
                 for interface in &struct_.implements {
                     let Some(ResolvedName::Nominal(interface_id)) = input

@@ -793,6 +793,7 @@ pub(crate) struct HirFunction {
     pub(crate) parameter_type_ids: Arc<[TypeId]>,
     pub(crate) parameter_definitions: Arc<[DefinitionId]>,
     pub(crate) return_type: Type,
+    pub(crate) return_type_id: TypeId,
     pub(crate) body: Arc<[Statement]>,
     pub(crate) source: SourceRange,
 }
@@ -811,6 +812,7 @@ pub(crate) struct HirConstant {
 pub(crate) struct HirTest {
     pub(crate) parameters: Vec<(LocalId, Type, AccessMode)>,
     pub(crate) parameter_type_ids: Arc<[TypeId]>,
+    pub(crate) return_type_id: TypeId,
     pub(crate) body: Arc<[Statement]>,
     pub(crate) source: SourceRange,
 }
@@ -826,6 +828,7 @@ pub(crate) struct HirClosure {
     pub(crate) captures: Arc<[(LocalId, Type)]>,
     capture_type_ids: Arc<[TypeId]>,
     pub(crate) return_type: Type,
+    pub(crate) return_type_id: TypeId,
     pub(crate) body: Expression,
     pub(crate) source: SourceRange,
     identity_key: Arc<[u8]>,
@@ -1698,6 +1701,11 @@ pub(crate) fn verify(
             )?);
         }
         let body = lowerer.statements(&function.body, &function.return_type)?;
+        let return_type_id = observe_type_tree(
+            &function.return_type,
+            lowerer.identity_catalog,
+            lowerer.discharge_laws,
+        )?;
         if syntax_statements_fall_through(&function.body) {
             lowerer.check_recoverable_exit()?;
         }
@@ -1716,6 +1724,7 @@ pub(crate) fn verify(
                     .map(|parameter| parameter.definition)
                     .collect(),
                 return_type: function.return_type.clone(),
+                return_type_id,
                 body: body.into(),
                 source: function.source.clone(),
             }),
@@ -1802,6 +1811,11 @@ pub(crate) fn verify(
             )?);
         }
         let body: Arc<[Statement]> = lowerer.statements(&test.body, &Type::Unit)?.into();
+        let return_type_id = observe_type_tree(
+            &Type::Unit,
+            lowerer.identity_catalog,
+            lowerer.discharge_laws,
+        )?;
         if syntax_statements_fall_through(&test.body) {
             lowerer.check_recoverable_exit()?;
         }
@@ -1813,6 +1827,7 @@ pub(crate) fn verify(
             HirTest {
                 parameters,
                 parameter_type_ids: parameter_type_ids.into(),
+                return_type_id,
                 body,
                 source: test.source.clone(),
             },
@@ -1920,6 +1935,10 @@ pub(crate) fn verify(
             append_part(&mut canonical, &parameter.type_.canonical_key());
         }
         let body = &test_bodies[id];
+        for type_id in body.parameter_type_ids.iter() {
+            canonical.extend_from_slice(&type_id.0.to_be_bytes());
+        }
+        canonical.extend_from_slice(&body.return_type_id.0.to_be_bytes());
         append_statements(&mut canonical, &body.body);
     }
     append_collection_header(&mut canonical, 7, comptime_expressions.len());
@@ -2250,6 +2269,11 @@ fn lower_concrete_function(
         )?);
     }
     let body = lowerer.statements(&function.body, &function.return_type)?;
+    let return_type_id = observe_type_tree(
+        &function.return_type,
+        lowerer.identity_catalog,
+        lowerer.discharge_laws,
+    )?;
     if syntax_statements_fall_through(&function.body) {
         lowerer.check_recoverable_exit()?;
     }
@@ -2266,6 +2290,7 @@ fn lower_concrete_function(
             .map(|parameter| parameter.definition)
             .collect(),
         return_type: function.return_type.clone(),
+        return_type_id,
         body: body.into(),
         source: function.source.clone(),
     })
@@ -2464,6 +2489,11 @@ pub(crate) fn lower_functions_for_error_inference(
             )?);
         }
         let body = lowerer.statements(&function.body, &function.return_type)?;
+        let return_type_id = observe_type_tree(
+            &function.return_type,
+            lowerer.identity_catalog,
+            lowerer.discharge_laws,
+        )?;
         if syntax_statements_fall_through(&function.body) {
             lowerer.check_recoverable_exit()?;
         }
@@ -2482,6 +2512,7 @@ pub(crate) fn lower_functions_for_error_inference(
                     .map(|parameter| parameter.definition)
                     .collect(),
                 return_type: function.return_type.clone(),
+                return_type_id,
                 body: body.into(),
                 source: function.source.clone(),
             }),
@@ -2581,6 +2612,11 @@ fn materialize_missing_specializations(
         }
         let return_type = substitute(&function.return_type, &substitutions);
         let body = lowerer.statements(&function.body, &return_type)?;
+        let return_type_id = observe_type_tree(
+            &return_type,
+            lowerer.identity_catalog,
+            lowerer.discharge_laws,
+        )?;
         if syntax_statements_fall_through(&function.body) {
             lowerer.check_recoverable_exit()?;
         }
@@ -2599,6 +2635,7 @@ fn materialize_missing_specializations(
                     .map(|parameter| parameter.definition)
                     .collect(),
                 return_type,
+                return_type_id,
                 body: body.into(),
                 source: function.source.clone(),
             }),
@@ -3213,6 +3250,9 @@ fn verify_specialized_artifact(
                 .iter()
                 .any(|(_, type_, _)| type_has_placeholder(type_))
             || type_has_placeholder(&function.return_type)
+            || !catalog
+                .identities
+                .type_matches(function.return_type_id, &function.return_type)
         {
             return defect("concrete Specialization body contains template facts");
         }
@@ -3537,6 +3577,9 @@ fn verify_lowered_artifact(
         }
         if function.parameters.len() != function.parameter_definitions.len()
             || function.parameters.len() != function.parameter_type_ids.len()
+            || !catalog
+                .identities
+                .type_matches(function.return_type_id, &function.return_type)
             || function
                 .parameter_definitions
                 .iter()
@@ -3604,7 +3647,11 @@ fn verify_lowered_artifact(
         }
     }
     for test in tests.values() {
-        if test.parameters.len() != test.parameter_type_ids.len() {
+        if test.parameters.len() != test.parameter_type_ids.len()
+            || !catalog
+                .identities
+                .type_matches(test.return_type_id, &Type::Unit)
+        {
             return defect("lowered Test parameter identities are malformed");
         }
         let mut locals = test
@@ -4925,6 +4972,9 @@ fn verify_expression_artifact_with_cleanup(
                     .zip(closure.parameters.iter())
                     .any(|(expected, (_, actual))| expected != actual)
                 || **return_type != closure.return_type
+                || !catalog
+                    .identities
+                    .type_matches(closure.return_type_id, &closure.return_type)
                 || closure.id.0 != xxh3_128(&closure.identity_key)
             {
                 return defect("lowered closure signature or identity is inconsistent");
@@ -7715,6 +7765,11 @@ impl<'a> Lowerer<'a> {
                         observe_type_tree(type_, self.identity_catalog, self.discharge_laws)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let return_type_id = observe_type_tree(
+                    &lowered_body.type_,
+                    self.identity_catalog,
+                    self.discharge_laws,
+                )?;
                 self.locals = before_locals;
                 self.moved = before_moved;
                 self.known_integers = before_known;
@@ -7726,6 +7781,7 @@ impl<'a> Lowerer<'a> {
                         captures: captures.into(),
                         capture_type_ids: capture_type_ids.into(),
                         return_type: lowered_body.type_.clone(),
+                        return_type_id,
                         body: lowered_body,
                         source: syntax.range.clone(),
                         identity_key: key.into(),
@@ -11353,6 +11409,7 @@ fn append_function(bytes: &mut impl ByteSink, function: &HirFunction) {
         bytes.push(access.canonical_tag());
     }
     append_part(bytes, &function.return_type.canonical_key());
+    bytes.extend_from_slice(&function.return_type_id.0.to_be_bytes());
     append_statements(bytes, &function.body);
 }
 
@@ -11626,6 +11683,7 @@ fn append_expression(bytes: &mut impl ByteSink, expression: &Expression) {
                 append_part(bytes, &type_.canonical_key());
             }
             append_part(bytes, &closure.return_type.canonical_key());
+            bytes.extend_from_slice(&closure.return_type_id.0.to_be_bytes());
             append_expression(bytes, &closure.body);
         }
         ExpressionKind::CleanupCapture(ordinal) => {
@@ -12751,6 +12809,11 @@ mod tests {
                             parameter_type_ids: Arc::from([resource_id]),
                             parameter_definitions: Arc::from([parameter]),
                             return_type: return_type.clone(),
+                            return_type_id: if *return_type == Type::Unit {
+                                unit_id
+                            } else {
+                                resource_id
+                            },
                             body: Arc::from([]),
                             source: owner.clone(),
                         }),

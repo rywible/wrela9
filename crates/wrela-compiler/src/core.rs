@@ -10,7 +10,7 @@ use crate::completed_semantic::{
     CoreSourceExecutableBody, CoreSourceExecutableInput, CoreSourceExecutableKind,
 };
 use crate::image_planning::{CorePlanningInput, ExecutableRef, GeneratedRole};
-use crate::model::{IntegerType, SpecializationId, Type};
+use crate::model::{IntegerType, SpecializationId, Type, TypeId};
 use crate::typed_hir::{
     BinaryOperator, CallTarget, Expression, ExpressionKind, HirMatchPattern, Literal, Place,
     PlaceProjection, Statement,
@@ -178,6 +178,9 @@ enum FailureLaw {
     PropagateInOrder,
     TerminalPanic,
     RecordTestFailure,
+    ArithmeticPanic,
+    BoundsPanic,
+    CallPanicPropagation,
 }
 
 impl FailureLaw {
@@ -188,6 +191,9 @@ impl FailureLaw {
             Self::PropagateInOrder => 2,
             Self::TerminalPanic => 3,
             Self::RecordTestFailure => 4,
+            Self::ArithmeticPanic => 5,
+            Self::BoundsPanic => 6,
+            Self::CallPanicPropagation => 7,
         }
     }
 }
@@ -205,6 +211,7 @@ struct Operation {
     result: Option<ValueId>,
     type_identity: Option<u128>,
     operands: Arc<[ValueId]>,
+    call_binding: Arc<[u16]>,
     successors: Arc<[RegionId]>,
     details: Arc<[u128]>,
     effect: EffectBoundary,
@@ -327,6 +334,7 @@ pub struct CoreExecutableObservation {
     effectful: bool,
     parameters: Arc<[CoreParameterObservation]>,
     return_type_identity: u128,
+    operation_type_identities: Arc<[u128]>,
     access_laws: Arc<[CoreAccessLaw]>,
     rewrites: Arc<[CoreRewriteKind]>,
 }
@@ -404,6 +412,11 @@ impl CoreExecutableObservation {
     #[must_use]
     pub const fn return_type_identity(&self) -> u128 {
         self.return_type_identity
+    }
+
+    #[must_use]
+    pub fn operation_type_identities(&self) -> &[u128] {
+        &self.operation_type_identities
     }
 
     #[must_use]
@@ -503,6 +516,13 @@ impl VerifiedCoreProgram {
                         .collect::<Vec<_>>()
                         .into(),
                     return_type_identity: executable.signature.return_type.identity,
+                    operation_type_identities: executable
+                        .regions
+                        .iter()
+                        .flat_map(|region| region.operations.iter())
+                        .filter_map(|operation| operation.type_identity)
+                        .collect::<Vec<_>>()
+                        .into(),
                     access_laws: executable
                         .regions
                         .iter()
@@ -707,6 +727,10 @@ impl<'a> CoreOperationIndex<'a> {
         self.0.operands.iter().map(|value| value.0)
     }
 
+    pub(crate) fn call_binding(self) -> &'a [u16] {
+        &self.0.call_binding
+    }
+
     pub(crate) fn successors(self) -> impl ExactSizeIterator<Item = u32> + 'a {
         self.0.successors.iter().map(|region| region.0)
     }
@@ -835,8 +859,12 @@ fn produce_source_executable(
                     function
                         .parameters
                         .iter()
-                        .map(|(local, type_, access)| (local.0, type_, core_access(*access))),
+                        .zip(function.parameter_type_ids.iter())
+                        .map(|((local, type_, access), type_id)| {
+                            (local.0, type_, *type_id, core_access(*access))
+                        }),
                     &function.return_type,
+                    function.return_type_id,
                 ),
                 Some(function.id.0),
                 ExecutableFacts {
@@ -861,11 +889,15 @@ fn produce_source_executable(
                 signature(
                     test.parameters
                         .iter()
-                        .map(|(local, type_, access)| (local.0, type_, core_access(*access))),
+                        .zip(test.parameter_type_ids.iter())
+                        .map(|((local, type_, access), type_id)| {
+                            (local.0, type_, *type_id, core_access(*access))
+                        }),
                     &Type::Unit,
+                    test.return_type_id,
                 ),
                 None,
-                facts_from_regions(&regions),
+                facts_from_regions(&regions, semantic),
                 regions,
                 rewrites,
             )
@@ -882,11 +914,15 @@ fn produce_source_executable(
                     closure
                         .parameters
                         .iter()
-                        .map(|(local, type_)| (local.0, type_, CoreAccessLaw::CopyValue)),
+                        .zip(closure.parameter_type_ids.iter())
+                        .map(|((local, type_), type_id)| {
+                            (local.0, type_, *type_id, CoreAccessLaw::CopyValue)
+                        }),
                     &closure.return_type,
+                    closure.return_type_id,
                 ),
                 None,
-                facts_from_regions(&regions),
+                facts_from_regions(&regions, semantic),
                 regions,
                 rewrites,
             )
@@ -934,6 +970,7 @@ fn produce_generated_executable(
         result: None,
         type_identity: None,
         operands: Arc::from([]),
+        call_binding: Arc::from([]),
         successors: Arc::from([]),
         details: details.into(),
         effect: EffectBoundary::None,
@@ -962,7 +999,7 @@ fn produce_generated_executable(
             ownership_transfer: false,
             evaluator_eligible: false,
         },
-        signature: signature(std::iter::empty(), &Type::Unit),
+        signature: generated_signature(),
         rewrites: Arc::from([]),
         source_definition: None,
         fingerprint: 0,
@@ -990,29 +1027,39 @@ const fn source_kind(kind: CoreSourceExecutableKind) -> CoreExecutableKind {
     }
 }
 
-fn core_type(type_: &Type) -> CoreType {
-    let shape = type_.canonical_key();
+fn core_type(type_: &Type, type_id: TypeId) -> CoreType {
     CoreType {
-        identity: xxh3_128(&shape),
-        shape,
+        identity: type_id.0,
+        shape: type_.canonical_key(),
     }
 }
 
 fn signature<'a>(
-    parameters: impl IntoIterator<Item = (u32, &'a Type, CoreAccessLaw)>,
+    parameters: impl IntoIterator<Item = (u32, &'a Type, TypeId, CoreAccessLaw)>,
     return_type: &Type,
+    return_type_id: TypeId,
 ) -> CoreSignature {
     CoreSignature {
         parameters: parameters
             .into_iter()
-            .map(|(local, type_, access)| CoreParameter {
+            .map(|(local, type_, type_id, access)| CoreParameter {
                 local,
-                type_: core_type(type_),
+                type_: core_type(type_, type_id),
                 access,
             })
             .collect::<Vec<_>>()
             .into(),
-        return_type: core_type(return_type),
+        return_type: core_type(return_type, return_type_id),
+    }
+}
+
+fn generated_signature() -> CoreSignature {
+    CoreSignature {
+        parameters: Arc::from([]),
+        return_type: CoreType {
+            identity: 0,
+            shape: Type::Unit.canonical_key(),
+        },
     }
 }
 
@@ -1117,6 +1164,7 @@ impl<'a> ProducerLowerer<'a> {
             result,
             type_identity,
             operands: operands.into_iter().collect::<Vec<_>>().into(),
+            call_binding: Arc::from([]),
             successors: successors.into_iter().collect::<Vec<_>>().into(),
             details: details.into_iter().collect::<Vec<_>>().into(),
             effect,
@@ -1225,7 +1273,15 @@ impl<'a> ProducerLowerer<'a> {
                     [],
                     details,
                     EffectBoundary::LocalMutation,
-                    FailureLaw::CheckBeforeSuccess,
+                    if place
+                        .projections
+                        .iter()
+                        .any(|projection| matches!(projection, PlaceProjection::Index { .. }))
+                    {
+                        FailureLaw::BoundsPanic
+                    } else {
+                        FailureLaw::CheckBeforeSuccess
+                    },
                     source.clone(),
                     CoreAccessLaw::None,
                 );
@@ -1546,7 +1602,11 @@ impl<'a> ProducerLowerer<'a> {
                     operands,
                     call_target_details(target),
                     effect,
-                    FailureLaw::PropagateInOrder,
+                    if kind == CoreOperationKind::Call {
+                        FailureLaw::CallPanicPropagation
+                    } else {
+                        FailureLaw::PropagateInOrder
+                    },
                 )
             }
             ExpressionKind::Array(values) | ExpressionKind::Tuple(values) => {
@@ -1562,7 +1622,7 @@ impl<'a> ProducerLowerer<'a> {
                         ExpressionKind::Tuple(_)
                     ))],
                     EffectBoundary::Ownership,
-                    FailureLaw::PropagateInOrder,
+                    FailureLaw::None,
                 )
             }
             ExpressionKind::RepeatedArray { value, length } => (
@@ -1570,7 +1630,7 @@ impl<'a> ProducerLowerer<'a> {
                 vec![self.lower_expression(value, operations)?],
                 vec![2, u128::from(*length)],
                 EffectBoundary::Ownership,
-                FailureLaw::PropagateInOrder,
+                FailureLaw::None,
             ),
             ExpressionKind::Index { value, index } => (
                 CoreOperationKind::Index,
@@ -1580,7 +1640,7 @@ impl<'a> ProducerLowerer<'a> {
                 ],
                 vec![],
                 EffectBoundary::None,
-                FailureLaw::CheckBeforeSuccess,
+                FailureLaw::BoundsPanic,
             ),
             ExpressionKind::Positive(value) => (
                 CoreOperationKind::Unary,
@@ -1594,7 +1654,11 @@ impl<'a> ProducerLowerer<'a> {
                 vec![self.lower_expression(value, operations)?],
                 vec![2],
                 EffectBoundary::None,
-                FailureLaw::CheckBeforeSuccess,
+                if matches!(expression.type_, Type::Integer(_)) {
+                    FailureLaw::ArithmeticPanic
+                } else {
+                    FailureLaw::None
+                },
             ),
             ExpressionKind::BitNot(value) => (
                 CoreOperationKind::Unary,
@@ -1668,7 +1732,7 @@ impl<'a> ProducerLowerer<'a> {
                     vec![u128::from(operator_tag(*operator))],
                     EffectBoundary::None,
                     if kind == CoreOperationKind::CheckedArithmetic {
-                        FailureLaw::CheckBeforeSuccess
+                        FailureLaw::ArithmeticPanic
                     } else {
                         FailureLaw::None
                     },
@@ -1688,11 +1752,20 @@ impl<'a> ProducerLowerer<'a> {
             source,
             operation_access,
         );
+        if let ExpressionKind::Call { target, arguments } = &expression.kind {
+            operations
+                .last_mut()
+                .expect("call operation was just emitted")
+                .call_binding = producer_call_binding(target, arguments.len());
+        }
         Ok(result)
     }
 }
 
-fn facts_from_regions(regions: &[Region]) -> ExecutableFacts {
+fn facts_from_regions(
+    regions: &[Region],
+    semantic: crate::completed_semantic::CorePlanningSemanticProgram<'_>,
+) -> ExecutableFacts {
     let operations = regions.iter().flat_map(|region| region.operations.iter());
     let mut facts = ExecutableFacts {
         pure: true,
@@ -1702,12 +1775,7 @@ fn facts_from_regions(regions: &[Region]) -> ExecutableFacts {
         evaluator_eligible: true,
     };
     for operation in operations {
-        facts.may_panic |= matches!(
-            operation.failure,
-            FailureLaw::CheckBeforeSuccess
-                | FailureLaw::PropagateInOrder
-                | FailureLaw::TerminalPanic
-        );
+        facts.may_panic |= operation_may_panic(operation, semantic);
         facts.suspends |= operation.effect == EffectBoundary::Suspension;
         facts.ownership_transfer |= operation.effect == EffectBoundary::Ownership;
         facts.pure &= !matches!(
@@ -1717,6 +1785,22 @@ fn facts_from_regions(regions: &[Region]) -> ExecutableFacts {
     }
     facts.evaluator_eligible = facts.pure && !facts.suspends;
     facts
+}
+
+fn operation_may_panic(
+    operation: &Operation,
+    semantic: crate::completed_semantic::CorePlanningSemanticProgram<'_>,
+) -> bool {
+    match operation.failure {
+        FailureLaw::TerminalPanic | FailureLaw::ArithmeticPanic | FailureLaw::BoundsPanic => true,
+        FailureLaw::CallPanicPropagation => direct_call_target(operation)
+            .and_then(|identity| semantic.specialization_facts(SpecializationId(identity)))
+            .is_none_or(|facts| facts.may_panic),
+        FailureLaw::None
+        | FailureLaw::CheckBeforeSuccess
+        | FailureLaw::PropagateInOrder
+        | FailureLaw::RecordTestFailure => false,
+    }
 }
 
 fn place_index_values(
@@ -1847,6 +1931,23 @@ fn call_target_details(target: &CallTarget) -> Vec<u128> {
             values.extend(argument_parameters.iter().map(|value| value.0));
             values
         }
+    }
+}
+
+fn producer_call_binding(target: &CallTarget, argument_count: usize) -> Arc<[u16]> {
+    match target {
+        CallTarget::Function { argument_order, .. }
+        | CallTarget::UserVariant { argument_order, .. }
+        | CallTarget::Interface { argument_order, .. }
+        | CallTarget::Test { argument_order, .. } => Arc::clone(argument_order),
+        CallTarget::Callable { .. }
+        | CallTarget::TemplateFunction { .. }
+        | CallTarget::Build { .. }
+        | CallTarget::BuiltinVariant(_)
+        | CallTarget::Struct { .. } => (0..argument_count)
+            .map(|index| u16::try_from(index).unwrap_or(u16::MAX))
+            .collect::<Vec<_>>()
+            .into(),
     }
 }
 
@@ -2037,6 +2138,11 @@ fn encode_executable(
                     .to_be_bytes(),
             );
             hash.update(&operation.type_identity.unwrap_or(0).to_be_bytes());
+            hash.update(&(operation.call_binding.len() as u64).to_be_bytes());
+            for parameter in operation.call_binding.iter() {
+                checkpoint(cancellation)?;
+                hash.update(&parameter.to_be_bytes());
+            }
             for operand in operation.operands.iter() {
                 checkpoint(cancellation)?;
                 hash.update(&operand.0.to_be_bytes());
@@ -2229,6 +2335,7 @@ impl<'a> VerifierLowerer<'a> {
             result,
             type_identity,
             operands: operands.into_iter().collect::<Vec<_>>().into(),
+            call_binding: Arc::from([]),
             successors: successors.into_iter().collect::<Vec<_>>().into(),
             details: details.into_iter().collect::<Vec<_>>().into(),
             effect,
@@ -2362,7 +2469,15 @@ impl<'a> VerifierLowerer<'a> {
                     [],
                     details,
                     EffectBoundary::LocalMutation,
-                    FailureLaw::CheckBeforeSuccess,
+                    if place
+                        .projections
+                        .iter()
+                        .any(|projection| matches!(projection, PlaceProjection::Index { .. }))
+                    {
+                        FailureLaw::BoundsPanic
+                    } else {
+                        FailureLaw::CheckBeforeSuccess
+                    },
                     source.clone(),
                     CoreAccessLaw::None,
                 );
@@ -2687,7 +2802,11 @@ impl<'a> VerifierLowerer<'a> {
                     operands,
                     verifier_call_target_details(target),
                     effect,
-                    FailureLaw::PropagateInOrder,
+                    if kind == CoreOperationKind::Call {
+                        FailureLaw::CallPanicPropagation
+                    } else {
+                        FailureLaw::PropagateInOrder
+                    },
                 )
             }
             ExpressionKind::Array(values) | ExpressionKind::Tuple(values) => {
@@ -2704,7 +2823,7 @@ impl<'a> VerifierLowerer<'a> {
                         ExpressionKind::Tuple(_)
                     ))],
                     EffectBoundary::Ownership,
-                    FailureLaw::PropagateInOrder,
+                    FailureLaw::None,
                 )
             }
             ExpressionKind::RepeatedArray { value, length } => (
@@ -2712,7 +2831,7 @@ impl<'a> VerifierLowerer<'a> {
                 vec![self.reconstruct_expression(value, operations)?],
                 vec![2, u128::from(*length)],
                 EffectBoundary::Ownership,
-                FailureLaw::PropagateInOrder,
+                FailureLaw::None,
             ),
             ExpressionKind::Index { value, index } => (
                 CoreOperationKind::Index,
@@ -2722,7 +2841,7 @@ impl<'a> VerifierLowerer<'a> {
                 ],
                 vec![],
                 EffectBoundary::None,
-                FailureLaw::CheckBeforeSuccess,
+                FailureLaw::BoundsPanic,
             ),
             ExpressionKind::Positive(value) => (
                 CoreOperationKind::Unary,
@@ -2736,7 +2855,11 @@ impl<'a> VerifierLowerer<'a> {
                 vec![self.reconstruct_expression(value, operations)?],
                 vec![2],
                 EffectBoundary::None,
-                FailureLaw::CheckBeforeSuccess,
+                if matches!(expression.type_, Type::Integer(_)) {
+                    FailureLaw::ArithmeticPanic
+                } else {
+                    FailureLaw::None
+                },
             ),
             ExpressionKind::BitNot(value) => (
                 CoreOperationKind::Unary,
@@ -2809,7 +2932,7 @@ impl<'a> VerifierLowerer<'a> {
                     vec![u128::from(operator_tag(*operator))],
                     EffectBoundary::None,
                     if kind == CoreOperationKind::CheckedArithmetic {
-                        FailureLaw::CheckBeforeSuccess
+                        FailureLaw::ArithmeticPanic
                     } else {
                         FailureLaw::None
                     },
@@ -2829,6 +2952,12 @@ impl<'a> VerifierLowerer<'a> {
             provenance,
             access,
         );
+        if let ExpressionKind::Call { target, arguments } = &expression.kind {
+            operations
+                .last_mut()
+                .expect("call operation was just reconstructed")
+                .call_binding = verifier_call_binding(target, arguments.len());
+        }
         Ok(result)
     }
 
@@ -2958,6 +3087,23 @@ fn verifier_call_target_details(target: &CallTarget) -> Vec<u128> {
     }
 }
 
+fn verifier_call_binding(target: &CallTarget, argument_count: usize) -> Arc<[u16]> {
+    match target {
+        CallTarget::Function { argument_order, .. }
+        | CallTarget::UserVariant { argument_order, .. }
+        | CallTarget::Interface { argument_order, .. }
+        | CallTarget::Test { argument_order, .. } => Arc::clone(argument_order),
+        CallTarget::Callable { .. }
+        | CallTarget::TemplateFunction { .. }
+        | CallTarget::Build { .. }
+        | CallTarget::BuiltinVariant(_)
+        | CallTarget::Struct { .. } => (0..argument_count)
+            .map(|index| u16::try_from(index).unwrap_or(u16::MAX))
+            .collect::<Vec<_>>()
+            .into(),
+    }
+}
+
 fn verifier_pattern_details(pattern: &HirMatchPattern) -> Vec<u128> {
     fn encode(pattern: &HirMatchPattern, output: &mut Vec<u128>) {
         match pattern {
@@ -3067,6 +3213,7 @@ fn verify_generated_executable(
         || operation.result.is_some()
         || operation.type_identity.is_some()
         || !operation.operands.is_empty()
+        || !operation.call_binding.is_empty()
         || !operation.successors.is_empty()
         || operation.details.as_ref() != details
         || operation.effect != EffectBoundary::None
@@ -3074,7 +3221,8 @@ fn verify_generated_executable(
         || operation.failure != FailureLaw::None
         || operation.provenance != provenance
         || !supplied.signature.parameters.is_empty()
-        || !verifier_type_matches(&supplied.signature.return_type, &Type::Unit)
+        || supplied.signature.return_type.identity != 0
+        || supplied.signature.return_type.shape != Type::Unit.canonical_key()
         || !supplied.rewrites.is_empty()
         || supplied.source_definition.is_some()
         || supplied.facts
@@ -3113,9 +3261,16 @@ impl VerifierLowerer<'_> {
         cancellation: &Cancellation,
     ) -> Result<(), CoreFailure> {
         checkpoint(cancellation)?;
-        let (owner, provenance, parameters, return_type, source_definition, facts) = match input
-            .body
-        {
+        let (
+            owner,
+            provenance,
+            parameters,
+            parameter_type_ids,
+            return_type,
+            return_type_id,
+            source_definition,
+            facts,
+        ) = match input.body {
             CoreSourceExecutableBody::Specialization(function) => {
                 let facts = semantic
                     .specialization_facts(SpecializationId(input.reference.identity()))
@@ -3126,7 +3281,9 @@ impl VerifierLowerer<'_> {
                     function.id.0,
                     &function.source,
                     function.parameters.as_slice(),
+                    function.parameter_type_ids.as_ref(),
                     &function.return_type,
+                    function.return_type_id,
                     Some(function.id.0),
                     Some(facts),
                 )
@@ -3135,7 +3292,9 @@ impl VerifierLowerer<'_> {
                 input.reference.identity(),
                 &test.source,
                 test.parameters.as_slice(),
+                test.parameter_type_ids.as_ref(),
                 &Type::Unit,
+                test.return_type_id,
                 None,
                 None,
             ),
@@ -3145,11 +3304,16 @@ impl VerifierLowerer<'_> {
                         .signature
                         .parameters
                         .iter()
-                        .zip(closure.parameters.iter())
-                        .any(|(actual, (local, type_))| {
+                        .zip(
+                            closure
+                                .parameters
+                                .iter()
+                                .zip(closure.parameter_type_ids.iter()),
+                        )
+                        .any(|(actual, ((local, type_), type_id))| {
                             actual.local != local.0
                                 || actual.access != CoreAccessLaw::CopyValue
-                                || !verifier_type_matches(&actual.type_, type_)
+                                || !verifier_type_matches(&actual.type_, type_, *type_id)
                         })
                 {
                     return defect("Core Closure signature is false");
@@ -3158,7 +3322,9 @@ impl VerifierLowerer<'_> {
                     closure.id.0,
                     &closure.source,
                     &[][..],
+                    &[][..],
                     &closure.return_type,
+                    closure.return_type_id,
                     None,
                     None,
                 )
@@ -3171,19 +3337,23 @@ impl VerifierLowerer<'_> {
             || supplied.semantic_owner != owner
             || &supplied.provenance != provenance
             || supplied.source_definition != source_definition
-            || !verifier_type_matches(&supplied.signature.return_type, return_type)
+            || !verifier_type_matches(&supplied.signature.return_type, return_type, return_type_id)
         {
             return defect("Core executable header or return meaning is false");
         }
         if !matches!(input.body, CoreSourceExecutableBody::Closure(_))
             && (supplied.signature.parameters.len() != parameters.len()
-                || supplied.signature.parameters.iter().zip(parameters).any(
-                    |(actual, (local, type_, access))| {
+                || parameters.len() != parameter_type_ids.len()
+                || supplied
+                    .signature
+                    .parameters
+                    .iter()
+                    .zip(parameters.iter().zip(parameter_type_ids.iter()))
+                    .any(|(actual, ((local, type_, access), type_id))| {
                         actual.local != local.0
                             || actual.access != verifier_access(*access)
-                            || !verifier_type_matches(&actual.type_, type_)
-                    },
-                ))
+                            || !verifier_type_matches(&actual.type_, type_, *type_id)
+                    }))
         {
             return defect("Core executable parameter signature is false");
         }
@@ -3205,7 +3375,7 @@ impl VerifierLowerer<'_> {
                 evaluator_eligible: facts.evaluator_eligible,
             }
         } else {
-            verifier_facts_from_regions(&reconstruction.regions)
+            verifier_facts_from_regions(&reconstruction.regions, semantic)
         };
         if supplied.facts != expected_facts {
             return defect("Core solved executable facts are false");
@@ -3218,7 +3388,10 @@ impl VerifierLowerer<'_> {
     }
 }
 
-fn verifier_facts_from_regions(regions: &[Region]) -> ExecutableFacts {
+fn verifier_facts_from_regions(
+    regions: &[Region],
+    semantic: crate::completed_semantic::CorePlanningSemanticProgram<'_>,
+) -> ExecutableFacts {
     let mut facts = ExecutableFacts {
         pure: true,
         may_panic: false,
@@ -3227,12 +3400,18 @@ fn verifier_facts_from_regions(regions: &[Region]) -> ExecutableFacts {
         evaluator_eligible: true,
     };
     for operation in regions.iter().flat_map(|region| region.operations.iter()) {
-        facts.may_panic |= matches!(
-            operation.failure,
-            FailureLaw::CheckBeforeSuccess
-                | FailureLaw::PropagateInOrder
-                | FailureLaw::TerminalPanic
-        );
+        facts.may_panic |= match operation.failure {
+            FailureLaw::TerminalPanic | FailureLaw::ArithmeticPanic | FailureLaw::BoundsPanic => {
+                true
+            }
+            FailureLaw::CallPanicPropagation => verifier_direct_call_target(operation)
+                .and_then(|identity| semantic.specialization_facts(SpecializationId(identity)))
+                .is_none_or(|facts| facts.may_panic),
+            FailureLaw::None
+            | FailureLaw::CheckBeforeSuccess
+            | FailureLaw::PropagateInOrder
+            | FailureLaw::RecordTestFailure => false,
+        };
         facts.suspends |= operation.effect == EffectBoundary::Suspension;
         facts.ownership_transfer |= operation.effect == EffectBoundary::Ownership;
         facts.pure &= !matches!(
@@ -3244,9 +3423,14 @@ fn verifier_facts_from_regions(regions: &[Region]) -> ExecutableFacts {
     facts
 }
 
-fn verifier_type_matches(actual: &CoreType, expected: &Type) -> bool {
-    let shape = expected.canonical_key();
-    actual.identity == xxh3_128(&shape) && actual.shape == shape
+fn verifier_direct_call_target(operation: &Operation) -> Option<u128> {
+    matches!(operation.details.as_ref(), [3, ..])
+        .then(|| operation.details.get(2).copied())
+        .flatten()
+}
+
+fn verifier_type_matches(actual: &CoreType, expected: &Type, expected_id: TypeId) -> bool {
+    actual.identity == expected_id.0 && actual.shape == expected.canonical_key()
 }
 
 const fn verifier_access(access: crate::typed_hir::AccessMode) -> CoreAccessLaw {
@@ -3342,6 +3526,11 @@ fn verifier_encode_executable(
                     .to_be_bytes(),
             );
             bytes.extend_from_slice(&operation.type_identity.unwrap_or(0).to_be_bytes());
+            bytes.extend_from_slice(&(operation.call_binding.len() as u64).to_be_bytes());
+            for parameter in operation.call_binding.iter() {
+                checkpoint(cancellation)?;
+                bytes.extend_from_slice(&parameter.to_be_bytes());
+            }
             operation.operands.iter().try_for_each(|value| {
                 checkpoint(cancellation)?;
                 bytes.extend_from_slice(&value.0.to_be_bytes());
@@ -3503,7 +3692,7 @@ fn run_oracle(
         let CoreSourceExecutableBody::Specialization(function) = source.body else {
             return defect("oracle specialization has the wrong source kind");
         };
-        let mut work = OracleBudget::new(candidate, cancellation);
+        let mut work = OracleBudget::for_execution(candidate, executable, cancellation)?;
         let core_outcome = oracle_execute(candidate, executable, &[], &mut work)?;
         let evaluator = crate::evaluator::Engine::new(semantic.verified_program(), cancellation)
             .evaluate_function(function.id)
@@ -3554,6 +3743,23 @@ impl<'a> OracleBudget<'a> {
         }
     }
 
+    fn for_execution(
+        candidate: &VerifiedCoreProgram,
+        executable: &CoreExecutable,
+        cancellation: &'a Cancellation,
+    ) -> Result<Self, CoreFailure> {
+        let remaining = oracle_execution_bound(candidate, executable, &mut BTreeSet::new())
+            .ok_or_else(|| {
+                CoreFailure::Defect(Arc::from(
+                    "Core oracle admitted an execution without a bounded work proof",
+                ))
+            })?;
+        Ok(Self {
+            remaining,
+            cancellation,
+        })
+    }
+
     fn step(&mut self) -> Result<(), CoreFailure> {
         checkpoint(self.cancellation)?;
         if self.remaining == 0 {
@@ -3561,6 +3767,68 @@ impl<'a> OracleBudget<'a> {
         }
         self.remaining -= 1;
         Ok(())
+    }
+}
+
+fn oracle_execution_bound(
+    candidate: &VerifiedCoreProgram,
+    executable: &CoreExecutable,
+    visiting: &mut BTreeSet<u128>,
+) -> Option<u64> {
+    const ORACLE_WORK_LIMIT: u64 = crate::evaluator::FUEL_LIMIT;
+    if !visiting.insert(executable.reference.identity) {
+        return None;
+    }
+    let mut base = executable
+        .regions
+        .iter()
+        .map(|region| region.operations.len() as u64 + 1)
+        .sum::<u64>()
+        .saturating_add(16);
+    let mut recurrence = 1_u64;
+    for operation in executable
+        .regions
+        .iter()
+        .flat_map(|region| region.operations.iter())
+    {
+        if operation.kind == CoreOperationKind::Loop {
+            let iterations = if operation.successors.len() == 3 {
+                u64::try_from(*operation.details.first()?)
+                    .ok()?
+                    .saturating_add(1)
+            } else {
+                u64::try_from(oracle_for_length(executable, operation)?).ok()?
+            };
+            recurrence = recurrence.saturating_mul(iterations.max(1));
+        }
+        if operation.kind == CoreOperationKind::Call {
+            let target_identity = direct_call_target(operation)?;
+            let target = candidate.executables.iter().find(|candidate| {
+                candidate.reference.kind == CoreExecutableKind::SourceSpecialization
+                    && candidate.reference.identity == target_identity
+            })?;
+            base = base.saturating_add(oracle_execution_bound(candidate, target, visiting)?);
+        }
+    }
+    visiting.remove(&executable.reference.identity);
+    let bound = base.saturating_mul(recurrence).saturating_add(1_024);
+    (bound <= ORACLE_WORK_LIMIT).then_some(bound)
+}
+
+fn oracle_for_length(executable: &CoreExecutable, operation: &Operation) -> Option<usize> {
+    let iterable = operation.operands.first()?;
+    let producer = executable
+        .regions
+        .iter()
+        .flat_map(|region| region.operations.iter())
+        .find(|candidate| candidate.result == Some(*iterable))?;
+    if producer.kind != CoreOperationKind::Aggregate {
+        return None;
+    }
+    match producer.details.as_ref() {
+        [0] => Some(producer.operands.len()),
+        [2, length] => usize::try_from(*length).ok(),
+        _ => None,
     }
 }
 
@@ -3587,14 +3855,38 @@ fn oracle_supported(
             CoreOperationKind::Read => operation.details.len() == 1,
             CoreOperationKind::Store => operation.details.len() == 2,
             CoreOperationKind::Unary => matches!(operation.details.as_ref(), [1..=4]),
-            CoreOperationKind::CheckedArithmetic | CoreOperationKind::Binary => operation
+            CoreOperationKind::CheckedArithmetic => operation
                 .details
                 .first()
                 .and_then(|tag| operator_from_tag(*tag))
                 .is_some_and(|operator| {
-                    !matches!(
+                    matches!(
                         operator,
-                        BinaryOperator::Range | BinaryOperator::RangeInclusive
+                        BinaryOperator::Add
+                            | BinaryOperator::Subtract
+                            | BinaryOperator::Multiply
+                            | BinaryOperator::Divide
+                            | BinaryOperator::Remainder
+                    )
+                }),
+            CoreOperationKind::Binary => operation
+                .details
+                .first()
+                .and_then(|tag| operator_from_tag(*tag))
+                .is_some_and(|operator| {
+                    matches!(
+                        operator,
+                        BinaryOperator::BitAnd
+                            | BinaryOperator::BitOr
+                            | BinaryOperator::BitXor
+                            | BinaryOperator::ShiftLeft
+                            | BinaryOperator::ShiftRight
+                            | BinaryOperator::Equal
+                            | BinaryOperator::NotEqual
+                            | BinaryOperator::Less
+                            | BinaryOperator::LessEqual
+                            | BinaryOperator::Greater
+                            | BinaryOperator::GreaterEqual
                     )
                 }),
             CoreOperationKind::ShortCircuit => operation
@@ -3604,12 +3896,12 @@ fn oracle_supported(
                 .is_some_and(|operator| {
                     matches!(operator, BinaryOperator::And | BinaryOperator::Or)
                 }),
+            CoreOperationKind::Aggregate => matches!(operation.details.as_ref(), [0 | 1] | [2, _]),
             CoreOperationKind::Return
             | CoreOperationKind::TerminalPanic
             | CoreOperationKind::Assert
             | CoreOperationKind::Expect
             | CoreOperationKind::Branch
-            | CoreOperationKind::Loop
             | CoreOperationKind::LoopBack
             | CoreOperationKind::Break
             | CoreOperationKind::Continue => true,
@@ -3626,13 +3918,30 @@ fn oracle_supported(
                     visiting.remove(&executable.reference.identity);
                     return Ok(false);
                 };
+                if !valid_call_binding(operation, target)
+                    || target.signature.parameters.iter().any(|parameter| {
+                        matches!(
+                            parameter.access,
+                            CoreAccessLaw::ExclusiveLoan | CoreAccessLaw::Move
+                        )
+                    })
+                {
+                    visiting.remove(&executable.reference.identity);
+                    return Ok(false);
+                }
                 oracle_supported(candidate, target, visiting, budget)?
+            }
+            CoreOperationKind::Loop => {
+                match (operation.successors.len(), operation.details.as_ref()) {
+                    (3, [_]) => true,
+                    (1, [8, ..]) => oracle_for_length(executable, operation).is_some(),
+                    _ => false,
+                }
             }
             CoreOperationKind::Pass
             | CoreOperationKind::Constant
             | CoreOperationKind::ClosureValue
             | CoreOperationKind::BuildConstruction
-            | CoreOperationKind::Aggregate
             | CoreOperationKind::Index
             | CoreOperationKind::Propagate
             | CoreOperationKind::PatternTest
@@ -3780,11 +4089,40 @@ fn oracle_region(
                 }
             }
             CoreOperationKind::Unary => {
-                let value = oracle_unary(
+                let value = match oracle_unary(
                     operation.details[0],
                     required_operand(operation, 0, values)?,
                     &operation.provenance,
-                )?;
+                ) {
+                    Ok(value) => value,
+                    Err(signal) => return Ok(signal),
+                };
+                values.insert(required_result(operation)?, value);
+            }
+            CoreOperationKind::Aggregate => {
+                let operands = operation
+                    .operands
+                    .iter()
+                    .map(|operand| {
+                        values.get(operand).cloned().ok_or_else(|| {
+                            CoreFailure::Defect(Arc::from("Core aggregate operand is unavailable"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let value = match operation.details.as_ref() {
+                    [0] => CanonicalValue::Array(operands.into()),
+                    [1] => CanonicalValue::Tuple(operands.into()),
+                    [2, length] => {
+                        let Some(value) = operands.first() else {
+                            return defect("Core repeated aggregate has no element");
+                        };
+                        let length = usize::try_from(*length).map_err(|_| {
+                            CoreFailure::Defect(Arc::from("Core aggregate length overflows"))
+                        })?;
+                        CanonicalValue::Array(vec![value.clone(); length].into())
+                    }
+                    _ => return defect("unsupported aggregate entered Core oracle"),
+                };
                 values.insert(required_result(operation)?, value);
             }
             CoreOperationKind::Return => {
@@ -3822,6 +4160,35 @@ fn oracle_region(
                 }
             }
             CoreOperationKind::Loop => {
+                if operation.successors.len() == 1 {
+                    let iterable = required_operand(operation, 0, values)?;
+                    let CanonicalValue::Array(elements) = iterable else {
+                        return defect("Core bounded for iterable is not an array");
+                    };
+                    let [8, local, ..] = operation.details.as_ref() else {
+                        return defect("Core bounded for pattern is unsupported");
+                    };
+                    let local = u32::try_from(*local).map_err(|_| {
+                        CoreFailure::Defect(Arc::from("Core for binding identity overflows"))
+                    })?;
+                    for element in elements.iter() {
+                        budget.step()?;
+                        locals.insert(local, element.clone());
+                        match oracle_region(
+                            candidate,
+                            executable,
+                            operation.successors[0],
+                            values,
+                            locals,
+                            budget,
+                        )? {
+                            Signal::Continue | Signal::ContinueLoop => {}
+                            Signal::Break => break,
+                            signal => return Ok(signal),
+                        }
+                    }
+                    continue;
+                }
                 let max = u64::try_from(operation.details[0]).unwrap_or(u64::MAX);
                 let [condition_region, body_region, _exit_region] = operation.successors.as_ref()
                 else {
@@ -3905,6 +4272,7 @@ fn oracle_region(
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let arguments = bind_call_arguments(operation, arguments, target)?;
                 match oracle_execute(candidate, target, &arguments, budget)? {
                     CompactOutcome::Completed(value) => {
                         values.insert(required_result(operation)?, value);
@@ -3941,6 +4309,46 @@ fn direct_call_target(operation: &Operation) -> Option<u128> {
     matches!(operation.details.as_ref(), [3, ..])
         .then(|| operation.details.get(2).copied())
         .flatten()
+}
+
+fn valid_call_binding(operation: &Operation, target: &CoreExecutable) -> bool {
+    if operation.call_binding.len() != operation.operands.len()
+        || operation.call_binding.len() != target.signature.parameters.len()
+    {
+        return false;
+    }
+    let mut seen = vec![false; operation.call_binding.len()];
+    for parameter in operation.call_binding.iter().copied() {
+        let parameter = usize::from(parameter);
+        if parameter >= seen.len() || seen[parameter] {
+            return false;
+        }
+        seen[parameter] = true;
+    }
+    seen.into_iter().all(std::convert::identity)
+}
+
+fn bind_call_arguments(
+    operation: &Operation,
+    source_arguments: Vec<CanonicalValue>,
+    target: &CoreExecutable,
+) -> Result<Vec<CanonicalValue>, CoreFailure> {
+    if !valid_call_binding(operation, target) {
+        return defect("Core call binding is not a complete parameter permutation");
+    }
+    let mut parameters = vec![None; source_arguments.len()];
+    for (value, parameter) in source_arguments
+        .into_iter()
+        .zip(operation.call_binding.iter().copied())
+    {
+        parameters[usize::from(parameter)] = Some(value);
+    }
+    parameters
+        .into_iter()
+        .map(|value| {
+            value.ok_or_else(|| CoreFailure::Defect(Arc::from("Core call parameter is unbound")))
+        })
+        .collect()
 }
 
 fn canonical_literal_from_details(details: &[u128]) -> Option<CanonicalValue> {
@@ -3988,7 +4396,7 @@ fn oracle_unary(
     tag: u128,
     value: CanonicalValue,
     site: &SourceRange,
-) -> Result<CanonicalValue, CoreFailure> {
+) -> Result<CanonicalValue, Signal> {
     match (tag, value) {
         (1, value) => Ok(value),
         (2, CanonicalValue::Integer { type_name, value }) => {
@@ -3997,20 +4405,29 @@ fn oracle_unary(
                 .filter(|value| integer_kind(&type_name).is_ok_and(|kind| kind.fits(*value)));
             value
                 .map(|value| CanonicalValue::Integer { type_name, value })
-                .ok_or_else(|| {
-                    CoreFailure::Defect(Arc::from(format!(
-                        "oracle panic:{}:{}",
-                        panic_tag(EvaluationPanicKind::IntegerOverflow),
-                        site.start()
-                    )))
-                })
+                .ok_or_else(|| Signal::Panic(EvaluationPanicKind::IntegerOverflow, site.clone()))
         }
-        (3, CanonicalValue::Integer { type_name, value }) => Ok(CanonicalValue::Integer {
-            type_name,
-            value: !value,
-        }),
+        (2, CanonicalValue::Float { type_name, bits }) => {
+            let bits = match type_name.as_ref() {
+                "f16" => u64::from((-half::f16::from_bits(bits as u16)).to_bits()),
+                "f32" => u64::from((-f32::from_bits(bits as u32)).to_bits()),
+                "f64" => (-f64::from_bits(bits)).to_bits(),
+                _ => return Err(Signal::Continue),
+            };
+            Ok(CanonicalValue::Float { type_name, bits })
+        }
+        (3, CanonicalValue::Integer { type_name, value }) => {
+            let kind = integer_kind(&type_name)?;
+            let value = if kind.is_signed() {
+                !value
+            } else {
+                let mask = (1_i128 << kind.bits()) - 1;
+                (!value) & mask
+            };
+            Ok(CanonicalValue::Integer { type_name, value })
+        }
         (4, CanonicalValue::Bool(value)) => Ok(CanonicalValue::Bool(!value)),
-        _ => defect("Core unary law and operand disagree"),
+        _ => Err(Signal::Continue),
     }
 }
 
@@ -4146,7 +4563,43 @@ fn oracle_binary(
                 },
             })
         }
-        _ => Err(Signal::Continue),
+        (left, right) if operator == BinaryOperator::Equal => {
+            Ok(CanonicalValue::Bool(left == right))
+        }
+        (left, right) if operator == BinaryOperator::NotEqual => {
+            Ok(CanonicalValue::Bool(left != right))
+        }
+        (left, right) => {
+            let Some(ordering) = oracle_data_order(left, right) else {
+                return Err(Signal::Continue);
+            };
+            Ok(CanonicalValue::Bool(match operator {
+                BinaryOperator::Less => ordering.is_lt(),
+                BinaryOperator::LessEqual => ordering.is_le(),
+                BinaryOperator::Greater => ordering.is_gt(),
+                BinaryOperator::GreaterEqual => ordering.is_ge(),
+                _ => return Err(Signal::Continue),
+            }))
+        }
+    }
+}
+
+fn oracle_data_order(left: &CanonicalValue, right: &CanonicalValue) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (CanonicalValue::Text(left), CanonicalValue::Text(right)) => Some(left.cmp(right)),
+        (CanonicalValue::Scalar(left), CanonicalValue::Scalar(right)) => Some(left.cmp(right)),
+        (CanonicalValue::Bytes(left), CanonicalValue::Bytes(right)) => Some(left.cmp(right)),
+        (CanonicalValue::Tuple(left), CanonicalValue::Tuple(right))
+        | (CanonicalValue::Array(left), CanonicalValue::Array(right)) => {
+            for (left, right) in left.iter().zip(right.iter()) {
+                let ordering = oracle_data_order(left, right)?;
+                if !ordering.is_eq() {
+                    return Some(ordering);
+                }
+            }
+            Some(left.len().cmp(&right.len()))
+        }
+        _ => None,
     }
 }
 
@@ -4371,15 +4824,17 @@ mod tests {
         let request = CompilationRequest::new(
             ProjectSnapshot::new(vec![ProjectFile::new(
                 "src/image.wr",
-                br#"pure fn answer() -> i64:
-    value = 6
+                br#"pure fn answer(value: i64) -> i64:
     if true:
         return value * 7
     return value + 1
 
+pure fn wrapper() -> i64:
+    return answer(6)
+
 @image
 fn build() -> Image:
-    return Image.new(value=answer())
+    return Image.new(value=wrapper())
 "#,
             )]),
             Root::Image,
@@ -4636,6 +5091,19 @@ fn build() -> Image:
         resign(&mut false_type, &planning);
         assert!(rejected(&false_type, &planning));
 
+        let mut mixed_parameter_type = core.clone();
+        let mut executables = mixed_parameter_type.executables.to_vec();
+        let source = executables
+            .iter_mut()
+            .find(|executable| !executable.signature.parameters.is_empty())
+            .expect("parameterized source executable");
+        let mut parameters = source.signature.parameters.to_vec();
+        parameters[0].type_.identity ^= 1;
+        source.signature.parameters = parameters.into();
+        mixed_parameter_type.executables = executables.into();
+        resign(&mut mixed_parameter_type, &planning);
+        assert!(rejected(&mixed_parameter_type, &planning));
+
         let mut false_rewrite = core.clone();
         let mut executables = false_rewrite.executables.to_vec();
         let source = executables
@@ -4678,6 +5146,11 @@ fn build() -> Image:
             operation.details = Arc::from([99]);
         });
         corruptions.push(("details", rejected(&candidate, &planning)));
+
+        let candidate = corrupt_source_operation(&core, CoreOperationKind::Call, |operation| {
+            operation.call_binding = Arc::from([u16::MAX]);
+        });
+        corruptions.push(("call binding", rejected(&candidate, &planning)));
 
         let candidate = corrupt_source_operation(&core, CoreOperationKind::Branch, |operation| {
             operation.effect = EffectBoundary::Call;
@@ -4746,5 +5219,68 @@ fn build() -> Image:
                 })
             })
         }));
+    }
+
+    #[test]
+    fn oracle_budget_boundary_and_call_cycle_are_contained_deterministically() {
+        let cancellation = Cancellation::new();
+        let mut boundary = OracleBudget {
+            remaining: 1,
+            cancellation: &cancellation,
+        };
+        assert_eq!(boundary.step(), Ok(()));
+        assert!(matches!(boundary.step(), Err(CoreFailure::Defect(_))));
+
+        let (core, _) = fixture();
+        let mut cyclic = core.clone();
+        let mut executables = cyclic.executables.to_vec();
+        let caller = executables
+            .iter_mut()
+            .find(|executable| {
+                executable.reference.kind == CoreExecutableKind::SourceSpecialization
+                    && executable.regions.iter().any(|region| {
+                        region
+                            .operations
+                            .iter()
+                            .any(|operation| operation.kind == CoreOperationKind::Call)
+                    })
+            })
+            .expect("direct caller");
+        let caller_identity = caller.reference.identity;
+        let mut regions = caller.regions.to_vec();
+        let region = regions
+            .iter_mut()
+            .find(|region| {
+                region
+                    .operations
+                    .iter()
+                    .any(|operation| operation.kind == CoreOperationKind::Call)
+            })
+            .expect("call region");
+        let mut operations = region.operations.to_vec();
+        let call = operations
+            .iter_mut()
+            .find(|operation| operation.kind == CoreOperationKind::Call)
+            .expect("call operation");
+        let mut details = call.details.to_vec();
+        details[2] = caller_identity;
+        call.details = details.into();
+        region.operations = operations.into();
+        caller.regions = regions.into();
+        cyclic.executables = executables.into();
+        let caller = cyclic
+            .executables
+            .iter()
+            .find(|executable| executable.reference.identity == caller_identity)
+            .expect("cyclic caller");
+        let mut support_budget = OracleBudget::new(&cyclic, &cancellation);
+        assert_eq!(
+            oracle_supported(&cyclic, caller, &mut BTreeSet::new(), &mut support_budget,),
+            Ok(false)
+        );
+        assert_eq!(
+            oracle_execution_bound(&cyclic, caller, &mut BTreeSet::new()),
+            None
+        );
     }
 }

@@ -57,7 +57,7 @@ fn newest():
 struct Worker:
     pub async fn run(self, take first: Token, take second: Token, take third: Token, take fourth: Token, take fifth: Token, take sixth: Token, take seventh: Token, take eighth: Token):
         mut all = actors.Group.all(bound=2u64)
-        all.logical_deadline(epoch=5u64, slack=100u64)
+        all.logical_deadline(epoch=5u64, slack=1000u64)
         defer oldest()
         defer newest()
         first_child = all.child(value=take first)
@@ -110,6 +110,38 @@ fn build() -> Image:
         panic!("authenticated Group policies accept: {outcome:#?}");
     };
     let flow = accepted.inspection().flow_program().expect("Flow selected");
+    let assignment = accepted
+        .inspection()
+        .whole_image_assignment()
+        .expect("Assignment selected");
+    let service = accepted
+        .inspection()
+        .service_plan()
+        .expect("verified Service Plan selected");
+    assert_eq!(
+        service.whole_image_assignment_fingerprint(),
+        assignment.fingerprint()
+    );
+    for kind in [
+        wrela_compiler::ServiceClassKind::Ingress,
+        wrela_compiler::ServiceClassKind::ActorTurn,
+        wrela_compiler::ServiceClassKind::GroupChild,
+        wrela_compiler::ServiceClassKind::Cleanup,
+    ] {
+        assert!(service.classes().iter().any(|class| class.kind() == kind));
+    }
+    assert!(
+        service
+            .cores()
+            .iter()
+            .all(|core| core.cycle_units() <= core.maximum_cycle_units())
+    );
+    assert!(service.classes().iter().all(|class| {
+        class.quota() > 0
+            && class.maximum_response_units() <= class.maximum_delay_units()
+            && class.maximum_cancellation_response_units()
+                <= class.maximum_cancellation_delay_units()
+    }));
     assert_eq!(flow.groups().len(), 4);
     let policies = flow
         .groups()
@@ -188,7 +220,7 @@ fn build() -> Image:
         logical.deadline_class(),
         Some(wrela_compiler::FlowDeadlineClass::Logical)
     );
-    assert_eq!(logical.deadline_slack(), Some(100));
+    assert_eq!(logical.deadline_slack(), Some(1000));
     assert_ne!(logical.deadline_authority(), Some(0));
     assert!(logical.maximum_uninterrupted_work_units() > 4);
     assert_eq!(logical.cleanup_actions().len(), 2);
@@ -314,7 +346,7 @@ struct Sender:
 
     pub async fn deliver(self, receiver: Receiver):
         mut group = actors.Group.all(bound=1u64)
-        group.logical_deadline(epoch=7u64, slack=12u64)
+        group.logical_deadline(epoch=7u64, slack=1000u64)
         await send receiver.receive()
         _ = actors.Group.complete(take group)
 
@@ -349,7 +381,7 @@ fn build() -> Image:
         waiting.deadline_class(),
         Some(wrela_compiler::FlowDeadlineClass::Logical)
     );
-    assert_eq!(group.deadline_slack(), Some(12));
+    assert_eq!(group.deadline_slack(), Some(1000));
 }
 
 #[test]

@@ -1726,6 +1726,10 @@ impl<'a> ImagePlanningActor<'a> {
 }
 
 impl ImagePlanningGroup<'_> {
+    pub(crate) const fn identity(self) -> u128 {
+        self.0.identity
+    }
+
     pub(crate) const fn actor(self) -> u128 {
         self.0.actor
     }
@@ -6461,7 +6465,7 @@ fn clean():
 struct Worker:
     pub async fn run(self, take first: Token, take second: Token):
         mut outer = actors.Group.all(bound=1u64)
-        outer.logical_deadline(epoch=7u64, slack=100u64)
+        outer.logical_deadline(epoch=7u64, slack=1000u64)
         defer clean()
         outer_child = outer.child(value=take first)
         mut inner = actors.Group.race(bound=1u64)

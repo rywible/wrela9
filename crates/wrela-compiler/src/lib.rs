@@ -65,6 +65,7 @@ pub use image_planning::{
     PlanningMultiplicity, PlanningReservation, PoolAdmissionEvidenceObservation,
     PoolModelObservation, PoolObservation, RequirementBounds, RequirementCategory,
     RequirementDischargeObservation, RequirementObservation, RequirementProvenance,
-    RequirementSource, RequirementSubject, WholeImageAssignmentObservation,
+    RequirementSource, RequirementSubject, ServiceClassKind, ServiceClassObservation,
+    ServiceCoreObservation, ServicePlanObservation, WholeImageAssignmentObservation,
 };
 pub use typed_hir::PoolOperation;

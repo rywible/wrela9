@@ -14,8 +14,9 @@ use crate::architecture_planning::{
 use crate::core::{CoreFailure, CoreProgramObservation, VerifiedCoreProgram};
 use crate::flow::{FlowFailure, FlowProgramObservation, VerifiedFlowProgram};
 use crate::image_planning::{
-    PlanningFailure, PlanningFoundationObservation, VerifiedPlanningFoundation,
-    VerifiedPrivateConflict, VerifiedWholeImageAssignment, WholeImageAssignmentObservation,
+    PlanningFailure, PlanningFoundationObservation, ServicePlanObservation, ServicePlanOutcome,
+    VerifiedPlanningFoundation, VerifiedPrivateConflict, VerifiedServiceConflict,
+    VerifiedServicePlan, VerifiedWholeImageAssignment, WholeImageAssignmentObservation,
     WholeImageSolveOutcome,
 };
 use crate::syntax;
@@ -1175,6 +1176,7 @@ pub struct Inspection {
     core_program: Option<CoreProgramObservation>,
     flow_program: Option<FlowProgramObservation>,
     whole_image_assignment: Option<WholeImageAssignmentObservation>,
+    service_plan: Option<ServicePlanObservation>,
 }
 
 impl Inspection {
@@ -1291,6 +1293,11 @@ impl Inspection {
     #[must_use]
     pub const fn whole_image_assignment(&self) -> Option<&WholeImageAssignmentObservation> {
         self.whole_image_assignment.as_ref()
+    }
+
+    #[must_use]
+    pub const fn service_plan(&self) -> Option<&ServicePlanObservation> {
+        self.service_plan.as_ref()
     }
 }
 
@@ -2321,6 +2328,7 @@ pub struct AcceptedCompilation {
     core_program: Option<Arc<VerifiedCoreProgram>>,
     flow_program: Option<Arc<VerifiedFlowProgram>>,
     whole_image_assignment: Option<Arc<VerifiedWholeImageAssignment>>,
+    service_plan: Option<Arc<VerifiedServicePlan>>,
 }
 
 impl AcceptedCompilation {
@@ -2363,6 +2371,11 @@ impl AcceptedCompilation {
             .map(|assignment| assignment.fingerprint())
     }
 
+    #[must_use]
+    pub fn service_plan_fingerprint(&self) -> Option<u128> {
+        self.service_plan.as_ref().map(|plan| plan.fingerprint())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn completed_semantic_program(
         &self,
@@ -2391,6 +2404,7 @@ pub struct RejectedCompilation {
     diagnostics: Arc<[Diagnostic]>,
     inspection: Inspection,
     planning_conflict: Option<Arc<VerifiedPrivateConflict>>,
+    service_conflict: Option<Arc<VerifiedServiceConflict>>,
 }
 
 impl RejectedCompilation {
@@ -2621,6 +2635,7 @@ impl Compiler {
                     ..Inspection::default()
                 },
                 planning_conflict: None,
+                service_conflict: None,
             });
         };
 
@@ -3078,6 +3093,52 @@ impl Compiler {
             _ => None,
         };
 
+        let mut service_conflict = None;
+        let service_plan = match whole_image_assignment.as_ref() {
+            Some(assignment) => match self
+                .distribution
+                .image_planning()
+                .service_plan(Arc::clone(assignment), cancellation)
+            {
+                Ok(ServicePlanOutcome::Plan(plan)) => Some(Arc::new(plan)),
+                Ok(ServicePlanOutcome::Conflict(conflict)) => {
+                    diagnostics.push(
+                        Diagnostic::new(
+                            "admission.service_conflict",
+                            SourceRange::new("<planning>", 0, 0),
+                            RecoveryAction::None,
+                        )
+                        .with_unsigned_parameter("conflict_kind", u128::from(conflict.code().tag()))
+                        .with_unsigned_parameter(
+                            "requirement_count",
+                            u128::try_from(conflict.requirement_count()).unwrap_or(u128::MAX),
+                        )
+                        .with_unsigned_parameter(
+                            "required_units",
+                            u128::from(conflict.required_units()),
+                        )
+                        .with_unsigned_parameter(
+                            "available_units",
+                            u128::from(conflict.available_units()),
+                        ),
+                    );
+                    service_conflict = Some(Arc::new(conflict));
+                    None
+                }
+                Err(PlanningFailure::Cancelled) => return CompilationOutcome::Cancelled,
+                Err(PlanningFailure::Defect(evidence)) => {
+                    return CompilationOutcome::Defect(Defect::new("Service Plan", evidence));
+                }
+                Err(_) => {
+                    return CompilationOutcome::Defect(Defect::new(
+                        "Service Plan",
+                        "service planning returned a pre-Assignment planning failure",
+                    ));
+                }
+            },
+            None => None,
+        };
+
         let Some(unreachable_project_syntax) = parse_unreachable_project_syntax(
             &request.project,
             &parsed_sources,
@@ -3204,9 +3265,15 @@ impl Compiler {
             core_program: core_observation,
             flow_program: flow_observation,
             whole_image_assignment: if request.inspection.planning {
-                whole_image_assignment
+                service_plan
                     .as_ref()
+                    .and(whole_image_assignment.as_ref())
                     .map(|assignment| assignment.observation())
+            } else {
+                None
+            },
+            service_plan: if request.inspection.planning {
+                service_plan.as_ref().map(|plan| plan.observation())
             } else {
                 None
             },
@@ -3227,12 +3294,14 @@ impl Compiler {
                 core_program,
                 flow_program,
                 whole_image_assignment,
+                service_plan,
             })
         } else {
             CompilationOutcome::Rejected(RejectedCompilation {
                 diagnostics: diagnostics.into(),
                 inspection,
                 planning_conflict: whole_image_conflict,
+                service_conflict,
             })
         }
     }

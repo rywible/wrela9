@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 use wrela_compiler::{
     ArchitectureProfile, Cancellation, CompilationOutcome, CompilationRequest, Compiler,
     CompilerInstallation, DiagnosticValue, FacilityBindingAvailability, FacilityEndpointOwnership,
@@ -703,6 +704,42 @@ fn build() -> Image:
             .count(),
         6
     );
+
+    let assignment = accepted.inspection().whole_image_assignment().unwrap();
+    let service = accepted.inspection().service_plan().unwrap();
+    let drivers = service
+        .classes()
+        .iter()
+        .filter(|class| class.kind() == wrela_compiler::ServiceClassKind::Driver)
+        .collect::<Vec<_>>();
+    assert_eq!(drivers.len(), 7);
+    for driver in drivers {
+        let requirement = planning
+            .requirements()
+            .iter()
+            .find(|requirement| requirement.reference() == driver.requirement())
+            .unwrap();
+        let wrela_compiler::RequirementSubject::GeneratedRole(role_identity) =
+            requirement.subject()
+        else {
+            panic!("Driver service is bound to a generated-role Requirement");
+        };
+        let executable = planning
+            .generated_roles()
+            .iter()
+            .find(|role| role.identity() == role_identity)
+            .unwrap()
+            .executable();
+        assert_eq!(
+            driver.core(),
+            assignment
+                .placements()
+                .iter()
+                .find(|placement| placement.executable() == executable)
+                .unwrap()
+                .core()
+        );
+    }
 }
 
 fn input_with_actor_meaning(value: u64) -> CompilationRequest {
@@ -1041,6 +1078,14 @@ fn planning_inspection_is_output_only_and_compiler_use_is_deterministic() {
         first.whole_image_assignment_fingerprint(),
         repeated.whole_image_assignment_fingerprint()
     );
+    assert_eq!(
+        without.service_plan_fingerprint(),
+        first.service_plan_fingerprint()
+    );
+    assert_eq!(
+        first.service_plan_fingerprint(),
+        repeated.service_plan_fingerprint()
+    );
     assert!(without.inspection().planning_foundation().is_none());
     assert_eq!(
         first
@@ -1074,6 +1119,7 @@ fn planning_inspection_is_output_only_and_compiler_use_is_deterministic() {
             accepted.semantic_program_fingerprint(),
             accepted.planning_foundation_fingerprint(),
             accepted.whole_image_assignment_fingerprint(),
+            accepted.service_plan_fingerprint(),
             accepted
                 .inspection()
                 .planning_foundation()
@@ -1083,6 +1129,11 @@ fn planning_inspection_is_output_only_and_compiler_use_is_deterministic() {
                 .inspection()
                 .whole_image_assignment()
                 .expect("planning assignment selected")
+                .clone(),
+            accepted
+                .inspection()
+                .service_plan()
+                .expect("planning Service Plan selected")
                 .clone(),
         )
     };
@@ -1348,11 +1399,9 @@ fn build() -> Image:
     );
 }
 
-#[test]
-fn compiler_rejects_a_positive_but_unmeetable_verified_group_deadline() {
-    let source = |slack| {
-        format!(
-            r#"from core import actor as actors
+fn compile_service_deadline(slack: u64) -> CompilationOutcome {
+    let source = format!(
+        r#"from core import actor as actors
 
 @actor
 struct Worker:
@@ -1366,30 +1415,77 @@ fn build() -> Image:
     worker = Worker()
     return Image.new(worker=worker)
 "#
-        )
-        .into_bytes()
-    };
-    let compiler = Compiler::open(CompilerInstallation::layer1()).unwrap();
-    let compile = |slack| {
-        compiler.compile(
+    )
+    .into_bytes();
+    Compiler::open(CompilerInstallation::layer1())
+        .unwrap()
+        .compile(
             CompilationRequest::new(
-                ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source(slack))]),
+                ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
                 Root::Image,
             )
             .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
             .with_inspection(InspectSelection::all()),
             &Cancellation::new(),
         )
-    };
-    assert!(matches!(compile(7), CompilationOutcome::Accepted(_)));
-    let outcome = compile(6);
+}
+
+fn exact_service_deadline_outcome() -> &'static CompilationOutcome {
+    static OUTCOME: OnceLock<CompilationOutcome> = OnceLock::new();
+    OUTCOME.get_or_init(|| compile_service_deadline(65))
+}
+
+#[test]
+fn compiler_rejects_a_positive_but_unmeetable_verified_group_deadline() {
+    assert!(matches!(
+        exact_service_deadline_outcome(),
+        CompilationOutcome::Accepted(_)
+    ));
+    let outcome = compile_service_deadline(64);
     let CompilationOutcome::Rejected(rejected) = outcome else {
         panic!("positive slack below verified Flow work must reject: {outcome:#?}");
     };
     assert_eq!(
         rejected.diagnostics()[0].code(),
-        "admission.whole_image_conflict"
+        "admission.service_conflict"
     );
     assert!(rejected.inspection().flow_program().is_some());
     assert!(rejected.inspection().whole_image_assignment().is_none());
+    assert!(rejected.inspection().service_plan().is_none());
+}
+
+#[test]
+fn compiler_planning_inspection_reports_the_verified_deterministic_service_plan() {
+    let outcome = exact_service_deadline_outcome();
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("bounded Actor service must admit: {outcome:#?}");
+    };
+    let inspection = accepted.inspection();
+    let assignment = inspection.whole_image_assignment().unwrap();
+    let service = inspection
+        .service_plan()
+        .expect("planning inspection includes the verified Service Plan");
+    assert_eq!(
+        service.whole_image_assignment_fingerprint(),
+        assignment.fingerprint()
+    );
+    for kind in [
+        wrela_compiler::ServiceClassKind::Ingress,
+        wrela_compiler::ServiceClassKind::ActorTurn,
+        wrela_compiler::ServiceClassKind::GroupChild,
+    ] {
+        assert!(service.classes().iter().any(|class| class.kind() == kind));
+    }
+    assert!(
+        service
+            .cores()
+            .iter()
+            .all(|core| core.cycle_units() <= core.maximum_cycle_units())
+    );
+    assert!(service.classes().iter().all(|class| {
+        class.quota() > 0
+            && class.maximum_response_units() <= class.maximum_delay_units()
+            && class.maximum_cancellation_response_units()
+                <= class.maximum_cancellation_delay_units()
+    }));
 }

@@ -448,7 +448,6 @@ pub(crate) struct PatternArgumentSyntax {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum UnsupportedStatementKind {
     Take,
-    Send,
 }
 
 #[derive(Clone, Debug)]

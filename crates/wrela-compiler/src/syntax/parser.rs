@@ -1424,7 +1424,6 @@ enum StatementContext {
 pub(super) fn unsupported_statement_node(kind: UnsupportedStatementKind) -> SyntaxNodeKind {
     match kind {
         UnsupportedStatementKind::Take => SyntaxNodeKind::TakeStatement,
-        UnsupportedStatementKind::Send => SyntaxNodeKind::SendStatement,
     }
 }
 
@@ -1688,12 +1687,8 @@ fn parse_statement_block(
                     range: line.range.clone(),
                 }
             }
-            kind @ (TokenKind::Take | TokenKind::Send) => StatementSyntax::Unsupported {
-                kind: match kind {
-                    TokenKind::Take => UnsupportedStatementKind::Take,
-                    TokenKind::Send => UnsupportedStatementKind::Send,
-                    _ => unreachable!("guarded opaque statement"),
-                },
+            TokenKind::Take => StatementSyntax::Unsupported {
+                kind: UnsupportedStatementKind::Take,
                 range: line.range.clone(),
             },
             TokenKind::If => {

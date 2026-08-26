@@ -817,6 +817,7 @@ pub(crate) struct HirFunction {
     pub(crate) module_display: String,
     pub(crate) modifier: crate::syntax::FunctionModifier,
     pub(crate) pool_operation: Option<PoolOperation>,
+    pub(crate) group_operation: Option<GroupOperation>,
     pub(crate) parameters: Vec<(LocalId, Type, AccessMode)>,
     pub(crate) parameter_type_ids: Arc<[TypeId]>,
     pub(crate) parameter_definitions: Arc<[DefinitionId]>,
@@ -1156,6 +1157,8 @@ pub(crate) enum CallTarget {
         specialization: SpecializationId,
         argument_order: Arc<[u16]>,
         argument_parameters: Arc<[DefinitionId]>,
+        receiver_loan: bool,
+        group_operation: Option<GroupOperation>,
     },
     Build {
         primitive: BuildPrimitive,
@@ -1307,6 +1310,8 @@ pub(crate) enum CreatorFailureKind {
     TrySendRequiresActorContext,
     SendRequiresActorHandler,
     SendRequiresActorContext,
+    SendRequiresAwait,
+    DeadlineUnmeetable,
 }
 
 impl CreatorFailureKind {
@@ -1366,6 +1371,8 @@ impl CreatorFailureKind {
             Self::TrySendRequiresActorContext => "semantic.try_send_requires_actor_context",
             Self::SendRequiresActorHandler => "semantic.send_requires_actor_handler",
             Self::SendRequiresActorContext => "semantic.send_requires_actor_context",
+            Self::SendRequiresAwait => "semantic.send_requires_await",
+            Self::DeadlineUnmeetable => "admission.deadline_unmeetable",
         }
     }
 }
@@ -1424,6 +1431,50 @@ pub enum PoolOperation {
     Release,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum GroupOperation {
+    OpenAll,
+    OpenCollect,
+    OpenRace,
+    OpenSupervise,
+    LogicalDeadline,
+    RealtimeDeadline,
+    Child,
+    Complete,
+    Cancel,
+}
+
+impl GroupOperation {
+    pub(crate) const fn canonical_tag(self) -> u8 {
+        match self {
+            Self::OpenAll => 1,
+            Self::OpenCollect => 2,
+            Self::OpenRace => 3,
+            Self::OpenSupervise => 4,
+            Self::LogicalDeadline => 5,
+            Self::RealtimeDeadline => 6,
+            Self::Child => 7,
+            Self::Complete => 8,
+            Self::Cancel => 9,
+        }
+    }
+
+    pub(crate) const fn from_canonical_tag(tag: u128) -> Option<Self> {
+        match tag {
+            1 => Some(Self::OpenAll),
+            2 => Some(Self::OpenCollect),
+            3 => Some(Self::OpenRace),
+            4 => Some(Self::OpenSupervise),
+            5 => Some(Self::LogicalDeadline),
+            6 => Some(Self::RealtimeDeadline),
+            7 => Some(Self::Child),
+            8 => Some(Self::Complete),
+            9 => Some(Self::Cancel),
+            _ => None,
+        }
+    }
+}
+
 impl PoolOperation {
     pub(crate) const fn canonical_tag(self) -> u8 {
         match self {
@@ -1442,6 +1493,7 @@ impl PoolOperation {
 pub(crate) struct PoolAuthority {
     scoped_factory: Option<DefinitionId>,
     operations: BTreeMap<DefinitionId, PoolOperation>,
+    group_operations: BTreeMap<DefinitionId, GroupOperation>,
     _sealed: SealedPoolAuthority,
 }
 
@@ -1476,6 +1528,7 @@ impl PoolAuthority {
         Self {
             scoped_factory,
             operations: BTreeMap::new(),
+            group_operations: BTreeMap::new(),
             _sealed: SealedPoolAuthority,
         }
     }
@@ -1483,10 +1536,12 @@ impl PoolAuthority {
     pub(crate) fn from_authenticated_pool(
         scoped_factory: Option<DefinitionId>,
         operations: impl IntoIterator<Item = (DefinitionId, PoolOperation)>,
+        group_operations: impl IntoIterator<Item = (DefinitionId, GroupOperation)>,
     ) -> Self {
         Self {
             scoped_factory,
             operations: operations.into_iter().collect(),
+            group_operations: group_operations.into_iter().collect(),
             _sealed: SealedPoolAuthority,
         }
     }
@@ -1497,6 +1552,10 @@ impl PoolAuthority {
 
     pub(crate) fn operation(&self, definition: DefinitionId) -> Option<PoolOperation> {
         self.operations.get(&definition).copied()
+    }
+
+    pub(crate) fn group_operation(&self, definition: DefinitionId) -> Option<GroupOperation> {
+        self.group_operations.get(&definition).copied()
     }
 
     pub(crate) fn canonical_grants(
@@ -1510,6 +1569,14 @@ impl PoolAuthority {
                     .iter()
                     .map(|(definition, operation)| (*definition, Some(*operation))),
             )
+    }
+
+    pub(crate) fn canonical_group_grants(
+        &self,
+    ) -> impl Iterator<Item = (DefinitionId, GroupOperation)> + '_ {
+        self.group_operations
+            .iter()
+            .map(|(definition, operation)| (*definition, *operation))
     }
 }
 
@@ -1889,6 +1956,7 @@ pub(crate) fn verify(
                 module_display: function.module_display.clone(),
                 modifier: function.modifier,
                 pool_operation: pool_authority.operation(function.id),
+                group_operation: pool_authority.group_operation(function.id),
                 parameters,
                 parameter_type_ids: parameter_type_ids.into(),
                 parameter_definitions: function
@@ -2461,6 +2529,7 @@ fn lower_concrete_function(
         module_display: function.module_display.clone(),
         modifier: function.modifier,
         pool_operation: authorities.pool().operation(function.id),
+        group_operation: authorities.pool().group_operation(function.id),
         parameters,
         parameter_type_ids: parameter_type_ids.into(),
         parameter_definitions: function
@@ -2687,6 +2756,7 @@ pub(crate) fn lower_functions_for_error_inference(
                 module_display: function.module_display.clone(),
                 modifier: function.modifier,
                 pool_operation: pool_authority.operation(function.id),
+                group_operation: pool_authority.group_operation(function.id),
                 parameters,
                 parameter_type_ids: parameter_type_ids.into(),
                 parameter_definitions: function
@@ -2811,6 +2881,7 @@ fn materialize_missing_specializations(
                 module_display: function.module_display.clone(),
                 modifier: function.modifier,
                 pool_operation: authorities.pool().operation(function.id),
+                group_operation: authorities.pool().group_operation(function.id),
                 parameters,
                 parameter_type_ids: parameter_type_ids.into(),
                 parameter_definitions: function
@@ -5509,6 +5580,8 @@ fn verify_expression_artifact_with_cleanup(
                     specialization,
                     argument_order,
                     argument_parameters,
+                    receiver_loan: _,
+                    group_operation,
                 } => {
                     let record = catalog.specializations.get(specialization).ok_or_else(|| {
                         VerificationFailure::Defect {
@@ -5531,6 +5604,7 @@ fn verify_expression_artifact_with_cleanup(
                         .collect::<Vec<_>>();
                     let ordered = reorder_types(&argument_types, argument_order)?;
                     if function.id != *definition
+                        || function.group_operation != *group_operation
                         || argument_parameters.as_ref() != expected_parameters
                         || !arguments_match(&ordered, &function.parameters)
                         || !argument_accesses_match(arguments, argument_order, &function.parameters)
@@ -5932,6 +6006,9 @@ fn verify_expression_artifact_with_cleanup(
             else {
                 return defect("lowered send does not contain an Actor message call");
             };
+            if message_call_loan(value).is_some() {
+                return defect("lowered send retains a payload or receiver loan");
+            }
             let _ = verify_expression_artifact_with_cleanup(
                 value,
                 locals,
@@ -5953,6 +6030,9 @@ fn verify_expression_artifact_with_cleanup(
             else {
                 return defect("lowered request does not contain an Actor handler call");
             };
+            if message_call_loan(value).is_some() {
+                return defect("lowered request retains a payload or receiver loan");
+            }
             let returned = verify_expression_artifact_with_cleanup(
                 value,
                 locals,
@@ -5974,6 +6054,9 @@ fn verify_expression_artifact_with_cleanup(
             else {
                 return defect("lowered try_send does not contain a message call");
             };
+            if message_call_loan(value).is_some() {
+                return defect("lowered try_send retains a payload or receiver loan");
+            }
             let _ = verify_expression_artifact_with_cleanup(
                 value,
                 locals,
@@ -7888,7 +7971,12 @@ impl<'a> Lowerer<'a> {
                         .map(|argument| argument.label.clone())
                         .collect::<Vec<_>>(),
                 );
-                let (target, type_) = if let Some(callable) = callable {
+                let receiver_loan = receiver.as_ref().is_some_and(|(value, _, _)| {
+                    matches!(value.access, AccessMode::Read | AccessMode::Mut)
+                        || root_place(value)
+                            .is_some_and(|place| self.non_custodial_locals.contains(&place.local))
+                });
+                let (mut target, type_) = if let Some(callable) = callable {
                     if labels.iter().any(Option::is_some) {
                         return creator(CreatorFailureKind::ArgumentLabelMismatch, &syntax.range);
                     }
@@ -7925,6 +8013,15 @@ impl<'a> Lowerer<'a> {
                 } else {
                     self.call(callee, &lowered, &labels, &syntax.range)?
                 };
+                if let CallTarget::Function {
+                    definition,
+                    receiver_loan: target_receiver_loan,
+                    ..
+                } = &mut target
+                    && self.input.actor_handlers.contains(definition)
+                {
+                    *target_receiver_loan = receiver_loan;
+                }
                 if let CallTarget::Function {
                     definition,
                     specialization,
@@ -8224,54 +8321,85 @@ impl<'a> Lowerer<'a> {
                 (ExpressionKind::Not(Box::new(value)), Type::Bool)
             }
             ExpressionSyntaxKind::Await(value) => {
-                let value = self.expression(value)?;
-                let actor_request = matches!(
-                    &value.kind,
-                    ExpressionKind::Call {
+                if let ExpressionSyntaxKind::Send(message) = &value.kind {
+                    if self
+                        .owner_identity
+                        .is_none_or(|owner| !self.input.actor_handlers.contains(&owner))
+                    {
+                        return creator(
+                            CreatorFailureKind::SendRequiresActorContext,
+                            &syntax.range,
+                        );
+                    }
+                    let message = self.expression(message)?;
+                    let ExpressionKind::Call {
                         target: CallTarget::Function { definition, .. },
                         ..
-                    } if self.input.actor_handlers.contains(definition)
-                );
-                if !actor_request && let Some(loan) = call_loan(&value) {
-                    let place = root_place(loan).ok_or_else(|| VerificationFailure::Defect {
-                        evidence: Arc::from("lowered Resource loan has no source place"),
-                    })?;
-                    return Err(self.custody_failure(
-                        CreatorFailureKind::LoanAcrossSuspension,
-                        &syntax.range,
-                        &PlaceKey::from_place(&place),
-                        CustodyDiagnosticState::Loaned,
-                        Some(loan.source.clone()),
-                    ));
-                }
-                let type_ = value.type_.clone();
-                if matches!(value.kind, ExpressionKind::Send(_)) {
-                    (value.kind, type_)
-                } else if actor_request {
-                    (ExpressionKind::Request(Box::new(value)), type_)
+                    } = &message.kind
+                    else {
+                        return creator(
+                            CreatorFailureKind::SendRequiresActorHandler,
+                            &syntax.range,
+                        );
+                    };
+                    if !self.input.actor_handlers.contains(definition) {
+                        return creator(
+                            CreatorFailureKind::SendRequiresActorHandler,
+                            &syntax.range,
+                        );
+                    }
+                    if let Some(loan) = message_call_loan(&message) {
+                        let place =
+                            root_place(loan).ok_or_else(|| VerificationFailure::Defect {
+                                evidence: Arc::from("lowered message loan has no source place"),
+                            })?;
+                        return Err(self.custody_failure(
+                            CreatorFailureKind::LoanAcrossSuspension,
+                            &syntax.range,
+                            &PlaceKey::from_place(&place),
+                            CustodyDiagnosticState::Loaned,
+                            Some(loan.source.clone()),
+                        ));
+                    }
+                    (ExpressionKind::Send(Box::new(message)), Type::Unit)
                 } else {
-                    (ExpressionKind::Await(Box::new(value)), type_)
+                    let value = self.expression(value)?;
+                    let actor_request = matches!(
+                        &value.kind,
+                        ExpressionKind::Call {
+                            target: CallTarget::Function { definition, .. },
+                            ..
+                        } if self.input.actor_handlers.contains(definition)
+                    );
+                    if let Some(loan) = if actor_request {
+                        message_call_loan(&value)
+                    } else {
+                        call_loan(&value)
+                    } {
+                        let place =
+                            root_place(loan).ok_or_else(|| VerificationFailure::Defect {
+                                evidence: Arc::from("lowered Resource loan has no source place"),
+                            })?;
+                        return Err(self.custody_failure(
+                            CreatorFailureKind::LoanAcrossSuspension,
+                            &syntax.range,
+                            &PlaceKey::from_place(&place),
+                            CustodyDiagnosticState::Loaned,
+                            Some(loan.source.clone()),
+                        ));
+                    }
+                    let type_ = value.type_.clone();
+                    if matches!(value.kind, ExpressionKind::Send(_)) {
+                        (value.kind, type_)
+                    } else if actor_request {
+                        (ExpressionKind::Request(Box::new(value)), type_)
+                    } else {
+                        (ExpressionKind::Await(Box::new(value)), type_)
+                    }
                 }
             }
-            ExpressionSyntaxKind::Send(value) => {
-                if self
-                    .owner_identity
-                    .is_none_or(|owner| !self.input.actor_handlers.contains(&owner))
-                {
-                    return creator(CreatorFailureKind::SendRequiresActorContext, &syntax.range);
-                }
-                let value = self.expression(value)?;
-                let ExpressionKind::Call {
-                    target: CallTarget::Function { definition, .. },
-                    ..
-                } = &value.kind
-                else {
-                    return creator(CreatorFailureKind::SendRequiresActorHandler, &syntax.range);
-                };
-                if !self.input.actor_handlers.contains(definition) {
-                    return creator(CreatorFailureKind::SendRequiresActorHandler, &syntax.range);
-                }
-                (ExpressionKind::Send(Box::new(value)), Type::Unit)
+            ExpressionSyntaxKind::Send(_) => {
+                return creator(CreatorFailureKind::SendRequiresAwait, &syntax.range);
             }
             ExpressionSyntaxKind::TrySend(value) => {
                 if self
@@ -8299,6 +8427,18 @@ impl<'a> Lowerer<'a> {
                         CreatorFailureKind::TrySendRequiresActorHandler,
                         &syntax.range,
                     );
+                }
+                if let Some(loan) = message_call_loan(&value) {
+                    let place = root_place(loan).ok_or_else(|| VerificationFailure::Defect {
+                        evidence: Arc::from("lowered message loan has no source place"),
+                    })?;
+                    return Err(self.custody_failure(
+                        CreatorFailureKind::LoanAcrossSuspension,
+                        &syntax.range,
+                        &PlaceKey::from_place(&place),
+                        CustodyDiagnosticState::Loaned,
+                        Some(loan.source.clone()),
+                    ));
                 }
                 let Some(message_full_definition) = self.input.message_full_definition else {
                     return Err(VerificationFailure::Defect {
@@ -10819,6 +10959,16 @@ impl<'a> Lowerer<'a> {
             LabelMode::Optional,
             site,
         )?;
+        if matches!(
+            self.pool_authority.group_operation(id),
+            Some(GroupOperation::LogicalDeadline | GroupOperation::RealtimeDeadline)
+        ) && arguments
+            .last()
+            .and_then(expression_integer_value)
+            .is_some_and(|slack| slack <= 0)
+        {
+            return creator(CreatorFailureKind::DeadlineUnmeetable, site);
+        }
         let mut substitutions = BTreeMap::new();
         if self.pool_authority.is_scoped_factory(id)
             && let Some(pool) = self.pending_scoped_pool
@@ -10915,6 +11065,8 @@ impl<'a> Lowerer<'a> {
                 specialization: specialization.id,
                 argument_order,
                 argument_parameters,
+                receiver_loan: false,
+                group_operation: self.pool_authority.group_operation(id),
             },
             return_type,
         ))
@@ -11215,6 +11367,26 @@ fn call_loan(expression: &Expression) -> Option<&Expression> {
     };
     arguments
         .iter()
+        .find(|argument| matches!(argument.access, AccessMode::Read | AccessMode::Mut))
+}
+
+fn message_call_loan(expression: &Expression) -> Option<&Expression> {
+    let ExpressionKind::Call { target, arguments } = &expression.kind else {
+        return None;
+    };
+    let receiver_loan = matches!(
+        target,
+        CallTarget::Function {
+            receiver_loan: true,
+            ..
+        }
+    );
+    if receiver_loan {
+        return arguments.first();
+    }
+    arguments
+        .iter()
+        .skip(1)
         .find(|argument| matches!(argument.access, AccessMode::Read | AccessMode::Mut))
 }
 
@@ -12716,6 +12888,8 @@ fn append_expression(bytes: &mut impl ByteSink, expression: &Expression) {
                     specialization,
                     argument_order,
                     argument_parameters,
+                    receiver_loan,
+                    group_operation,
                 } => {
                     bytes.push(1);
                     bytes.extend_from_slice(&definition.0.to_be_bytes());
@@ -12724,6 +12898,8 @@ fn append_expression(bytes: &mut impl ByteSink, expression: &Expression) {
                     for parameter in argument_parameters.iter() {
                         bytes.extend_from_slice(&parameter.0.to_be_bytes());
                     }
+                    bytes.push(u8::from(*receiver_loan));
+                    bytes.push(group_operation.map_or(0, GroupOperation::canonical_tag));
                 }
                 CallTarget::Interface {
                     interface,
@@ -13900,6 +14076,7 @@ mod tests {
                             },
                             body: Arc::from([]),
                             pool_operation: None,
+                            group_operation: None,
                             source: owner.clone(),
                         }),
                     )
@@ -13960,6 +14137,8 @@ mod tests {
                         specialization: specializations[index],
                         argument_order: Arc::from([0]),
                         argument_parameters: Arc::from([parameter_definitions[index]]),
+                        receiver_loan: false,
+                        group_operation: None,
                     },
                     arguments: Arc::from([argument]),
                 },

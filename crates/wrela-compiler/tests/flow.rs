@@ -1,8 +1,8 @@
 use wrela_compiler::{
     ArchitectureProfile, Cancellation, CompilationOutcome, CompilationRequest, Compiler,
-    CompilerInstallation, FlowAdmissionKind, FlowCustodian, FlowDeadlineClass, FlowEventKind,
-    FlowGroupPolicy, FlowRequirementKind, FlowSendOutcome, FlowStructuredOutcome,
-    FlowStructuredScenarioKind, InspectSelection, ProjectFile, ProjectSnapshot, Root,
+    CompilerInstallation, FlowAdmissionKind, FlowCustodian, FlowEventKind, FlowGroupPolicy,
+    FlowRequirementKind, FlowSendOutcome, FlowStructuredOutcome, FlowStructuredScenarioKind,
+    InspectSelection, ProjectFile, ProjectSnapshot, Root,
 };
 
 fn actor_request(inspection: InspectSelection) -> CompilationRequest {
@@ -35,6 +35,276 @@ fn build() -> Image:
     )
     .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
     .with_inspection(inspection)
+}
+
+#[test]
+fn authenticated_groups_derive_all_four_exact_policies_and_child_bounds() {
+    let source = br#"from core import actor as actors
+
+resource struct Token:
+    value: i64
+
+fn consume(take token: Token):
+    pass
+
+fn oldest():
+    pass
+
+fn newest():
+    pass
+
+@actor
+struct Worker:
+    pub async fn run(self, take first: Token, take second: Token, take third: Token, take fourth: Token):
+        mut all = actors.Group.all(bound=1u64)
+        all.logical_deadline(epoch=5u64, slack=10u64)
+        defer oldest()
+        defer newest()
+        first = all.child(value=take first)
+        _ = actors.Group.complete(take all)
+        consume(take first)
+
+        mut collect = actors.Group.collect(bound=1u64)
+        second = collect.child(value=take second)
+        _ = actors.Group.complete(take collect)
+        consume(take second)
+
+        mut race = actors.Group.race(bound=1u64)
+        third = race.child(value=take third)
+        _ = actors.Group.complete(take race)
+        consume(take third)
+
+        mut supervise = actors.Group.supervise(bound=1u64)
+        fourth = supervise.child(value=take fourth)
+        _ = actors.Group.complete(take supervise)
+        consume(take fourth)
+
+@image
+fn build() -> Image:
+    worker = Worker()
+    return Image.new(worker=worker)
+"#;
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    );
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("authenticated Group policies accept: {outcome:#?}");
+    };
+    let flow = accepted.inspection().flow_program().expect("Flow selected");
+    assert_eq!(flow.groups().len(), 4);
+    let policies = flow
+        .groups()
+        .iter()
+        .map(|group| {
+            assert_eq!(group.child_activation_bound(), 1);
+            assert_eq!(group.child_activations().len(), 1);
+            assert_eq!(group.moved_resources().len(), 1);
+            assert_ne!(group.noncopyable_cancellation_authority(), 0);
+            assert_ne!(group.return_home(), 0);
+            group.policy()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        policies,
+        std::collections::BTreeSet::from([
+            FlowGroupPolicy::All,
+            FlowGroupPolicy::Collect,
+            FlowGroupPolicy::Race,
+            FlowGroupPolicy::Supervise,
+        ])
+    );
+    assert_eq!(flow.group_policy_laws().len(), 4);
+    let logical = flow
+        .groups()
+        .iter()
+        .find(|group| group.policy() == FlowGroupPolicy::All)
+        .expect("logical All Group");
+    assert_eq!(
+        logical.deadline_class(),
+        Some(wrela_compiler::FlowDeadlineClass::Logical)
+    );
+    assert_eq!(logical.deadline_slack(), Some(10));
+    assert_ne!(logical.deadline_authority(), Some(0));
+    assert!(logical.maximum_cancellation_latency() > 4);
+    assert_eq!(logical.cleanup_actions().len(), 2);
+    assert_eq!(
+        logical.cleanup_execution_order(),
+        [logical.cleanup_actions()[1], logical.cleanup_actions()[0]]
+    );
+    assert_eq!(flow.deadline_laws().len(), 1);
+    assert!(flow.structured_scenarios().iter().any(|scenario| {
+        scenario.kind() == FlowStructuredScenarioKind::DeadlineExceeded
+            && scenario.outcome() == FlowStructuredOutcome::DeadlineExceeded
+            && scenario
+                .events()
+                .iter()
+                .all(|event| event.subject().is_some())
+    }));
+    assert!(flow.structured_scenarios().iter().any(|scenario| {
+        scenario.kind() == FlowStructuredScenarioKind::ReverseCleanup
+            && scenario
+                .events()
+                .windows(2)
+                .all(|events| events[0].logical_coordinate() < events[1].logical_coordinate())
+    }));
+    assert!(flow.model_agrees());
+}
+
+#[test]
+fn awaited_send_inherits_exact_source_group_and_logical_deadline() {
+    let source = br#"from core import actor as actors
+
+@actor
+struct Receiver:
+    pub async fn receive(self):
+        pass
+
+@actor
+struct Sender:
+    receiver: Receiver
+
+    pub async fn deliver(self, receiver: Receiver):
+        mut group = actors.Group.all(bound=1u64)
+        group.logical_deadline(epoch=7u64, slack=12u64)
+        await send receiver.receive()
+        _ = actors.Group.complete(take group)
+
+@image
+fn build() -> Image:
+    receiver = Receiver()
+    sender = Sender(receiver=receiver)
+    return Image.new(receiver=receiver, sender=sender)
+"#;
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    );
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("Group-owned await send accepts: {outcome:#?}");
+    };
+    let flow = accepted.inspection().flow_program().expect("Flow selected");
+    let group = flow.groups().first().expect("source Group");
+    let waiting = flow
+        .proposal_templates()
+        .iter()
+        .find(|template| template.admission_kind() == FlowAdmissionKind::WaitingSend)
+        .expect("waiting send template");
+    assert_eq!(waiting.owning_group(), Some(group.identity()));
+    assert_eq!(
+        waiting.deadline_class(),
+        Some(wrela_compiler::FlowDeadlineClass::Logical)
+    );
+    assert_eq!(group.deadline_slack(), Some(12));
+}
+
+#[test]
+fn impossible_group_deadline_and_missing_realtime_authority_reject_before_flow() {
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let compile = |source: &'static [u8]| {
+        compiler.compile(
+            CompilationRequest::new(
+                ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+                Root::Image,
+            )
+            .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+            .with_inspection(InspectSelection::all()),
+            &Cancellation::new(),
+        )
+    };
+    let impossible = compile(
+        br#"from core import actor as actors
+
+@actor
+struct Worker:
+    pub async fn run(self):
+        mut group = actors.Group.all(bound=1u64)
+        group.logical_deadline(epoch=1u64, slack=0u64)
+        _ = actors.Group.complete(take group)
+
+@image
+fn build() -> Image:
+    worker = Worker()
+    return Image.new(worker=worker)
+"#,
+    );
+    let CompilationOutcome::Rejected(impossible) = impossible else {
+        panic!("zero deadline slack rejects: {impossible:#?}");
+    };
+    assert_eq!(
+        impossible.diagnostics()[0].code(),
+        "admission.deadline_unmeetable"
+    );
+    assert!(impossible.inspection().flow_program().is_none());
+
+    let missing_authority = compile(
+        br#"from core import actor as actors
+
+@actor
+struct Worker:
+    pub async fn run(self):
+        mut group = actors.Group.all(bound=1u64)
+        group.realtime_deadline(slack=5u64)
+        _ = actors.Group.complete(take group)
+
+@image
+fn build() -> Image:
+    worker = Worker()
+    return Image.new(worker=worker)
+"#,
+    );
+    let CompilationOutcome::Rejected(missing_authority) = missing_authority else {
+        panic!("realtime without clock/capture rejects: {missing_authority:#?}");
+    };
+    assert_eq!(
+        missing_authority.diagnostics()[0].code(),
+        "semantic.argument_count"
+    );
+    assert!(missing_authority.inspection().flow_program().is_none());
+
+    let bound = compile(
+        br#"from core import actor as actors
+
+resource struct Token:
+    value: i64
+
+fn consume(take token: Token):
+    pass
+
+@actor
+struct Worker:
+    pub async fn run(self, take token: Token):
+        mut group = actors.Group.all(bound=0u64)
+        token = group.child(value=take token)
+        _ = actors.Group.complete(take group)
+        consume(take token)
+
+@image
+fn build() -> Image:
+    worker = Worker()
+    return Image.new(worker=worker)
+"#,
+    );
+    let CompilationOutcome::Rejected(bound) = bound else {
+        panic!("Group child beyond bound rejects: {bound:#?}");
+    };
+    assert_eq!(
+        bound.diagnostics()[0].code(),
+        "admission.group_child_bound_exceeded"
+    );
+    assert!(bound.inspection().flow_program().is_none());
 }
 
 const ONE_WAY_SOURCE: &[u8] = br#"resource struct Token:
@@ -252,7 +522,6 @@ fn flow_semantic_identities_ignore_blank_lines_and_comments() {
     let projection = |accepted: &wrela_compiler::AcceptedCompilation| {
         let flow = accepted.inspection().flow_program().expect("Flow selected");
         (
-            flow.fingerprint(),
             flow.actors()
                 .iter()
                 .map(|actor| (actor.identity(), actor.construction_identity()))
@@ -280,6 +549,18 @@ fn flow_semantic_identities_ignore_blank_lines_and_comments() {
     };
 
     assert_eq!(projection(&baseline), projection(&with_trivia));
+    assert_ne!(
+        baseline
+            .inspection()
+            .flow_program()
+            .expect("Flow selected")
+            .fingerprint(),
+        with_trivia
+            .inspection()
+            .flow_program()
+            .expect("Flow selected")
+            .fingerprint()
+    );
 }
 
 #[test]
@@ -333,7 +614,6 @@ pub struct Sender:
     let projection = |accepted: &wrela_compiler::AcceptedCompilation| {
         let flow = accepted.inspection().flow_program().expect("Flow selected");
         (
-            flow.fingerprint(),
             flow.actors()
                 .iter()
                 .map(|actor| {
@@ -389,6 +669,18 @@ pub struct Sender:
     };
 
     assert_eq!(projection(&baseline), projection(&moved));
+    assert_ne!(
+        baseline
+            .inspection()
+            .flow_program()
+            .expect("Flow selected")
+            .fingerprint(),
+        moved
+            .inspection()
+            .flow_program()
+            .expect("Flow selected")
+            .fingerprint()
+    );
 }
 
 #[test]
@@ -995,12 +1287,8 @@ fn build() -> Image:
     let flow = accepted.inspection().flow_program().expect("Flow selected");
     let template = flow.proposal_templates().first().expect("send template");
     assert_eq!(template.admission_kind(), FlowAdmissionKind::WaitingSend);
-    assert!(template.owning_group().is_some());
-    assert_eq!(template.deadline_class(), Some(FlowDeadlineClass::Logical));
-    assert!(flow.requirements().iter().any(|requirement| {
-        requirement.kind() == FlowRequirementKind::CancellationMaximumLatency
-            && requirement.bound() > 0
-    }));
+    assert_eq!(template.owning_group(), None);
+    assert_eq!(template.deadline_class(), None);
 
     let pre_commit = flow
         .structured_scenarios()
@@ -1135,9 +1423,27 @@ fn build() -> Image:
     assert_eq!(reply.capacity(), 1);
     assert!(reply.fulfillment_capacity_infallible());
     assert!(reply.acyclic_wait_requirement() != 0);
+    assert!(
+        !reply.fulfillment_references().is_empty()
+            && reply
+                .fulfillment_references()
+                .iter()
+                .all(|(reference, meaning)| *reference != 0 && *meaning != 0)
+    );
     assert!(flow.requirements().iter().any(|requirement| {
         requirement.kind() == FlowRequirementKind::ReplyResponseHome
             && requirement.site() == Some(reply.response_home())
+    }));
+
+    let delivered = flow
+        .structured_scenarios()
+        .iter()
+        .find(|scenario| scenario.kind() == FlowStructuredScenarioKind::ReplyDelivered)
+        .expect("delivered Reply scenario");
+    assert!(delivered.events().iter().any(|event| {
+        event.kind() == FlowEventKind::ReplyFulfilled
+            && event.subject() == Some(reply.identity())
+            && event.custodian() == Some(FlowCustodian::ResponseHome)
     }));
 
     let closed = flow
@@ -1150,48 +1456,22 @@ fn build() -> Image:
         event.kind() == FlowEventKind::ReplyClosed
             && event.custodian() == Some(FlowCustodian::ReplyClosed)
             && event.must_use()
+            && event.subject() == Some(reply.identity())
     }));
     assert!(flow.model_agrees());
 }
 
 #[test]
-fn structured_group_deadline_cleanup_and_panic_scenarios_are_typed_and_deterministic() {
+fn absent_group_deadline_and_panic_facts_emit_no_fabricated_flow_authority() {
     let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
     let outcome = compiler.compile(actor_request(InspectSelection::all()), &Cancellation::new());
     let CompilationOutcome::Accepted(accepted) = outcome else {
         panic!("Actor Flow fixture accepts: {outcome:#?}");
     };
     let flow = accepted.inspection().flow_program().expect("Flow selected");
-    assert!(flow.groups().iter().all(|group| {
-        group.child_activation_bound() > 0
-            && group.noncopyable_cancellation_authority() != 0
-            && group.return_home() != 0
-            && group.maximum_cancellation_latency() > 0
-    }));
-    assert_eq!(
-        flow.group_policy_laws()
-            .iter()
-            .map(|law| law.policy())
-            .collect::<std::collections::BTreeSet<_>>(),
-        std::collections::BTreeSet::from([
-            FlowGroupPolicy::All,
-            FlowGroupPolicy::Collect,
-            FlowGroupPolicy::Race,
-            FlowGroupPolicy::Supervise,
-        ])
-    );
-    let logical = flow
-        .deadline_laws()
-        .iter()
-        .find(|law| law.class() == FlowDeadlineClass::Logical)
-        .expect("logical deadline law");
-    assert!(logical.deterministic() && !logical.replay_capture_required());
-    let realtime = flow
-        .deadline_laws()
-        .iter()
-        .find(|law| law.class() == FlowDeadlineClass::Realtime)
-        .expect("realtime deadline law");
-    assert!(realtime.authority() != 0 && realtime.replay_capture_required());
+    assert!(flow.groups().is_empty());
+    assert!(flow.group_policy_laws().is_empty());
+    assert!(flow.deadline_laws().is_empty());
     for kind in [
         FlowStructuredScenarioKind::GroupPolicies,
         FlowStructuredScenarioKind::DeadlineUnmeetable,
@@ -1201,28 +1481,16 @@ fn structured_group_deadline_cleanup_and_panic_scenarios_are_typed_and_determini
         FlowStructuredScenarioKind::TerminalPanic,
     ] {
         assert!(
-            flow.structured_scenarios()
+            !flow
+                .structured_scenarios()
                 .iter()
                 .any(|scenario| scenario.kind() == kind)
         );
     }
-    let cleanup = flow
-        .structured_scenarios()
-        .iter()
-        .find(|scenario| scenario.kind() == FlowStructuredScenarioKind::ReverseCleanup)
-        .expect("cleanup scenario");
-    assert_eq!(cleanup.cleanup_order(), &[2, 1, 0]);
-    let panic = flow
-        .structured_scenarios()
-        .iter()
-        .find(|scenario| scenario.kind() == FlowStructuredScenarioKind::TerminalPanic)
-        .expect("Panic scenario");
-    assert_eq!(panic.outcome(), FlowStructuredOutcome::Panic);
-    assert!(panic.cleanup_order().is_empty());
 }
 
 #[test]
-fn group_static_cleanup_actions_are_exact_and_execute_in_reverse_registration_order() {
+fn ordinary_defer_cleanup_is_not_fabricated_into_a_group() {
     let source = br#"fn oldest():
     pass
 
@@ -1258,33 +1526,32 @@ fn build() -> Image:
         panic!("cleanup Group fixture accepts: {outcome:#?}");
     };
     let flow = accepted.inspection().flow_program().expect("Flow selected");
-    let group = flow
-        .groups()
-        .iter()
-        .find(|group| group.cleanup_actions().len() == 2)
-        .expect("handler Group owns both exact cleanup actions");
-    assert_eq!(
-        group.cleanup_execution_order(),
-        &group
-            .cleanup_actions()
+    assert!(flow.groups().is_empty());
+    assert!(
+        !flow
+            .requirements()
             .iter()
-            .rev()
-            .copied()
-            .collect::<Vec<_>>()
+            .any(|requirement| requirement.kind() == FlowRequirementKind::GroupCleanupOrder)
     );
 }
 
 #[test]
 fn statically_knowable_reply_wait_cycle_is_creator_rejected_with_exact_evidence() {
     let source = br#"@actor
-struct Loop:
-    pub async fn ping(self):
-        await self.ping()
+struct Left:
+    pub async fn first(self, right: Right, left: Left):
+        await right.second(left, right)
+
+@actor
+struct Right:
+    pub async fn second(self, left: Left, right: Right):
+        await left.first(right, left)
 
 @image
 fn build() -> Image:
-    loop_actor = Loop()
-    return Image.new(loop_actor=loop_actor)
+    left = Left()
+    right = Right()
+    return Image.new(left=left, right=right)
 "#;
     let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
     let outcome = compiler.compile(
@@ -1307,5 +1574,431 @@ fn build() -> Image:
         panic!("exact cycle diagnostic: {:#?}", rejected.diagnostics());
     };
     assert_eq!(diagnostic.labels().len(), 1);
+    assert!(diagnostic.typed_parameters().iter().any(|(name, value)| {
+        name.as_ref() == "cycle_length" && *value == wrela_compiler::DiagnosticValue::Unsigned(2)
+    }));
+    assert_eq!(
+        diagnostic
+            .typed_parameters()
+            .iter()
+            .filter(|(name, _)| name.as_ref() == "actor")
+            .count(),
+        2
+    );
     assert!(rejected.inspection().flow_program().is_none());
+}
+
+#[test]
+fn actor_message_admission_rejects_payload_and_receiver_loans_before_core_or_flow() {
+    let cases: &[(&str, &[u8])] = &[
+        (
+            "read-payload",
+            br#"resource struct Token:
+    value: i64
+
+@actor
+struct Worker:
+    pub async fn accept(self, read token: Token):
+        pass
+
+    pub async fn start(self, take token: Token):
+        admission = try_send self.accept(token)
+        match admission:
+            case Result.Ok(_):
+                pass
+            case Result.Err(_):
+                pass
+
+@image
+fn build() -> Image:
+    worker = Worker()
+    return Image.new(worker=worker)
+"#,
+        ),
+        (
+            "mut-payload",
+            br#"resource struct Token:
+    value: i64
+
+@actor
+struct Worker:
+    pub async fn accept(self, mut token: Token):
+        pass
+
+    pub async fn start(self, take token: Token):
+        await send self.accept(mut token)
+
+@image
+fn build() -> Image:
+    worker = Worker()
+    return Image.new(worker=worker)
+"#,
+        ),
+        (
+            "request-payload",
+            br#"resource struct Token:
+    value: i64
+
+@actor
+struct Worker:
+    pub async fn accept(self, read token: Token) -> i64:
+        return 1
+
+    pub async fn start(self, take token: Token):
+        _ = await self.accept(token)
+
+@image
+fn build() -> Image:
+    worker = Worker()
+    return Image.new(worker=worker)
+"#,
+        ),
+        (
+            "implicit-receiver",
+            br#"@actor
+struct Worker:
+    pub async fn ping(read self):
+        pass
+
+    pub async fn start(self):
+        admission = try_send self.ping()
+        match admission:
+            case Result.Ok(_):
+                pass
+            case Result.Err(_):
+                pass
+
+@image
+fn build() -> Image:
+    worker = Worker()
+    return Image.new(worker=worker)
+"#,
+        ),
+    ];
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    for (name, source) in cases {
+        let outcome = compiler.compile(
+            CompilationRequest::new(
+                ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+                Root::Image,
+            )
+            .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+            .with_inspection(InspectSelection::all()),
+            &Cancellation::new(),
+        );
+        let CompilationOutcome::Rejected(rejected) = outcome else {
+            panic!("{name} message loan must be Creator-rejected: {outcome:#?}");
+        };
+        assert!(
+            rejected
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code() == "semantic.loan_across_suspension"),
+            "{name}: {:#?}",
+            rejected.diagnostics()
+        );
+        assert!(rejected.inspection().core_program().is_none());
+        assert!(rejected.inspection().flow_program().is_none());
+    }
+}
+
+#[test]
+fn send_is_only_valid_as_the_direct_operand_of_await() {
+    let cases: &[(&str, &[u8])] = &[
+        (
+            "standalone",
+            br#"@actor
+struct Worker:
+    pub async fn ping(self):
+        pass
+
+    pub async fn start(self):
+        send self.ping()
+
+@image
+fn build() -> Image:
+    worker = Worker()
+    return Image.new(worker=worker)
+"#,
+        ),
+        (
+            "nested",
+            br#"fn consume(value: Unit):
+    pass
+
+@actor
+struct Worker:
+    pub async fn ping(self):
+        pass
+
+    pub async fn start(self):
+        consume(send self.ping())
+
+@image
+fn build() -> Image:
+    worker = Worker()
+    return Image.new(worker=worker)
+"#,
+        ),
+    ];
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    for (name, source) in cases {
+        let outcome = compiler.compile(
+            CompilationRequest::new(
+                ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+                Root::Image,
+            ),
+            &Cancellation::new(),
+        );
+        let CompilationOutcome::Rejected(rejected) = outcome else {
+            panic!("{name} send must reject: {outcome:#?}");
+        };
+        assert!(
+            rejected
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code() == "semantic.send_requires_await"),
+            "{name}: {:#?}",
+            rejected.diagnostics()
+        );
+        assert!(rejected.inspection().core_program().is_none());
+    }
+}
+
+#[test]
+fn bounded_model_sampling_never_rejects_a_valid_static_flow_graph() {
+    let source = br#"@actor
+struct Sink:
+    pub async fn sink(self):
+        pass
+
+@actor
+struct WorkerOne:
+    sink: Sink
+
+    pub async fn one(self, sink: Sink, flag: bool):
+        if flag:
+            match try_send sink.sink():
+                case Result.Ok(_):
+                    pass
+                case Result.Err(_):
+                    pass
+        else:
+            match try_send sink.sink():
+                case Result.Ok(_):
+                    pass
+                case Result.Err(_):
+                    pass
+        pass
+
+@actor
+struct WorkerTwo:
+    sink: Sink
+
+    pub async fn two(self, sink: Sink, flag: bool):
+        if flag:
+            match try_send sink.sink():
+                case Result.Ok(_):
+                    pass
+                case Result.Err(_):
+                    pass
+        else:
+            match try_send sink.sink():
+                case Result.Ok(_):
+                    pass
+                case Result.Err(_):
+                    pass
+        pass
+
+@actor
+struct WorkerThree:
+    sink: Sink
+
+    pub async fn three(self, sink: Sink, flag: bool):
+        if flag:
+            match try_send sink.sink():
+                case Result.Ok(_):
+                    pass
+                case Result.Err(_):
+                    pass
+        else:
+            match try_send sink.sink():
+                case Result.Ok(_):
+                    pass
+                case Result.Err(_):
+                    pass
+        pass
+
+@actor
+struct WorkerFour:
+    sink: Sink
+
+    pub async fn four(self, sink: Sink, flag: bool):
+        if flag:
+            match try_send sink.sink():
+                case Result.Ok(_):
+                    pass
+                case Result.Err(_):
+                    pass
+        else:
+            match try_send sink.sink():
+                case Result.Ok(_):
+                    pass
+                case Result.Err(_):
+                    pass
+        pass
+
+@actor
+struct WorkerFive:
+    sink: Sink
+
+    pub async fn five(self, sink: Sink, flag: bool):
+        if flag:
+            match try_send sink.sink():
+                case Result.Ok(_):
+                    pass
+                case Result.Err(_):
+                    pass
+        else:
+            match try_send sink.sink():
+                case Result.Ok(_):
+                    pass
+                case Result.Err(_):
+                    pass
+        pass
+
+@image
+fn build() -> Image:
+    sink = Sink()
+    one = WorkerOne(sink=sink)
+    two = WorkerTwo(sink=sink)
+    three = WorkerThree(sink=sink)
+    four = WorkerFour(sink=sink)
+    five = WorkerFive(sink=sink)
+    return Image.new(sink=sink, one=one, two=two, three=three, four=four, five=five)
+"#;
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    );
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("valid static graph is independent of bounded model sample count: {outcome:#?}");
+    };
+    let flow = accepted.inspection().flow_program().expect("Flow selected");
+    assert!(!flow.model_evidence_complete());
+    assert_eq!(flow.model_scenario_bound(), 16);
+    assert_eq!(flow.model_scenarios().len(), 16);
+}
+
+#[test]
+fn mailbox_capacity_is_global_for_waiting_sends_and_requests() {
+    let source = br#"resource struct Token:
+    value: i64
+
+fn consume(take token: Token):
+    pass
+
+@actor
+struct Receiver:
+    pub async fn receive(self, take token: Token):
+        consume(take token)
+
+    pub async fn request(self, value: i64) -> i64:
+        return value
+
+@actor
+struct SendOwner:
+    receiver: Receiver
+
+    pub async fn run(self, receiver: Receiver, take first: Token, take second: Token):
+        await send receiver.receive(take first)
+        await send receiver.receive(take second)
+
+@actor
+struct RequestOwner:
+    receiver: Receiver
+
+    pub async fn run(self, receiver: Receiver):
+        _ = await receiver.request(1)
+        _ = await receiver.request(2)
+
+@image
+fn build() -> Image:
+    receiver = Receiver()
+    sends = SendOwner(receiver=receiver)
+    requests = RequestOwner(receiver=receiver)
+    return Image.new(receiver=receiver, sends=sends, requests=requests)
+"#;
+    let compiler = Compiler::open(CompilerInstallation::layer1()).expect("distribution opens");
+    let outcome = compiler.compile(
+        CompilationRequest::new(
+            ProjectSnapshot::new(vec![ProjectFile::new("src/image.wr", source)]),
+            Root::Image,
+        )
+        .with_architecture_profile(ArchitectureProfile::CurrentAarch64)
+        .with_inspection(InspectSelection::all()),
+        &Cancellation::new(),
+    );
+    let CompilationOutcome::Accepted(accepted) = outcome else {
+        panic!("global Mailbox fixture accepts: {outcome:#?}");
+    };
+    let flow = accepted.inspection().flow_program().expect("Flow selected");
+    let receiver = flow
+        .actors()
+        .iter()
+        .find(|actor| actor.handlers().len() == 2)
+        .expect("Receiver Actor");
+    for scenario in flow.model_scenarios() {
+        let destination = scenario
+            .proposals()
+            .iter()
+            .filter(|proposal| proposal.key().destination() == receiver.identity())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            destination
+                .iter()
+                .filter(|proposal| proposal.outcome() == FlowSendOutcome::Admitted)
+                .count(),
+            1
+        );
+        assert!(
+            destination
+                .iter()
+                .any(|proposal| proposal.outcome() == FlowSendOutcome::Waiting)
+        );
+        assert!(
+            destination
+                .iter()
+                .filter(|proposal| {
+                    flow.proposal_templates()
+                        .iter()
+                        .find(|template| template.identity() == proposal.template_identity())
+                        .is_some_and(|template| {
+                            template.admission_kind() == FlowAdmissionKind::Request
+                        })
+                })
+                .all(|proposal| {
+                    let records = scenario
+                        .trace()
+                        .iter()
+                        .filter(|record| record.proposal() == Some(proposal.key()))
+                        .collect::<Vec<_>>();
+                    let reserved = records
+                        .iter()
+                        .position(|record| record.kind() == FlowEventKind::ReplyPathReserved);
+                    let proposed = records
+                        .iter()
+                        .position(|record| record.kind() == FlowEventKind::MessageProposed);
+                    reserved
+                        .zip(proposed)
+                        .is_some_and(|(reserved, proposed)| reserved < proposed)
+                })
+        );
+    }
 }

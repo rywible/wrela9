@@ -286,7 +286,6 @@ fn build() -> Image:
         SyntaxNodeKind::DeferStatement,
         SyntaxNodeKind::WithStatement,
         SyntaxNodeKind::TakeStatement,
-        SyntaxNodeKind::SendStatement,
         SyntaxNodeKind::RangeExpression,
         SyntaxNodeKind::IsExpression,
         SyntaxNodeKind::ClosureExpression,
@@ -570,7 +569,7 @@ fn compiler_open_seals_validated_versioned_distribution_content() {
     );
     assert_eq!(
         first.distribution_digest(),
-        242_677_290_295_645_107_132_227_190_453_846_957_018
+        28_208_861_244_888_492_952_817_465_218_491_169_049
     );
     assert_eq!(first.distribution_digest(), same.distribution_digest());
     assert_ne!(first.distribution_digest(), changed.distribution_digest());

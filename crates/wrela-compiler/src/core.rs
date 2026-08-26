@@ -12,13 +12,14 @@ use crate::completed_semantic::{
 use crate::image_planning::{CorePlanningInput, ExecutableRef, GeneratedRole};
 use crate::model::{BuiltinVariant, IntegerType, SpecializationId, Type, TypeId};
 use crate::typed_hir::{
-    BinaryOperator, CallTarget, Expression, ExpressionKind, HirMatchPattern, Literal, Place,
-    PlaceProjection, PoolOperation, Statement, root_place,
+    BinaryOperator, CallTarget, Expression, ExpressionKind, GroupOperation, HirMatchPattern,
+    Literal, Place, PlaceProjection, PoolOperation, Statement, root_place,
 };
 use crate::{Cancellation, CanonicalValue, EvaluationOutcome, EvaluationPanicKind, SourceRange};
 
 pub(crate) const PHASE_SCHEMA: &str = "wrela.core.v3";
 const SCHEMA_VERSION: u16 = 3;
+const GROUP_CALL_MARKER: u128 = u128::from_be_bytes(*b"wrela-group-call");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CoreExecutableKind {
@@ -1552,7 +1553,6 @@ impl FlowCoreView<'_> {
                     .collect::<Vec<_>>();
                 proposals.push(FlowCoreMessageProposal {
                     sender_handler: executable.reference.identity,
-                    sender_flow_identity: executable_identity,
                     destination_handler: operation.details.first().copied().unwrap_or(0),
                     admission_kind: operation
                         .details
@@ -1615,12 +1615,246 @@ impl FlowCoreView<'_> {
         sites.sort_by_key(|site| (site.handler, site.program_order, site.identity));
         sites
     }
+
+    pub(crate) fn group_sites(&self) -> Vec<FlowCoreGroupSite> {
+        let executable_identities = stable_executable_identities(&self.core.executables);
+        let mut groups = Vec::new();
+        for executable in self.core.executables.iter() {
+            let executable_identity = executable_identities
+                .get(&executable.reference.identity)
+                .copied()
+                .unwrap_or(u128::MAX);
+            let mut calls = executable
+                .regions
+                .iter()
+                .flat_map(|region| region.operations.iter())
+                .filter_map(|operation| {
+                    flow_group_call(operation).map(|(kind, arguments)| (operation, kind, arguments))
+                })
+                .collect::<Vec<_>>();
+            calls.sort_by_key(|(operation, _, _)| operation.identity);
+            let mut active: Option<FlowCoreGroupSite> = None;
+            for (operation, kind, arguments) in calls {
+                match kind {
+                    GroupOperation::OpenAll
+                    | GroupOperation::OpenCollect
+                    | GroupOperation::OpenRace
+                    | GroupOperation::OpenSupervise => {
+                        if let Some(previous) = active.take() {
+                            groups.push(previous);
+                        }
+                        let mut identity = Xxh3::new();
+                        identity.update(b"wrela.core.group-site\0\x01");
+                        identity.update(&executable_identity.to_be_bytes());
+                        identity.update(&operation.identity.to_be_bytes());
+                        let reference_identity = identity.digest128();
+                        let bound = arguments.first().map_or(u64::MAX, |argument| {
+                            u64::try_from(argument.literal).unwrap_or(u64::MAX)
+                        });
+                        active = Some(FlowCoreGroupSite {
+                            handler: executable.reference.identity,
+                            reference_identity,
+                            reference_current_meaning: 0,
+                            policy: match kind {
+                                GroupOperation::OpenAll => FlowCoreGroupPolicy::All,
+                                GroupOperation::OpenCollect => FlowCoreGroupPolicy::Collect,
+                                GroupOperation::OpenRace => FlowCoreGroupPolicy::Race,
+                                GroupOperation::OpenSupervise => FlowCoreGroupPolicy::Supervise,
+                                _ => unreachable!("matched open Group operation"),
+                            },
+                            child_activation_bound: bound,
+                            children: Arc::from([]),
+                            deadline: None,
+                            open_program_order: operation.identity,
+                            terminal_program_order: u32::MAX,
+                            cancelled: false,
+                            source: operation.provenance.clone(),
+                        });
+                    }
+                    GroupOperation::Child => {
+                        let Some(group) = active.as_mut() else {
+                            continue;
+                        };
+                        let Some(argument) = arguments.last() else {
+                            continue;
+                        };
+                        let mut identity = Xxh3::new();
+                        identity.update(b"wrela.core.group-child\0\x01");
+                        identity.update(&group.reference_identity.to_be_bytes());
+                        identity.update(&operation.identity.to_be_bytes());
+                        let identity = identity.digest128();
+                        let mut meaning = Xxh3::new();
+                        meaning.update(b"wrela.core.group-child-meaning\0\x01");
+                        meaning.update(&identity.to_be_bytes());
+                        meaning.update(&argument.type_identity.to_be_bytes());
+                        meaning.update(&argument.access.to_be_bytes());
+                        let child = FlowCoreGroupChild {
+                            identity,
+                            current_meaning: meaning.digest128(),
+                            type_identity: argument.type_identity,
+                            moved: argument.access == 4,
+                            program_order: operation.identity,
+                            source: operation.provenance.clone(),
+                        };
+                        let mut children = group.children.to_vec();
+                        children.push(child);
+                        group.children = children.into();
+                    }
+                    GroupOperation::LogicalDeadline => {
+                        if let Some(group) = active.as_mut() {
+                            let epoch = arguments
+                                .iter()
+                                .rev()
+                                .nth(1)
+                                .map_or(u128::MAX, |argument| argument.literal);
+                            let slack = arguments.last().map_or(u64::MAX, |argument| {
+                                u64::try_from(argument.literal).unwrap_or(u64::MAX)
+                            });
+                            let mut authority = Xxh3::new();
+                            authority.update(b"wrela.core.logical-deadline\0\x01");
+                            authority.update(&group.reference_identity.to_be_bytes());
+                            authority.update(&epoch.to_be_bytes());
+                            group.deadline = Some(FlowCoreGroupDeadline {
+                                class: FlowCoreDeadlineClass::Logical,
+                                authority: authority.digest128(),
+                                capture_authority: None,
+                                slack,
+                                epoch,
+                            });
+                        }
+                    }
+                    GroupOperation::RealtimeDeadline => {
+                        if let Some(group) = active.as_mut() {
+                            let clock = arguments
+                                .get(arguments.len().saturating_sub(3))
+                                .map_or(0, |argument| argument.type_identity);
+                            let capture = arguments
+                                .get(arguments.len().saturating_sub(2))
+                                .map_or(0, |argument| argument.type_identity);
+                            let slack = arguments.last().map_or(u64::MAX, |argument| {
+                                u64::try_from(argument.literal).unwrap_or(u64::MAX)
+                            });
+                            group.deadline = Some(FlowCoreGroupDeadline {
+                                class: FlowCoreDeadlineClass::Realtime,
+                                authority: clock,
+                                capture_authority: (capture != 0).then_some(capture),
+                                slack,
+                                epoch: 0,
+                            });
+                        }
+                    }
+                    GroupOperation::Complete | GroupOperation::Cancel => {
+                        if let Some(mut group) = active.take() {
+                            group.terminal_program_order = operation.identity;
+                            group.cancelled = kind == GroupOperation::Cancel;
+                            let mut meaning = Xxh3::new();
+                            meaning.update(b"wrela.core.group-site-meaning\0\x01");
+                            meaning.update(&group.reference_identity.to_be_bytes());
+                            meaning.update(&[group.policy.tag()]);
+                            meaning.update(&group.child_activation_bound.to_be_bytes());
+                            meaning.update(&group.terminal_program_order.to_be_bytes());
+                            for child in group.children.iter() {
+                                meaning.update(&child.identity.to_be_bytes());
+                                meaning.update(&child.current_meaning.to_be_bytes());
+                            }
+                            if let Some(deadline) = group.deadline {
+                                meaning.update(&[deadline.class.tag()]);
+                                meaning.update(&deadline.authority.to_be_bytes());
+                                meaning
+                                    .update(&deadline.capture_authority.unwrap_or(0).to_be_bytes());
+                                meaning.update(&deadline.slack.to_be_bytes());
+                                meaning.update(&deadline.epoch.to_be_bytes());
+                            }
+                            group.reference_current_meaning = meaning.digest128();
+                            groups.push(group);
+                        }
+                    }
+                }
+            }
+            if let Some(group) = active {
+                groups.push(group);
+            }
+        }
+        groups.sort_by_key(|group| (group.handler, group.open_program_order));
+        groups
+    }
+
+    pub(crate) fn reply_fulfillment_sites(&self) -> Vec<FlowCoreReplyFulfillmentSite> {
+        let executable_identities = stable_executable_identities(&self.core.executables);
+        let mut sites = Vec::new();
+        for executable in self.core.executables.iter() {
+            let executable_identity = executable_identities
+                .get(&executable.reference.identity)
+                .copied()
+                .unwrap_or(u128::MAX);
+            for operation in executable
+                .regions
+                .iter()
+                .flat_map(|region| region.operations.iter())
+                .filter(|operation| operation.kind == CoreOperationKind::Return)
+            {
+                let mut identity = Xxh3::new();
+                identity.update(b"wrela.core.reply-fulfillment\0\x01");
+                identity.update(&executable_identity.to_be_bytes());
+                identity.update(&operation.identity.to_be_bytes());
+                let identity = identity.digest128();
+                let mut meaning = Xxh3::new();
+                meaning.update(b"wrela.core.reply-fulfillment-meaning\0\x01");
+                meaning.update(&identity.to_be_bytes());
+                meaning.update(
+                    &operation
+                        .operands
+                        .first()
+                        .map_or(0, |operand| u128::from(operand.0))
+                        .to_be_bytes(),
+                );
+                sites.push(FlowCoreReplyFulfillmentSite {
+                    handler: executable.reference.identity,
+                    reference_identity: identity,
+                    reference_current_meaning: meaning.digest128(),
+                    response_type_identity: executable.signature.return_type.identity,
+                    program_order: operation.identity,
+                    source: operation.provenance.clone(),
+                });
+            }
+        }
+        sites.sort_by_key(|site| (site.handler, site.program_order, site.reference_identity));
+        sites
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FlowGroupCallArgument {
+    type_identity: u128,
+    access: u128,
+    literal: u128,
+}
+
+fn flow_group_call(operation: &Operation) -> Option<(GroupOperation, Vec<FlowGroupCallArgument>)> {
+    let marker = operation
+        .details
+        .iter()
+        .position(|detail| *detail == GROUP_CALL_MARKER)?;
+    let kind = GroupOperation::from_canonical_tag(*operation.details.get(marker + 1)?)?;
+    let count = usize::try_from(*operation.details.get(marker + 2)?).ok()?;
+    let encoded = operation.details.get(marker + 3..)?;
+    if encoded.len() != count.checked_mul(3)? {
+        return None;
+    }
+    let arguments = encoded
+        .chunks_exact(3)
+        .map(|parts| FlowGroupCallArgument {
+            type_identity: parts[0],
+            access: parts[1],
+            literal: parts[2],
+        })
+        .collect();
+    Some((kind, arguments))
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct FlowCoreMessageProposal {
     pub(crate) sender_handler: u128,
-    pub(crate) sender_flow_identity: u128,
     pub(crate) destination_handler: u128,
     pub(crate) admission_kind: FlowCoreAdmissionKind,
     pub(crate) response_type_identity: u128,
@@ -1684,6 +1918,84 @@ pub(crate) struct FlowCoreCleanupSite {
     pub(crate) handler: u128,
     pub(crate) identity: u128,
     pub(crate) current_meaning: u128,
+    pub(crate) program_order: u32,
+    pub(crate) source: SourceRange,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlowCoreGroupPolicy {
+    All,
+    Collect,
+    Race,
+    Supervise,
+}
+
+impl FlowCoreGroupPolicy {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::All => 1,
+            Self::Collect => 2,
+            Self::Race => 3,
+            Self::Supervise => 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlowCoreDeadlineClass {
+    Logical,
+    Realtime,
+}
+
+impl FlowCoreDeadlineClass {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Logical => 1,
+            Self::Realtime => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FlowCoreGroupDeadline {
+    pub(crate) class: FlowCoreDeadlineClass,
+    pub(crate) authority: u128,
+    pub(crate) capture_authority: Option<u128>,
+    pub(crate) slack: u64,
+    pub(crate) epoch: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FlowCoreGroupChild {
+    pub(crate) identity: u128,
+    pub(crate) current_meaning: u128,
+    pub(crate) type_identity: u128,
+    pub(crate) moved: bool,
+    pub(crate) program_order: u32,
+    pub(crate) source: SourceRange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FlowCoreGroupSite {
+    pub(crate) handler: u128,
+    pub(crate) reference_identity: u128,
+    pub(crate) reference_current_meaning: u128,
+    pub(crate) policy: FlowCoreGroupPolicy,
+    pub(crate) child_activation_bound: u64,
+    pub(crate) children: Arc<[FlowCoreGroupChild]>,
+    pub(crate) deadline: Option<FlowCoreGroupDeadline>,
+    pub(crate) open_program_order: u32,
+    pub(crate) terminal_program_order: u32,
+    pub(crate) cancelled: bool,
+    pub(crate) source: SourceRange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FlowCoreReplyFulfillmentSite {
+    pub(crate) handler: u128,
+    pub(crate) reference_identity: u128,
+    pub(crate) reference_current_meaning: u128,
+    pub(crate) response_type_identity: u128,
     pub(crate) program_order: u32,
     pub(crate) source: SourceRange,
 }
@@ -3808,7 +4120,7 @@ impl<'a> ProducerLowerer<'a> {
                 (
                     kind,
                     operands,
-                    call_target_details(target),
+                    producer_group_call_details(target, arguments),
                     effect,
                     if kind == CoreOperationKind::Call {
                         FailureLaw::CallPanicPropagation
@@ -4152,6 +4464,7 @@ fn call_target_details(target: &CallTarget) -> Vec<u128> {
             specialization,
             argument_order,
             argument_parameters,
+            ..
         } => {
             let mut values = vec![3, definition.0, specialization.0];
             values.extend(argument_order.iter().map(|value| u128::from(*value)));
@@ -4220,6 +4533,35 @@ fn actor_admission_details(target: &CallTarget, admission: FlowCoreAdmissionKind
         _ => 0,
     };
     vec![destination_handler, u128::from(admission.tag())]
+}
+
+fn producer_group_call_details(target: &CallTarget, arguments: &[Expression]) -> Vec<u128> {
+    let mut details = call_target_details(target);
+    let CallTarget::Function {
+        group_operation: Some(operation),
+        ..
+    } = target
+    else {
+        return details;
+    };
+    details.extend([GROUP_CALL_MARKER, u128::from(operation.canonical_tag())]);
+    details.push(u128::try_from(arguments.len()).unwrap_or(u128::MAX));
+    for argument in arguments {
+        details.push(argument.type_id.0);
+        details.push(match argument.access {
+            crate::typed_hir::AccessMode::Copy => 1,
+            crate::typed_hir::AccessMode::Read => 2,
+            crate::typed_hir::AccessMode::Mut => 3,
+            crate::typed_hir::AccessMode::Move => 4,
+        });
+        details.push(match &argument.kind {
+            ExpressionKind::Literal(Literal::Integer { value, .. }) => {
+                u128::try_from(*value).unwrap_or(u128::MAX)
+            }
+            _ => u128::MAX,
+        });
+    }
+    details
 }
 
 fn producer_call_binding(target: &CallTarget, argument_count: usize) -> Arc<[u16]> {
@@ -5281,7 +5623,7 @@ impl<'a> VerifierLowerer<'a> {
                 (
                     kind,
                     operands,
-                    verifier_call_target_details(target),
+                    verifier_group_call_details(target, arguments),
                     effect,
                     if kind == CoreOperationKind::Call {
                         FailureLaw::CallPanicPropagation
@@ -5692,6 +6034,7 @@ fn verifier_call_target_details(target: &CallTarget) -> Vec<u128> {
             specialization,
             argument_order,
             argument_parameters,
+            ..
         } => {
             let mut values = vec![3, definition.0, specialization.0];
             values.extend(argument_order.iter().map(|value| u128::from(*value)));
@@ -5750,6 +6093,35 @@ fn verifier_call_target_details(target: &CallTarget) -> Vec<u128> {
             values
         }
     }
+}
+
+fn verifier_group_call_details(target: &CallTarget, arguments: &[Expression]) -> Vec<u128> {
+    let mut details = verifier_call_target_details(target);
+    let CallTarget::Function {
+        group_operation: Some(operation),
+        ..
+    } = target
+    else {
+        return details;
+    };
+    details.extend([GROUP_CALL_MARKER, u128::from(operation.canonical_tag())]);
+    details.push(u128::try_from(arguments.len()).unwrap_or(u128::MAX));
+    for argument in arguments {
+        details.push(argument.type_id.0);
+        details.push(match argument.access {
+            crate::typed_hir::AccessMode::Copy => 1,
+            crate::typed_hir::AccessMode::Read => 2,
+            crate::typed_hir::AccessMode::Mut => 3,
+            crate::typed_hir::AccessMode::Move => 4,
+        });
+        details.push(match &argument.kind {
+            ExpressionKind::Literal(Literal::Integer { value, .. }) => {
+                u128::try_from(*value).unwrap_or(u128::MAX)
+            }
+            _ => u128::MAX,
+        });
+    }
+    details
 }
 
 fn verifier_call_binding(target: &CallTarget, argument_count: usize) -> Arc<[u16]> {

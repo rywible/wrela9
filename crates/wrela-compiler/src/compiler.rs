@@ -68,6 +68,47 @@ fn layer1_actor_module() -> ProjectFile {
 
 pub resource struct ReplyClosed[T]:
     pub response: T
+
+pub enum GroupOutcome:
+    Completed
+    Cancelled
+    DeadlineExceeded
+
+pub resource struct MonotonicClock:
+    identity: u64
+
+pub resource struct ReplayCapture:
+    identity: u64
+
+pub resource struct Group:
+    bound: u64
+
+    pub pure fn all(bound: u64) -> Group:
+        panic "sealed Group all"
+
+    pub pure fn collect(bound: u64) -> Group:
+        panic "sealed Group collect"
+
+    pub pure fn race(bound: u64) -> Group:
+        panic "sealed Group race"
+
+    pub pure fn supervise(bound: u64) -> Group:
+        panic "sealed Group supervise"
+
+    pub fn logical_deadline(mut self, epoch: u64, slack: u64):
+        pass
+
+    pub fn realtime_deadline(mut self, read clock: MonotonicClock, read capture: ReplayCapture, slack: u64):
+        pass
+
+    pub fn child[T](mut self, take value: T) -> T:
+        panic "sealed Group child"
+
+    pub fn complete(take self) -> GroupOutcome:
+        return GroupOutcome.Completed
+
+    pub fn cancel(take self) -> GroupOutcome:
+        return GroupOutcome.Cancelled
 "#,
     )
 }
@@ -2703,18 +2744,33 @@ impl Compiler {
             ) {
                 Ok(flow) => Some(Arc::new(flow)),
                 Err(FlowFailure::Cancelled) => return CompilationOutcome::Cancelled,
-                Err(FlowFailure::Admission { source, cycle }) => {
-                    let mut diagnostic = Diagnostic::new(
-                        "admission.reply_wait_cycle",
-                        source.clone(),
-                        RecoveryAction::None,
-                    )
-                    .with_unsigned_parameter("cycle_length", cycle.len() as u128);
-                    for _ in cycle.iter().skip(1).take(1) {
+                Err(FlowFailure::Admission { sources, actors }) => {
+                    let source = sources
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| SourceRange::new("<flow>", 0, 0));
+                    let mut diagnostic =
+                        Diagnostic::new("admission.reply_wait_cycle", source, RecoveryAction::None)
+                            .with_unsigned_parameter(
+                                "cycle_length",
+                                u128::try_from(sources.len()).unwrap_or(u128::MAX),
+                            );
+                    for actor in actors.iter().copied() {
+                        diagnostic = diagnostic.with_identity_parameter(
+                            "actor",
+                            IdentityDomain::Definition,
+                            actor,
+                        );
+                    }
+                    for source in sources.iter().skip(1) {
                         diagnostic =
                             diagnostic.with_label(source.clone(), DiagnosticLabelRole::Related);
                     }
                     diagnostics.push(diagnostic);
+                    None
+                }
+                Err(FlowFailure::Creator { code, source }) => {
+                    diagnostics.push(Diagnostic::new(code, source, RecoveryAction::None));
                     None
                 }
                 Err(FlowFailure::Defect(evidence)) => {
@@ -2761,6 +2817,12 @@ impl Compiler {
                     return CompilationOutcome::Defect(Defect::new(
                         "Flow inspection",
                         "verified Flow inspection produced a Creator admission rejection",
+                    ));
+                }
+                Err(FlowFailure::Creator { .. }) => {
+                    return CompilationOutcome::Defect(Defect::new(
+                        "Flow inspection",
+                        "verified Flow inspection produced a Creator rejection",
                     ));
                 }
                 Err(FlowFailure::Defect(evidence)) => {

@@ -14,7 +14,9 @@ use crate::image_planning::ImagePlanningModule;
 use crate::model::BuildKind;
 use crate::semantic;
 use crate::syntax::{DeclarationKind, DeclarationSyntax, FunctionModifier, TypeSyntax};
-use crate::typed_hir::{AuthorityContext, BuildAuthority, PoolAuthority, PoolOperation};
+use crate::typed_hir::{
+    AuthorityContext, BuildAuthority, GroupOperation, PoolAuthority, PoolOperation,
+};
 use crate::{Cancellation, syntax};
 
 const DISTRIBUTION_VERSION: &str = "wrela9-layer2-architecture-v1";
@@ -274,7 +276,33 @@ fn authenticated_pool_authority(
                 .map(|definition| (definition, operation))
         })
     });
-    PoolAuthority::from_authenticated_pool(scoped_factory, operations)
+    let group_operations = identities
+        .definition(
+            "src/core/actor.wr",
+            DeclarationKind::ResourceStruct,
+            "Group",
+        )
+        .into_iter()
+        .flat_map(|group| {
+            [
+                ("all", GroupOperation::OpenAll),
+                ("collect", GroupOperation::OpenCollect),
+                ("race", GroupOperation::OpenRace),
+                ("supervise", GroupOperation::OpenSupervise),
+                ("logical_deadline", GroupOperation::LogicalDeadline),
+                ("realtime_deadline", GroupOperation::RealtimeDeadline),
+                ("child", GroupOperation::Child),
+                ("complete", GroupOperation::Complete),
+                ("cancel", GroupOperation::Cancel),
+            ]
+            .into_iter()
+            .filter_map(move |(name, operation)| {
+                identities
+                    .associated_function(group, name)
+                    .map(|definition| (definition, operation))
+            })
+        });
+    PoolAuthority::from_authenticated_pool(scoped_factory, operations, group_operations)
 }
 
 fn authenticated_build_authority(
@@ -426,6 +454,10 @@ fn distribution_digest(
         hasher.update(b"pool.authority\0");
         hasher.update(&definition.0.to_be_bytes());
         hasher.update(&[operation.map_or(0, PoolOperation::canonical_tag)]);
+    }
+    for (definition, operation) in pool_authority.canonical_group_grants() {
+        hasher.update(&definition.0.to_be_bytes());
+        hasher.update(&[0x47, operation.canonical_tag()]);
     }
     hasher.digest128()
 }

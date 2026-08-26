@@ -37,6 +37,7 @@ pub(crate) struct IdentityCatalog {
     tests: BTreeMap<(String, String, String), TestId>,
     types: BTreeMap<DefinitionId, TypeId>,
     pools: BTreeMap<DefinitionId, PoolId>,
+    scoped_pools: BTreeMap<(DefinitionId, String), PoolId>,
     interned_types: BTreeMap<Arc<[u8]>, TypeId>,
     variants: BTreeMap<(DefinitionId, String), VariantId>,
     full_keys: BTreeMap<u128, Arc<[u8]>>,
@@ -69,6 +70,7 @@ impl IdentityCatalog {
             tests: BTreeMap::new(),
             types: BTreeMap::new(),
             pools: BTreeMap::new(),
+            scoped_pools: BTreeMap::new(),
             interned_types: BTreeMap::new(),
             variants: BTreeMap::new(),
             full_keys: BTreeMap::new(),
@@ -294,6 +296,35 @@ impl IdentityCatalog {
     #[allow(dead_code)]
     pub(crate) fn pool_for_definition(&self, definition: DefinitionId) -> Option<PoolId> {
         self.pools.get(&definition).copied()
+    }
+
+    pub(crate) fn scoped_pool(
+        &mut self,
+        owner: DefinitionId,
+        binding: &str,
+    ) -> Result<PoolId, IdentityCollision> {
+        let map_key = (owner, binding.to_owned());
+        if let Some(pool) = self.scoped_pools.get(&map_key).copied() {
+            return Ok(pool);
+        }
+        let canonical_key = key(
+            IdentityDomain::Pool,
+            IdentityOrigin::Generated,
+            &[&owner.0.to_be_bytes(), binding.as_bytes()],
+        );
+        let observation = intern(
+            IdentityDomain::Pool,
+            IdentityOrigin::Generated,
+            format!("{:032x}.{binding}", owner.0),
+            Arc::clone(&canonical_key),
+            fingerprint(&canonical_key),
+            &xxh3_128,
+            &mut self.full_keys,
+        )?;
+        let pool = PoolId(observation.digest());
+        self.scoped_pools.insert(map_key, pool);
+        self.push_record(observation);
+        Ok(pool)
     }
 
     pub(crate) fn specialization(
@@ -865,6 +896,7 @@ where
         tests,
         types,
         pools,
+        scoped_pools: BTreeMap::new(),
         interned_types: BTreeMap::new(),
         variants,
         full_keys: digests,

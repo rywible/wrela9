@@ -195,6 +195,15 @@ impl MoveState {
         self.restore_place(&Place::local(local))
     }
 
+    fn collapse_consumed_root(&mut self, place: &Place, source: &SourceRange) {
+        let root = PlaceKey::from_place(place);
+        self.places.retain(|moved| !root.covers(moved));
+        self.restored.retain(|restored| !root.covers(restored));
+        self.origins.retain(|moved, _| !root.covers(moved));
+        self.places.insert(root.clone());
+        self.origins.insert(root, source.clone());
+    }
+
     fn finish_aggregate_restoration(&mut self, aggregate: &Place, children: &[Place]) {
         if self.is_unreadable(aggregate) && children.iter().all(|child| !self.is_unreadable(child))
         {
@@ -907,6 +916,7 @@ pub(crate) enum Statement {
         source: SourceRange,
     },
     WithPool {
+        pool: PoolId,
         binding: Place,
         scope: Expression,
         body: Arc<[Statement]>,
@@ -976,6 +986,16 @@ pub(crate) enum HirMatchPattern {
         type_: Type,
         access: AccessMode,
     },
+}
+
+fn result_pattern_consumes_payload(pattern: &HirMatchPattern) -> bool {
+    matches!(
+        pattern,
+        HirMatchPattern::BuiltinVariant {
+            variant: BuiltinVariant::ResultOk | BuiltinVariant::ResultErr,
+            payload,
+        } if matches!(payload.as_ref(), [HirMatchPattern::Binding { access: AccessMode::Move, .. }])
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -4389,6 +4409,7 @@ fn verify_statements(
                     let mut case_locals = locals.clone();
                     let mut case_moved = moved.clone();
                     let mut case_excluded = visible.clone();
+                    let mut pattern_consumes = false;
                     if let Some(pattern) = &case.pattern {
                         verify_match_pattern_artifact(
                             pattern,
@@ -4397,12 +4418,14 @@ fn verify_statements(
                             catalog,
                         )?;
                         if let Some(place) = root_place(value) {
-                            for moved_place in artifact_pattern_move_keys(
+                            let moved_places = artifact_pattern_move_keys(
                                 pattern,
                                 &matched,
                                 &PlaceKey::from_place(&place),
                                 catalog,
-                            )? {
+                            )?;
+                            pattern_consumes = result_pattern_consumes_payload(pattern);
+                            for moved_place in moved_places {
                                 if !case_moved.move_key(moved_place) {
                                     return defect(
                                         "lowered take pattern moves an unreadable component",
@@ -4439,6 +4462,15 @@ fn verify_statements(
                             &case_excluded,
                             catalog,
                         )?;
+                        for binding in case_locals.keys().filter(|local| !visible.contains(local)) {
+                            case_moved.restore_local(*binding);
+                        }
+                        if pattern_consumes
+                            && artifact_type_owns_resource(value.type_id, &matched, catalog)
+                            && let Some(place) = root_place(value)
+                        {
+                            case_moved.collapse_consumed_root(&place, &case.source);
+                        }
                         branch_moved.push(case_moved);
                     }
                 }
@@ -4447,6 +4479,7 @@ fn verify_statements(
                 }
             }
             Statement::WithPool {
+                pool: _,
                 binding,
                 scope,
                 body,
@@ -5198,7 +5231,16 @@ fn verify_expression_artifact_with_cleanup(
                         if !arguments_match(&ordered, &function.parameters) {
                             return defect("template call operands disagree with parameters");
                         }
-                        Ok(function.return_type.clone())
+                        let mut substitutions = BTreeMap::new();
+                        for (actual, (_, expected, _)) in ordered.iter().zip(&function.parameters) {
+                            bind_type(expected, actual, &mut substitutions, &expression.source)
+                                .map_err(|_| VerificationFailure::Defect {
+                                    evidence: Arc::from(
+                                        "template call generic operands do not bind consistently",
+                                    ),
+                                })?;
+                        }
+                        Ok(substitute(&function.return_type, &substitutions))
                     })
                     .transpose()?
                     .ok_or_else(|| VerificationFailure::Defect {
@@ -5863,8 +5905,11 @@ struct Lowerer<'a> {
     concrete_context: bool,
     test_application_context: u16,
     expected_expression_type: Option<Type>,
+    pending_scoped_pool: Option<PoolId>,
+    scoped_pool_types: BTreeMap<String, PoolId>,
     owner_identity: Option<DefinitionId>,
     generic_interface_bounds: BTreeMap<TypeParameterId, DefinitionId>,
+    generic_pool_bounds: BTreeSet<TypeParameterId>,
     generic_const_values: BTreeMap<String, (IntegerType, u64)>,
 }
 
@@ -5916,8 +5961,11 @@ impl<'a> Lowerer<'a> {
             concrete_context,
             test_application_context: 0,
             expected_expression_type: None,
+            pending_scoped_pool: None,
+            scoped_pool_types: BTreeMap::new(),
             owner_identity: None,
             generic_interface_bounds: BTreeMap::new(),
+            generic_pool_bounds: BTreeSet::new(),
             generic_const_values: BTreeMap::new(),
         }
     }
@@ -5938,6 +5986,15 @@ impl<'a> Lowerer<'a> {
                     interface: Some(interface),
                 } => Some((parameter, *interface)),
                 _ => None,
+            })
+            .collect();
+        self.generic_pool_bounds = function
+            .type_parameters
+            .iter()
+            .copied()
+            .zip(function.generic_constraints.iter())
+            .filter_map(|(parameter, constraint)| {
+                matches!(constraint, GenericConstraint::Pool).then_some(parameter)
             })
             .collect();
         self.generic_const_values = function
@@ -6959,12 +7016,15 @@ impl<'a> Lowerer<'a> {
                         self.moved.clone_from(&moved_before);
                         self.known_integers.clone_from(&known_before);
                         let pattern = self.lower_match_pattern(&case.pattern, &value.type_)?;
+                        let mut pattern_consumes = false;
                         if let (Some(pattern), Some(place)) = (&pattern, root_place(&value)) {
-                            for moved in self.pattern_move_keys(
+                            let moved_keys = self.pattern_move_keys(
                                 pattern,
                                 &value.type_,
                                 &PlaceKey::from_place(&place),
-                            )? {
+                            )?;
+                            pattern_consumes = result_pattern_consumes_payload(pattern);
+                            for moved in moved_keys {
                                 self.moved.move_key_at(moved, &case.pattern.range);
                             }
                         }
@@ -6991,6 +7051,18 @@ impl<'a> Lowerer<'a> {
                         let body = self.statements(&case.body, return_type)?;
                         if syntax_statements_fall_through(&case.body) {
                             self.check_recoverable_exit_excluding(&visible_before)?;
+                            if let Some(pattern) = &pattern {
+                                for binding in match_pattern_binding_signature(pattern).keys() {
+                                    self.moved.restore_local(*binding);
+                                }
+                            }
+                            if pattern_consumes
+                                && self.type_owns_resource(&value.type_)
+                                && let Some(place) = root_place(&value)
+                            {
+                                self.moved
+                                    .collapse_consumed_root(&place, &case.pattern.range);
+                            }
                             continuing_custody.push(self.moved.clone());
                             continuing_known.push(self.known_integers.clone());
                         }
@@ -7084,7 +7156,24 @@ impl<'a> Lowerer<'a> {
                     let Some(binding) = binding else {
                         return creator(CreatorFailureKind::UnsupportedLayerOneSyntax, range);
                     };
-                    let scope = self.expression(scope)?;
+                    let owner = self
+                        .owner_identity
+                        .ok_or_else(|| VerificationFailure::Defect {
+                            evidence: Arc::from("authenticated scoped Pool has no semantic owner"),
+                        })?;
+                    let pool =
+                        self.identity_catalog
+                            .scoped_pool(owner, binding)
+                            .map_err(|collision| VerificationFailure::Defect {
+                                evidence: Arc::from(format!(
+                                    "scoped Pool identity collision {:032x}",
+                                    collision.digest
+                                )),
+                            })?;
+                    let previous_pool = self.pending_scoped_pool.replace(pool);
+                    let scope_result = self.expression(scope);
+                    self.pending_scoped_pool = previous_pool;
+                    let scope = scope_result?;
                     let definition = match &scope.kind {
                         ExpressionKind::Call {
                             target:
@@ -7110,7 +7199,14 @@ impl<'a> Lowerer<'a> {
                         self.bind_source_local(binding, scope.type_.clone(), true, range)?;
                     scope_exclusions.insert(binding_place);
                     let body_falls_through = syntax_statements_fall_through(body);
+                    let previous_binding_pool =
+                        self.scoped_pool_types.insert(binding.clone(), pool);
                     let body = self.statements(body, return_type)?;
+                    if let Some(previous) = previous_binding_pool {
+                        self.scoped_pool_types.insert(binding.clone(), previous);
+                    } else {
+                        self.scoped_pool_types.remove(binding);
+                    }
                     if body_falls_through {
                         self.check_recoverable_exit_excluding(&scope_exclusions)?;
                     }
@@ -7118,6 +7214,7 @@ impl<'a> Lowerer<'a> {
                     self.moved.restore_local(binding_place);
                     self.known_integers.remove(&binding_place);
                     Statement::WithPool {
+                        pool,
                         binding: Place::local(binding_place),
                         scope,
                         body: body.into(),
@@ -7443,6 +7540,21 @@ impl<'a> Lowerer<'a> {
                         let (expected, ownership) = &parameter_context[source_index];
                         self.apply_expected_type(value, expected)?;
                         self.apply_authored_ownership(value, *ownership)?;
+                    }
+                } else if let CallTarget::TemplateFunction {
+                    definition,
+                    argument_order,
+                    ..
+                } = &target
+                {
+                    let ownership = argument_order
+                        .iter()
+                        .map(|parameter| {
+                            self.functions[definition].parameters[usize::from(*parameter)].ownership
+                        })
+                        .collect::<Vec<_>>();
+                    for (value, ownership) in lowered.iter_mut().zip(ownership) {
+                        self.apply_authored_ownership(value, ownership)?;
                     }
                 }
                 if let CallTarget::Build { primitive, .. } = &target {
@@ -8720,6 +8832,11 @@ impl<'a> Lowerer<'a> {
                 if let Some(type_) = resolve_builtin_type(name) {
                     return Some(type_);
                 }
+                if let [name] = name.segments.as_slice()
+                    && let Some(pool) = self.scoped_pool_types.get(name)
+                {
+                    return Some(Type::PoolArgument(*pool));
+                }
                 match self.namespace.resolve(self.module, &name.segments)? {
                     ResolvedName::Pool(pool) => Some(Type::PoolArgument(pool)),
                     ResolvedName::Nominal(definition)
@@ -8805,6 +8922,14 @@ impl<'a> Lowerer<'a> {
                 return_type: Arc::new(self.resolve_local_type(return_type)?),
             }),
             TypeSyntax::Own { pool, value } => {
+                if let [name] = pool.segments.as_slice()
+                    && let Some(pool) = self.scoped_pool_types.get(name)
+                {
+                    return Some(Type::Own {
+                        pool: PoolTerm::Concrete(*pool),
+                        value: Arc::new(self.resolve_local_type(value)?),
+                    });
+                }
                 let ResolvedName::Pool(pool) =
                     self.namespace.resolve(self.module, &pool.segments)?
                 else {
@@ -10164,6 +10289,16 @@ impl<'a> Lowerer<'a> {
             site,
         )?;
         let mut substitutions = BTreeMap::new();
+        if self.pool_authority.is_scoped_factory(id)
+            && let Some(pool) = self.pending_scoped_pool
+            && let Some((parameter, _)) = function
+                .type_parameters
+                .iter()
+                .zip(function.generic_constraints.iter())
+                .find(|(_, constraint)| matches!(constraint, GenericConstraint::Pool))
+        {
+            substitutions.insert(*parameter, Type::PoolArgument(pool));
+        }
         if type_has_placeholder(&function.return_type)
             && let Some(expected) = self.expected_expression_type.as_ref()
         {
@@ -10379,7 +10514,11 @@ impl<'a> Lowerer<'a> {
                     (Type::Integer(kind), Type::ConstU64(value)) => kind.fits(i128::from(*value)),
                     _ => false,
                 },
-                GenericConstraint::Pool => matches!(argument, Type::PoolArgument(_)),
+                GenericConstraint::Pool => match argument {
+                    Type::PoolArgument(_) => true,
+                    Type::Parameter { id, .. } => self.generic_pool_bounds.contains(id),
+                    _ => false,
+                },
             };
             if !valid {
                 return creator(CreatorFailureKind::GenericArgumentConflict, site);
@@ -11901,12 +12040,14 @@ fn append_statements(bytes: &mut impl ByteSink, statements: &[Statement]) {
                 }
             }
             Statement::WithPool {
+                pool,
                 binding,
                 scope,
                 body,
                 source,
             } => {
                 bytes.push(16);
+                bytes.extend_from_slice(&pool.0.to_be_bytes());
                 append_place(bytes, binding);
                 append_range(bytes, source);
                 append_expression(bytes, scope);

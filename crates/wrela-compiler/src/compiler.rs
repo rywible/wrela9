@@ -75,50 +75,50 @@ pub struct Test:
 fn layer1_pool_module() -> ProjectFile {
     ProjectFile::new(
         "src/core/pool.wr",
-        br#"pub struct Key[T]:
+        br#"pub struct Key[P: Pool, T]:
     pool_identity: u64
     slot: u64
     generation: u64
     type_identity: u64
 
-pub resource struct Allocation[T]:
+pub resource struct Allocation[P: Pool, T]:
     value: T
-    pub key: Key[T]
+    pub key: Key[P, T]
 
 pub resource struct PoolFull[T]:
     pub value: T
 
-pub resource struct Permit[T]:
+pub resource struct Permit[P: Pool, T]:
     pool_identity: u64
     slot: u64
     generation: u64
     type_identity: u64
 
-pub resource struct Scope:
+pub resource struct Scope[P: Pool]:
     capacity: u64
 
-    pub fn try_allocate[T](mut self, take value: T) -> Result[Allocation[T], PoolFull[T]]:
+    pub fn try_allocate[T](mut self, take value: T) -> Result[Allocation[P, T], PoolFull[T]]:
         panic "sealed Pool try_allocate"
 
-    pub fn allocate[T](mut self, take value: T) -> Allocation[T]:
+    pub fn allocate[T](mut self, take value: T) -> Allocation[P, T]:
         panic "sealed proof-required Pool allocate"
 
-    pub fn reserve[T](mut self) -> Permit[T]:
+    pub fn reserve[T](mut self) -> Permit[P, T]:
         panic "sealed proof-required Pool reserve"
 
-    pub fn consume[T](mut self, take permit: Permit[T], take value: T) -> Allocation[T]:
+    pub fn consume[T](mut self, take permit: Permit[P, T], take value: T) -> Allocation[P, T]:
         panic "sealed Pool Permit consumption"
 
-    pub pure fn lookup[T](read self, key: Key[T]) -> Option[T]:
+    pub pure fn lookup[Q: Pool, T](read self, key: Key[Q, T]) -> Option[T]:
         panic "sealed generation-checked Pool lookup"
 
-    pub fn reclaim[T](mut self, take allocation: Allocation[T]) -> T:
+    pub fn reclaim[T](mut self, take allocation: Allocation[P, T]) -> T:
         panic "sealed Pool reclaim"
 
-    pub fn release[T](mut self, take permit: Permit[T]):
+    pub fn release[T](mut self, take permit: Permit[P, T]):
         pass
 
-pub pure fn scoped(capacity: u64) -> Scope:
+pub pure fn scoped[P: Pool](capacity: u64) -> Scope[P]:
     return Scope(capacity=capacity)
 "#,
     )

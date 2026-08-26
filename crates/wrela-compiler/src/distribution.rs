@@ -222,7 +222,14 @@ fn authenticated_pool_authority(
                         declaration.syntax.as_ref(),
                         Some(DeclarationSyntax::Function(function))
                             if function.modifier == FunctionModifier::Pure
-                                && function.type_parameters.is_empty()
+                                && function.type_parameters.as_slice() == ["P"]
+                                && matches!(
+                                    function.generic_parameters.as_slice(),
+                                    [crate::syntax::GenericParameterSyntax {
+                                        name,
+                                        kind: crate::syntax::GenericParameterKindSyntax::Pool,
+                                    }] if name == "P"
+                                )
                                 && function.parameters.len() == 1
                                 && function.parameters[0].name == "capacity"
                                 && matches!(
@@ -232,8 +239,9 @@ fn authenticated_pool_authority(
                                 )
                                 && matches!(
                                     &function.return_type,
-                                    TypeSyntax::Named(name)
-                                        if name.segments.as_slice() == ["Scope"]
+                                    TypeSyntax::Apply { base, arguments }
+                                        if base.segments.as_slice() == ["Scope"]
+                                            && matches!(arguments.as_slice(), [TypeSyntax::Named(name)] if name.segments.as_slice() == ["P"])
                                 )
                     )
             })

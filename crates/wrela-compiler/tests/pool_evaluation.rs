@@ -148,7 +148,7 @@ fn build() -> Image:
     return Image.new(first=take first, second=take second)
 "#;
 
-    let outcome = compile(source);
+    let outcome = compile_planned(source);
     assert!(
         matches!(outcome, CompilationOutcome::Accepted(_)),
         "PoolFull must retain the exact pre-commit resource value: {outcome:#?}"
@@ -166,13 +166,13 @@ resource struct Token:
 fn build() -> Image:
     token = Token(value=7)
     with pools.scoped(capacity=1) as scratch:
-        permit: pools.Permit[Token] = scratch.reserve()
+        permit: pools.Permit[scratch, Token] = scratch.reserve()
         allocation = scratch.consume(permit=take permit, value=take token)
         token = scratch.reclaim(allocation=take allocation)
     return Image.new(token=take token)
 "#;
 
-    let outcome = compile(source);
+    let outcome = compile_planned(source);
     assert!(
         matches!(outcome, CompilationOutcome::Accepted(_)),
         "consuming a Permit must convert, rather than add, commitment: {outcome:#?}"
@@ -186,7 +186,7 @@ fn held_permit_is_compiler_reclaimed_when_the_pool_scope_closes() {
 @image
 fn build() -> Image:
     with pools.scoped(capacity=1) as scratch:
-        permit: pools.Permit[i64] = scratch.reserve()
+        permit: pools.Permit[scratch, i64] = scratch.reserve()
     return Image.new()
 "#;
 
@@ -265,7 +265,7 @@ fn build() -> Image:
     with pools.scoped(capacity=1) as scratch:
         allocation = scratch.allocate(value=take token)
         token = scratch.reclaim(allocation=take allocation)
-        permit: pools.Permit[Token] = scratch.reserve()
+        permit: pools.Permit[scratch, Token] = scratch.reserve()
         scratch.release(permit=take permit)
     return Image.new(token=take token)
 "#;
@@ -350,7 +350,7 @@ fn build() -> Image:
     assert!(
         proof_effects
             .iter()
-            .all(|effect| effect.retains_fallible_source_type())
+            .all(|effect| effect.retains_source_return_type())
     );
 }
 
@@ -392,7 +392,7 @@ fn compiler_reclaimed_permit_keeps_the_slot_committed_until_scope_cleanup() {
 fn build() -> Image:
     mut value = 0
     with pools.scoped(capacity=1) as scratch:
-        permit: pools.Permit[i64] = scratch.reserve()
+        permit: pools.Permit[scratch, i64] = scratch.reserve()
         allocation = scratch.allocate(value=7)
         value = scratch.reclaim(allocation=take allocation)
     return Image.new(value=value)
@@ -460,8 +460,8 @@ fn build() -> Image:
         match attempted:
             case Result.Ok(take allocation):
                 token = scratch.reclaim(allocation=take allocation)
-            case _:
-                panic "an empty Pool reported full"
+            case Result.Err(take full):
+                token = take full.value
     return Image.new(token=take token)
 "#;
 
@@ -469,5 +469,175 @@ fn build() -> Image:
     assert!(
         matches!(outcome, CompilationOutcome::Accepted(_)),
         "successful try_allocate commits one live slot and reclaim releases it: {outcome:#?}"
+    );
+}
+
+#[test]
+fn foreign_allocation_is_rejected_by_pool_identity_typing() {
+    let source = br#"from core import pool as pools
+
+@image
+fn build() -> Image:
+    mut value = 0
+    with pools.scoped(capacity=1) as first_pool:
+        allocation = first_pool.allocate(value=7)
+        with pools.scoped(capacity=1) as second_pool:
+            value = second_pool.reclaim(allocation=take allocation)
+    return Image.new(value=value)
+"#;
+
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Rejected(_)),
+        "foreign Allocation custody must be rejected statically, never reach evaluator Defect: {outcome:#?}"
+    );
+}
+
+#[test]
+fn foreign_permit_is_rejected_by_pool_identity_typing() {
+    let source = br#"from core import pool as pools
+
+@image
+fn build() -> Image:
+    with pools.scoped(capacity=1) as first_pool:
+        permit: pools.Permit[first_pool, i64] = first_pool.reserve()
+        with pools.scoped(capacity=1) as second_pool:
+            second_pool.release(permit=take permit)
+    return Image.new()
+"#;
+
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Rejected(_)),
+        "foreign Permit custody must be rejected statically, never reach evaluator Defect: {outcome:#?}"
+    );
+}
+
+#[test]
+fn repeated_sequential_invocation_closes_the_same_scoped_pool_site() {
+    let source = br#"from core import pool as pools
+
+fn touch_pool():
+    with pools.scoped(capacity=1) as scratch:
+        allocation = scratch.allocate(value=7)
+        value = scratch.reclaim(allocation=take allocation)
+
+@image
+fn build() -> Image:
+    touch_pool()
+    touch_pool()
+    return Image.new()
+"#;
+
+    let outcome = compile(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "scope cleanup must close runtime Pool state before the same site opens again: {outcome:#?}"
+    );
+}
+
+#[test]
+fn helper_and_caller_simultaneous_commitment_is_rejected_interprocedurally() {
+    let source = br#"from core import pool as pools
+
+fn hold[P: Pool](mut scratch: pools.Scope[P]) -> pools.Allocation[P, i64]:
+    return scratch.allocate(value=1)
+
+@image
+fn build() -> Image:
+    mut one = 0
+    mut two = 0
+    with pools.scoped(capacity=1) as scratch:
+        first = hold(mut scratch)
+        second = scratch.allocate(value=2)
+        one = scratch.reclaim(allocation=take first)
+        two = scratch.reclaim(allocation=take second)
+    return Image.new(one=one, two=two)
+"#;
+
+    let outcome = compile_planned(source);
+    let CompilationOutcome::Rejected(rejected) = outcome else {
+        panic!("interprocedural peak commitment two must exceed capacity one: {outcome:#?}");
+    };
+    assert!(
+        rejected
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code() == "admission.pool_capacity"),
+        "{rejected:#?}"
+    );
+}
+
+#[test]
+fn helper_and_caller_sequential_commitments_share_one_slot_interprocedurally() {
+    let source = br#"from core import pool as pools
+
+fn use_slot[P: Pool](mut scratch: pools.Scope[P]):
+    allocation = scratch.allocate(value=1)
+    value = scratch.reclaim(allocation=take allocation)
+
+@image
+fn build() -> Image:
+    mut value = 0
+    with pools.scoped(capacity=1) as scratch:
+        use_slot(mut scratch)
+        allocation = scratch.allocate(value=2)
+        value = scratch.reclaim(allocation=take allocation)
+    return Image.new(value=value)
+"#;
+
+    let outcome = compile_planned(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "discharged helper and caller commitments have an interprocedural peak of one: {outcome:#?}"
+    );
+}
+
+#[test]
+fn inner_scope_permit_cleanup_releases_before_later_same_pool_allocation() {
+    let source = br#"from core import pool as pools
+
+@image
+fn build() -> Image:
+    mut value = 0
+    with pools.scoped(capacity=1) as scratch:
+        if true:
+            permit: pools.Permit[scratch, i64] = scratch.reserve()
+        allocation = scratch.allocate(value=7)
+        value = scratch.reclaim(allocation=take allocation)
+    return Image.new(value=value)
+"#;
+
+    let outcome = compile_planned(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "recoverable inner-scope cleanup must execute the Permit release transition: {outcome:#?}"
+    );
+}
+
+#[test]
+fn planned_try_allocate_result_custody_reaches_verified_core() {
+    let source = br#"from core import pool as pools
+
+resource struct Token:
+    value: i64
+
+@image
+fn build() -> Image:
+    token = Token(value=7)
+    with pools.scoped(capacity=1) as scratch:
+        attempted = scratch.try_allocate(value=take token)
+        match attempted:
+            case Result.Ok(take allocation):
+                token = scratch.reclaim(allocation=take allocation)
+            case Result.Err(take full):
+                token = take full.value
+    return Image.new(token=take token)
+"#;
+
+    let outcome = compile_planned(source);
+    assert!(
+        matches!(outcome, CompilationOutcome::Accepted(_)),
+        "fallible Pool custody must survive Plan and verified Core Result matching: {outcome:#?}"
     );
 }

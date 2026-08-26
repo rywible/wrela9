@@ -7,8 +7,8 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_128;
 
 use crate::model::{
-    BuildKind, BuiltinVariant, DefinitionId, FloatType, IntegerType, SpecializationId, TestId,
-    Type, VariantId,
+    BuildKind, BuiltinVariant, DefinitionId, FloatType, IntegerType, PoolId, SpecializationId,
+    TestId, Type, VariantId,
 };
 use crate::typed_hir::{
     AccessMode, BinaryOperator, CallTarget, CleanupAction, ClosureId, Expression, ExpressionKind,
@@ -236,7 +236,7 @@ enum Control<'hir> {
     ClearLocals(Vec<LocalId>),
     ReclaimCompilerOwnedLocal(LocalId),
     FinishOpenPool {
-        site: &'hir SourceRange,
+        pool: PoolId,
     },
     ForNext {
         function: &'hir HirFunction,
@@ -384,6 +384,7 @@ pub(crate) struct Engine<'a> {
     root_dependencies: BTreeSet<crate::typed_hir::EvaluationRoot>,
     fuel_by_site: BTreeMap<SourceRange, u64>,
     pools: BTreeMap<u128, RuntimePoolState>,
+    pool_activations: BTreeMap<PoolId, u64>,
 }
 
 pub(crate) struct Run {
@@ -458,6 +459,7 @@ impl<'a> Engine<'a> {
             root_dependencies: BTreeSet::new(),
             fuel_by_site: BTreeMap::new(),
             pools: BTreeMap::new(),
+            pool_activations: BTreeMap::new(),
         }
     }
 
@@ -494,6 +496,7 @@ impl<'a> Engine<'a> {
         self.evaluation_provenance = None;
         self.fuel_by_site.clear();
         self.pools.clear();
+        self.pool_activations.clear();
     }
 
     fn finish(&mut self, result: Result<Value, EvalFailure>) -> Run {
@@ -1065,13 +1068,27 @@ impl<'a> Engine<'a> {
                     index,
                 } => {
                     if index == 0 {
-                        frames
+                        let controls = &mut frames
                             .last_mut()
                             .expect("machine has current frame")
-                            .controls
-                            .push(Control::EndScope {
-                                deferred: Vec::new(),
-                            });
+                            .controls;
+                        controls.push(Control::EndScope {
+                            deferred: Vec::new(),
+                        });
+                        let locals = statements
+                            .iter()
+                            .filter_map(|statement| match statement {
+                                Statement::Initialize { place, .. }
+                                    if place.projections.is_empty() =>
+                                {
+                                    Some(place.local)
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        if !locals.is_empty() {
+                            controls.push(Control::ClearLocals(locals));
+                        }
                     }
                     if let Some(statement) = statements.get(index) {
                         let controls = &mut frames
@@ -1268,10 +1285,11 @@ impl<'a> Engine<'a> {
                             );
                         }
                         Statement::WithPool {
+                            pool,
                             binding,
                             scope,
                             body,
-                            source,
+                            source: _,
                         } => {
                             controls.push(Control::ReclaimCompilerOwnedLocal(binding.local));
                             controls.push(Control::Block {
@@ -1283,7 +1301,7 @@ impl<'a> Engine<'a> {
                                 local: binding.local,
                                 initialize: true,
                             });
-                            controls.push(Control::FinishOpenPool { site: source });
+                            controls.push(Control::FinishOpenPool { pool: *pool });
                             controls.push(Control::Expression(scope));
                         }
                         Statement::Pass(_) => {}
@@ -1789,7 +1807,7 @@ impl<'a> Engine<'a> {
                 Control::ReclaimCompilerOwnedLocal(local) => {
                     self.reclaim_compiler_owned_local(&mut frames, local)?
                 }
-                Control::FinishOpenPool { site } => {
+                Control::FinishOpenPool { pool } => {
                     let mut scope = self.pop_value(&mut frames)?;
                     let Value::Struct { fields, .. } = &mut scope else {
                         return Err(EvalFailure::Defect(Arc::from(
@@ -1817,19 +1835,18 @@ impl<'a> Engine<'a> {
                     let declared_capacity = u64::try_from(*value).map_err(|_| {
                         EvalFailure::Defect(Arc::from("authenticated Pool capacity is outside u64"))
                     })?;
-                    let mut identity = Vec::new();
-                    identity.extend_from_slice(b"wrela.pool.runtime-identity\0\x01");
-                    identity.extend_from_slice(site.path().as_bytes());
-                    identity.extend_from_slice(&site.start().to_be_bytes());
-                    identity.extend_from_slice(&site.end().to_be_bytes());
-                    identity.extend_from_slice(
-                        &self
-                            .evaluation_root
-                            .expect("Pool opens during an evaluator root")
-                            .identity()
-                            .to_be_bytes(),
+                    let activation = self.pool_activations.entry(pool).or_default();
+                    let identity = xxh3_128(
+                        &[
+                            b"wrela.pool-runtime-activation.v1".as_slice(),
+                            &pool.0.to_be_bytes(),
+                            &activation.to_be_bytes(),
+                        ]
+                        .concat(),
                     );
-                    let identity = xxh3_128(&identity);
+                    *activation = activation.checked_add(1).ok_or_else(|| {
+                        EvalFailure::Defect(Arc::from("Pool activation identity exhausted"))
+                    })?;
                     if self
                         .pools
                         .insert(
@@ -2757,15 +2774,15 @@ impl<'a> Engine<'a> {
         frames: &mut [MachineFrame<'hir>],
         locals: &[LocalId],
     ) -> Result<(), EvalFailure> {
-        let frame = frames
-            .last_mut()
-            .ok_or_else(|| EvalFailure::Defect(Arc::from("local cleanup without a frame")))?;
         for local in locals {
-            if let Some(value) = frame
+            let value = frames
+                .last_mut()
+                .ok_or_else(|| EvalFailure::Defect(Arc::from("local cleanup without a frame")))?
                 .locals
                 .get_mut(local.0 as usize)
-                .and_then(Option::take)
-            {
+                .and_then(Option::take);
+            if let Some(value) = value {
+                self.release_compiler_owned_permit(&value)?;
                 self.release(value_size(&value))?;
             }
         }
@@ -2788,7 +2805,98 @@ impl<'a> Engine<'a> {
                     "authenticated compiler-owned local was omitted or reclaimed twice",
                 ))
             })?;
+        self.close_compiler_owned_pool(&value)?;
         self.release(value_size(&value))
+    }
+
+    fn release_compiler_owned_permit(&mut self, value: &Value) -> Result<(), EvalFailure> {
+        let Value::Struct { fields, .. } = value else {
+            return Ok(());
+        };
+        if fields.iter().all(|(_, value)| *value == Value::Unavailable) {
+            return Ok(());
+        }
+        if !fields
+            .iter()
+            .any(|(name, _)| name.as_ref() == "permit_identity")
+        {
+            return Ok(());
+        }
+        let pool_identity = hidden_u128(fields, "pool_identity")?;
+        let slot = usize::try_from(hidden_u64(fields, "slot")?).map_err(|_| {
+            EvalFailure::Defect(Arc::from(
+                "compiler-reclaimed Pool Permit slot exceeds host bounds",
+            ))
+        })?;
+        let generation = hidden_u64(fields, "generation")?;
+        let permit_identity = hidden_u128(fields, "permit_identity")?;
+        let record = self
+            .pools
+            .get_mut(&pool_identity)
+            .and_then(|pool| pool.slots.get_mut(slot))
+            .ok_or_else(|| {
+                EvalFailure::Defect(Arc::from(
+                    "compiler-reclaimed Pool Permit names no open slot",
+                ))
+            })?;
+        if record.generation != generation || record.reserved != Some(permit_identity) {
+            return Err(EvalFailure::Defect(Arc::from(
+                "compiler-reclaimed Pool Permit was stale or already discharged",
+            )));
+        }
+        record.reserved = None;
+        Ok(())
+    }
+
+    fn close_compiler_owned_pool(&mut self, value: &Value) -> Result<(), EvalFailure> {
+        let Value::Struct { fields, .. } = value else {
+            return Err(EvalFailure::Defect(Arc::from(
+                "authenticated compiler-owned Pool scope is not a struct",
+            )));
+        };
+        let capacity = fields
+            .iter()
+            .find(|(name, _)| name.as_ref() == "capacity")
+            .map(|(_, value)| value)
+            .ok_or_else(|| {
+                EvalFailure::Defect(Arc::from(
+                    "authenticated compiler-owned Pool scope omitted capacity",
+                ))
+            })?;
+        let Value::Tuple(parts) = capacity else {
+            return Err(EvalFailure::Defect(Arc::from(
+                "authenticated compiler-owned Pool scope was not opened",
+            )));
+        };
+        let identity = parts
+            .get(1)
+            .and_then(|value| match value {
+                Value::Bytes(bytes) if bytes.len() == 16 => {
+                    let mut identity = [0_u8; 16];
+                    identity.copy_from_slice(bytes);
+                    Some(u128::from_be_bytes(identity))
+                }
+                _ => None,
+            })
+            .ok_or_else(|| {
+                EvalFailure::Defect(Arc::from(
+                    "authenticated compiler-owned Pool scope omitted identity",
+                ))
+            })?;
+        let pool = self.pools.get(&identity).ok_or_else(|| {
+            EvalFailure::Defect(Arc::from("compiler-owned Pool scope was closed twice"))
+        })?;
+        if pool
+            .slots
+            .iter()
+            .any(|slot| slot.live.is_some() || slot.reserved.is_some())
+        {
+            return Err(EvalFailure::Defect(Arc::from(
+                "compiler-owned Pool closed with live custody or reservations",
+            )));
+        }
+        self.pools.remove(&identity);
+        Ok(())
     }
 
     fn complete_frame<'hir>(
@@ -4662,7 +4770,28 @@ mod tests {
         let cancellation = Cancellation::new();
         let mut engine = Engine::new(&program, &cancellation);
         let local = LocalId(0);
-        let value = Value::Bool(true);
+        let identity = 7_u128;
+        engine.pools.insert(
+            identity,
+            RuntimePoolState {
+                slots: Vec::new(),
+                next_permit: 1,
+            },
+        );
+        let value = Value::Struct {
+            definition: DefinitionId(1),
+            type_display: Arc::from("Scope"),
+            fields: Arc::from([(
+                Arc::from("capacity"),
+                Value::Tuple(Arc::from([
+                    Value::Integer {
+                        kind: IntegerType::U64,
+                        value: 0,
+                    },
+                    Value::Bytes(Arc::from(identity.to_be_bytes())),
+                ])),
+            )]),
+        };
         engine
             .retain(value_size(&value))
             .expect("fixture is retained");
@@ -4680,6 +4809,82 @@ mod tests {
             .expect("first authenticated reclaim succeeds");
         assert!(matches!(
             engine.reclaim_compiler_owned_local(&mut frames, local),
+            Err(EvalFailure::Defect(_))
+        ));
+    }
+
+    #[test]
+    fn compiler_pool_cleanup_rejects_double_permit_release_and_close_with_live_state() {
+        let mut identities = crate::identity::IdentityCatalog::empty();
+        let program = typed_hir::verify(
+            ProgramInput::default(),
+            &BuildAuthority::test_compiler_distribution(),
+            &PoolAuthority::from_authenticated_scoped_factory(None),
+            &mut identities,
+            &Cancellation::new(),
+        )
+        .expect("empty program verifies");
+        let cancellation = Cancellation::new();
+        let mut engine = Engine::new(&program, &cancellation);
+        let identity = 9_u128;
+        engine.pools.insert(
+            identity,
+            RuntimePoolState {
+                slots: vec![RuntimePoolSlot {
+                    generation: 0,
+                    live: None,
+                    reserved: Some(3),
+                    retired: false,
+                }],
+                next_permit: 4,
+            },
+        );
+        let permit = Value::Struct {
+            definition: DefinitionId(2),
+            type_display: Arc::from("Permit"),
+            fields: Arc::from([
+                (
+                    Arc::from("pool_identity"),
+                    Value::Bytes(Arc::from(identity.to_be_bytes())),
+                ),
+                (Arc::from("slot"), u64_value(0).expect("slot")),
+                (Arc::from("generation"), u64_value(0).expect("generation")),
+                (
+                    Arc::from("type_identity"),
+                    Value::Bytes(Arc::from(5_u128.to_be_bytes())),
+                ),
+                (
+                    Arc::from("permit_identity"),
+                    Value::Bytes(Arc::from(3_u128.to_be_bytes())),
+                ),
+            ]),
+        };
+        engine
+            .release_compiler_owned_permit(&permit)
+            .expect("first cleanup releases the reservation");
+        assert!(matches!(
+            engine.release_compiler_owned_permit(&permit),
+            Err(EvalFailure::Defect(_))
+        ));
+
+        engine.pools.get_mut(&identity).expect("pool").slots[0].live =
+            Some(RuntimePoolAllocation {
+                type_identity: 5,
+                value: Value::Bool(true),
+            });
+        let scope = Value::Struct {
+            definition: DefinitionId(1),
+            type_display: Arc::from("Scope"),
+            fields: Arc::from([(
+                Arc::from("capacity"),
+                Value::Tuple(Arc::from([
+                    u64_value(1).expect("capacity"),
+                    Value::Bytes(Arc::from(identity.to_be_bytes())),
+                ])),
+            )]),
+        };
+        assert!(matches!(
+            engine.close_compiler_owned_pool(&scope),
             Err(EvalFailure::Defect(_))
         ));
     }

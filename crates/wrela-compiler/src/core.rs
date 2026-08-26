@@ -10,10 +10,10 @@ use crate::completed_semantic::{
     CoreSourceExecutableBody, CoreSourceExecutableInput, CoreSourceExecutableKind,
 };
 use crate::image_planning::{CorePlanningInput, ExecutableRef, GeneratedRole};
-use crate::model::{IntegerType, SpecializationId, Type, TypeId};
+use crate::model::{BuiltinVariant, IntegerType, SpecializationId, Type, TypeId};
 use crate::typed_hir::{
     BinaryOperator, CallTarget, Expression, ExpressionKind, HirMatchPattern, Literal, Place,
-    PlaceProjection, PoolOperation, Statement,
+    PlaceProjection, PoolOperation, Statement, root_place,
 };
 use crate::{Cancellation, CanonicalValue, EvaluationOutcome, EvaluationPanicKind, SourceRange};
 
@@ -236,7 +236,7 @@ struct ProofCondition {
     requirement_identity: u128,
     requirement_current_meaning: u128,
     source_type_identity: u128,
-    retains_fallible_source_type: bool,
+    retains_source_return_type: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -507,7 +507,7 @@ pub struct CoreCustodyEffectObservation {
     requirement_identity: Option<u128>,
     requirement_current_meaning: Option<u128>,
     source_type_identity: Option<u128>,
-    retains_fallible_source_type: bool,
+    retains_source_return_type: bool,
 }
 
 impl CoreCustodyEffectObservation {
@@ -592,8 +592,8 @@ impl CoreCustodyEffectObservation {
     }
 
     #[must_use]
-    pub const fn retains_fallible_source_type(&self) -> bool {
-        self.retains_fallible_source_type
+    pub const fn retains_source_return_type(&self) -> bool {
+        self.retains_source_return_type
     }
 }
 
@@ -1262,10 +1262,10 @@ fn observe_executable_custody(
                     .proof
                     .as_ref()
                     .map(|proof| proof.source_type_identity),
-                retains_fallible_source_type: effect
+                retains_source_return_type: effect
                     .proof
                     .as_ref()
-                    .is_some_and(|proof| proof.retains_fallible_source_type),
+                    .is_some_and(|proof| proof.retains_source_return_type),
             });
         }
         if operation.kind == CoreOperationKind::Store
@@ -1726,7 +1726,13 @@ fn produce_source_executable(
         semantic.verified_program(),
         cancellation,
     )?;
-    attach_pool_proof_conditions(&mut regions, semantic, planning, cancellation)?;
+    attach_pool_proof_conditions(
+        &mut regions,
+        reference.identity,
+        semantic,
+        planning,
+        cancellation,
+    )?;
     let mut executable = CoreExecutable {
         reference,
         semantic_owner: owner,
@@ -2121,6 +2127,7 @@ fn pool_operation_for_core_call(
 
 fn pool_proof_condition(
     operation: &Operation,
+    executable_identity: u128,
     semantic: crate::completed_semantic::CorePlanningSemanticProgram<'_>,
     planning: CorePlanningInput<'_>,
 ) -> Option<ProofCondition> {
@@ -2132,17 +2139,18 @@ fn pool_proof_condition(
         return None;
     }
     let (requirement, source_type_identity) =
-        planning.pool_admission_site(pool_operation, &operation.provenance)?;
+        planning.pool_admission_site(executable_identity, pool_operation, &operation.provenance)?;
     Some(ProofCondition {
         requirement_identity: requirement.identity(),
         requirement_current_meaning: requirement.current_meaning(),
         source_type_identity,
-        retains_fallible_source_type: true,
+        retains_source_return_type: true,
     })
 }
 
 fn attach_pool_proof_conditions(
     regions: &mut Arc<[Region]>,
+    executable_identity: u128,
     semantic: crate::completed_semantic::CorePlanningSemanticProgram<'_>,
     planning: CorePlanningInput<'_>,
     cancellation: &Cancellation,
@@ -2152,7 +2160,9 @@ fn attach_pool_proof_conditions(
         let mut operations = region.operations.to_vec();
         for operation in &mut operations {
             checkpoint(cancellation)?;
-            if let Some(proof) = pool_proof_condition(operation, semantic, planning) {
+            if let Some(proof) =
+                pool_proof_condition(operation, executable_identity, semantic, planning)
+            {
                 let mut effect = custody_effect(
                     CoreCustodyOperation::ProofCondition,
                     (
@@ -2190,7 +2200,8 @@ fn verify_pool_proof_conditions(
         .flat_map(|region| region.operations.iter())
     {
         checkpoint(cancellation)?;
-        let expected = pool_proof_condition(operation, semantic, planning);
+        let expected =
+            pool_proof_condition(operation, executable.reference.identity, semantic, planning);
         let supplied = operation
             .custody
             .iter()
@@ -2243,6 +2254,7 @@ impl ProducerCustodyFlow<'_> {
             })?
             .operations
             .to_vec();
+        let mut known = live.clone();
         let mut terminated = false;
         for operation in &operations {
             checkpoint(self.cancellation)?;
@@ -2260,13 +2272,22 @@ impl ProducerCustodyFlow<'_> {
                 self.components,
                 &mut live,
             );
+            if operation.kind == CoreOperationKind::Store {
+                producer_update_live_places(
+                    operation,
+                    self.value_types,
+                    self.program,
+                    self.components,
+                    &mut known,
+                );
+            }
             if matches!(
                 operation.kind,
                 CoreOperationKind::Branch | CoreOperationKind::Match
             ) {
                 let mut outputs = Vec::new();
                 for successor in operation.successors.iter().copied() {
-                    if let Some(output) = self.region(successor, live.clone(), live.clone())? {
+                    if let Some(output) = self.region(successor, live.clone(), known.clone())? {
                         outputs.push(output);
                     }
                 }
@@ -2330,7 +2351,7 @@ impl ProducerCustodyFlow<'_> {
                 for (place, _) in discharges {
                     live.remove(&place);
                 }
-                terminated = matches!(
+                terminated |= matches!(
                     operation.kind,
                     CoreOperationKind::Return | CoreOperationKind::Propagate
                 );
@@ -3123,12 +3144,45 @@ impl<'a> ProducerLowerer<'a> {
                 cases,
                 source,
             } => {
+                let matched_place = root_place(value).map(|place| place_details(&place));
                 let value = self.lower_expression(value, operations)?;
                 let mut successors = Vec::new();
                 let mut details = vec![u128::try_from(cases.len()).unwrap_or(u128::MAX)];
                 for case in cases.iter() {
                     let case_region = self.reserve_region();
                     let mut case_operations = Vec::new();
+                    if let (Some(pattern), Some(place)) = (&case.pattern, &matched_place)
+                        && let Some((binding, type_identity)) =
+                            producer_result_payload_move_binding(pattern)
+                    {
+                        let payload = self.value();
+                        self.push_operation(
+                            &mut case_operations,
+                            CoreOperationKind::Read,
+                            Some(payload),
+                            Some(type_identity),
+                            [],
+                            [],
+                            place.iter().copied(),
+                            EffectBoundary::Ownership,
+                            FailureLaw::None,
+                            case.source.clone(),
+                            CoreAccessLaw::Move,
+                        );
+                        self.push_operation(
+                            &mut case_operations,
+                            CoreOperationKind::Store,
+                            None,
+                            None,
+                            [payload],
+                            [],
+                            [binding, 1],
+                            EffectBoundary::Ownership,
+                            FailureLaw::None,
+                            case.source.clone(),
+                            CoreAccessLaw::None,
+                        );
+                    }
                     if let Some(guard) = &case.guard {
                         let guard_value = self.lower_expression(guard, &mut case_operations)?;
                         details.push(u128::from(guard_value.0));
@@ -3207,6 +3261,7 @@ impl<'a> ProducerLowerer<'a> {
                 scope,
                 body,
                 source,
+                ..
             } => {
                 let scope = self.lower_expression(scope, operations)?;
                 let body = self.lower_block(body)?;
@@ -3706,6 +3761,26 @@ fn pattern_details(pattern: &HirMatchPattern) -> Vec<u128> {
     output
 }
 
+fn producer_result_payload_move_binding(pattern: &HirMatchPattern) -> Option<(u128, u128)> {
+    match pattern {
+        HirMatchPattern::BuiltinVariant {
+            variant: BuiltinVariant::ResultOk | BuiltinVariant::ResultErr,
+            payload,
+        } => match payload.as_ref() {
+            [
+                HirMatchPattern::Binding {
+                    local,
+                    type_id,
+                    access: crate::typed_hir::AccessMode::Move,
+                    ..
+                },
+            ] => Some((u128::from(local.0), type_id.0)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn append_pattern(pattern: &HirMatchPattern, output: &mut Vec<u128>) {
     match pattern {
         HirMatchPattern::Wildcard => output.push(1),
@@ -3963,7 +4038,7 @@ fn encode_custody(
             hash.update(&proof.requirement_identity.to_be_bytes());
             hash.update(&proof.requirement_current_meaning.to_be_bytes());
             hash.update(&proof.source_type_identity.to_be_bytes());
-            hash.update(&[u8::from(proof.retains_fallible_source_type)]);
+            hash.update(&[u8::from(proof.retains_source_return_type)]);
         } else {
             hash.update(&[0]);
         }
@@ -4455,6 +4530,7 @@ impl<'a> VerifierLowerer<'a> {
                 cases,
                 source,
             } => {
+                let matched_place = root_place(value).map(|place| place_details(&place));
                 let value = self.reconstruct_expression(value, operations)?;
                 let mut successors = Vec::new();
                 let mut details = vec![u128::try_from(cases.len()).unwrap_or(u128::MAX)];
@@ -4462,6 +4538,38 @@ impl<'a> VerifierLowerer<'a> {
                     checkpoint(self.cancellation)?;
                     let case_region = self.reserve_region();
                     let mut case_operations = Vec::new();
+                    if let (Some(pattern), Some(place)) = (&case.pattern, &matched_place)
+                        && let Some((binding, type_identity)) =
+                            verifier_result_payload_move_binding(pattern)
+                    {
+                        let payload = self.value();
+                        self.emit(
+                            &mut case_operations,
+                            CoreOperationKind::Read,
+                            Some(payload),
+                            Some(type_identity),
+                            [],
+                            [],
+                            place.iter().copied(),
+                            EffectBoundary::Ownership,
+                            FailureLaw::None,
+                            case.source.clone(),
+                            CoreAccessLaw::Move,
+                        );
+                        self.emit(
+                            &mut case_operations,
+                            CoreOperationKind::Store,
+                            None,
+                            None,
+                            [payload],
+                            [],
+                            [binding, 1],
+                            EffectBoundary::Ownership,
+                            FailureLaw::None,
+                            case.source.clone(),
+                            CoreAccessLaw::None,
+                        );
+                    }
                     if let Some(guard) = &case.guard {
                         let guard = self.reconstruct_expression(guard, &mut case_operations)?;
                         details.push(u128::from(guard.0));
@@ -4541,6 +4649,7 @@ impl<'a> VerifierLowerer<'a> {
                 scope,
                 body,
                 source,
+                ..
             } => {
                 let scope = self.reconstruct_expression(scope, operations)?;
                 let body = self.reconstruct_block(body)?;
@@ -5153,6 +5262,26 @@ fn verifier_pattern_details(pattern: &HirMatchPattern) -> Vec<u128> {
     output
 }
 
+fn verifier_result_payload_move_binding(pattern: &HirMatchPattern) -> Option<(u128, u128)> {
+    match pattern {
+        HirMatchPattern::BuiltinVariant {
+            variant: BuiltinVariant::ResultOk | BuiltinVariant::ResultErr,
+            payload,
+        } => match payload.as_ref() {
+            [
+                HirMatchPattern::Binding {
+                    local,
+                    type_id,
+                    access: crate::typed_hir::AccessMode::Move,
+                    ..
+                },
+            ] => Some((u128::from(local.0), type_id.0)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 const fn verifier_access_tag(access: crate::typed_hir::AccessMode) -> u8 {
     match access {
         crate::typed_hir::AccessMode::Copy => 1,
@@ -5610,7 +5739,7 @@ fn verifier_encode_custody(
             bytes.extend_from_slice(&proof.requirement_identity.to_be_bytes());
             bytes.extend_from_slice(&proof.requirement_current_meaning.to_be_bytes());
             bytes.extend_from_slice(&proof.source_type_identity.to_be_bytes());
-            bytes.push(u8::from(proof.retains_fallible_source_type));
+            bytes.push(u8::from(proof.retains_source_return_type));
         } else {
             bytes.push(0);
         }
@@ -6489,7 +6618,7 @@ fn valid_custody_law(effect: &CustodyEffect) -> bool {
                     proof.requirement_identity != 0
                         && proof.requirement_current_meaning != 0
                         && proof.source_type_identity != 0
-                        && proof.retains_fallible_source_type
+                        && proof.retains_source_return_type
                 })
         }
         CoreCustodyOperation::Panic => {
@@ -6805,6 +6934,7 @@ fn source_flow_statements(
     cancellation: &Cancellation,
     discharges: &mut BTreeMap<(Arc<[u128]>, u128), usize>,
 ) -> Result<Option<SourceLiveRoots>, CoreFailure> {
+    let mut known = live.clone();
     for statement in statements {
         checkpoint(cancellation)?;
         match statement {
@@ -6825,7 +6955,9 @@ fn source_flow_statements(
             Statement::Initialize { place, value, .. } | Statement::Assign { place, value, .. } => {
                 source_flow_expression(value, program, &mut live, cancellation)?;
                 if program.owns_resource_type(value.type_id) {
-                    live.insert(Arc::from(place_details(place)), value.type_id.0);
+                    let place = Arc::from(place_details(place));
+                    live.insert(Arc::clone(&place), value.type_id.0);
+                    known.insert(place, value.type_id.0);
                 }
             }
             Statement::Evaluate(expression) => {
@@ -6849,7 +6981,7 @@ fn source_flow_statements(
                     if let Some(output) = source_flow_statements(
                         branch,
                         live.clone(),
-                        &live,
+                        &known,
                         false,
                         program,
                         cancellation,
@@ -6907,13 +7039,22 @@ fn source_flow_statements(
                 let mut outputs = Vec::new();
                 for case in cases.iter() {
                     let mut case_live = live.clone();
+                    if let (Some(pattern), Some(place)) = (
+                        &case.pattern,
+                        root_place(value).map(|place| place_details(&place)),
+                    ) && let Some((binding, type_identity)) =
+                        source_result_payload_move_binding(pattern)
+                    {
+                        case_live.retain(|candidate, _| !places_overlap(candidate, &place));
+                        case_live.insert(Arc::from([binding]), type_identity);
+                    }
                     if let Some(guard) = &case.guard {
                         source_flow_expression(guard, program, &mut case_live, cancellation)?;
                     }
                     if let Some(output) = source_flow_statements(
                         &case.body,
                         case_live,
-                        &live,
+                        &known,
                         false,
                         program,
                         cancellation,
@@ -7435,6 +7576,29 @@ fn source_custody_statements(
                         u32::from(CoreOperationKind::Match.tag()),
                         u32::try_from(ordinal).unwrap_or(u32::MAX),
                     ]);
+                    if let (Some(pattern), Some(place)) = (
+                        &case.pattern,
+                        root_place(value).map(|place| place_details(&place)),
+                    ) && let Some((binding, type_identity)) =
+                        source_result_payload_move_binding(pattern)
+                    {
+                        source_custody_event(
+                            events,
+                            CoreCustodyOperation::Move,
+                            Some(type_identity),
+                            place,
+                            &case.source,
+                            &child,
+                        );
+                        source_custody_event(
+                            events,
+                            CoreCustodyOperation::TransferCommit,
+                            Some(type_identity),
+                            Arc::from([binding]),
+                            &case.source,
+                            &child,
+                        );
+                    }
                     if let Some(guard) = &case.guard {
                         source_custody_expression(guard, &child, program, cancellation, events)?;
                     }
@@ -7475,6 +7639,7 @@ fn source_custody_statements(
                 scope,
                 body,
                 source,
+                ..
             } => {
                 source_custody_expression(scope, path, program, cancellation, events)?;
                 if program.owns_resource_type(scope.type_id) {
@@ -7495,6 +7660,26 @@ fn source_custody_statements(
         }
     }
     Ok(())
+}
+
+fn source_result_payload_move_binding(pattern: &HirMatchPattern) -> Option<(u128, u128)> {
+    match pattern {
+        HirMatchPattern::BuiltinVariant {
+            variant: BuiltinVariant::ResultOk | BuiltinVariant::ResultErr,
+            payload,
+        } => match payload.as_ref() {
+            [
+                HirMatchPattern::Binding {
+                    local,
+                    type_id,
+                    access: crate::typed_hir::AccessMode::Move,
+                    ..
+                },
+            ] => Some((u128::from(local.0), type_id.0)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn core_custody_contract(
@@ -7667,7 +7852,9 @@ fn verifier_expected_custody_trace(
                 .expected
                 .remove(&operation.identity)
                 .unwrap_or_default();
-            if let Some(proof) = pool_proof_condition(operation, semantic, planning) {
+            if let Some(proof) =
+                pool_proof_condition(operation, executable.reference.identity, semantic, planning)
+            {
                 let mut effect = verifier_effect(
                     CoreCustodyOperation::ProofCondition,
                     (
@@ -7722,6 +7909,7 @@ impl VerifierCustodyFlow<'_> {
             })?
             .operations
             .to_vec();
+        let mut known = state.clone();
         let mut terminal = false;
         for operation in &operations {
             checkpoint(self.cancellation)?;
@@ -7749,11 +7937,15 @@ impl VerifierCustodyFlow<'_> {
                         if let Some(children) = self.components.get(&place[0]) {
                             state.retain(|candidate, _| !place_is_prefix(&place, candidate));
                             state.extend(children.iter().cloned());
+                            known.retain(|candidate, _| !place_is_prefix(&place, candidate));
+                            known.extend(children.iter().cloned());
                         } else {
-                            state.insert(place, type_identity);
+                            state.insert(Arc::clone(&place), type_identity);
+                            known.insert(place, type_identity);
                         }
                     } else {
-                        state.insert(place, type_identity);
+                        state.insert(Arc::clone(&place), type_identity);
+                        known.insert(place, type_identity);
                     }
                 }
             }
@@ -7764,7 +7956,7 @@ impl VerifierCustodyFlow<'_> {
                 let mut continuations = Vec::new();
                 for successor in operation.successors.iter().copied() {
                     if let Some(output) =
-                        self.inspect_region(successor, state.clone(), state.clone())?
+                        self.inspect_region(successor, state.clone(), known.clone())?
                     {
                         continuations.push(output);
                     }
@@ -9879,7 +10071,7 @@ fn build() -> Image:
                     requirement_identity: 1,
                     requirement_current_meaning: 2,
                     source_type_identity: 3,
-                    retains_fallible_source_type: true,
+                    retains_source_return_type: true,
                 });
                 effects.push(proof);
                 operation.custody = effects.into();

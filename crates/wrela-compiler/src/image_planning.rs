@@ -10651,6 +10651,9 @@ struct ServiceDemand {
     identity: u128,
     requirement: u128,
     requirements: Arc<[ServiceRequirementRef]>,
+    capacity_requirements: Arc<[ServiceRequirementRef]>,
+    response_requirements: Arc<[ServiceRequirementRef]>,
+    cancellation_requirements: Arc<[ServiceRequirementRef]>,
     kind: ServiceClassKind,
     core: u16,
     maximum_simultaneous_release: u32,
@@ -10993,6 +10996,22 @@ fn solve_service_problem_with_limit(
                     .requirements
                     .iter()
                     .any(|reference| reference.identity == demand.requirement)
+                || [
+                    demand.capacity_requirements.as_ref(),
+                    demand.response_requirements.as_ref(),
+                    demand.cancellation_requirements.as_ref(),
+                ]
+                .iter()
+                .any(|evidence| {
+                    evidence.is_empty()
+                        || evidence.windows(2).any(|pair| pair[0] >= pair[1])
+                        || evidence
+                            .iter()
+                            .any(|reference| !demand.requirements.contains(reference))
+                        || !evidence
+                            .iter()
+                            .any(|reference| reference.identity == demand.requirement)
+                })
                 || !cores.iter().any(|core| core.ordinal == demand.core)
                 || demand.maximum_simultaneous_release == 0
                 || demand.maximum_concurrency == 0
@@ -11153,9 +11172,9 @@ fn service_conflict(
             .collect::<Vec<_>>();
         if let Some(candidate) =
             classify_service_conflict_subset(problem, cores, &subset, cancellation, &mut states)?
-            && best.as_ref().is_none_or(|current| {
-                service_conflict_rank(&candidate) < service_conflict_rank(current)
-            })
+            && best
+                .as_ref()
+                .is_none_or(|current| service_conflict_precedes(&candidate, current))
         {
             best = Some(candidate);
         }
@@ -11165,22 +11184,31 @@ fn service_conflict(
     })
 }
 
-fn service_conflict_rank(
-    conflict: &VerifiedServiceConflict,
-) -> (
-    usize,
-    ServiceConflictCode,
-    &[ServiceRequirementRef],
-    u64,
-    u64,
-) {
-    (
-        conflict.requirements.len(),
-        conflict.code,
-        &conflict.requirements,
-        conflict.required_units,
-        conflict.available_units,
-    )
+fn service_conflict_precedes(
+    candidate: &VerifiedServiceConflict,
+    current: &VerifiedServiceConflict,
+) -> bool {
+    let mut candidate_identities = candidate
+        .requirements
+        .iter()
+        .map(|reference| reference.identity)
+        .collect::<Vec<_>>();
+    candidate_identities.sort_unstable();
+    let mut current_identities = current
+        .requirements
+        .iter()
+        .map(|reference| reference.identity)
+        .collect::<Vec<_>>();
+    current_identities.sort_unstable();
+    candidate.requirements.len() < current.requirements.len()
+        || (candidate.requirements.len() == current.requirements.len()
+            && (candidate.code < current.code
+                || (candidate.code == current.code
+                    && (candidate_identities
+                        .cmp(&current_identities)
+                        .then_with(|| candidate.required_units.cmp(&current.required_units))
+                        .then_with(|| candidate.available_units.cmp(&current.available_units))
+                        .is_lt()))))
 }
 
 fn classify_service_conflict_subset(
@@ -11190,11 +11218,6 @@ fn classify_service_conflict_subset(
     cancellation: &Cancellation,
     states: &mut u64,
 ) -> Result<Option<VerifiedServiceConflict>, PlanningFailure> {
-    let requirements = canonical_service_requirements(
-        demands
-            .iter()
-            .flat_map(|demand| demand.requirements.iter().copied()),
-    );
     for core in cores {
         checkpoint(cancellation)?;
         let required = demands
@@ -11204,6 +11227,12 @@ fn classify_service_conflict_subset(
                 total.saturating_add(demand.activation_units)
             });
         if required > core.maximum_cycle_units {
+            let requirements = canonical_service_requirements(
+                demands
+                    .iter()
+                    .filter(|demand| demand.core == core.ordinal)
+                    .flat_map(|demand| demand.capacity_requirements.iter().copied()),
+            );
             return Ok(Some(VerifiedServiceConflict {
                 code: ServiceConflictCode::CycleCapacity,
                 context: problem.context,
@@ -11285,37 +11314,61 @@ fn classify_service_conflict_subset(
             break;
         }
     }
-    if let Some((index, demand)) = demands
-        .iter()
-        .enumerate()
-        .find(|(index, demand)| minimum_delay[*index] > demand.maximum_delay_units)
-    {
-        return Ok(Some(VerifiedServiceConflict {
-            code: ServiceConflictCode::MaximumDelay,
-            context: problem.context,
-            assignment_fingerprint: problem.assignment_fingerprint,
-            requirements,
-            required_units: minimum_delay[index],
-            available_units: demand.maximum_delay_units,
-        }));
+    let mut exact_bound_conflict: Option<VerifiedServiceConflict> = None;
+    for (index, demand) in demands.iter().enumerate() {
+        for (code, required_units, available_units, requirement_evidence) in [
+            (
+                ServiceConflictCode::MaximumDelay,
+                minimum_delay[index],
+                demand.maximum_delay_units,
+                demand.response_requirements.as_ref(),
+            ),
+            (
+                ServiceConflictCode::CancellationDelay,
+                minimum_cancellation[index],
+                demand.maximum_cancellation_delay_units,
+                demand.cancellation_requirements.as_ref(),
+            ),
+        ] {
+            if required_units <= available_units {
+                continue;
+            }
+            let candidate = VerifiedServiceConflict {
+                code,
+                context: problem.context,
+                assignment_fingerprint: problem.assignment_fingerprint,
+                requirements: canonical_service_requirements(
+                    demands
+                        .iter()
+                        .filter(|other| other.core == demand.core)
+                        .flat_map(|other| other.capacity_requirements.iter().copied())
+                        .chain(requirement_evidence.iter().copied()),
+                ),
+                required_units,
+                available_units,
+            };
+            if exact_bound_conflict
+                .as_ref()
+                .is_none_or(|current| service_conflict_precedes(&candidate, current))
+            {
+                exact_bound_conflict = Some(candidate);
+            }
+        }
     }
-    if let Some((index, demand)) = demands.iter().enumerate().find(|(index, demand)| {
-        minimum_cancellation[*index] > demand.maximum_cancellation_delay_units
-    }) {
-        return Ok(Some(VerifiedServiceConflict {
-            code: ServiceConflictCode::CancellationDelay,
-            context: problem.context,
-            assignment_fingerprint: problem.assignment_fingerprint,
-            requirements,
-            required_units: minimum_cancellation[index],
-            available_units: demand.maximum_cancellation_delay_units,
-        }));
+    if exact_bound_conflict.is_some() {
+        return Ok(exact_bound_conflict);
     }
     Ok(Some(VerifiedServiceConflict {
         code: ServiceConflictCode::SimultaneousMaximums,
         context: problem.context,
         assignment_fingerprint: problem.assignment_fingerprint,
-        requirements,
+        requirements: canonical_service_requirements(demands.iter().flat_map(|demand| {
+            demand
+                .response_requirements
+                .iter()
+                .chain(demand.cancellation_requirements.iter())
+                .copied()
+        })),
         required_units: minimum_violations,
         available_units: 0,
     }))
@@ -11548,19 +11601,31 @@ fn verifier_expected_service_conflict(
         if let Some(candidate) =
             verifier_classify_service_subset(problem, cores, &subset, cancellation, &mut states)?
         {
+            let mut candidate_identities = candidate
+                .requirements
+                .iter()
+                .map(|reference| reference.identity)
+                .collect::<Vec<_>>();
+            candidate_identities.sort_unstable();
             let candidate_key = (
                 candidate.requirements.len(),
                 candidate.code,
-                candidate.requirements.as_ref(),
+                candidate_identities,
                 candidate.required_units,
                 candidate.available_units,
             );
             let replace = best.as_ref().is_none_or(|current| {
+                let mut current_identities = current
+                    .requirements
+                    .iter()
+                    .map(|reference| reference.identity)
+                    .collect::<Vec<_>>();
+                current_identities.sort_unstable();
                 candidate_key
                     < (
                         current.requirements.len(),
                         current.code,
-                        current.requirements.as_ref(),
+                        current_identities,
                         current.required_units,
                         current.available_units,
                     )
@@ -11584,12 +11649,6 @@ fn verifier_classify_service_subset(
     cancellation: &Cancellation,
     states: &mut u64,
 ) -> Result<Option<VerifiedServiceConflict>, PlanningFailure> {
-    let mut requirements = demands
-        .iter()
-        .flat_map(|demand| demand.requirements.iter().copied())
-        .collect::<Vec<_>>();
-    requirements.sort_unstable();
-    requirements.dedup();
     for core in cores {
         checkpoint(cancellation)?;
         let required = demands
@@ -11598,6 +11657,13 @@ fn verifier_classify_service_subset(
             .map(|demand| demand.activation_units)
             .fold(0_u64, u64::saturating_add);
         if required > core.maximum_cycle_units {
+            let mut requirements = demands
+                .iter()
+                .filter(|demand| demand.core == core.ordinal)
+                .flat_map(|demand| demand.capacity_requirements.iter().copied())
+                .collect::<Vec<_>>();
+            requirements.sort_unstable();
+            requirements.dedup();
             return Ok(Some(VerifiedServiceConflict {
                 code: ServiceConflictCode::CycleCapacity,
                 context: problem.context,
@@ -11683,38 +11749,92 @@ fn verifier_classify_service_subset(
         }
         minimum_violations = minimum_violations.min(violations);
     }
-    let (code, required_units, available_units) = if let Some((index, demand)) = demands
+    let mut bound_candidates = Vec::new();
+    for (index, demand) in demands.iter().enumerate() {
+        for (code, required_units, available_units, evidence) in [
+            (
+                ServiceConflictCode::MaximumDelay,
+                minimum_delay[index],
+                demand.maximum_delay_units,
+                demand.response_requirements.as_ref(),
+            ),
+            (
+                ServiceConflictCode::CancellationDelay,
+                minimum_cancellation[index],
+                demand.maximum_cancellation_delay_units,
+                demand.cancellation_requirements.as_ref(),
+            ),
+        ] {
+            if required_units <= available_units {
+                continue;
+            }
+            let mut requirements = demands
+                .iter()
+                .filter(|other| other.core == demand.core)
+                .flat_map(|other| other.capacity_requirements.iter().copied())
+                .chain(evidence.iter().copied())
+                .collect::<Vec<_>>();
+            requirements.sort_unstable();
+            requirements.dedup();
+            bound_candidates.push(VerifiedServiceConflict {
+                code,
+                context: problem.context,
+                assignment_fingerprint: problem.assignment_fingerprint,
+                requirements: requirements.into(),
+                required_units,
+                available_units,
+            });
+        }
+    }
+    if !bound_candidates.is_empty() {
+        return Ok(bound_candidates.into_iter().min_by(|left, right| {
+            let mut left_identities = left
+                .requirements
+                .iter()
+                .map(|reference| reference.identity)
+                .collect::<Vec<_>>();
+            left_identities.sort_unstable();
+            let mut right_identities = right
+                .requirements
+                .iter()
+                .map(|reference| reference.identity)
+                .collect::<Vec<_>>();
+            right_identities.sort_unstable();
+            (
+                left.requirements.len(),
+                left.code,
+                left_identities,
+                left.required_units,
+                left.available_units,
+            )
+                .cmp(&(
+                    right.requirements.len(),
+                    right.code,
+                    right_identities,
+                    right.required_units,
+                    right.available_units,
+                ))
+        }));
+    }
+    let mut requirements = demands
         .iter()
-        .enumerate()
-        .find(|(index, demand)| minimum_delay[*index] > demand.maximum_delay_units)
-    {
-        (
-            ServiceConflictCode::MaximumDelay,
-            minimum_delay[index],
-            demand.maximum_delay_units,
-        )
-    } else if let Some((index, demand)) = demands.iter().enumerate().find(|(index, demand)| {
-        minimum_cancellation[*index] > demand.maximum_cancellation_delay_units
-    }) {
-        (
-            ServiceConflictCode::CancellationDelay,
-            minimum_cancellation[index],
-            demand.maximum_cancellation_delay_units,
-        )
-    } else {
-        (
-            ServiceConflictCode::SimultaneousMaximums,
-            minimum_violations,
-            0,
-        )
-    };
+        .flat_map(|demand| {
+            demand
+                .response_requirements
+                .iter()
+                .chain(demand.cancellation_requirements.iter())
+                .copied()
+        })
+        .collect::<Vec<_>>();
+    requirements.sort_unstable();
+    requirements.dedup();
     Ok(Some(VerifiedServiceConflict {
-        code,
+        code: ServiceConflictCode::SimultaneousMaximums,
         context: problem.context,
         assignment_fingerprint: problem.assignment_fingerprint,
         requirements: requirements.into(),
-        required_units,
-        available_units,
+        required_units: minimum_violations,
+        available_units: 0,
     }))
 }
 
@@ -11832,20 +11952,25 @@ fn independently_classify_service_conflict(
             .filter(|(index, _)| mask & (1_usize << index) != 0)
             .map(|(_, demand)| demand)
             .collect::<Vec<_>>();
-        let mut requirements = subset
-            .iter()
-            .flat_map(|demand| demand.requirements.iter().copied())
-            .collect::<Vec<_>>();
-        requirements.sort_unstable();
-        requirements.dedup();
-        if let Some((required, available)) = cores.iter().find_map(|core| {
+        if let Some((core, required, available)) = cores.iter().find_map(|core| {
             let required = subset
                 .iter()
                 .filter(|demand| demand.core == core.ordinal)
                 .map(|demand| demand.activation_units)
                 .sum::<u64>();
-            (required > core.maximum_cycle_units).then_some((required, core.maximum_cycle_units))
+            (required > core.maximum_cycle_units).then_some((
+                core.ordinal,
+                required,
+                core.maximum_cycle_units,
+            ))
         }) {
+            let mut requirements = subset
+                .iter()
+                .filter(|demand| demand.core == core)
+                .flat_map(|demand| demand.capacity_requirements.iter().copied())
+                .collect::<Vec<_>>();
+            requirements.sort_unstable();
+            requirements.dedup();
             candidates.push(VerifiedServiceConflict {
                 code: ServiceConflictCode::CycleCapacity,
                 context: problem.context,
@@ -11915,54 +12040,93 @@ fn independently_classify_service_conflict(
         if feasible {
             continue;
         }
-        let (code, required_units, available_units) = if let Some((index, demand)) = subset
-            .iter()
-            .enumerate()
-            .find(|(index, demand)| minimum_delay[*index] > demand.maximum_delay_units)
-        {
-            (
-                ServiceConflictCode::MaximumDelay,
-                minimum_delay[index],
-                demand.maximum_delay_units,
-            )
-        } else if let Some((index, demand)) = subset.iter().enumerate().find(|(index, demand)| {
-            minimum_cancellation[*index] > demand.maximum_cancellation_delay_units
-        }) {
-            (
-                ServiceConflictCode::CancellationDelay,
-                minimum_cancellation[index],
-                demand.maximum_cancellation_delay_units,
-            )
-        } else {
-            (
-                ServiceConflictCode::SimultaneousMaximums,
-                minimum_violations,
-                0,
-            )
-        };
-        candidates.push(VerifiedServiceConflict {
-            code,
-            context: problem.context,
-            assignment_fingerprint: problem.assignment_fingerprint,
-            requirements: requirements.into(),
-            required_units,
-            available_units,
-        });
+        let mut found_exact_bound = false;
+        for (index, demand) in subset.iter().enumerate() {
+            for (code, required_units, available_units, evidence) in [
+                (
+                    ServiceConflictCode::MaximumDelay,
+                    minimum_delay[index],
+                    demand.maximum_delay_units,
+                    demand.response_requirements.as_ref(),
+                ),
+                (
+                    ServiceConflictCode::CancellationDelay,
+                    minimum_cancellation[index],
+                    demand.maximum_cancellation_delay_units,
+                    demand.cancellation_requirements.as_ref(),
+                ),
+            ] {
+                if required_units <= available_units {
+                    continue;
+                }
+                found_exact_bound = true;
+                let mut requirements = subset
+                    .iter()
+                    .filter(|other| other.core == demand.core)
+                    .flat_map(|other| other.capacity_requirements.iter().copied())
+                    .chain(evidence.iter().copied())
+                    .collect::<Vec<_>>();
+                requirements.sort_unstable();
+                requirements.dedup();
+                candidates.push(VerifiedServiceConflict {
+                    code,
+                    context: problem.context,
+                    assignment_fingerprint: problem.assignment_fingerprint,
+                    requirements: requirements.into(),
+                    required_units,
+                    available_units,
+                });
+            }
+        }
+        if !found_exact_bound {
+            let mut requirements = subset
+                .iter()
+                .flat_map(|demand| {
+                    demand
+                        .response_requirements
+                        .iter()
+                        .chain(demand.cancellation_requirements.iter())
+                        .copied()
+                })
+                .collect::<Vec<_>>();
+            requirements.sort_unstable();
+            requirements.dedup();
+            candidates.push(VerifiedServiceConflict {
+                code: ServiceConflictCode::SimultaneousMaximums,
+                context: problem.context,
+                assignment_fingerprint: problem.assignment_fingerprint,
+                requirements: requirements.into(),
+                required_units: minimum_violations,
+                available_units: 0,
+            });
+        }
     }
     candidates
         .into_iter()
         .min_by(|left, right| {
+            let mut left_identities = left
+                .requirements
+                .iter()
+                .map(|reference| reference.identity)
+                .collect::<Vec<_>>();
+            left_identities.sort_unstable();
+            let mut right_identities = right
+                .requirements
+                .iter()
+                .map(|reference| reference.identity)
+                .collect::<Vec<_>>();
+            right_identities.sort_unstable();
             (
                 left.requirements.len(),
                 left.code,
-                left.requirements.as_ref(),
+                left_identities,
                 left.required_units,
                 left.available_units,
             )
                 .cmp(&(
                     right.requirements.len(),
                     right.code,
-                    right.requirements.as_ref(),
+                    right_identities,
                     right.required_units,
                     right.available_units,
                 ))
@@ -11979,6 +12143,7 @@ fn tiny_service_problem(
     cancellation_work: u64,
     maximum_cancellation_delay: u64,
 ) -> ServiceProblem {
+    let requirements = synthetic_service_requirements(1, 20 + u128::from(kind.tag()));
     ServiceProblem {
         name,
         context: 1,
@@ -11990,7 +12155,10 @@ fn tiny_service_problem(
         demands: vec![ServiceDemand {
             identity: 10 + u128::from(kind.tag()),
             requirement: 20 + u128::from(kind.tag()),
-            requirements: synthetic_service_requirements(1, 20 + u128::from(kind.tag())),
+            requirements: Arc::clone(&requirements),
+            capacity_requirements: Arc::clone(&requirements),
+            response_requirements: Arc::clone(&requirements),
+            cancellation_requirements: requirements,
             kind,
             core: 0,
             maximum_simultaneous_release: 1,
@@ -12070,10 +12238,14 @@ fn named_tiny_service_puzzles() -> Vec<ServiceProblem> {
         8,
     ));
     let demand = |identity, kind, core, release, concurrency, activation, delay| -> ServiceDemand {
+        let requirements = synthetic_service_requirements(1, identity + 100);
         ServiceDemand {
             identity,
             requirement: identity + 100,
-            requirements: synthetic_service_requirements(1, identity + 100),
+            requirements: Arc::clone(&requirements),
+            capacity_requirements: Arc::clone(&requirements),
+            response_requirements: Arc::clone(&requirements),
+            cancellation_requirements: requirements,
             kind,
             core,
             maximum_simultaneous_release: release,
@@ -12260,6 +12432,10 @@ fn service_demand_identity(kind: ServiceClassKind, subject: u128) -> u128 {
     )
 }
 
+fn actor_turn_service_identity(actor: u128, handler: u128) -> u128 {
+    producer_hash(b"wrela.service-demand.actor-handler.v1", &[actor, handler])
+}
+
 fn service_release(bound: u64) -> Result<u32, PlanningFailure> {
     u32::try_from(bound)
         .map_err(|_| PlanningFailure::Defect(Arc::from("service release bound exceeds schema")))
@@ -12351,24 +12527,6 @@ fn production_service_problem(
         if handler_cores.iter().any(|placed| *placed != core) {
             return defect("Service Plan Actor violates permanent placement");
         }
-        let maximum_handler_work = actor
-            .handlers()
-            .map(|handler| {
-                handler_work
-                    .get(&handler)
-                    .copied()
-                    .filter(|work| work.context == foundation.context)
-                    .map(|work| work.maximum_logical_work_units)
-                    .ok_or_else(|| {
-                        PlanningFailure::Defect(Arc::from(
-                            "Service Plan Actor handler has no verified Core work bound",
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .max()
-            .unwrap_or(1);
         let mailbox = flow_requirements
             .iter()
             .copied()
@@ -12405,33 +12563,22 @@ fn production_service_problem(
                     "Service Plan Actor is missing its placement Requirement",
                 ))
             })?;
-        let handler_evidence = actor
-            .handlers()
-            .filter_map(|handler| handler_work.get(&handler).copied())
-            .map(|handler| ServiceRequirementRef {
-                source: ServiceRequirementSource::Core,
-                context: handler.context,
-                identity: handler.identity,
-                current_meaning: handler.current_meaning,
-            })
-            .collect::<Vec<_>>();
         let release = service_release(actor.mailbox_capacity())?;
         let ingress_units = u64::from(service.ingress_units)
             .checked_add(u64::from(service.cross_core_units))
             .ok_or_else(|| PlanningFailure::Defect(Arc::from("ingress service cost overflow")))?;
-        let turn_units = u64::from(service.actor_turn_units)
-            .checked_add(maximum_handler_work)
-            .ok_or_else(|| {
-                PlanningFailure::Defect(Arc::from("Actor Turn service cost overflow"))
-            })?;
+        let ingress_requirements = canonical_service_requirements([
+            architecture_evidence,
+            flow_evidence(mailbox),
+            flow_evidence(placement),
+        ]);
         demands.push(ServiceDemand {
             identity: service_demand_identity(ServiceClassKind::Ingress, actor.identity()),
             requirement: mailbox.reference().identity(),
-            requirements: canonical_service_requirements([
-                architecture_evidence,
-                flow_evidence(mailbox),
-                flow_evidence(placement),
-            ]),
+            requirements: Arc::clone(&ingress_requirements),
+            capacity_requirements: Arc::clone(&ingress_requirements),
+            response_requirements: Arc::clone(&ingress_requirements),
+            cancellation_requirements: ingress_requirements,
             kind: ServiceClassKind::Ingress,
             core,
             maximum_simultaneous_release: release,
@@ -12442,29 +12589,52 @@ fn production_service_problem(
             cancellation_work_units: 0,
             maximum_cancellation_delay_units: default_cancellation_delay,
         });
-        demands.push(ServiceDemand {
-            identity: service_demand_identity(ServiceClassKind::ActorTurn, actor.identity()),
-            requirement: turn.reference().identity(),
-            requirements: canonical_service_requirements(
-                [
-                    architecture_evidence,
-                    flow_evidence(mailbox),
-                    flow_evidence(turn),
-                    flow_evidence(placement),
-                ]
-                .into_iter()
-                .chain(handler_evidence),
-            ),
-            kind: ServiceClassKind::ActorTurn,
-            core,
-            maximum_simultaneous_release: release,
-            maximum_concurrency: u32::from(actor.max_active_turns()),
-            activation_units: turn_units,
-            maximum_non_preemptive_units: turn_units,
-            maximum_delay_units: default_delay,
-            cancellation_work_units: u64::from(service.cancellation_checkpoint_units),
-            maximum_cancellation_delay_units: default_cancellation_delay,
-        });
+        for handler in actor.handlers() {
+            checkpoint(cancellation)?;
+            let work = handler_work
+                .get(&handler)
+                .copied()
+                .filter(|work| work.context == foundation.context)
+                .ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from(
+                        "Service Plan Actor handler has no verified Core work bound",
+                    ))
+                })?;
+            let turn_units = u64::from(service.actor_turn_units)
+                .checked_add(work.maximum_logical_work_units)
+                .ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from("Actor Turn service cost overflow"))
+                })?;
+            let turn_requirements = canonical_service_requirements([
+                architecture_evidence,
+                flow_evidence(mailbox),
+                flow_evidence(turn),
+                flow_evidence(placement),
+                ServiceRequirementRef {
+                    source: ServiceRequirementSource::Core,
+                    context: work.context,
+                    identity: work.identity,
+                    current_meaning: work.current_meaning,
+                },
+            ]);
+            demands.push(ServiceDemand {
+                identity: actor_turn_service_identity(actor.identity(), handler),
+                requirement: turn.reference().identity(),
+                requirements: Arc::clone(&turn_requirements),
+                capacity_requirements: Arc::clone(&turn_requirements),
+                response_requirements: Arc::clone(&turn_requirements),
+                cancellation_requirements: turn_requirements,
+                kind: ServiceClassKind::ActorTurn,
+                core,
+                maximum_simultaneous_release: release,
+                maximum_concurrency: u32::from(actor.max_active_turns()),
+                activation_units: turn_units,
+                maximum_non_preemptive_units: turn_units,
+                maximum_delay_units: default_delay,
+                cancellation_work_units: u64::from(service.cancellation_checkpoint_units),
+                maximum_cancellation_delay_units: default_cancellation_delay,
+            });
+        }
     }
 
     for group in flow.groups() {
@@ -12486,18 +12656,85 @@ fn production_service_problem(
                     "Service Plan Group is missing its child Requirement",
                 ))
             })?;
-        let mut group_evidence = vec![architecture_evidence, flow_evidence(child)];
-        for kind in [
-            FlowRequirementKind::CancellationObservationWorkBound,
-            FlowRequirementKind::DeadlineSlack,
-            FlowRequirementKind::DeadlineFeasibility,
-        ] {
-            if let Some(requirement) = flow_requirements.iter().copied().find(|requirement| {
-                requirement.kind() == kind && requirement.site() == Some(group.identity())
-            }) {
-                group_evidence.push(flow_evidence(requirement));
-            }
-        }
+        let placement = flow_requirements
+            .iter()
+            .copied()
+            .find(|requirement| {
+                requirement.kind() == FlowRequirementKind::PermanentCorePlacement
+                    && requirement.actor() == group.actor()
+            })
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from(
+                    "Service Plan Group is missing its placement Requirement",
+                ))
+            })?;
+        let work_bound = flow_requirements
+            .iter()
+            .copied()
+            .find(|requirement| {
+                requirement.kind() == FlowRequirementKind::CancellationObservationWorkBound
+                    && requirement.site() == Some(group.identity())
+            })
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from(
+                    "Service Plan Group is missing its work-bound Requirement",
+                ))
+            })?;
+        let deadline_evidence = flow_requirements
+            .iter()
+            .copied()
+            .filter(|requirement| {
+                matches!(
+                    requirement.kind(),
+                    FlowRequirementKind::DeadlineClass
+                        | FlowRequirementKind::DeadlineAuthority
+                        | FlowRequirementKind::DeadlineSlack
+                        | FlowRequirementKind::DeadlineFeasibility
+                ) && (requirement.site() == Some(group.identity())
+                    || requirement.site() == group.deadline_authority())
+            })
+            .map(flow_evidence)
+            .collect::<Vec<_>>();
+        let cancellation_evidence = flow_requirements
+            .iter()
+            .copied()
+            .filter(|requirement| {
+                (matches!(
+                    requirement.kind(),
+                    FlowRequirementKind::GroupCancellationAuthority
+                        | FlowRequirementKind::GroupCleanupOrder
+                ) && requirement.site() == Some(group.identity()))
+                    || (requirement.kind() == FlowRequirementKind::CancellationCheckpoint
+                        && requirement
+                            .site()
+                            .is_some_and(|site| group.has_cancellation_checkpoint(site)))
+            })
+            .map(flow_evidence)
+            .collect::<Vec<_>>();
+        let capacity_requirements = canonical_service_requirements([
+            architecture_evidence,
+            flow_evidence(child),
+            flow_evidence(placement),
+            flow_evidence(work_bound),
+        ]);
+        let response_requirements = canonical_service_requirements(
+            capacity_requirements
+                .iter()
+                .copied()
+                .chain(deadline_evidence.iter().copied()),
+        );
+        let cancellation_requirements = canonical_service_requirements(
+            capacity_requirements
+                .iter()
+                .copied()
+                .chain(cancellation_evidence.iter().copied()),
+        );
+        let group_requirements = canonical_service_requirements(
+            response_requirements
+                .iter()
+                .copied()
+                .chain(cancellation_requirements.iter().copied()),
+        );
         let release = service_release(group.child_activation_bound())?;
         let work = u64::from(service.group_child_units)
             .checked_add(group.maximum_uninterrupted_work_units())
@@ -12516,7 +12753,10 @@ fn production_service_problem(
         demands.push(ServiceDemand {
             identity: service_demand_identity(ServiceClassKind::GroupChild, group.identity()),
             requirement: child.reference().identity(),
-            requirements: canonical_service_requirements(group_evidence.clone()),
+            requirements: Arc::clone(&group_requirements),
+            capacity_requirements: Arc::clone(&capacity_requirements),
+            response_requirements: Arc::clone(&response_requirements),
+            cancellation_requirements: Arc::clone(&cancellation_requirements),
             kind: ServiceClassKind::GroupChild,
             core,
             maximum_simultaneous_release: release,
@@ -12543,15 +12783,36 @@ fn production_service_problem(
             let cleanup_release = u32::try_from(group.cleanup_action_count()).map_err(|_| {
                 PlanningFailure::Defect(Arc::from("cleanup release bound exceeds schema"))
             })?;
+            let cleanup_capacity_requirements = canonical_service_requirements([
+                architecture_evidence,
+                flow_evidence(cleanup),
+                flow_evidence(placement),
+            ]);
+            let cleanup_response_requirements = canonical_service_requirements(
+                cleanup_capacity_requirements
+                    .iter()
+                    .copied()
+                    .chain(deadline_evidence.iter().copied()),
+            );
+            let cleanup_cancellation_requirements = canonical_service_requirements(
+                cleanup_capacity_requirements
+                    .iter()
+                    .copied()
+                    .chain(cancellation_evidence.iter().copied()),
+            );
+            let cleanup_requirements = canonical_service_requirements(
+                cleanup_response_requirements
+                    .iter()
+                    .copied()
+                    .chain(cleanup_cancellation_requirements.iter().copied()),
+            );
             demands.push(ServiceDemand {
                 identity: service_demand_identity(ServiceClassKind::Cleanup, group.identity()),
                 requirement: cleanup.reference().identity(),
-                requirements: canonical_service_requirements(
-                    group_evidence
-                        .iter()
-                        .copied()
-                        .chain([flow_evidence(cleanup)]),
-                ),
+                requirements: Arc::clone(&cleanup_requirements),
+                capacity_requirements: cleanup_capacity_requirements,
+                response_requirements: cleanup_response_requirements,
+                cancellation_requirements: cleanup_cancellation_requirements,
                 kind: ServiceClassKind::Cleanup,
                 core,
                 maximum_simultaneous_release: cleanup_release,
@@ -12599,18 +12860,22 @@ fn production_service_problem(
                     "Service Plan Driver is missing its realization Requirement",
                 ))
             })?;
+        let driver_requirements = canonical_service_requirements([
+            architecture_evidence,
+            ServiceRequirementRef {
+                source: ServiceRequirementSource::Foundation,
+                context: requirement.reference.context,
+                identity: requirement.reference.identity,
+                current_meaning: requirement.reference.current_meaning,
+            },
+        ]);
         demands.push(ServiceDemand {
             identity: service_demand_identity(ServiceClassKind::Driver, role.reference.identity),
             requirement: requirement.reference.identity,
-            requirements: canonical_service_requirements([
-                architecture_evidence,
-                ServiceRequirementRef {
-                    source: ServiceRequirementSource::Foundation,
-                    context: requirement.reference.context,
-                    identity: requirement.reference.identity,
-                    current_meaning: requirement.reference.current_meaning,
-                },
-            ]),
+            requirements: Arc::clone(&driver_requirements),
+            capacity_requirements: Arc::clone(&driver_requirements),
+            response_requirements: Arc::clone(&driver_requirements),
+            cancellation_requirements: driver_requirements,
             kind: ServiceClassKind::Driver,
             core,
             maximum_simultaneous_release: 1,
@@ -12656,11 +12921,59 @@ fn verify_actor_turn_demand_work(
         identity: architecture.contract_identity(),
         current_meaning: architecture.contract_current_meaning(),
     };
+    let service = architecture.costs();
+    let flow_requirements = flow.requirements().collect::<Vec<_>>();
+    let placements = assignment
+        .placements
+        .iter()
+        .map(|placement| (placement.executable, placement.core))
+        .collect::<BTreeMap<_, _>>();
+    let mut expected_identities = BTreeSet::new();
 
     for actor in flow.actors() {
         checkpoint(cancellation)?;
-        let mut maximum_work = None;
-        let mut core_references = Vec::new();
+        let mailbox = flow_requirements
+            .iter()
+            .copied()
+            .find(|requirement| {
+                requirement.actor() == actor.identity()
+                    && requirement.kind() == FlowRequirementKind::MailboxCapacity
+            })
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from(
+                    "Service work verifier is missing an Actor mailbox Requirement",
+                ))
+            })?;
+        let turn = flow_requirements
+            .iter()
+            .copied()
+            .find(|requirement| {
+                requirement.actor() == actor.identity()
+                    && requirement.kind() == FlowRequirementKind::TurnLease
+            })
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from(
+                    "Service work verifier is missing an Actor Turn Requirement",
+                ))
+            })?;
+        let placement = flow_requirements
+            .iter()
+            .copied()
+            .find(|requirement| {
+                requirement.actor() == actor.identity()
+                    && requirement.kind() == FlowRequirementKind::PermanentCorePlacement
+            })
+            .ok_or_else(|| {
+                PlanningFailure::Defect(Arc::from(
+                    "Service work verifier is missing an Actor placement Requirement",
+                ))
+            })?;
+        let reference = |requirement: ImagePlanningFlowRequirement<'_>| ServiceRequirementRef {
+            source: ServiceRequirementSource::Flow,
+            context: foundation.context,
+            identity: requirement.reference().identity(),
+            current_meaning: requirement.reference().current_meaning(),
+        };
         for handler in actor.handlers() {
             checkpoint(cancellation)?;
             let work = core
@@ -12671,50 +12984,75 @@ fn verify_actor_turn_demand_work(
                         "Service work verifier cannot reconstruct an Actor handler",
                     ))
                 })?;
-            maximum_work = Some(
-                maximum_work
-                    .unwrap_or(0_u64)
-                    .max(work.maximum_logical_work_units),
-            );
-            core_references.push(ServiceRequirementRef {
-                source: ServiceRequirementSource::Core,
-                context: work.context,
-                identity: work.identity,
-                current_meaning: work.current_meaning,
-            });
+            let expected_units = baseline
+                .checked_add(work.maximum_logical_work_units)
+                .ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from("Actor Turn verifier overflow"))
+                })?;
+            let identity = actor_turn_service_identity(actor.identity(), handler);
+            expected_identities.insert(identity);
+            let demand = problem
+                .demands
+                .iter()
+                .find(|demand| {
+                    demand.kind == ServiceClassKind::ActorTurn && demand.identity == identity
+                })
+                .ok_or_else(|| {
+                    PlanningFailure::Defect(Arc::from(
+                        "Service work verifier is missing a handler-specific Actor Turn demand",
+                    ))
+                })?;
+            let mut expected_references = vec![
+                architecture_reference,
+                reference(mailbox),
+                reference(turn),
+                reference(placement),
+                ServiceRequirementRef {
+                    source: ServiceRequirementSource::Core,
+                    context: work.context,
+                    identity: work.identity,
+                    current_meaning: work.current_meaning,
+                },
+            ];
+            expected_references.sort_unstable();
+            expected_references.dedup();
+            if demand.requirement != turn.reference().identity()
+                || demand.requirements.as_ref() != expected_references
+                || demand.capacity_requirements.as_ref() != expected_references
+                || demand.response_requirements.as_ref() != expected_references
+                || demand.cancellation_requirements.as_ref() != expected_references
+                || demand.core
+                    != placements.get(&handler).copied().ok_or_else(|| {
+                        PlanningFailure::Defect(Arc::from(
+                            "Service work verifier cannot reconstruct handler placement",
+                        ))
+                    })?
+                || demand.maximum_simultaneous_release != service_release(actor.mailbox_capacity())?
+                || demand.maximum_concurrency != u32::from(actor.max_active_turns())
+                || demand.activation_units != expected_units
+                || demand.maximum_non_preemptive_units != expected_units
+                || demand.maximum_delay_units != u64::from(service.maximum_cycle_units)
+                || demand.cancellation_work_units
+                    != u64::from(service.cancellation_checkpoint_units)
+                || demand.maximum_cancellation_delay_units
+                    != u64::from(service.maximum_cancellation_delay_units)
+            {
+                return defect(
+                    "Handler-specific Actor Turn service or evidence does not reconstruct",
+                );
+            }
         }
-        let Some(maximum_work) = maximum_work else {
-            continue;
-        };
-        core_references.sort_unstable();
-        let expected_units = baseline
-            .checked_add(maximum_work)
-            .ok_or_else(|| PlanningFailure::Defect(Arc::from("Actor Turn verifier overflow")))?;
-        let identity = service_demand_identity(ServiceClassKind::ActorTurn, actor.identity());
-        let demand = problem
-            .demands
-            .iter()
-            .find(|demand| {
-                demand.kind == ServiceClassKind::ActorTurn && demand.identity == identity
-            })
-            .ok_or_else(|| {
-                PlanningFailure::Defect(Arc::from(
-                    "Service work verifier is missing an Actor Turn demand",
-                ))
-            })?;
-        let actual_core_references = demand
-            .requirements
-            .iter()
-            .copied()
-            .filter(|reference| reference.source == ServiceRequirementSource::Core)
-            .collect::<Vec<_>>();
-        if demand.activation_units != expected_units
-            || demand.maximum_non_preemptive_units != expected_units
-            || !demand.requirements.contains(&architecture_reference)
-            || actual_core_references != core_references
-        {
-            return defect("Actor Turn work or authenticated evidence does not reconstruct");
-        }
+    }
+    let actual_identities = problem
+        .demands
+        .iter()
+        .filter(|demand| demand.kind == ServiceClassKind::ActorTurn)
+        .map(|demand| demand.identity)
+        .collect::<Vec<_>>();
+    if actual_identities.len() != expected_identities.len()
+        || actual_identities.into_iter().collect::<BTreeSet<_>>() != expected_identities
+    {
+        return defect("Service work verifier found extra or repointed Actor Turn service");
     }
     Ok(())
 }
@@ -12841,7 +13179,13 @@ fn build() -> Image:
     }
 
     fn assignment_fixture() -> VerifiedWholeImageAssignment {
-        let foundation = Arc::new(fixture(Root::Image));
+        assignment_from_foundation(fixture(Root::Image))
+    }
+
+    fn assignment_from_foundation(
+        foundation: VerifiedPlanningFoundation,
+    ) -> VerifiedWholeImageAssignment {
+        let foundation = Arc::new(foundation);
         let core = Arc::new(
             CoreModule
                 .derive(foundation.for_core(), &Cancellation::new())
@@ -15125,19 +15469,25 @@ fn build() -> Image:
     }
 
     fn service_corruption_fixture() -> (ServiceProblem, ServicePlanCandidate) {
-        let demand = |identity, kind| ServiceDemand {
-            identity,
-            requirement: identity + 100,
-            requirements: synthetic_service_requirements(7, identity + 100),
-            kind,
-            core: 0,
-            maximum_simultaneous_release: 2,
-            maximum_concurrency: 2,
-            activation_units: 2,
-            maximum_non_preemptive_units: 1,
-            maximum_delay_units: 20,
-            cancellation_work_units: 1,
-            maximum_cancellation_delay_units: 21,
+        let demand = |identity, kind| {
+            let requirements = synthetic_service_requirements(7, identity + 100);
+            ServiceDemand {
+                identity,
+                requirement: identity + 100,
+                requirements: Arc::clone(&requirements),
+                capacity_requirements: Arc::clone(&requirements),
+                response_requirements: Arc::clone(&requirements),
+                cancellation_requirements: requirements,
+                kind,
+                core: 0,
+                maximum_simultaneous_release: 2,
+                maximum_concurrency: 2,
+                activation_units: 2,
+                maximum_non_preemptive_units: 1,
+                maximum_delay_units: 20,
+                cancellation_work_units: 1,
+                maximum_cancellation_delay_units: 21,
+            }
         };
         let problem = ServiceProblem {
             name: "corruption",
@@ -15241,6 +15591,78 @@ fn build() -> Image:
     }
 
     #[test]
+    fn handler_specific_service_verifier_rejects_duplicate_missing_repointed_and_corrupted_demands()
+    {
+        let assignment = assignment_from_foundation(fixture_from_source(
+            "src/image.wr",
+            br#"@actor
+struct Worker:
+    pub async fn light(self):
+        pass
+
+    pub async fn heavy(self):
+        first = 1 + 2
+        _ = first * 3
+
+@image
+fn build() -> Image:
+    worker = Worker()
+    return Image.new(worker=worker)
+"#,
+            Root::Image,
+        ));
+        let canonical = production_service_problem(&assignment, &Cancellation::new()).unwrap();
+        verify_actor_turn_demand_work(&assignment, &canonical, &Cancellation::new()).unwrap();
+        let actor_turns = canonical
+            .demands
+            .iter()
+            .filter(|demand| demand.kind == ServiceClassKind::ActorTurn)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(actor_turns.len(), 2);
+
+        let mut duplicate = canonical.clone();
+        duplicate.demands.push(actor_turns[0].clone());
+        assert!(matches!(
+            verify_actor_turn_demand_work(&assignment, &duplicate, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut missing = canonical.clone();
+        missing
+            .demands
+            .retain(|demand| demand.identity != actor_turns[0].identity);
+        assert!(matches!(
+            verify_actor_turn_demand_work(&assignment, &missing, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut repointed = canonical.clone();
+        repointed
+            .demands
+            .iter_mut()
+            .find(|demand| demand.identity == actor_turns[0].identity)
+            .unwrap()
+            .identity ^= 1;
+        assert!(matches!(
+            verify_actor_turn_demand_work(&assignment, &repointed, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+
+        let mut corrupted = canonical;
+        let demand = corrupted
+            .demands
+            .iter_mut()
+            .find(|demand| demand.identity == actor_turns[0].identity)
+            .unwrap();
+        demand.activation_units += 1;
+        assert!(matches!(
+            verify_actor_turn_demand_work(&assignment, &corrupted, &Cancellation::new()),
+            Err(PlanningFailure::Defect(_))
+        ));
+    }
+
+    #[test]
     fn service_conflict_evidence_has_exact_bounds_and_cancellation_publishes_nothing() {
         let puzzle = tiny_service_problem("one_short", ServiceClassKind::Cleanup, 3, 6, 0, 6);
         let ServiceSolveOutcome::Conflict(conflict) =
@@ -15282,19 +15704,25 @@ fn build() -> Image:
 
     #[test]
     fn service_concurrency_caps_quota_and_fallback_only_borrows_fitting_activations() {
-        let demand = |identity, activation, release, concurrency| ServiceDemand {
-            identity,
-            requirement: identity + 100,
-            requirements: synthetic_service_requirements(1, identity + 100),
-            kind: ServiceClassKind::ActorTurn,
-            core: 0,
-            maximum_simultaneous_release: release,
-            maximum_concurrency: concurrency,
-            activation_units: activation,
-            maximum_non_preemptive_units: activation,
-            maximum_delay_units: 34,
-            cancellation_work_units: 0,
-            maximum_cancellation_delay_units: 34,
+        let demand = |identity, activation, release, concurrency| {
+            let requirements = synthetic_service_requirements(1, identity + 100);
+            ServiceDemand {
+                identity,
+                requirement: identity + 100,
+                requirements: Arc::clone(&requirements),
+                capacity_requirements: Arc::clone(&requirements),
+                response_requirements: Arc::clone(&requirements),
+                cancellation_requirements: requirements,
+                kind: ServiceClassKind::ActorTurn,
+                core: 0,
+                maximum_simultaneous_release: release,
+                maximum_concurrency: concurrency,
+                activation_units: activation,
+                maximum_non_preemptive_units: activation,
+                maximum_delay_units: 34,
+                cancellation_work_units: 0,
+                maximum_cancellation_delay_units: 34,
+            }
         };
         let mut problem = ServiceProblem {
             name: "concurrency_and_fallback",
@@ -15343,30 +15771,57 @@ fn build() -> Image:
     }
 
     #[test]
-    fn expensive_handler_service_is_exact_at_capacity_and_conflicts_one_unit_short() {
-        let mut problem = tiny_service_problem(
-            "expensive_handler_exact_fit",
-            ServiceClassKind::ActorTurn,
-            10,
-            20,
-            0,
-            20,
-        );
-        problem.demands[0].activation_units = 10;
-        problem.demands[0].maximum_non_preemptive_units = 10;
-        let ServiceSolveOutcome::Plan(_) =
+    fn handler_specific_cheap_and_expensive_service_is_exact_and_conflicts_one_unit_short() {
+        let demand = |identity, activation| {
+            let requirements = synthetic_service_requirements(1, identity + 100);
+            ServiceDemand {
+                identity,
+                requirement: identity + 100,
+                requirements: Arc::clone(&requirements),
+                capacity_requirements: Arc::clone(&requirements),
+                response_requirements: Arc::clone(&requirements),
+                cancellation_requirements: requirements,
+                kind: ServiceClassKind::ActorTurn,
+                core: 0,
+                maximum_simultaneous_release: 1,
+                maximum_concurrency: 1,
+                activation_units: activation,
+                maximum_non_preemptive_units: activation,
+                maximum_delay_units: 21,
+                cancellation_work_units: 0,
+                maximum_cancellation_delay_units: 21,
+            }
+        };
+        let mut problem = ServiceProblem {
+            name: "handler_specific_exact_fit",
+            context: 1,
+            assignment_fingerprint: 2,
+            cores: vec![ServiceCoreResource {
+                ordinal: 0,
+                maximum_cycle_units: 11,
+            }],
+            demands: vec![demand(1, 1), demand(2, 10)],
+        };
+        let ServiceSolveOutcome::Plan(plan) =
             solve_service_problem(&problem, &Cancellation::new()).unwrap()
         else {
-            panic!("expensive handler must fit its exact authenticated capacity");
+            panic!("cheap and expensive handler costs must fit their exact combined capacity");
         };
-        problem.cores[0].maximum_cycle_units = 9;
+        assert_eq!(
+            plan.classes
+                .iter()
+                .map(|class| class.activation_units)
+                .collect::<Vec<_>>(),
+            vec![1, 10]
+        );
+        problem.cores[0].maximum_cycle_units = 10;
         let ServiceSolveOutcome::Conflict(conflict) =
             solve_service_problem(&problem, &Cancellation::new()).unwrap()
         else {
-            panic!("expensive handler must conflict one authenticated unit short");
+            panic!("handler-specific service must conflict one authenticated unit short");
         };
-        assert_eq!(conflict.required_units, 10);
-        assert_eq!(conflict.available_units, 9);
+        assert_eq!(conflict.required_units, 11);
+        assert_eq!(conflict.available_units, 10);
     }
 
     #[test]
@@ -15391,19 +15846,25 @@ fn build() -> Image:
 
     #[test]
     fn service_conflict_is_bound_to_exact_canonical_inclusion_minimal_requirements() {
-        let demand = |identity| ServiceDemand {
-            identity,
-            requirement: identity + 100,
-            requirements: synthetic_service_requirements(7, identity + 100),
-            kind: ServiceClassKind::Driver,
-            core: 0,
-            maximum_simultaneous_release: 1,
-            maximum_concurrency: 1,
-            activation_units: 4,
-            maximum_non_preemptive_units: 4,
-            maximum_delay_units: 100,
-            cancellation_work_units: 0,
-            maximum_cancellation_delay_units: 100,
+        let demand = |identity| {
+            let requirements = synthetic_service_requirements(7, identity + 100);
+            ServiceDemand {
+                identity,
+                requirement: identity + 100,
+                requirements: Arc::clone(&requirements),
+                capacity_requirements: Arc::clone(&requirements),
+                response_requirements: Arc::clone(&requirements),
+                cancellation_requirements: requirements,
+                kind: ServiceClassKind::Driver,
+                core: 0,
+                maximum_simultaneous_release: 1,
+                maximum_concurrency: 1,
+                activation_units: 4,
+                maximum_non_preemptive_units: 4,
+                maximum_delay_units: 100,
+                cancellation_work_units: 0,
+                maximum_cancellation_delay_units: 100,
+            }
         };
         let problem = ServiceProblem {
             name: "minimal_cycle_witness",
@@ -15468,5 +15929,262 @@ fn build() -> Image:
         });
         corrupt.requirements = extra.into();
         rejects_conflict(&corrupt);
+
+        let evidence = |architecture_identity, flow_identity| {
+            canonical_service_requirements([
+                ServiceRequirementRef {
+                    source: ServiceRequirementSource::Architecture,
+                    context: 7,
+                    identity: architecture_identity,
+                    current_meaning: architecture_identity + 1,
+                },
+                ServiceRequirementRef {
+                    source: ServiceRequirementSource::Flow,
+                    context: 7,
+                    identity: flow_identity,
+                    current_meaning: flow_identity + 1,
+                },
+            ])
+        };
+        let lex_demand = |identity, requirements: Arc<[ServiceRequirementRef]>| ServiceDemand {
+            identity,
+            requirement: requirements
+                .iter()
+                .find(|reference| reference.source == ServiceRequirementSource::Flow)
+                .unwrap()
+                .identity,
+            requirements: Arc::clone(&requirements),
+            capacity_requirements: Arc::clone(&requirements),
+            response_requirements: Arc::clone(&requirements),
+            cancellation_requirements: requirements,
+            kind: ServiceClassKind::Driver,
+            core: 0,
+            maximum_simultaneous_release: 1,
+            maximum_concurrency: 1,
+            activation_units: 4,
+            maximum_non_preemptive_units: 4,
+            maximum_delay_units: 100,
+            cancellation_work_units: 0,
+            maximum_cancellation_delay_units: 100,
+        };
+        let identity_rank_problem = ServiceProblem {
+            name: "requirement_identity_ranking",
+            context: 7,
+            assignment_fingerprint: 9,
+            cores: vec![ServiceCoreResource {
+                ordinal: 0,
+                maximum_cycle_units: 3,
+            }],
+            demands: vec![
+                lex_demand(1, evidence(100, 1)),
+                lex_demand(2, evidence(2, 99)),
+            ],
+        };
+        let ServiceSolveOutcome::Conflict(identity_ranked) =
+            solve_service_problem(&identity_rank_problem, &Cancellation::new()).unwrap()
+        else {
+            panic!("each single demand exceeds capacity");
+        };
+        assert_eq!(
+            identity_ranked
+                .requirements
+                .iter()
+                .map(|reference| reference.identity)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([1, 100])
+        );
+    }
+
+    #[test]
+    fn service_conflicts_retain_only_the_requirement_facts_used_by_the_selected_contradiction() {
+        let requirement = |source, identity| ServiceRequirementRef {
+            source,
+            context: 7,
+            identity,
+            current_meaning: identity + 100,
+        };
+        let architecture = requirement(ServiceRequirementSource::Architecture, 1);
+        let core_work = requirement(ServiceRequirementSource::Core, 2);
+        let service = requirement(ServiceRequirementSource::Flow, 3);
+        let placement = requirement(ServiceRequirementSource::Flow, 4);
+        let work_bound = requirement(ServiceRequirementSource::Flow, 5);
+        let deadline_slack = requirement(ServiceRequirementSource::Flow, 6);
+        let deadline_feasibility = requirement(ServiceRequirementSource::Flow, 7);
+        let demand = ServiceDemand {
+            identity: 11,
+            requirement: service.identity,
+            requirements: canonical_service_requirements([
+                architecture,
+                core_work,
+                service,
+                placement,
+                work_bound,
+                deadline_slack,
+                deadline_feasibility,
+            ]),
+            capacity_requirements: canonical_service_requirements([
+                architecture,
+                core_work,
+                service,
+                placement,
+                work_bound,
+            ]),
+            response_requirements: canonical_service_requirements([
+                architecture,
+                core_work,
+                service,
+                placement,
+                work_bound,
+                deadline_slack,
+                deadline_feasibility,
+            ]),
+            cancellation_requirements: canonical_service_requirements([
+                architecture,
+                core_work,
+                service,
+                placement,
+                work_bound,
+            ]),
+            kind: ServiceClassKind::GroupChild,
+            core: 0,
+            maximum_simultaneous_release: 1,
+            maximum_concurrency: 1,
+            activation_units: 4,
+            maximum_non_preemptive_units: 2,
+            maximum_delay_units: 100,
+            cancellation_work_units: 1,
+            maximum_cancellation_delay_units: 100,
+        };
+        let mut problem = ServiceProblem {
+            name: "exact_conflict_requirements",
+            context: 7,
+            assignment_fingerprint: 9,
+            cores: vec![ServiceCoreResource {
+                ordinal: 0,
+                maximum_cycle_units: 3,
+            }],
+            demands: vec![demand],
+        };
+        let ServiceSolveOutcome::Conflict(capacity) =
+            solve_service_problem(&problem, &Cancellation::new()).unwrap()
+        else {
+            panic!("one-short capacity must conflict");
+        };
+        assert_eq!(capacity.code, ServiceConflictCode::CycleCapacity);
+        assert_eq!(
+            capacity.requirements.as_ref(),
+            [architecture, core_work, service, placement, work_bound]
+        );
+
+        problem.cores[0].maximum_cycle_units = 4;
+        problem.demands[0].maximum_delay_units = 5;
+        let ServiceSolveOutcome::Conflict(deadline) =
+            solve_service_problem(&problem, &Cancellation::new()).unwrap()
+        else {
+            panic!("one-short deadline must conflict");
+        };
+        assert_eq!(deadline.code, ServiceConflictCode::MaximumDelay);
+        assert_eq!(
+            deadline.requirements.as_ref(),
+            [
+                architecture,
+                core_work,
+                service,
+                placement,
+                work_bound,
+                deadline_slack,
+                deadline_feasibility,
+            ]
+        );
+    }
+
+    #[test]
+    fn production_group_conflicts_partition_capacity_and_deadline_requirement_authority() {
+        let assignment = assignment_from_foundation(fixture_from_source(
+            "src/image.wr",
+            br#"from core import actor as actors
+
+@actor
+struct Worker:
+    pub async fn run(self):
+        mut group = actors.Group.all(bound=1u64)
+        group.logical_deadline(epoch=1u64, slack=1000u64)
+        _ = actors.Group.complete(take group)
+
+@image
+fn build() -> Image:
+    worker = Worker()
+    return Image.new(worker=worker)
+"#,
+            Root::Image,
+        ));
+        let translated = production_service_problem(&assignment, &Cancellation::new()).unwrap();
+        let group = translated
+            .demands
+            .iter()
+            .find(|demand| demand.kind == ServiceClassKind::GroupChild)
+            .unwrap()
+            .clone();
+        let deadline_identities = assignment
+            .flow_program
+            .for_image_planning()
+            .requirements()
+            .filter(|requirement| {
+                matches!(
+                    requirement.kind(),
+                    FlowRequirementKind::DeadlineClass
+                        | FlowRequirementKind::DeadlineAuthority
+                        | FlowRequirementKind::DeadlineSlack
+                        | FlowRequirementKind::DeadlineFeasibility
+                )
+            })
+            .map(|requirement| requirement.reference().identity())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            group
+                .capacity_requirements
+                .iter()
+                .all(|reference| !deadline_identities.contains(&reference.identity))
+        );
+        assert!(deadline_identities.iter().all(|identity| {
+            group
+                .response_requirements
+                .iter()
+                .any(|reference| reference.identity == *identity)
+        }));
+
+        let mut capacity_problem = translated.clone();
+        capacity_problem.demands = vec![group.clone()];
+        capacity_problem.cores = vec![ServiceCoreResource {
+            ordinal: group.core,
+            maximum_cycle_units: group.activation_units - 1,
+        }];
+        let ServiceSolveOutcome::Conflict(capacity) =
+            solve_service_problem(&capacity_problem, &Cancellation::new()).unwrap()
+        else {
+            panic!("production Group capacity must conflict one unit short");
+        };
+        assert_eq!(capacity.requirements, group.capacity_requirements);
+        verify_service_conflict(&capacity_problem, &capacity, &Cancellation::new()).unwrap();
+
+        let mut deadline_problem = translated;
+        let required_response = group
+            .maximum_non_preemptive_units
+            .checked_add(group.activation_units)
+            .unwrap();
+        let mut deadline_group = group;
+        deadline_group.maximum_delay_units = required_response - 1;
+        deadline_problem.demands = vec![deadline_group.clone()];
+        deadline_problem.cores = vec![ServiceCoreResource {
+            ordinal: deadline_group.core,
+            maximum_cycle_units: deadline_group.activation_units,
+        }];
+        let ServiceSolveOutcome::Conflict(deadline) =
+            solve_service_problem(&deadline_problem, &Cancellation::new()).unwrap()
+        else {
+            panic!("production Group deadline must conflict one unit short");
+        };
+        assert_eq!(deadline.requirements, deadline_group.response_requirements);
+        verify_service_conflict(&deadline_problem, &deadline, &Cancellation::new()).unwrap();
     }
 }

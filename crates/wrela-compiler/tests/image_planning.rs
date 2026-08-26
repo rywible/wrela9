@@ -1501,15 +1501,13 @@ fn compiler_planning_inspection_reports_the_verified_deterministic_service_plan(
 }
 
 #[test]
-fn actor_turn_service_cost_uses_the_worst_verified_handler_work() {
+fn actor_turn_service_cost_is_handler_specific_without_charging_cheap_work_the_expensive_cost() {
     let source = br#"@actor
-struct Light:
-    pub async fn run(self):
+struct Worker:
+    pub async fn light(self):
         pass
 
-@actor
-struct Heavy:
-    pub async fn run(self):
+    pub async fn heavy(self):
         first = 1 + 2
         second = first * 3
         third = second + first
@@ -1517,9 +1515,8 @@ struct Heavy:
 
 @image
 fn build() -> Image:
-    light = Light()
-    heavy = Heavy()
-    return Image.new(light=light, heavy=heavy)
+    worker = Worker()
+    return Image.new(worker=worker)
 "#;
     let outcome = Compiler::open(CompilerInstallation::layer1())
         .unwrap()
@@ -1535,28 +1532,16 @@ fn build() -> Image:
     let CompilationOutcome::Accepted(accepted) = outcome else {
         panic!("bounded handler work admits: {outcome:#?}");
     };
-    let flow = accepted.inspection().flow_program().unwrap();
     let service = accepted.inspection().service_plan().unwrap();
-    let turn_cost = |actor| {
-        let requirement = flow
-            .requirements()
-            .iter()
-            .find(|requirement| {
-                requirement.actor() == actor
-                    && requirement.kind() == wrela_compiler::FlowRequirementKind::TurnLease
-            })
-            .unwrap();
-        service
-            .classes()
-            .iter()
-            .find(|class| class.requirement() == requirement.identity())
-            .unwrap()
-            .activation_units()
-    };
-    let costs = flow
-        .actors()
+    let costs = service
+        .classes()
         .iter()
-        .map(|actor| turn_cost(actor.identity()))
+        .filter(|class| class.kind() == wrela_compiler::ServiceClassKind::ActorTurn)
+        .map(|class| class.activation_units())
         .collect::<BTreeSet<_>>();
-    assert_eq!(costs.len(), 2, "trivial and expensive handlers must differ");
+    assert_eq!(
+        costs.len(),
+        2,
+        "one Actor must retain distinct cheap and expensive handler costs"
+    );
 }
